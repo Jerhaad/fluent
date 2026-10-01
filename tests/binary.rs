@@ -46250,6 +46250,9 @@ if [[ "${1:-}" == "login" && "${2:-}" == "status" ]]; then
   test -f "$FLUENT_TEST_CODEX_AUTHENTICATED"
   exit 0
 fi
+if [[ "${1:-}" == "--version" ]]; then
+  exit 0
+fi
 printf '%s\n' "$CODEX_HOME" >> "$FLUENT_TEST_CODEX_EXEC_LOG"
 printf 'resumed writer output\n' > resumed-writer-output.txt
 git add resumed-writer-output.txt

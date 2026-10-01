@@ -1121,7 +1121,6 @@ fn run_write_task_with_coder(
             &writer_cache,
             sandbox_profile.as_ref(),
             coder_override,
-            None,
         ),
         reservation.coder,
         transcript.clone(),
@@ -1173,7 +1172,6 @@ fn run_write_task_with_coder(
                 &writer_cache,
                 sandbox_profile.as_ref(),
                 coder_override,
-                None,
             ),
             reservation.coder,
             transcript.clone(),
@@ -1206,110 +1204,25 @@ fn run_write_task_with_coder(
         return Err(error);
     }
 
-    let mut handoff = match writer_handoff_result(&config, &workspace_path, &baseline_commit) {
-        Ok(state) => state,
-        Err(error) => {
-            mark_task_failed_attempt_needs_user(
-                config.store,
-                config.project_root,
-                config.work_item_id,
-                config.attempt_id,
-                config.task_id,
-                &TaskFailure::WriterCompletion(format!(
-                    "Writer candidate state is unverifiable: {error:#}"
-                )),
-                &crate::notify::notify,
-            )?;
-            return Err(error);
-        }
-    };
-    if let Err(first_error) = &handoff {
-        let feedback = format!(
-            "The Writer handoff is incomplete: {first_error:#}. Work only in {}. Commit all intended changes, or, for an authorized follow-up with no changes, write a valid no-change declaration. Then finish this same Task.",
-            workspace_path.display()
-        );
-        run_result = provider_pause_error(
-            run_task_coder_with_optional_coder(
-                &item,
-                config.attempt_id,
-                config.task_id,
-                config.project_root,
-                &workspace_path,
-                &prior_reviews,
-                config.resolver,
-                config.extra_args,
-                reservation.coder,
-                config.no_sandbox,
-                reservation.model.as_deref(),
-                reservation.effort.as_deref(),
-                &pump_config,
-                provider_readiness.codex_worker(),
-                claude_home.as_deref(),
-                &writer_cache,
-                sandbox_profile.as_ref(),
-                coder_override,
-                Some(&feedback),
-            ),
-            reservation.coder,
-            transcript.clone(),
-        );
-        if let Err(error) = ensure_source_product_unchanged(config.project_root, &source_before) {
-            mark_task_failed_attempt_needs_user(
-                config.store,
-                config.project_root,
-                config.work_item_id,
-                config.attempt_id,
-                config.task_id,
-                &TaskFailure::WriterCompletion(error.to_string()),
-                &crate::notify::notify,
-            )?;
-            return Err(error);
-        }
-        if let Err(error) = run_result {
-            mark_task_failed_attempt_needs_user(
-                config.store,
-                config.project_root,
-                config.work_item_id,
-                config.attempt_id,
-                config.task_id,
-                &TaskFailure::WriterCompletion(format!(
-                    "Writer handoff correction failed after {first_error:#}: {error:#}"
-                )),
-                &crate::notify::notify,
-            )?;
-            return Err(error);
-        }
-        handoff = match writer_handoff_result(&config, &workspace_path, &baseline_commit) {
-            Ok(state) => state,
-            Err(error) => {
-                mark_task_failed_attempt_needs_user(
-                    config.store,
-                    config.project_root,
-                    config.work_item_id,
-                    config.attempt_id,
-                    config.task_id,
-                    &TaskFailure::WriterCompletion(format!(
-                        "Writer candidate state is unverifiable after correction: {error:#}"
-                    )),
-                    &crate::notify::notify,
-                )?;
-                return Err(error);
-            }
-        };
+    if let Err(error) = ensure_clean_worktree(&workspace_path) {
+        mark_task_failed(
+            config.store,
+            config.work_item_id,
+            config.attempt_id,
+            config.task_id,
+            config.store_lock.is_some(),
+        )?;
+        return Err(error);
     }
-    let (_produced_count, no_change) = match handoff {
-        Ok(result) => result,
+    let produced_count = match commits_ahead(&workspace_path, &baseline_commit) {
+        Ok(count) => count,
         Err(error) => {
-            mark_task_failed_attempt_needs_user(
+            mark_task_failed(
                 config.store,
-                config.project_root,
                 config.work_item_id,
                 config.attempt_id,
                 config.task_id,
-                &TaskFailure::WriterCompletion(format!(
-                    "Writer handoff remains incomplete after one correction: {error:#}"
-                )),
-                &crate::notify::notify,
+                config.store_lock.is_some(),
             )?;
             return Err(error);
         }
@@ -1340,6 +1253,25 @@ fn run_write_task_with_coder(
         )?;
         return Err(error);
     }
+    let no_change = if produced_count == 0 {
+        match validate_followup_no_change(&config, &workspace_path) {
+            Ok(no_change) => Some(no_change),
+            Err(error) => {
+                mark_task_failed_attempt_needs_user(
+                    config.store,
+                    config.project_root,
+                    config.work_item_id,
+                    config.attempt_id,
+                    config.task_id,
+                    &TaskFailure::WriterCompletion(error.to_string()),
+                    &crate::notify::notify,
+                )?;
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
     // Route every post-reservation completion failure — head lookup, completion
     // read/find, and the terminal write — through one durable terminal-state
     // boundary, so no raw `?` after the reservation can leave the Task Executing.
@@ -4622,9 +4554,8 @@ fn run_task_coder_with_optional_coder(
     writer_cache: &crate::writer_cache::WriterDependencyCache,
     sandbox_profile: Option<&os::SandboxProfile>,
     coder_override: Option<&dyn Fn(CoderSandbox) -> Box<dyn crate::coder::Coder>>,
-    handoff_feedback: Option<&str>,
 ) -> Result<()> {
-    run_task_coder_with_coder_with_feedback(
+    run_task_coder_with_coder(
         item,
         attempt_id,
         task_id,
@@ -4642,7 +4573,6 @@ fn run_task_coder_with_optional_coder(
         claude_home,
         writer_cache,
         sandbox_profile,
-        handoff_feedback,
         move |sandbox, _executable| match coder_override {
             Some(make) => make(sandbox),
             None => coder_kind.boxed_with_model_and_executable(
@@ -4674,51 +4604,6 @@ fn run_task_coder_with_coder(
     claude_home: Option<&Path>,
     writer_cache: &crate::writer_cache::WriterDependencyCache,
     sandbox_profile: Option<&os::SandboxProfile>,
-    make_coder: impl FnOnce(CoderSandbox, Option<&Path>) -> Box<dyn crate::coder::Coder>,
-) -> Result<()> {
-    run_task_coder_with_coder_with_feedback(
-        item,
-        attempt_id,
-        task_id,
-        project_root,
-        workspace_path,
-        prior_reviews,
-        resolver,
-        extra_args,
-        coder_kind,
-        no_sandbox,
-        model,
-        effort,
-        pump_config,
-        codex_worker,
-        claude_home,
-        writer_cache,
-        sandbox_profile,
-        None,
-        make_coder,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_task_coder_with_coder_with_feedback(
-    item: &WorkItem,
-    attempt_id: &str,
-    task_id: &str,
-    project_root: &Path,
-    workspace_path: &Path,
-    prior_reviews: &[PathBuf],
-    resolver: &ContentResolver,
-    extra_args: &[String],
-    coder_kind: CoderKind,
-    no_sandbox: bool,
-    model: Option<&str>,
-    effort: Option<&str>,
-    pump_config: &crate::transcript_pump::TranscriptPumpConfig,
-    codex_worker: Option<&crate::codex_worker::CodexWorkerEnvironment>,
-    claude_home: Option<&Path>,
-    writer_cache: &crate::writer_cache::WriterDependencyCache,
-    sandbox_profile: Option<&os::SandboxProfile>,
-    handoff_feedback: Option<&str>,
     make_coder: impl FnOnce(CoderSandbox, Option<&Path>) -> Box<dyn crate::coder::Coder>,
 ) -> Result<()> {
     let needs_sandbox_host_preparation =
@@ -4822,10 +4707,6 @@ fn run_task_coder_with_coder_with_feedback(
             crate::writer_context::WriterPromptKind::Initial,
         )
     };
-    if let Some(feedback) = handoff_feedback {
-        prompt.push_str("\n\n## Writer handoff correction\n\n");
-        prompt.push_str(feedback);
-    }
 
     let attempt = item
         .attempts
@@ -5003,20 +4884,12 @@ fn run_task_coder_with_coder_with_feedback(
         // Injected route tests have no production worker home; preserve their
         // ability to exercise the selected session value directly.
         .unwrap_or(true);
-    let correction_session = handoff_feedback
-        .and_then(|_| transcript_path.as_deref())
-        .and_then(crate::work_attempt_loop::writer_session_id);
-    let session = correction_session
-        .as_deref()
-        .map(crate::coder::CoderSession::Resume)
-        .unwrap_or_else(|| {
-            writer_coder_session_with_codex_snapshot(
-                item,
-                attempt_id,
-                coder_kind,
-                codex_snapshot_available,
-            )
-        });
+    let session = writer_coder_session_with_codex_snapshot(
+        item,
+        attempt_id,
+        coder_kind,
+        codex_snapshot_available,
+    );
     let completion = coder.run_captured_reported_session(
         &prompt,
         &system_prompt,
@@ -11700,8 +11573,8 @@ mod tests {
             "the Writer profile must not grant the host-owned Task record: {profile}"
         );
         assert!(
-            !profile.contains(&task_records),
-            "the Writer profile must not grant the Task-record subtree: {profile}"
+            !profile.contains(&format!("(allow file-write* (subpath \"{task_records}\"))")),
+            "the Writer profile must not grant writes to the Task-record subtree: {profile}"
         );
     }
 

@@ -30,7 +30,22 @@ pub(crate) fn deny_writer_source_entries(
     task_artifact: &Path,
 ) -> Result<()> {
     let physical_source = std::fs::canonicalize(source)?;
-    let physical_candidate = std::fs::canonicalize(candidate)?;
+    // The Writer profile is rendered before the worktree is created. Resolve
+    // its existing parent without creating the workspace during preflight.
+    let physical_candidate = match std::fs::canonicalize(candidate) {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let parent = candidate
+                .parent()
+                .context("Writer candidate has no parent")?;
+            std::fs::canonicalize(parent)?.join(
+                candidate
+                    .file_name()
+                    .context("Writer candidate has no file name")?,
+            )
+        }
+        Err(error) => return Err(error.into()),
+    };
     let artifact_root = source.join(".fluent/work/artifacts");
     let relative_artifact = task_artifact
         .strip_prefix(&artifact_root)

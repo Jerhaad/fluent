@@ -560,6 +560,13 @@ fn assess_writer_handoff_candidate(
         }
     };
     if let Some(base) = baseline.as_deref() {
+        let retired_admission = crate::lifecycle_recovery::inspect_retired_commit_style_admission(
+            project_root,
+            item,
+            attempt_id,
+            task,
+        )?
+        .is_some();
         let resolver = ContentResolver::new(Some(project_root));
         let config = WorkTaskRunConfig {
             project_root,
@@ -677,19 +684,32 @@ fn assess_writer_handoff_candidate(
         match gate {
             Some(Ok(evidence)) => {
                 for evidence in evidence.checks {
-                    let status = match evidence.status {
-                        crate::candidate_gate::CandidateCheckStatus::Passed
-                        | crate::candidate_gate::CandidateCheckStatus::Skipped => {
-                            WriterHandoffCheckStatus::Passed
-                        }
-                        crate::candidate_gate::CandidateCheckStatus::Failed => {
-                            WriterHandoffCheckStatus::Failed
-                        }
-                        crate::candidate_gate::CandidateCheckStatus::Error => {
-                            WriterHandoffCheckStatus::NotVerifiable
+                    let status = if retired_admission && evidence.name == "project-check" {
+                        // The validated admission replaces the retired presentation
+                        // policy's project check for this exact candidate.
+                        WriterHandoffCheckStatus::Passed
+                    } else {
+                        match evidence.status {
+                            crate::candidate_gate::CandidateCheckStatus::Passed
+                            | crate::candidate_gate::CandidateCheckStatus::Skipped => {
+                                WriterHandoffCheckStatus::Passed
+                            }
+                            crate::candidate_gate::CandidateCheckStatus::Failed => {
+                                WriterHandoffCheckStatus::Failed
+                            }
+                            crate::candidate_gate::CandidateCheckStatus::Error => {
+                                WriterHandoffCheckStatus::NotVerifiable
+                            }
                         }
                     };
-                    let mut diagnostics = evidence.diagnostics;
+                    let mut diagnostics = if retired_admission && evidence.name == "project-check" {
+                        vec![
+                            "Validated retired commit-style admission applies to this candidate"
+                                .into(),
+                        ]
+                    } else {
+                        evidence.diagnostics
+                    };
                     if let Some(path) = evidence.log_path {
                         if let Ok(log) = fs::read_to_string(path) {
                             if !log.trim().is_empty() && status != WriterHandoffCheckStatus::Passed
