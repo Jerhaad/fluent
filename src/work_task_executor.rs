@@ -2,7 +2,8 @@ use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read};
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 
 use crate::coder::{CoderKind, CoderSandbox};
@@ -9106,7 +9107,14 @@ fn writer_handoff_result(
     Ok(Ok((count, no_change)))
 }
 
-fn source_product_snapshot(source: &Path) -> Result<(String, Vec<u8>)> {
+#[derive(Debug, PartialEq, Eq)]
+struct SourceProductSnapshot {
+    head: String,
+    status: Vec<u8>,
+    content_hashes: BTreeMap<PathBuf, String>,
+}
+
+fn source_product_snapshot(source: &Path) -> Result<SourceProductSnapshot> {
     let head = head_commit(source)?;
     let output = git_status_output(
         source,
@@ -9123,19 +9131,95 @@ fn source_product_snapshot(source: &Path) -> Result<(String, Vec<u8>)> {
         "cannot inspect source checkout product status: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    Ok((head, output.stdout))
+    let files = git::run_raw(
+        source,
+        &[
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--",
+            ".",
+            ":(exclude).fluent/work",
+        ],
+    )?;
+    anyhow::ensure!(
+        files.status.success(),
+        "cannot list source checkout product files: {}",
+        String::from_utf8_lossy(&files.stderr)
+    );
+    let mut content_hashes = BTreeMap::new();
+    for raw_path in files
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+    {
+        let relative = PathBuf::from(std::ffi::OsString::from_vec(raw_path.to_vec()));
+        anyhow::ensure!(
+            relative
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_))),
+            "Git listed a noncanonical source product path: {}",
+            relative.display()
+        );
+        let path = source.join(&relative);
+        let digest = match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let target = fs::read_link(&path)?;
+                format!(
+                    "symlink:{:x}",
+                    Sha256::digest(target.as_os_str().as_encoded_bytes())
+                )
+            }
+            Ok(metadata) if metadata.is_file() => {
+                let mut file = fs::File::open(&path)
+                    .with_context(|| format!("read source product {}", path.display()))?;
+                let mut hasher = Sha256::new();
+                let mut buffer = [0_u8; 64 * 1024];
+                loop {
+                    let count = file.read(&mut buffer)?;
+                    if count == 0 {
+                        break;
+                    }
+                    hasher.update(&buffer[..count]);
+                }
+                format!("file:{:x}", hasher.finalize())
+            }
+            Ok(metadata) if metadata.is_dir() => "directory".to_string(),
+            Ok(_) => "other".to_string(),
+            Err(error) if error.kind() == ErrorKind::NotFound => "missing".to_string(),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("inspect source product {}", path.display()));
+            }
+        };
+        content_hashes.insert(relative, digest);
+    }
+    Ok(SourceProductSnapshot {
+        head,
+        status: output.stdout,
+        content_hashes,
+    })
 }
 
-fn ensure_source_product_unchanged(source: &Path, before: &(String, Vec<u8>)) -> Result<()> {
+fn ensure_source_product_unchanged(source: &Path, before: &SourceProductSnapshot) -> Result<()> {
     let after = source_product_snapshot(source)?;
+    let changed_paths = before
+        .content_hashes
+        .keys()
+        .chain(after.content_hashes.keys())
+        .filter(|path| before.content_hashes.get(*path) != after.content_hashes.get(*path))
+        .collect::<BTreeSet<_>>();
     anyhow::ensure!(
         &after == before,
-        "Writer changed source checkout {}; preserve it for inspection and stop this Task (before HEAD {}, after HEAD {}; before status {:?}, after status {:?})",
+        "Writer changed source checkout {}; preserve it for inspection and stop this Task (before HEAD {}, after HEAD {}; before status {:?}, after status {:?}; changed product paths {:?})",
         source.display(),
-        before.0,
-        after.0,
-        String::from_utf8_lossy(&before.1),
-        String::from_utf8_lossy(&after.1),
+        before.head,
+        after.head,
+        String::from_utf8_lossy(&before.status),
+        String::from_utf8_lossy(&after.status),
+        changed_paths,
     );
     Ok(())
 }
@@ -21395,10 +21479,11 @@ while time.monotonic() < deadline:
         )));
         assert!(prompt.contains(&format!("source checkout is {}", source.display())));
         assert!(prompt.contains("product changes and commits only in the candidate checkout"));
+        assert!(prompt.contains("declared Task artifacts under the source checkout's `.fluent/work` tree remain writable"));
     }
 
     #[test]
-    fn writer_source_checkout_drift_needs_user() {
+    fn writer_source_checkout_drift_detects_changed_bytes() {
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source");
         fs::create_dir_all(&source).unwrap();
@@ -21416,11 +21501,29 @@ while time.monotonic() < deadline:
         let before = source_product_snapshot(&source).unwrap();
         fs::write(source.join("tracked.txt"), "after\n").unwrap();
         let error = ensure_source_product_unchanged(&source, &before).unwrap_err();
-        assert!(error.to_string().contains("preserve it for inspection"));
+        assert!(
+            error.to_string().contains("preserve it for inspection"),
+            "{error:#}"
+        );
         assert_eq!(
             fs::read_to_string(source.join("tracked.txt")).unwrap(),
             "after\n"
         );
+        let dirty_before = source_product_snapshot(&source).unwrap();
+        fs::write(source.join("tracked.txt"), "changed again\n").unwrap();
+        assert_eq!(
+            dirty_before.status,
+            source_product_snapshot(&source).unwrap().status
+        );
+        assert!(ensure_source_product_unchanged(&source, &dirty_before).is_err());
+        fs::write(source.join("new.txt"), "untracked before\n").unwrap();
+        let untracked_before = source_product_snapshot(&source).unwrap();
+        fs::write(source.join("new.txt"), "untracked after\n").unwrap();
+        assert_eq!(
+            untracked_before.status,
+            source_product_snapshot(&source).unwrap().status
+        );
+        assert!(ensure_source_product_unchanged(&source, &untracked_before).is_err());
     }
 
     struct HandoffCoder {
@@ -21580,7 +21683,7 @@ while time.monotonic() < deadline:
     }
 
     #[test]
-    fn writer_source_drift_pauses_without_retry_or_revert() {
+    fn writer_source_checkout_drift_needs_user() {
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source");
         fs::create_dir_all(source.join(".fluent/expertise")).unwrap();
@@ -21634,7 +21737,10 @@ while time.monotonic() < deadline:
             Some(&make_coder),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("preserve it for inspection"));
+        assert!(
+            error.to_string().contains("preserve it for inspection"),
+            "{error:#}"
+        );
         assert_eq!(launches.lock().unwrap().len(), 1);
         assert_eq!(
             fs::read_to_string(source.join("tracked.txt")).unwrap(),
