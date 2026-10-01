@@ -251,6 +251,20 @@ pub(crate) fn prepare_launch(
 
 thread_local! {
     static TASK_OWNER: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+    static HANDOFF_CORRECTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Mark only the Writer's in-process handoff correction as a permitted second launch.
+pub(crate) struct HandoffCorrection(bool);
+impl HandoffCorrection {
+    pub(crate) fn enter(enabled: bool) -> Self {
+        Self(HANDOFF_CORRECTION.with(|flag| flag.replace(enabled)))
+    }
+}
+impl Drop for HandoffCorrection {
+    fn drop(&mut self) {
+        HANDOFF_CORRECTION.with(|flag| flag.set(self.0));
+    }
 }
 
 /// Attribute nested deterministic commands, including baseline checks, to their Task.
@@ -306,6 +320,7 @@ pub fn spawn(command: &mut Command, transcript: &Path) -> Result<std::process::C
                 &item,
                 &owner.attempt_id,
                 transcript,
+                HANDOFF_CORRECTION.with(|flag| flag.get()),
             )?;
             crate::usage_limit_recovery::before_spawn(
                 &owner.project_root,

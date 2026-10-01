@@ -211,6 +211,7 @@ pub(crate) fn before_spawn(
     item: &WorkItem,
     attempt_id: &str,
     transcript: &Path,
+    handoff_correction: bool,
 ) -> Result<()> {
     let attempt = item
         .attempts
@@ -232,10 +233,26 @@ pub(crate) fn before_spawn(
     let marker = root
         .join(contracts::audit_ref(&retry)?.path)
         .with_file_name("launch.json");
-    anyhow::ensure!(
-        !marker.try_exists()?,
-        "this completion retry already attempted a provider launch"
-    );
+    if marker.try_exists()? {
+        anyhow::ensure!(
+            handoff_correction,
+            "this completion retry already attempted a provider launch"
+        );
+        let correction = marker.with_file_name("handoff-correction-launch.json");
+        anyhow::ensure!(
+            !correction.try_exists()?,
+            "this completion retry already attempted a handoff correction"
+        );
+        publish_recovery_snapshot(
+            root,
+            correction
+                .strip_prefix(root)?
+                .to_str()
+                .context("invalid handoff correction marker path")?,
+            b"handoff-correction",
+        )?;
+        return Ok(());
+    }
     let bytes = contracts::request(&retry, contracts::START)?.operation_id();
     // The caller holds the model lock through this one-time claim and spawn.
     publish_recovery_snapshot(

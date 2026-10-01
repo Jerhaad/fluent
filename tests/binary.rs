@@ -1306,7 +1306,7 @@ fn writer_completion_context_repaired_retry_queues_same_task() {
         .unwrap()
         .unwrap();
     fluent::scheduler::dispatch_one(&carried.project, &dispatch, &RetryRunner(bin)).unwrap();
-    assert_eq!(fs::read_to_string(marker).unwrap(), "launch");
+    assert_eq!(fs::read_to_string(marker).unwrap(), "launchlaunch");
     assert!(
         fluent::scheduler::pick_next_queued(&carried.project)
             .unwrap()
@@ -2509,6 +2509,9 @@ fn combined_recovery_import_predecessor(project: &Path, work: &str, name: &str) 
     for entry in fs::read_dir(project.join(format!(".fluent/work/tasks/{work}/attempt-1"))).unwrap()
     {
         let path = entry.unwrap().path();
+        if path.extension().is_none_or(|extension| extension != "json") {
+            continue;
+        }
         let mut record = read_json_path(&path);
         if record["writer_correction_assignment"].is_object() && name != "assignment" {
             assert!(
@@ -26390,8 +26393,8 @@ exit 0
     let value = read_work_show_json(&main_dir, "work-1");
     let attempt = &value["attempts"][0];
     let task = &attempt["tasks"][0];
-    assert_eq!(attempt["status"], "failed");
-    assert_eq!(task["status"], "failed");
+    assert_eq!(attempt["status"], "needs-user");
+    assert_eq!(task["status"], "needs-user");
     assert!(task.get("output").is_none());
 }
 
@@ -27527,7 +27530,7 @@ exit 0
         .failure()
         .stderr(predicate::str::contains("valid no-change declaration"));
 
-    assert_eq!(fs::read_to_string(counter).unwrap(), "2");
+    assert_eq!(fs::read_to_string(counter).unwrap(), "3");
     assert!(!declaration_path.exists());
 }
 

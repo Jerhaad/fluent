@@ -5018,6 +5018,8 @@ fn run_task_coder_with_coder_with_feedback(
                 codex_snapshot_available,
             )
         });
+    let _handoff_correction =
+        crate::execution::HandoffCorrection::enter(handoff_feedback.is_some());
     let completion = coder.run_captured_reported_session(
         &prompt,
         &system_prompt,
@@ -9975,6 +9977,26 @@ fn resolve_or_persist_write_baseline(
                          from HEAD and risk adopting a post-commit baseline",
                         path.display()
                     );
+                }
+                // Older correction Tasks and a setup interrupted between the
+                // two baseline writes can have only the artifact sidecar. The
+                // immutable correction assignment independently names the
+                // source commit, so it can bind that exact value before launch.
+                let host = host_write_baseline_path(
+                    &WorkModelStore::new(project_root),
+                    &task.work_item_id,
+                    task.attempt_id
+                        .as_deref()
+                        .context("Writer Task has no Attempt ID")?,
+                    &task.id,
+                )?;
+                if !host.try_exists()?
+                    && task
+                        .writer_correction_assignment
+                        .as_ref()
+                        .is_some_and(|assignment| assignment.source_candidate_commit == trimmed)
+                {
+                    bind_host_write_baseline(project_root, task, trimmed)?;
                 }
                 verify_host_write_baseline(project_root, task, trimmed)?;
                 return Ok(trimmed.to_string());
