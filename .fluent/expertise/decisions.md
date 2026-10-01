@@ -15,6 +15,16 @@ uncommitted files, or mutations that persist after the check. The candidate
 gate records the hook outcome, and Fluent checks the live candidate again after
 the assessment because the Writer may continue editing during preflight.
 
+## Bind the Writer baseline outside writable artifacts
+
+A host-owned `write-baseline` file beside the Task record is authoritative for
+the Writer's starting commit. Publish it before the writable artifact sidecar. If
+setup stops between those writes, resume from the host binding instead of the
+workspace HEAD. If a correction Task has an older sidecar but no host binding,
+restore the binding only when its immutable correction assignment names that
+exact source candidate commit. A different or unreadable binding must fail
+closed; the Writer cannot establish a new baseline from its own artifacts.
+
 ---
 
 ## capture-brief Phase 3 keeps cognitive science inline

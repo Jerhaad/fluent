@@ -562,12 +562,19 @@ Tasks, assignments, completion matrices, progress, reviews, and cancellation
 unchanged. A separate explicit resume retries the same unfinished Writer through
 ordinary execution and candidate gates.
 
-The same gate invokes the project's existing `check-pre-merge` hook from the
-candidate workspace. This keeps formatting and architecture rules project-owned;
+The Writer-phase gate invokes the project's existing `check-pre-merge` hook from
+a temporary shared clone checked out at the candidate commit with detached
+HEAD. The hook can inspect committed files and the commit range, but cannot
+depend on the live Writer workspace path, branch name, uncommitted files, or
+changes that persist after the check. Fluent checks the live candidate's HEAD
+and worktree status separately after assessment, then publishes that assessed
+gate result at final handoff. This keeps formatting and architecture rules project-owned;
 for example, this repository's hook rejects the dashboard `app` importing
 `render`, which would recreate the forbidden `app -> render -> app` dependency.
-The gate snapshots HEAD and worktree status around the hook, so a check may report
-but never repair. The later landing check remains an independent final safeguard.
+The gate snapshots the detached checkout's HEAD and worktree status around the
+hook, so a check may report but never repair. Other hook phases retain their
+own execution contexts. The later landing check remains an independent final
+safeguard.
 
 After the final Tester, the host runs a final-Tester candidate gate before it
 creates a Merge Candidate or launches the Learner. The gate matches each `Test:`

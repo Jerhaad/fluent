@@ -56,6 +56,14 @@ pub struct WriterHandoffReport {
     pub candidate_commit: String,
     pub overall: WriterHandoffCheckStatus,
     pub checks: Vec<WriterHandoffCheck>,
+    #[serde(skip)]
+    gate_assessment: Option<WriterGateAssessment>,
+}
+
+#[derive(Debug, Clone)]
+struct WriterGateAssessment {
+    evidence: crate::candidate_gate::CandidateGateEvidence,
+    logs: Vec<(usize, Vec<u8>)>,
 }
 
 fn handoff_check(
@@ -384,6 +392,7 @@ fn unverified_writer_handoff(candidate_commit: String, reason: String) -> Writer
     WriterHandoffReport {
         candidate_commit,
         overall: WriterHandoffCheckStatus::NotVerifiable,
+        gate_assessment: None,
         checks: names
             .into_iter()
             .map(|name| {
@@ -508,6 +517,7 @@ fn assess_writer_handoff_candidate(
         "read Writer candidate status",
     )?;
     let identity = task.output.as_ref().map(|output| output.commit.as_str());
+    let mut gate_assessment = None;
     let mut checks = vec![if identity.is_some_and(|commit| commit != before_head) {
         handoff_check(
             "candidate-identity",
@@ -693,6 +703,23 @@ fn assess_writer_handoff_candidate(
                 Some(task.role.as_str()),
             )
         });
+        if let Some(Ok(ref evidence)) = gate {
+            let logs = evidence
+                .checks
+                .iter()
+                .enumerate()
+                .filter_map(|(index, check)| check.log_path.as_ref().map(|path| (index, path)))
+                .map(|(index, path)| {
+                    fs::read(path)
+                        .map(|bytes| (index, bytes))
+                        .with_context(|| format!("read assessed Writer gate log {path}"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            gate_assessment = Some(WriterGateAssessment {
+                evidence: evidence.clone(),
+                logs,
+            });
+        }
         match gate {
             Some(Ok(evidence)) => {
                 for evidence in evidence.checks {
@@ -795,6 +822,7 @@ fn assess_writer_handoff_candidate(
         candidate_commit: before_head,
         overall,
         checks,
+        gate_assessment,
     })
 }
 
@@ -7771,12 +7799,31 @@ pub(crate) fn plan_after_completed_writer(
     } else {
         None
     };
+    if handoff
+        .as_ref()
+        .is_some_and(|report| report.gate_assessment.is_none())
+    {
+        let report = handoff.as_ref().unwrap();
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.status != WriterHandoffCheckStatus::Passed)
+            .context("Final Writer gate assessment is missing without a failing check")?;
+        bail!(
+            "Final Writer handoff {}: {}",
+            check.name,
+            check.diagnostics.join("; ")
+        );
+    }
     if let Some(outcome) = gate_candidate_after_writer(
         project_root,
         store,
         &mut item,
         attempt_id,
         latest_write_index,
+        handoff
+            .as_ref()
+            .and_then(|report| report.gate_assessment.as_ref()),
     )? {
         return Ok(outcome);
     }
@@ -8041,6 +8088,7 @@ fn gate_candidate_after_writer(
     item: &mut WorkItem,
     attempt_id: &str,
     write_index: usize,
+    assessed: Option<&WriterGateAssessment>,
 ) -> Result<Option<WorkAttemptRunOutcome>> {
     let attempt_index = item
         .attempts
@@ -8096,7 +8144,9 @@ fn gate_candidate_after_writer(
     // Run the hook against the same detached candidate context used by the
     // active Writer check. The authoritative gate still publishes its evidence
     // under the managed artifact path below.
-    let gate_copy = if crate::hooks::find_hook(project_root, "check-pre-merge").is_some() {
+    let gate_copy = if assessed.is_none()
+        && crate::hooks::find_hook(project_root, "check-pre-merge").is_some()
+    {
         let scratch = tempfile::tempdir().context("create final Writer gate workspace")?;
         let detached = scratch.path().join("candidate");
         git::run(
@@ -8128,31 +8178,55 @@ fn gate_candidate_after_writer(
         .as_ref()
         .map(|scratch| scratch.path().join("candidate"))
         .unwrap_or_else(|| workspace.clone());
-    let evidence = crate::candidate_gate::run_candidate_gate_with_prior_and_role(
-        crate::candidate_gate::CandidateGateRequest {
-            project_root,
-            workspace: &gate_workspace,
-            work_item_id: &item.id,
-            attempt_id,
-            task_id: Some(&task.id),
-            phase: crate::candidate_gate::CandidateGatePhase::Writer,
-            base_commit,
-            candidate_commit: &output.commit,
-            completion_contract: item.attempts[attempt_index]
-                .writer_completion_contract
-                .as_ref(),
-            allow_tree_identical_metadata_rewrite: task.input_artifacts.iter().any(|artifact| {
-                artifact.producer_id == "writer-completion-repair"
-                    && artifact.path.ends_with("writer-completion.json")
-            }),
-            metadata_rewrite_authorization: metadata_rewrite_authorization.as_ref(),
-            tester_results_path: None,
-            accepted_tester_commands: &[],
-            artifact_path: &project_root.join(&artifact.path),
-        },
-        prior_candidate_gate_path.as_deref(),
-        Some(task.role.as_str()),
-    )?;
+    let evidence = if let Some(assessed) = assessed {
+        let mut evidence = assessed.evidence.clone();
+        anyhow::ensure!(
+            evidence.candidate_commit == output.commit && evidence.base_commit == base_commit,
+            "Final Writer gate assessment does not match the completed Writer output"
+        );
+        let path = project_root.join(&artifact.path);
+        let log_dir = path
+            .parent()
+            .context("candidate gate artifact has no parent")?
+            .join("hooks");
+        fs::create_dir_all(&log_dir)?;
+        for (index, bytes) in &assessed.logs {
+            let log_path = log_dir.join(format!("assessed-check-{index}.log"));
+            crate::atomic_write::atomic_write(&log_path, bytes)?;
+            evidence.checks[*index].log_path = Some(log_path.to_string_lossy().into_owned());
+        }
+        fs::create_dir_all(path.parent().unwrap())?;
+        crate::atomic_write::atomic_write(&path, &serde_json::to_vec_pretty(&evidence)?)?;
+        evidence
+    } else {
+        crate::candidate_gate::run_candidate_gate_with_prior_and_role(
+            crate::candidate_gate::CandidateGateRequest {
+                project_root,
+                workspace: &gate_workspace,
+                work_item_id: &item.id,
+                attempt_id,
+                task_id: Some(&task.id),
+                phase: crate::candidate_gate::CandidateGatePhase::Writer,
+                base_commit,
+                candidate_commit: &output.commit,
+                completion_contract: item.attempts[attempt_index]
+                    .writer_completion_contract
+                    .as_ref(),
+                allow_tree_identical_metadata_rewrite: task.input_artifacts.iter().any(
+                    |artifact| {
+                        artifact.producer_id == "writer-completion-repair"
+                            && artifact.path.ends_with("writer-completion.json")
+                    },
+                ),
+                metadata_rewrite_authorization: metadata_rewrite_authorization.as_ref(),
+                tester_results_path: None,
+                accepted_tester_commands: &[],
+                artifact_path: &project_root.join(&artifact.path),
+            },
+            prior_candidate_gate_path.as_deref(),
+            Some(task.role.as_str()),
+        )?
+    };
     match evidence.disposition {
         crate::candidate_gate::CandidateGateDisposition::Passed => {
             if !item.attempts[attempt_index].artifacts.contains(&artifact) {
@@ -13784,10 +13858,16 @@ mod tests {
                     crate::work_model::CompletionResponsibility::Tester
                 );
             }
-            let outcome =
-                gate_candidate_after_writer(project.path(), &store, &mut item, "attempt-1", 0)
-                    .unwrap()
-                    .unwrap();
+            let outcome = gate_candidate_after_writer(
+                project.path(),
+                &store,
+                &mut item,
+                "attempt-1",
+                0,
+                None,
+            )
+            .unwrap()
+            .unwrap();
             if source_defect {
                 let WorkAttemptRunOutcome::PlannedWriteRound { task_id } = outcome else {
                     panic!("committed-source defects must retain correction: {outcome:?}");
@@ -22071,7 +22151,8 @@ print(json.dumps([json.loads(line) for line in (pathlib.Path(sys.argv[1])/'comma
         attach_gate_named_work_item_input(project.path(), &mut item);
 
         let outcome =
-            gate_candidate_after_writer(project.path(), &store, &mut item, "attempt-1", 0).unwrap();
+            gate_candidate_after_writer(project.path(), &store, &mut item, "attempt-1", 0, None)
+                .unwrap();
 
         assert!(outcome.is_none());
         let gate_path = project.path().join(
@@ -22089,6 +22170,92 @@ print(json.dumps([json.loads(line) for line in (pathlib.Path(sys.argv[1])/'comma
                 .base_commit
                 .as_deref()
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn final_writer_gate_publishes_assessed_result_without_rerunning_hook() {
+        let project = tempfile::tempdir().unwrap();
+        let marker = project.path().join("hook-ran");
+        let hook = format!(
+            "#!/bin/sh\nif [ -e '{}' ]; then exit 1; fi\nprintf x > '{}'\n",
+            marker.display(),
+            marker.display()
+        );
+        let (store, workspace) =
+            make_candidate_gate_fixture(project.path(), "pub fn value() {}\n", Some(&hook));
+        let mut item = store.read_work_item("work-1").unwrap();
+        let output = item.attempts[0].tasks[0].output.as_ref().unwrap();
+        let assessment_path = project.path().join("private/candidate-gate.json");
+        let evidence = crate::candidate_gate::assess_candidate_gate_with_prior_and_role(
+            crate::candidate_gate::CandidateGateRequest {
+                project_root: project.path(),
+                workspace: workspace.path(),
+                work_item_id: "work-1",
+                attempt_id: "attempt-1",
+                task_id: Some("attempt-1-write-1"),
+                phase: CandidateGatePhase::Writer,
+                base_commit: output.base_commit.as_deref().unwrap(),
+                candidate_commit: &output.commit,
+                completion_contract: None,
+                allow_tree_identical_metadata_rewrite: false,
+                metadata_rewrite_authorization: None,
+                tester_results_path: None,
+                accepted_tester_commands: &[],
+                artifact_path: &assessment_path,
+            },
+            None,
+            Some("writer"),
+        )
+        .unwrap();
+        assert_eq!(evidence.disposition, CandidateGateDisposition::Passed);
+        assert_eq!(fs::read(&marker).unwrap(), b"x");
+        let assessed = WriterGateAssessment {
+            logs: evidence
+                .checks
+                .iter()
+                .enumerate()
+                .filter_map(|(index, check)| {
+                    check
+                        .log_path
+                        .as_ref()
+                        .map(|path| (index, fs::read(project.path().join(path)).unwrap()))
+                })
+                .collect(),
+            evidence,
+        };
+        let outcome = gate_candidate_after_writer(
+            project.path(),
+            &store,
+            &mut item,
+            "attempt-1",
+            0,
+            Some(&assessed),
+        )
+        .unwrap();
+        assert!(outcome.is_none());
+        assert_eq!(
+            fs::read(&marker).unwrap(),
+            b"x",
+            "publication reran the hook"
+        );
+        let gate_path = project.path().join(
+            ".fluent/work/artifacts/work-1/attempt-1/candidate-gates/attempt-1-write-1/candidate-gate.json",
+        );
+        let gate: CandidateGateEvidence =
+            serde_json::from_slice(&fs::read(gate_path).unwrap()).unwrap();
+        assert_eq!(gate.disposition, assessed.evidence.disposition);
+        assert_eq!(
+            gate.checks
+                .iter()
+                .map(|check| &check.status)
+                .collect::<Vec<_>>(),
+            assessed
+                .evidence
+                .checks
+                .iter()
+                .map(|check| &check.status)
+                .collect::<Vec<_>>()
         );
     }
 
@@ -24665,7 +24832,7 @@ print(json.dumps([json.loads(line) for line in (pathlib.Path(sys.argv[1])/'comma
         // Reconstruct a persisted failure and corrective Task from an older Fluent.
         // Current admission accepts this message and cannot create this history.
         assert!(
-            gate_candidate_after_writer(project.path(), &store, &mut item, "attempt-1", 0)
+            gate_candidate_after_writer(project.path(), &store, &mut item, "attempt-1", 0, None)
                 .unwrap()
                 .is_none()
         );
