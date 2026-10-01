@@ -40996,6 +40996,12 @@ fn setup_active_writer_handoff(tmp: &TempDir) -> (PathBuf, PathBuf, String) {
     let area = project.join(&task.artifact_area.as_ref().unwrap().path);
     fs::create_dir_all(&area).unwrap();
     fs::write(area.join("write-baseline-commit"), &base).unwrap();
+    let binding = store
+        .work_task_path("handoff-1", "attempt-1", "attempt-1-write-1")
+        .unwrap()
+        .with_extension("write-baseline");
+    fs::create_dir_all(binding.parent().unwrap()).unwrap();
+    fs::write(binding, &base).unwrap();
     item.attempts[0].status = fluent::work_model::AttemptStatus::Executing;
     store.write_work_item(&item).unwrap();
     fs::write(candidate.join("change.txt"), "change\n").unwrap();
@@ -41024,6 +41030,47 @@ fn run_writer_handoff(candidate: &Path, task_id: &str) -> serde_json::Value {
         String::from_utf8_lossy(&output.stderr)
     );
     serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[test]
+fn writer_handoff_preflight_rejects_changed_writable_baseline() {
+    let tmp = TempDir::new().unwrap();
+    let (project, candidate, head) = setup_active_writer_handoff(&tmp);
+    let store = WorkModelStore::new(&project);
+    let item = store.read_work_item("handoff-1").unwrap();
+    let area = project.join(
+        &item.attempts[0].tasks[0]
+            .artifact_area
+            .as_ref()
+            .unwrap()
+            .path,
+    );
+    fs::write(area.join("write-baseline-commit"), &head).unwrap();
+    let report = run_writer_handoff(&candidate, "attempt-1-write-1");
+    assert_ne!(report["overall"], "pass");
+    assert!(
+        report["checks"].as_array().unwrap().iter().any(|check| {
+            check["name"] == "writer-output" && check["status"] == "not-verifiable"
+        })
+    );
+}
+
+#[test]
+fn writer_handoff_preflight_requires_host_baseline() {
+    let tmp = TempDir::new().unwrap();
+    let (project, candidate, _) = setup_active_writer_handoff(&tmp);
+    let binding = WorkModelStore::new(&project)
+        .work_task_path("handoff-1", "attempt-1", "attempt-1-write-1")
+        .unwrap()
+        .with_extension("write-baseline");
+    fs::remove_file(binding).unwrap();
+    let report = run_writer_handoff(&candidate, "attempt-1-write-1");
+    assert_eq!(report["overall"], "not-verifiable");
+    assert!(
+        report["checks"].as_array().unwrap().iter().any(|check| {
+            check["name"] == "writer-output" && check["status"] == "not-verifiable"
+        })
+    );
 }
 
 #[test]

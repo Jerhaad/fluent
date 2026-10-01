@@ -4,6 +4,19 @@ Architectural and design decisions that are intentional and should not be flagge
 
 ---
 
+## Writer handoff hooks run in a detached private candidate copy
+
+Active preflight and final handoff run the Writer-phase project hook against a
+temporary shared clone checked out at the candidate commit with detached HEAD.
+This keeps a hook from changing the live Writer worktree, branch, or commit while
+both checks apply the same policy. Hooks can inspect the candidate's committed
+files and commit range, but must not rely on the live worktree path, branch name,
+uncommitted files, or mutations that persist after the check. The candidate
+gate records the hook outcome, and Fluent checks the live candidate again after
+the assessment because the Writer may continue editing during preflight.
+
+---
+
 ## capture-brief Phase 3 keeps cognitive science inline
 
 The capture-brief skill includes cognitive science principles (anchoring bias, framing effects, etc.) directly in the skill content rather than referencing an external expertise file. This is intentional: agents are more likely to read and apply material that appears inline within the skill they are following than to follow a reference to a separate file.

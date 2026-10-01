@@ -529,16 +529,28 @@ fn assess_writer_handoff_candidate(
         .as_ref()
         .and_then(|output| output.base_commit.clone())
         .map(Ok)
-        .unwrap_or_else(|| {
-            task.artifact_area
+        .unwrap_or_else(|| -> Result<String> {
+            let host_path = work_task_executor::host_write_baseline_path(
+                store,
+                work_item_id,
+                attempt_id,
+                task_id,
+            )?;
+            let host = fs::read_to_string(&host_path).with_context(|| {
+                format!("read host-owned Writer baseline at {}", host_path.display())
+            })?;
+            let area = task
+                .artifact_area
                 .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("Writer Task {task_id:?} has no artifact area"))
-                .and_then(|area| {
-                    work_task_executor::resolve_managed_artifact_area_path(project_root, &area.path)
-                })
-                .and_then(|area| {
-                    fs::read_to_string(area.join("write-baseline-commit")).map_err(Into::into)
-                })
+                .ok_or_else(|| anyhow::anyhow!("Writer Task {task_id:?} has no artifact area"))?;
+            let area =
+                work_task_executor::resolve_managed_artifact_area_path(project_root, &area.path)?;
+            let sidecar = fs::read_to_string(area.join("write-baseline-commit"))?;
+            anyhow::ensure!(
+                host.trim() == sidecar.trim(),
+                "Writer artifact baseline differs from the host-owned baseline"
+            );
+            Ok(host)
         });
     let baseline = match baseline {
         Ok(value) if !value.trim().is_empty() => Some(value.trim().to_string()),
