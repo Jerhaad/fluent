@@ -41328,6 +41328,73 @@ fn writer_handoff_preflight_hook_cannot_commit_to_candidate() {
 }
 
 #[test]
+fn writer_handoff_preflight_rejects_changed_candidate_during_check() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new().unwrap();
+    let (project, candidate, _) = setup_active_writer_handoff(&tmp);
+    let hooks = project.join(".fluent/hooks");
+    fs::create_dir_all(&hooks).unwrap();
+    let hook = hooks.join("check-pre-merge");
+    fs::write(&hook, "#!/bin/sh\ntouch \"$FLUENT_TEST_HOOK_SENTINEL\"\nwhile [ ! -f \"$FLUENT_TEST_HOOK_RELEASE\" ]; do sleep 0.02; done\n").unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    let sentinel = tmp.path().join("hook-started");
+    let release = tmp.path().join("release-hook");
+    let worker_candidate = candidate.clone();
+    let worker_sentinel = sentinel.clone();
+    let worker_release = release.clone();
+    let worker = std::thread::spawn(move || {
+        let output = fluent_cmd()
+            .current_dir(&worker_candidate)
+            .env("FLUENT_TEST_HOOK_SENTINEL", &worker_sentinel)
+            .env("FLUENT_TEST_HOOK_RELEASE", &worker_release)
+            .args([
+                "task",
+                "check-handoff",
+                "handoff-1",
+                "attempt-1",
+                "attempt-1-write-1",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !sentinel.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    if !sentinel.exists() {
+        fs::write(&release, "go").unwrap();
+        let _ = worker.join();
+        panic!("project hook did not start");
+    }
+    fs::write(candidate.join("race.txt"), "changed while checking\n").unwrap();
+    fs::write(&release, "go").unwrap();
+    let report = worker.join().unwrap();
+    assert_eq!(report["overall"], "failed");
+    assert!(
+        report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|check| { check["name"] == "candidate-stability" && check["status"] == "failed" })
+    );
+    assert_eq!(
+        WorkModelStore::new(&project)
+            .read_work_item("handoff-1")
+            .unwrap()
+            .attempts[0]
+            .tasks[0]
+            .status,
+        TaskStatus::Executing
+    );
+}
+
+#[test]
 fn writer_preflight_and_final_handoff_have_check_parity() {
     let tmp = TempDir::new().unwrap();
     let (project, candidate, head) = setup_active_writer_handoff(&tmp);

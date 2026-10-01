@@ -307,20 +307,21 @@ fn active_writer_project_root(
         };
         let root = fs::canonicalize(path)?;
         let store = WorkModelStore::new(&root);
+        let item_path = store.work_item_path(work_item_id)?;
         let item = match store.read_work_item_snapshot(work_item_id) {
             Ok(item) => item,
-            Err(WorkModelStorageError::ReadFile { source, .. })
-                if source.kind() == ErrorKind::NotFound =>
+            Err(WorkModelStorageError::ReadFile { path, source })
+                if source.kind() == ErrorKind::NotFound && path == item_path =>
             {
                 continue;
             }
-            Err(WorkModelStorageError::ReadFile { source, .. })
-                if source.kind() == ErrorKind::PermissionDenied =>
-            {
+            Err(WorkModelStorageError::InvalidWorkItemId { id }) => {
+                bail!("Invalid Writer handoff Work Item ID {id:?}");
+            }
+            Err(_) => {
                 inaccessible = true;
                 continue;
             }
-            Err(error) => return Err(error.into()),
         };
         let Some(attempt) = item
             .attempts
@@ -418,9 +419,7 @@ pub fn check_writer_handoff(
     let store = WorkModelStore::new(project_root);
     let item = match store.read_work_item_snapshot(work_item_id) {
         Ok(item) => item,
-        Err(WorkModelStorageError::ReadFile { source, .. })
-            if source.kind() == ErrorKind::PermissionDenied =>
-        {
+        Err(_) => {
             let candidate = git::run_stdout(
                 &caller_workspace,
                 &["rev-parse", "HEAD"],
@@ -431,7 +430,6 @@ pub fn check_writer_handoff(
                 "Host-owned Work Item bindings became unreadable during preflight".into(),
             ));
         }
-        Err(error) => return Err(error.into()),
     };
     let attempt_index = item
         .attempts
