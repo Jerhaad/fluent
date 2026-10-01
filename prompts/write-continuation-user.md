@@ -1,5 +1,9 @@
 Continue Writer Task {{task_id}} for Work Item {{work_item_id}} ({{work_item_title}}).
 
+Candidate checkout: {{candidate_checkout_path}}
+Source checkout: {{source_checkout_path}}
+Commit product changes only in the candidate checkout. Keep source product files read-only; declared Task artifacts under the source checkout's `.fluent/work` tree remain writable.
+
 Stay in the current provider session when one is available. This prompt supplies bounded current state instead of repeating completed work and prior transcripts. Read the authoritative files by path when you need more detail.
 
 Reference paths:

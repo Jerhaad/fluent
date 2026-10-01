@@ -75,7 +75,7 @@ First, understand what this Work Item asks for:
 {{/if}}
 
 Before implementing, orient to the codebase so your work fits how this project already does things:
-- Your writable candidate checkout is {{candidate_checkout_path}}. The source checkout is {{source_checkout_path}}. Make product changes and commits only in the candidate checkout; treat the source checkout as read-only.
+- Your writable candidate checkout is {{candidate_checkout_path}}. The source checkout is {{source_checkout_path}}. Make product changes and commits only in the candidate checkout. Keep source product files read-only; declared Task artifacts under the source checkout's `.fluent/work` tree remain writable.
 - Skim the existing code around what the plan touches. Match its structure, naming, error
   handling, and idioms.
 - Follow the project's stated conventions in its `AGENTS.md` / `CLAUDE.md` (your coding agent

@@ -5511,6 +5511,11 @@ fn build_writer_continuation_prompt(
             ("work_item_title", &item.title),
             ("attempt_id", attempt_id),
             ("task_id", task_id),
+            (
+                "candidate_checkout_path",
+                &workspace_path.display().to_string(),
+            ),
+            ("source_checkout_path", &project_root.display().to_string()),
             ("prior_candidate_commit", &candidate_commit),
             (
                 "protected_base_commit",
@@ -5670,6 +5675,11 @@ fn build_reviewed_correction_prompt(
             ("work_item_title", &item.title),
             ("attempt_id", attempt_id),
             ("task_id", task_id),
+            (
+                "candidate_checkout_path",
+                &workspace_path.display().to_string(),
+            ),
+            ("source_checkout_path", &project_root.display().to_string()),
             ("brief_path", &planning.brief()),
             ("behaviors_path", &planning.behaviors()),
             ("approach_path", &planning.approach()),
@@ -19384,6 +19394,12 @@ while time.monotonic() < deadline:
         assert!(!prompt.contains("Fix the boundary"));
         assert!(!prompt.contains("Writer completion matrix:"));
         assert!(!prompt.contains("{{"));
+        assert!(prompt.contains(&format!(
+            "Candidate checkout: {}",
+            workspace.path().display()
+        )));
+        assert!(prompt.contains(&format!("Source checkout: {}", project.path().display())));
+        assert!(prompt.contains("Commit product changes only in the candidate checkout"));
 
         item.attempts[0].writer_completion_contract =
             Some(crate::work_model::WriterCompletionContract {
@@ -20028,6 +20044,12 @@ while time.monotonic() < deadline:
         )
         .unwrap();
         assert!(correction.contains("protected123"));
+        assert!(correction.contains(&format!(
+            "Candidate checkout: {}",
+            workspace.path().display()
+        )));
+        assert!(correction.contains(&format!("Source checkout: {}", project.path().display())));
+        assert!(correction.contains("Commit product changes only in the candidate checkout"));
         assert!(
             correction
                 .contains("Do not rewrite their metadata even if a review finding requests it")

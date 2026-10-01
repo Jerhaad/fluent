@@ -1,5 +1,9 @@
 Correct Writer Task {{task_id}} for Work Item {{work_item_id}} ({{work_item_title}}).
 
+Candidate checkout: {{candidate_checkout_path}}
+Source checkout: {{source_checkout_path}}
+Commit product changes only in the candidate checkout. Keep source product files read-only; declared Task artifacts under the source checkout's `.fluent/work` tree remain writable.
+
 Continue in the prior Writer session when Fluent provides it. The generated current context is
 the authoritative index for this correction:
 
