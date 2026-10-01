@@ -13881,6 +13881,89 @@ mod tests {
     }
 
     #[test]
+    fn host_evidence_survives_later_tester_finding() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, candidate) = final_tester_evidence_fixture(project.path());
+        add_completed_focused_tests_evidence(project.path(), &store, "xcodebuild test");
+        let before = store.read_work_item("work-1").unwrap();
+        let accepted = before.attempts[0].evidence_recoveries[0].clone();
+        let evidence_bytes =
+            fs::read(project.path().join(&accepted.attachment.snapshot_path)).unwrap();
+        let tester = before.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Tester)
+            .unwrap();
+        let results_path = project
+            .path()
+            .join(&tester.artifact_area.as_ref().unwrap().path)
+            .join("tester-results.json");
+        let mut results: serde_json::Value =
+            serde_json::from_slice(&fs::read(&results_path).unwrap()).unwrap();
+        results["tests"][0]["id"] = serde_json::json!("required_behavior");
+        results["tests"][0]["status"] = serde_json::json!("fail");
+        results["summary"] = serde_json::json!({"total":1,"pass":0,"fail":1,"skipped":0});
+        fs::write(&results_path, serde_json::to_vec(&results).unwrap()).unwrap();
+
+        let outcome =
+            interpret_reviews(project.path(), &store, before, "attempt-1", true, None).unwrap();
+        let WorkAttemptRunOutcome::PlannedReviews { task_ids } = outcome else {
+            panic!("expected fresh Tests Review: {outcome:?}");
+        };
+        store
+            .mutate_work_item("work-1", |item| {
+                for task in item.attempts[0]
+                    .tasks
+                    .iter_mut()
+                    .filter(|task| task_ids.contains(&task.id))
+                {
+                    task.status = TaskStatus::Complete;
+                    let area = project
+                        .path()
+                        .join(&task.artifact_area.as_ref().unwrap().path);
+                    fs::create_dir_all(&area).unwrap();
+                    fs::write(area.join("review.md"), "Verdict: pass\n").unwrap();
+                }
+                Ok(())
+            })
+            .unwrap();
+        let outcome = interpret_reviews(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+            true,
+            None,
+        )
+        .unwrap();
+        assert!(
+            matches!(outcome, WorkAttemptRunOutcome::PlannedWriteRound { .. }),
+            "{outcome:?}"
+        );
+        let after = store.read_work_item("work-1").unwrap();
+        assert_eq!(after.attempts[0].evidence_recoveries[0], accepted);
+        assert_eq!(
+            fs::read(project.path().join(&accepted.attachment.snapshot_path)).unwrap(),
+            evidence_bytes
+        );
+        assert_eq!(
+            after.attempts[0].tasks[0].output.as_ref().unwrap().commit,
+            candidate
+        );
+        let correction = after.attempts[0].tasks.last().unwrap();
+        assert_eq!(correction.kind, TaskKind::Write);
+        assert_eq!(correction.status, TaskStatus::Planned);
+        assert!(
+            !correction
+                .writer_correction_assignment
+                .as_ref()
+                .unwrap()
+                .findings
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn reference_assessment_controls_writer_admission() {
         for (reference, source_defect) in [
             (None, false),
