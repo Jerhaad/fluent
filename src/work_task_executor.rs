@@ -9902,11 +9902,10 @@ fn bind_host_write_baseline(
         ),
         Err(error) if error.kind() == ErrorKind::NotFound => {
             fs::create_dir_all(path.parent().context("Writer baseline has no parent")?)?;
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)?;
+            let mut file = tempfile::NamedTempFile::new_in(path.parent().unwrap())?;
             std::io::Write::write_all(&mut file, baseline.as_bytes())?;
+            file.as_file().sync_all()?;
+            file.persist_noclobber(&path).map_err(|error| error.error)?;
         }
         Err(error) => {
             return Err(error)
@@ -9992,7 +9991,34 @@ fn resolve_or_persist_write_baseline(
         }
     }
 
-    let baseline = head_commit(workspace_path)?;
+    // Publish the host-owned binding first. If setup stopped before writing the
+    // sidecar, reuse the binding rather than adopting a later workspace HEAD.
+    let store = WorkModelStore::new(project_root);
+    let attempt_id = task
+        .attempt_id
+        .as_deref()
+        .context("Writer Task has no Attempt ID")?;
+    let host_path = host_write_baseline_path(&store, &task.work_item_id, attempt_id, &task.id)?;
+    let baseline = match fs::read_to_string(&host_path) {
+        Ok(saved) => {
+            let saved = saved.trim();
+            anyhow::ensure!(
+                !saved.is_empty(),
+                "host-owned Writer baseline at {} is empty",
+                host_path.display()
+            );
+            saved.to_string()
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            let baseline = head_commit(workspace_path)?;
+            bind_host_write_baseline(project_root, task, &baseline)?;
+            baseline
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("read host Writer baseline at {}", host_path.display()));
+        }
+    };
     if let Some(path) = baseline_path.as_ref() {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -10000,15 +10026,18 @@ fn resolve_or_persist_write_baseline(
         // Create without overwriting: only a NotFound read reaches here, and the
         // Task lease serializes writers, so an existing sidecar means a concurrent
         // or prior baseline we must not clobber with a post-commit HEAD.
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-            .with_context(|| format!("persist write baseline at {}", path.display()))?;
+        let mut file = tempfile::NamedTempFile::new_in(
+            path.parent()
+                .context("Writer baseline sidecar has no parent")?,
+        )
+        .with_context(|| format!("prepare write baseline at {}", path.display()))?;
         std::io::Write::write_all(&mut file, baseline.as_bytes())
             .with_context(|| format!("persist write baseline at {}", path.display()))?;
+        file.as_file().sync_all()?;
+        file.persist_noclobber(path)
+            .map_err(|error| error.error)
+            .with_context(|| format!("persist write baseline at {}", path.display()))?;
     }
-    bind_host_write_baseline(project_root, task, &baseline)?;
     Ok(baseline)
 }
 
@@ -15152,16 +15181,37 @@ mod tests {
         let advanced = head_commit(&workspace).unwrap();
         assert_ne!(first, advanced, "HEAD must have advanced");
 
+        // Setup may stop after binding the host baseline but before creating
+        // the artifact sidecar. Restore from that binding, even if HEAD moved.
+        let sidecar = project_root
+            .join(task.artifact_area.as_ref().unwrap().path.as_str())
+            .join("write-baseline-commit");
+        fs::remove_file(&sidecar).unwrap();
+
         // Resume resolves the SAME persisted baseline, not the advanced HEAD.
         let resumed = resolve_or_persist_write_baseline(project_root, &task, &workspace).unwrap();
         assert_eq!(
             resumed, first,
             "resume must reuse the persisted pre-write baseline, not recompute from HEAD"
         );
+        assert_eq!(fs::read_to_string(&sidecar).unwrap(), first);
         assert!(
             commits_ahead(&workspace, &resumed).unwrap() >= 1,
             "the pre-failure commit must count as produced work on resume"
         );
+
+        // An artifact alone cannot establish a trusted baseline on resume.
+        let store = WorkModelStore::new(project_root);
+        let host_path = host_write_baseline_path(
+            &store,
+            &task.work_item_id,
+            task.attempt_id.as_deref().unwrap(),
+            &task.id,
+        )
+        .unwrap();
+        fs::remove_file(host_path).unwrap();
+        resolve_or_persist_write_baseline(project_root, &task, &workspace)
+            .expect_err("an unbound artifact baseline must fail closed");
     }
 
     #[test]
