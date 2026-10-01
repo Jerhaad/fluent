@@ -40,7 +40,18 @@ pub(crate) fn deny_writer_source_entries(
         if entry.file_name() == ".fluent" {
             for child in std::fs::read_dir(&path)? {
                 let child = child?;
-                if child.file_name() != "work" {
+                if child.file_name() == "work" {
+                    content.push_str(&format!(
+                        "\n(deny file-write* (subpath {}))",
+                        sbpl_string(&child.path())
+                    ));
+                    for allowed in ["artifacts", "progress"] {
+                        content.push_str(&format!(
+                            "\n(allow file-write* (subpath {}))",
+                            sbpl_string(&child.path().join(allowed))
+                        ));
+                    }
+                } else {
                     content.push_str(&format!(
                         "\n(deny file-write* (subpath {}))",
                         sbpl_string(&child.path())
@@ -1455,7 +1466,10 @@ mod tests {
         let source = root.path().join("source");
         let candidate = root.path().join("candidate");
         let artifact = source.join(".fluent/work/artifacts/task");
+        let model = source.join(".fluent/work/items/work.json");
         std::fs::create_dir_all(&artifact).unwrap();
+        std::fs::create_dir_all(model.parent().unwrap()).unwrap();
+        std::fs::write(&model, "host-owned").unwrap();
         std::fs::create_dir_all(source.join(".git")).unwrap();
         std::fs::create_dir_all(source.join("src")).unwrap();
         std::fs::create_dir_all(&candidate).unwrap();
@@ -1486,10 +1500,19 @@ mod tests {
             "(deny file-write* (subpath {}))",
             sbpl_string(&source.join(".git"))
         )));
-        assert!(!content.contains(&format!(
+        assert!(content.contains(&format!(
             "(deny file-write* (subpath {}))",
             sbpl_string(&source.join(".fluent/work"))
         )));
+        assert!(
+            content.rfind(&format!(
+                "(allow file-write* (subpath {}))",
+                sbpl_string(&source.join(".fluent/work/artifacts"))
+            )) > content.rfind(&format!(
+                "(deny file-write* (subpath {}))",
+                sbpl_string(&source.join(".fluent/work"))
+            ))
+        );
         #[cfg(target_os = "macos")]
         {
             if let Err(error) = preflight_profile_with(&profile, |profile_path| {
@@ -1508,15 +1531,16 @@ mod tests {
             }
             let output = std::process::Command::new("/usr/bin/sandbox-exec")
                 .arg("-f").arg(&profile.path)
-                .args(["/bin/sh", "-c", "if /bin/echo changed > \"$1\"; then exit 10; fi; /bin/echo candidate > \"$2\" || exit 11; /bin/echo git > \"$3\" || exit 12; /bin/echo artifact > \"$4\" || exit 13", "writer-profile-probe"])
+                .args(["/bin/sh", "-c", "if /bin/echo changed > \"$1\"; then exit 10; fi; /bin/echo candidate > \"$2\" || exit 11; /bin/echo git > \"$3\" || exit 12; /bin/echo artifact > \"$4\" || exit 13; if /bin/echo model > \"$5\"; then exit 14; fi", "writer-profile-probe"])
                 .arg(source.join("src/lib.rs"))
                 .arg(candidate.join("change.txt"))
                 .arg(source.join(".git/test"))
                 .arg(artifact.join("test"))
+                .arg(&model)
                 .output().unwrap();
             assert!(
                 output.status.success(),
-                "Writer source-confinement child exited with {} (10: source write allowed; 11: candidate write denied; 12: Git write denied; 13: Task-artifact write denied). stderr: {}",
+                "Writer source-confinement child exited with {} (10: source write allowed; 11: candidate write denied; 12: Git write denied; 13: Task-artifact write denied; 14: Work-model write allowed). stderr: {}",
                 output.status,
                 String::from_utf8_lossy(&output.stderr)
             );
@@ -1524,6 +1548,7 @@ mod tests {
                 std::fs::read_to_string(source.join("src/lib.rs")).unwrap(),
                 "source"
             );
+            assert_eq!(std::fs::read_to_string(&model).unwrap(), "host-owned");
         }
     }
 
