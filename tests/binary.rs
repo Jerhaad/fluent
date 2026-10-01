@@ -41466,6 +41466,143 @@ fn writer_preflight_and_final_handoff_have_check_parity() {
 }
 
 #[test]
+fn writer_required_progress_has_preflight_and_final_handoff_parity() {
+    use fluent::work_model::{ProgressContract, RequiredProgressEntry, WriterCompletionContract};
+
+    for case in ["pending", "unreadable", "complete"] {
+        let tmp = TempDir::new().unwrap();
+        let (project, candidate, head) = setup_active_writer_handoff(&tmp);
+        let store = WorkModelStore::new(&project);
+        let mut item = store.read_work_item("handoff-1").unwrap();
+        let requirement = "Complete the Writer change";
+        let contract = WriterCompletionContract {
+            version: WRITER_COMPLETION_CONTRACT_VERSION,
+            requirements: vec![WriterCompletionRequirement {
+                responsibility: Some(CompletionResponsibility::Writer),
+                id: "plan:step-1".into(),
+                kind: WriterCompletionRequirementKind::Plan,
+                source: "plan.md#step-1".into(),
+                requirement: requirement.into(),
+                verification_refs: vec!["cargo test writer_required_progress".into()],
+                command: None,
+            }],
+        };
+        let mut matrix =
+            WriterCompletionMatrix::skeleton(&contract, "attempt-1-write-1", &[], None).unwrap();
+        if case != "pending" {
+            matrix.rows[0].state = WriterCompletionState::Complete;
+            matrix.rows[0].implementation_evidence = vec!["change.txt committed".into()];
+            matrix.rows[0].verification = vec![WriterVerificationClaim {
+                command: "cargo test writer_required_progress".into(),
+                result: WriterVerificationResult::Pass,
+            }];
+        }
+        let area = project.join(
+            &item.attempts[0].tasks[0]
+                .artifact_area
+                .as_ref()
+                .unwrap()
+                .path,
+        );
+        fs::write(
+            area.join("writer-completion.json"),
+            serde_json::to_vec_pretty(&matrix).unwrap(),
+        )
+        .unwrap();
+        let progress = project.join(".fluent/work/progress/handoff-1/attempt-1/progress.md");
+        fs::create_dir_all(progress.parent().unwrap()).unwrap();
+        if case == "unreadable" {
+            fs::write(&progress, [0xff]).unwrap();
+        } else {
+            fs::write(
+                &progress,
+                "## Required completion\n\n- [ ] step-1 — Complete the Writer change\n",
+            )
+            .unwrap();
+        }
+        item.attempts[0].writer_completion_contract = Some(contract);
+        item.attempts[0].progress_contract = Some(ProgressContract {
+            version: fluent::work_model::PROGRESS_CONTRACT_VERSION,
+            required: vec![RequiredProgressEntry {
+                id: "step-1".into(),
+                requirement: requirement.into(),
+            }],
+        });
+        store.write_work_item(&item).unwrap();
+
+        let before_progress = fs::read(&progress).unwrap();
+        let preflight = run_writer_handoff(&candidate, "attempt-1-write-1");
+        let preflight_check = preflight["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["name"] == "required-progress")
+            .unwrap();
+        let expected = if case == "complete" {
+            "passed"
+        } else {
+            "failed"
+        };
+        assert_eq!(preflight_check["status"], expected, "{case}");
+        assert_eq!(preflight["overall"], expected, "{case}");
+        if case == "pending" {
+            assert!(
+                preflight_check["diagnostics"][0]
+                    .as_str()
+                    .unwrap()
+                    .contains("completion matrix must pass")
+            );
+        }
+        if case == "unreadable" {
+            assert!(
+                preflight_check["diagnostics"][0]
+                    .as_str()
+                    .unwrap()
+                    .contains("UTF-8")
+            );
+        }
+        assert_eq!(fs::read(&progress).unwrap(), before_progress, "{case}");
+
+        let task = &mut item.attempts[0].tasks[0];
+        task.status = TaskStatus::Complete;
+        task.output = Some(TaskOutput {
+            workspace_id: "candidate".into(),
+            workspace_path: task.workspace_access.writes[0].path.clone(),
+            source_branch: "main".into(),
+            base_commit: Some(
+                git::run_stdout(&project, &["rev-parse", "HEAD"], "read base").unwrap(),
+            ),
+            commit: head,
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        item.attempts[0].status = fluent::work_model::AttemptStatus::Complete;
+        store.write_work_item(&item).unwrap();
+        let final_report = serde_json::to_value(
+            fluent::work_attempt_loop::check_completed_writer_handoff(
+                &project,
+                "handoff-1",
+                "attempt-1",
+                "attempt-1-write-1",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let outcomes = |report: &serde_json::Value| {
+            report["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|check| (check["name"].clone(), check["status"].clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(outcomes(&preflight), outcomes(&final_report), "{case}");
+        assert_eq!(final_report["overall"], expected, "{case}");
+        assert_eq!(fs::read(&progress).unwrap(), before_progress, "{case}");
+    }
+}
+
+#[test]
 fn writer_handoff_failure_cases_have_final_check_parity() {
     use std::os::unix::fs::PermissionsExt;
     for case in ["dirty", "gate", "matrix", "host", "hook-context"] {
