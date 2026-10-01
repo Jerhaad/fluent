@@ -604,11 +604,11 @@ fn assess_writer_handoff_candidate(
             )?;
         let scratch = tempfile::tempdir().context("create private handoff hook area")?;
         let private_workspace = scratch.path().join("candidate");
-        let gate_workspace = if task.status == TaskStatus::Executing && !before_status.is_empty() {
+        let gate_workspace = if !before_status.is_empty() {
             checks.push(handoff_check("candidate-gate", WriterHandoffCheckStatus::NotVerifiable,
                 vec!["Commit or remove candidate worktree changes before checking the full candidate gate".into()]));
             None
-        } else if task.status == TaskStatus::Executing {
+        } else {
             let clone_result = git::run(
                 project_root,
                 &[
@@ -643,8 +643,6 @@ fn assess_writer_handoff_candidate(
                     None
                 }
             }
-        } else {
-            Some(workspace)
         };
         let artifact_path = scratch
             .path()
@@ -7708,12 +7706,13 @@ pub(crate) fn plan_after_completed_writer(
             task_ids: existing_review_ids,
         });
     }
-    if latest_write.output.as_ref().is_some_and(|output| {
-        output.base_commit.is_some()
-            && output.workspace_path
-                == crate::work_model::initial_candidate_workspace_path(&item.id, attempt_id)
-    }) {
-        let handoff = assess_completed_writer_handoff_in_item(
+    let handoff = if project_root.join(".git").exists()
+        && latest_write
+            .output
+            .as_ref()
+            .is_some_and(|output| output.base_commit.is_some())
+    {
+        let report = assess_completed_writer_handoff_in_item(
             project_root,
             store,
             &item,
@@ -7723,7 +7722,7 @@ pub(crate) fn plan_after_completed_writer(
                 .unwrap(),
             latest_write_index,
         )?;
-        for check in &handoff.checks {
+        for check in &report.checks {
             if matches!(
                 check.name.as_str(),
                 "candidate-identity" | "writer-output" | "candidate-stability"
@@ -7736,7 +7735,10 @@ pub(crate) fn plan_after_completed_writer(
                 );
             }
         }
-    }
+        Some(report)
+    } else {
+        None
+    };
     if let Some(outcome) = gate_candidate_after_writer(
         project_root,
         store,
@@ -7750,6 +7752,19 @@ pub(crate) fn plan_after_completed_writer(
         gate_writer_completion_before_reviews(project_root, store, &mut item, attempt_id)?
     {
         return Ok(outcome);
+    }
+    if let Some(report) = handoff {
+        if let Some(check) = report
+            .checks
+            .iter()
+            .find(|check| check.status != WriterHandoffCheckStatus::Passed)
+        {
+            bail!(
+                "Final Writer handoff {}: {}",
+                check.name,
+                check.diagnostics.join("; ")
+            );
+        }
     }
     if let Some(outcome) = advance_failed_command_recheck(
         project_root,
@@ -8046,10 +8061,45 @@ fn gate_candidate_after_writer(
             &item.attempts[attempt_index],
             task,
         )?;
+    // Run the hook against the same detached candidate context used by the
+    // active Writer check. The authoritative gate still publishes its evidence
+    // under the managed artifact path below.
+    let gate_copy = if crate::hooks::find_hook(project_root, "check-pre-merge").is_some() {
+        let scratch = tempfile::tempdir().context("create final Writer gate workspace")?;
+        let detached = scratch.path().join("candidate");
+        git::run(
+            project_root,
+            &[
+                "clone",
+                "--shared",
+                "--quiet",
+                "--no-checkout",
+                workspace
+                    .to_str()
+                    .context("candidate workspace is not UTF-8")?,
+                detached
+                    .to_str()
+                    .context("detached workspace is not UTF-8")?,
+            ],
+            "prepare final Writer gate candidate",
+        )?;
+        git::run(
+            &detached,
+            &["checkout", "--quiet", "--detach", &output.commit],
+            "check out final Writer gate candidate",
+        )?;
+        Some(scratch)
+    } else {
+        None
+    };
+    let gate_workspace = gate_copy
+        .as_ref()
+        .map(|scratch| scratch.path().join("candidate"))
+        .unwrap_or_else(|| workspace.clone());
     let evidence = crate::candidate_gate::run_candidate_gate_with_prior_and_role(
         crate::candidate_gate::CandidateGateRequest {
             project_root,
-            workspace: &workspace,
+            workspace: &gate_workspace,
             work_item_id: &item.id,
             attempt_id,
             task_id: Some(&task.id),

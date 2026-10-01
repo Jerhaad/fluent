@@ -4529,7 +4529,16 @@ fn preflight_write_sandbox_profile(
             codex_worker.map(|worker| worker.home()),
         )?
     };
-    os::deny_writer_source_entries(&profile, project_root, workspace_path)?;
+    let task_artifact = task
+        .artifact_area
+        .as_ref()
+        .context("Writer Task has no artifact area for sandbox grant")?;
+    os::deny_writer_source_entries(
+        &profile,
+        project_root,
+        workspace_path,
+        &project_root.join(&task_artifact.path),
+    )?;
     #[cfg(not(test))]
     if let Some(worker) = codex_worker {
         os::preflight_codex_launcher(&profile, worker)?;

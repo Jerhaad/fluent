@@ -41442,6 +41442,127 @@ fn writer_preflight_and_final_handoff_have_check_parity() {
     );
 }
 
+#[test]
+fn writer_handoff_failure_cases_have_final_check_parity() {
+    use std::os::unix::fs::PermissionsExt;
+    for case in ["dirty", "gate", "matrix", "host", "hook-context"] {
+        let tmp = TempDir::new().unwrap();
+        let (project, candidate, head) = setup_active_writer_handoff(&tmp);
+        let store = WorkModelStore::new(&project);
+        let mut item = store.read_work_item("handoff-1").unwrap();
+        let area = project.join(
+            &item.attempts[0].tasks[0]
+                .artifact_area
+                .as_ref()
+                .unwrap()
+                .path,
+        );
+        match case {
+            "dirty" => fs::write(candidate.join("unfinished.txt"), "unfinished\n").unwrap(),
+            "gate" | "hook-context" => {
+                let hooks = project.join(".fluent/hooks");
+                fs::create_dir_all(&hooks).unwrap();
+                let hook = hooks.join("check-pre-merge");
+                let script = if case == "gate" {
+                    "#!/bin/sh\nexit 9\n"
+                } else {
+                    "#!/bin/sh\n[ \"$(git branch --show-current)\" = \"\" ]\n"
+                };
+                fs::write(&hook, script).unwrap();
+                fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            "matrix" | "host" => {
+                item.attempts[0].writer_completion_contract =
+                    Some(fluent::work_model::WriterCompletionContract {
+                        version: WRITER_COMPLETION_CONTRACT_VERSION,
+                        requirements: if case == "host" {
+                            vec![WriterCompletionRequirement {
+                                responsibility: Some(CompletionResponsibility::Host),
+                                id: "plan:step-2".into(),
+                                kind: WriterCompletionRequirementKind::Plan,
+                                source: "plan.md#step-2".into(),
+                                requirement: "Prove confinement".into(),
+                                verification_refs: vec!["cargo test confinement".into()],
+                                command: Some(fluent::work_model::PlanCommand {
+                                    applicability: Default::default(),
+                                    command: "cargo test confinement".into(),
+                                    working_directory: ".".into(),
+                                    environment: Default::default(),
+                                    source_row: "plan:step-2".into(),
+                                }),
+                            }]
+                        } else {
+                            Vec::new()
+                        },
+                    });
+                if case == "matrix" {
+                    fs::write(area.join("writer-completion.json"), "{broken").unwrap();
+                } else {
+                    let matrix = WriterCompletionMatrix::skeleton(
+                        item.attempts[0]
+                            .writer_completion_contract
+                            .as_ref()
+                            .unwrap(),
+                        "attempt-1-write-1",
+                        &[],
+                        None,
+                    )
+                    .unwrap();
+                    fs::write(
+                        area.join("writer-completion.json"),
+                        serde_json::to_vec_pretty(&matrix).unwrap(),
+                    )
+                    .unwrap();
+                }
+                store.write_work_item(&item).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let preflight = run_writer_handoff(&candidate, "attempt-1-write-1");
+        let task = &mut item.attempts[0].tasks[0];
+        task.status = TaskStatus::Complete;
+        task.output = Some(TaskOutput {
+            workspace_id: "candidate".into(),
+            workspace_path: task.workspace_access.writes[0].path.clone(),
+            source_branch: "main".into(),
+            base_commit: Some(
+                git::run_stdout(&project, &["rev-parse", "HEAD"], "read base").unwrap(),
+            ),
+            commit: head,
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        item.attempts[0].status = fluent::work_model::AttemptStatus::Complete;
+        store.write_work_item(&item).unwrap();
+        let final_report = serde_json::to_value(
+            fluent::work_attempt_loop::check_completed_writer_handoff(
+                &project,
+                "handoff-1",
+                "attempt-1",
+                "attempt-1-write-1",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let states = |report: &serde_json::Value| {
+            report["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|check| (check["name"].clone(), check["status"].clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            preflight["candidate_commit"], final_report["candidate_commit"],
+            "{case}"
+        );
+        assert_eq!(states(&preflight), states(&final_report), "{case}");
+        if case == "hook-context" {
+            assert_eq!(preflight["overall"], "passed");
+        }
+    }
+}
+
 // -------------------------------------------------------------------------
 // Update: helpers
 // -------------------------------------------------------------------------

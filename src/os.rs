@@ -27,9 +27,21 @@ pub(crate) fn deny_writer_source_entries(
     profile: &SandboxProfile,
     source: &Path,
     candidate: &Path,
+    task_artifact: &Path,
 ) -> Result<()> {
     let physical_source = std::fs::canonicalize(source)?;
     let physical_candidate = std::fs::canonicalize(candidate)?;
+    let artifact_root = source.join(".fluent/work/artifacts");
+    let relative_artifact = task_artifact
+        .strip_prefix(&artifact_root)
+        .context("Writer artifact grant must stay inside the Work artifact tree")?;
+    anyhow::ensure!(
+        relative_artifact.components().count() >= 3
+            && relative_artifact
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_))),
+        "Writer artifact grant must name one Task artifact area"
+    );
     if physical_source == physical_candidate {
         return Ok(());
     }
@@ -54,7 +66,7 @@ pub(crate) fn deny_writer_source_entries(
                         &child.path(),
                         "deny",
                     );
-                    for allowed in ["artifacts", "progress"] {
+                    for allowed in ["progress"] {
                         append_writer_source_rule(
                             &mut content,
                             source,
@@ -63,6 +75,13 @@ pub(crate) fn deny_writer_source_entries(
                             "allow",
                         );
                     }
+                    append_writer_source_rule(
+                        &mut content,
+                        source,
+                        &physical_source,
+                        task_artifact,
+                        "allow",
+                    );
                 } else {
                     append_writer_source_rule(
                         &mut content,
@@ -1497,9 +1516,13 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source");
         let candidate = root.path().join("candidate");
-        let artifact = source.join(".fluent/work/artifacts/task");
+        let artifact = source.join(".fluent/work/artifacts/work/attempt/task");
+        let sibling_artifact = source.join(".fluent/work/artifacts/work/attempt/other-task");
+        let gate_artifact = source.join(".fluent/work/artifacts/work/attempt/candidate-gates");
         let model = source.join(".fluent/work/items/work.json");
         std::fs::create_dir_all(&artifact).unwrap();
+        std::fs::create_dir_all(&sibling_artifact).unwrap();
+        std::fs::create_dir_all(&gate_artifact).unwrap();
         std::fs::create_dir_all(model.parent().unwrap()).unwrap();
         std::fs::write(&model, "host-owned").unwrap();
         std::fs::create_dir_all(source.join(".git")).unwrap();
@@ -1513,7 +1536,7 @@ mod tests {
             &[],
         )
         .unwrap();
-        deny_writer_source_entries(&profile, &source, &candidate).unwrap();
+        deny_writer_source_entries(&profile, &source, &candidate, &artifact).unwrap();
         let content = std::fs::read_to_string(&profile.path).unwrap();
         let denial = format!(
             "(deny file-write* (subpath {}))",
@@ -1545,24 +1568,16 @@ mod tests {
             "(deny file-write* (subpath {}))",
             sbpl_string(&source.join(".fluent/work"))
         )));
-        assert!(
-            content.rfind(&format!(
+        for root in [&source, &physical_source] {
+            assert!(!content.contains(&format!(
                 "(allow file-write* (subpath {}))",
-                sbpl_string(&source.join(".fluent/work/artifacts"))
-            )) > content.rfind(&format!(
-                "(deny file-write* (subpath {}))",
-                sbpl_string(&source.join(".fluent/work"))
-            ))
-        );
-        assert!(
-            content.rfind(&format!(
+                sbpl_string(&root.join(".fluent/work/artifacts"))
+            )));
+            assert!(content.contains(&format!(
                 "(allow file-write* (subpath {}))",
-                sbpl_string(&physical_source.join(".fluent/work/artifacts"))
-            )) > content.rfind(&format!(
-                "(deny file-write* (subpath {}))",
-                sbpl_string(&physical_source.join(".fluent/work"))
-            ))
-        );
+                sbpl_string(&root.join(".fluent/work/artifacts/work/attempt/task"))
+            )));
+        }
         #[cfg(target_os = "macos")]
         {
             if let Err(error) = preflight_profile_with(&profile, |profile_path| {
@@ -1581,16 +1596,18 @@ mod tests {
             }
             let output = std::process::Command::new("/usr/bin/sandbox-exec")
                 .arg("-f").arg(&profile.path)
-                .args(["/bin/sh", "-c", "if /bin/echo changed > \"$1\"; then exit 10; fi; /bin/echo candidate > \"$2\" || exit 11; /bin/echo git > \"$3\" || exit 12; /bin/echo artifact > \"$4\" || exit 13; if /bin/echo model > \"$5\"; then exit 14; fi", "writer-profile-probe"])
+                .args(["/bin/sh", "-c", "if /bin/echo changed > \"$1\"; then exit 10; fi; /bin/echo candidate > \"$2\" || exit 11; /bin/echo git > \"$3\" || exit 12; /bin/echo artifact > \"$4\" || exit 13; if /bin/echo model > \"$5\"; then exit 14; fi; if /bin/echo sibling > \"$6\"; then exit 15; fi; if /bin/echo gate > \"$7\"; then exit 16; fi", "writer-profile-probe"])
                 .arg(source.join("src/lib.rs"))
                 .arg(candidate.join("change.txt"))
                 .arg(source.join(".git/test"))
                 .arg(artifact.join("test"))
                 .arg(&model)
+                .arg(sibling_artifact.join("test"))
+                .arg(gate_artifact.join("test"))
                 .output().unwrap();
             assert!(
                 output.status.success(),
-                "Writer source-confinement child exited with {} (10: source write allowed; 11: candidate write denied; 12: Git write denied; 13: Task-artifact write denied; 14: Work-model write allowed). stderr: {}",
+                "Writer source-confinement child exited with {} (10: source write allowed; 11: candidate write denied; 12: Git write denied; 13: Task-artifact write denied; 14: Work-model write allowed; 15: sibling artifact write allowed; 16: gate artifact write allowed). stderr: {}",
                 output.status,
                 String::from_utf8_lossy(&output.stderr)
             );
