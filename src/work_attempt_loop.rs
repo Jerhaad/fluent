@@ -6755,7 +6755,10 @@ fn writer_completion_artifact(task: &Task) -> Option<ArtifactRef> {
 #[serde(rename_all = "kebab-case")]
 struct WriterCompletionFormatRepair {
     row_id: String,
-    verification_index: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verification_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    field: Option<String>,
     original_result: String,
     normalized_result: String,
 }
@@ -6787,6 +6790,21 @@ fn recover_writer_completion_result_format(
             .and_then(serde_json::Value::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| format!("row-{row_index}"));
+        if row
+            .get("responsibility")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(|owner| owner == "writer")
+            && row.get("state").and_then(serde_json::Value::as_str) == Some("completed")
+        {
+            row["state"] = serde_json::Value::String("complete".to_string());
+            repairs.push(WriterCompletionFormatRepair {
+                row_id: row_id.clone(),
+                verification_index: None,
+                field: Some("state".to_string()),
+                original_result: "completed".to_string(),
+                normalized_result: "complete".to_string(),
+            });
+        }
         let Some(verification) = row
             .get_mut("verification")
             .and_then(serde_json::Value::as_array_mut)
@@ -6819,7 +6837,8 @@ fn recover_writer_completion_result_format(
                 });
                 repairs.push(WriterCompletionFormatRepair {
                     row_id: row_id.clone(),
-                    verification_index,
+                    verification_index: Some(verification_index),
+                    field: None,
                     original_result: original_claim,
                     normalized_result: "pass".to_string(),
                 });
@@ -6856,7 +6875,8 @@ fn recover_writer_completion_result_format(
             *result = serde_json::Value::String("pass".to_string());
             repairs.push(WriterCompletionFormatRepair {
                 row_id: row_id.clone(),
-                verification_index,
+                verification_index: Some(verification_index),
+                field: None,
                 original_result,
                 normalized_result: "pass".to_string(),
             });
@@ -20751,6 +20771,67 @@ print(json.dumps([json.loads(line) for line in (pathlib.Path(sys.argv[1])/'comma
                     .any(|artifact| { artifact.path.ends_with("/format/writer-completion.json") })
             );
         }
+    }
+
+    #[test]
+    fn completed_state_is_normalized_and_audited_before_review() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = make_completed_writer_matrix_fixture(tmp.path(), true);
+        let path = tmp.path().join(
+            ".fluent/work/artifacts/matrix-work/attempt-1/attempt-1-write-1/writer-completion.json",
+        );
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        value["rows"][0]["state"] = serde_json::json!("completed");
+        let original = serde_json::to_vec_pretty(&value).unwrap();
+        fs::write(&path, &original).unwrap();
+
+        let outcome = plan_after_completed_writer(
+            tmp.path(),
+            &store,
+            store.read_work_item("matrix-work").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedReviews { .. }
+        ));
+        let stored = store.read_work_item("matrix-work").unwrap();
+        let evidence_ref = stored.attempts[0]
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.path.ends_with("/format-repair.json"))
+            .unwrap();
+        let evidence: serde_json::Value =
+            serde_json::from_slice(&fs::read(tmp.path().join(&evidence_ref.path)).unwrap())
+                .unwrap();
+        assert_eq!(
+            evidence["source-sha256"],
+            format!("{:x}", Sha256::digest(&original))
+        );
+        assert_eq!(evidence["normalizations"][0]["field"], "state");
+        assert_eq!(
+            evidence["normalizations"][0]["original-result"],
+            "completed"
+        );
+        assert_eq!(
+            evidence["normalizations"][0]["normalized-result"],
+            "complete"
+        );
+        let repaired_ref = stored.attempts[0]
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.path.ends_with("/format/writer-completion.json"))
+            .unwrap();
+        let repaired: crate::work_model::WriterCompletionMatrix =
+            serde_json::from_slice(&fs::read(tmp.path().join(&repaired_ref.path)).unwrap())
+                .unwrap();
+        assert_eq!(
+            repaired.rows[0].state,
+            crate::work_model::WriterCompletionState::Complete
+        );
+        assert_eq!(fs::read(&path).unwrap(), original);
     }
 
     #[test]
