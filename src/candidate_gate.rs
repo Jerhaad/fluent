@@ -128,6 +128,7 @@ pub struct AuthorizedMetadataRewriteContext {
     pub candidate_tree: String,
 }
 
+#[derive(Clone, Copy)]
 pub struct CandidateGateRequest<'a> {
     pub project_root: &'a Path,
     pub workspace: &'a Path,
@@ -163,6 +164,35 @@ pub(crate) fn run_candidate_gate_with_prior(
 /// tree-identical rewrite scope even when their replacement is a descendant of
 /// the rejected candidate; ordinary Writers retain the append-only path.
 pub(crate) fn run_candidate_gate_with_prior_and_role(
+    request: CandidateGateRequest<'_>,
+    prior_candidate_gate_path: Option<&Path>,
+    writer_role: Option<&str>,
+) -> Result<CandidateGateEvidence> {
+    let evidence = assess_candidate_gate_with_prior_and_role(
+        CandidateGateRequest { ..request },
+        prior_candidate_gate_path,
+        writer_role,
+    )?;
+    let parent = request
+        .artifact_path
+        .parent()
+        .context("candidate gate artifact path has no parent")?;
+    fs::create_dir_all(parent).with_context(|| {
+        format!("create candidate gate artifact directory {}", parent.display())
+    })?;
+    let serialized = serde_json::to_vec_pretty(&evidence)?;
+    crate::atomic_write::atomic_write(request.artifact_path, &serialized).with_context(|| {
+        format!(
+            "write candidate gate evidence {}",
+            request.artifact_path.display()
+        )
+    })?;
+    Ok(evidence)
+}
+
+/// Apply the Writer gate policy without publishing canonical gate evidence.
+/// The caller chooses a private hook artifact directory for preflight.
+pub(crate) fn assess_candidate_gate_with_prior_and_role(
     request: CandidateGateRequest<'_>,
     prior_candidate_gate_path: Option<&Path>,
     writer_role: Option<&str>,
@@ -204,23 +234,6 @@ pub(crate) fn run_candidate_gate_with_prior_and_role(
         metadata_rewrite: identity.metadata_rewrite,
         checks,
     };
-    let parent = request
-        .artifact_path
-        .parent()
-        .context("candidate gate artifact path has no parent")?;
-    fs::create_dir_all(parent).with_context(|| {
-        format!(
-            "create candidate gate artifact directory {}",
-            parent.display()
-        )
-    })?;
-    let serialized = serde_json::to_vec_pretty(&evidence)?;
-    crate::atomic_write::atomic_write(request.artifact_path, &serialized).with_context(|| {
-        format!(
-            "write candidate gate evidence {}",
-            request.artifact_path.display()
-        )
-    })?;
     Ok(evidence)
 }
 
@@ -2099,6 +2112,22 @@ mod tests {
                 artifact_path,
             }
         }
+    }
+
+    #[test]
+    fn assessed_writer_gate_does_not_publish_authoritative_evidence() {
+        let fixture = Fixture::new();
+        let candidate = fixture.commit("change.txt", "change\n", "Add change");
+        let artifact = fixture.artifacts.path().join("candidate-gate.json");
+        let request = fixture.request(&candidate, None, None, &artifact);
+        let assessed = assess_candidate_gate_with_prior_and_role(request, None, None).unwrap();
+        assert_eq!(assessed.disposition, CandidateGateDisposition::Passed);
+        assert!(!artifact.exists());
+
+        let published = run_candidate_gate(fixture.request(&candidate, None, None, &artifact))
+            .unwrap();
+        assert_eq!(assessed.checks, published.checks);
+        assert!(artifact.exists());
     }
 
     fn behavior_contract(reference: &str) -> WriterCompletionContract {
