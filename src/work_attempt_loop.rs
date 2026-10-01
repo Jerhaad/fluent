@@ -13810,6 +13810,77 @@ mod tests {
     }
 
     #[test]
+    fn historical_writer_completion_ignores_later_tester_finding() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, _) = final_tester_evidence_fixture(project.path());
+        let item = store.read_work_item("work-1").unwrap();
+        let writer = &item.attempts[0].tasks[0];
+        let assigned =
+            crate::recovery_contracts::writer_completion_findings(project.path(), writer).unwrap();
+        assert!(assigned.is_empty());
+        let mut matrix = crate::work_model::WriterCompletionMatrix::skeleton(
+            item.attempts[0]
+                .writer_completion_contract
+                .as_ref()
+                .unwrap(),
+            &writer.id,
+            &assigned,
+            None,
+        )
+        .unwrap();
+        for row in &mut matrix.rows {
+            if row.responsibility == Some(crate::work_model::CompletionResponsibility::Host) {
+                continue;
+            }
+            row.state = crate::work_model::WriterCompletionState::Complete;
+            row.implementation_evidence = vec!["src/lib.rs".into()];
+            row.verification = vec![crate::work_model::WriterVerificationClaim {
+                command: "cargo test focused".into(),
+                result: crate::work_model::WriterVerificationResult::Pass,
+            }];
+        }
+
+        let tester = item.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Tester)
+            .unwrap();
+        let results_path = project
+            .path()
+            .join(&tester.artifact_area.as_ref().unwrap().path)
+            .join("tester-results.json");
+        let mut results: serde_json::Value =
+            serde_json::from_slice(&fs::read(&results_path).unwrap()).unwrap();
+        results["tests"][0]["id"] = serde_json::json!("required_behavior");
+        results["tests"][0]["status"] = serde_json::json!("fail");
+        results["summary"] = serde_json::json!({"total":1,"pass":0,"fail":1,"skipped":0});
+        fs::write(&results_path, serde_json::to_vec(&results).unwrap()).unwrap();
+        let current = crate::verification_assessment::assess_current_verification(
+            project.path(),
+            &item.attempts[0],
+        )
+        .unwrap();
+        assert!(!current.candidate_defects().is_empty());
+
+        let historical =
+            crate::recovery_contracts::writer_completion_findings(project.path(), writer).unwrap();
+        assert_eq!(historical, assigned);
+        assert!(
+            matrix
+                .status_against(
+                    item.attempts[0]
+                        .writer_completion_contract
+                        .as_ref()
+                        .unwrap(),
+                    &writer.id,
+                    &historical,
+                )
+                .unwrap()
+                .is_complete()
+        );
+    }
+
+    #[test]
     fn reference_assessment_controls_writer_admission() {
         for (reference, source_defect) in [
             (None, false),

@@ -1716,32 +1716,16 @@ fn writer_completion_findings_from_item(
         )?;
         return Ok(assignment.findings.clone());
     }
-    let assessment = item
-        .as_ref()
-        .and_then(|item| {
-            item.attempts
-                .iter()
-                .find(|attempt| Some(attempt.id.as_str()) == task.attempt_id.as_deref())
-        })
-        .filter(|attempt| {
-            attempt.tasks.iter().any(|task| {
-                task.kind == TaskKind::Write
-                    && task.status == TaskStatus::Complete
-                    && task.output.is_some()
-            })
-        })
-        .map(|attempt| {
-            crate::verification_assessment::assess_current_verification(project_root, attempt)
-        })
-        .transpose()?;
     for artifact in &task.input_artifacts {
         resolve_input_artifact_path(project_root, &artifact.path)?;
     }
+    // An unassigned Writer owns only the findings in its Task inputs. Later
+    // Tester results belong to the next corrective Writer's frozen assignment.
     findings_from_inputs(
         project_root,
         &task.input_artifacts,
         task.role != work_model::TESTER_HARNESS_REPAIR_ROLE,
-        assessment.as_ref(),
+        None,
     )
 }
 
