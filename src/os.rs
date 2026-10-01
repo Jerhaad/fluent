@@ -21,52 +21,84 @@ pub struct SandboxProfile {
 }
 
 /// Deny existing source product entries after the profile's broad temporary
-/// directory grants. Seatbelt resolves overlapping rules in declaration order.
+/// directory grants. Include the physical path because macOS resolves /var to
+/// /private/var before applying Seatbelt rules.
 pub(crate) fn deny_writer_source_entries(
     profile: &SandboxProfile,
     source: &Path,
     candidate: &Path,
 ) -> Result<()> {
-    if source == candidate {
+    let physical_source = std::fs::canonicalize(source)?;
+    let physical_candidate = std::fs::canonicalize(candidate)?;
+    if physical_source == physical_candidate {
         return Ok(());
     }
     let mut content = std::fs::read_to_string(&profile.path)?;
     for entry in std::fs::read_dir(source)? {
         let entry = entry?;
         let path = entry.path();
-        if candidate.starts_with(&path) || entry.file_name() == ".git" {
+        if candidate.starts_with(&path)
+            || physical_candidate.starts_with(physical_source.join(entry.file_name()))
+            || entry.file_name() == ".git"
+        {
             continue;
         }
         if entry.file_name() == ".fluent" {
             for child in std::fs::read_dir(&path)? {
                 let child = child?;
                 if child.file_name() == "work" {
-                    content.push_str(&format!(
-                        "\n(deny file-write* (subpath {}))",
-                        sbpl_string(&child.path())
-                    ));
+                    append_writer_source_rule(
+                        &mut content,
+                        source,
+                        &physical_source,
+                        &child.path(),
+                        "deny",
+                    );
                     for allowed in ["artifacts", "progress"] {
-                        content.push_str(&format!(
-                            "\n(allow file-write* (subpath {}))",
-                            sbpl_string(&child.path().join(allowed))
-                        ));
+                        append_writer_source_rule(
+                            &mut content,
+                            source,
+                            &physical_source,
+                            &child.path().join(allowed),
+                            "allow",
+                        );
                     }
                 } else {
-                    content.push_str(&format!(
-                        "\n(deny file-write* (subpath {}))",
-                        sbpl_string(&child.path())
-                    ));
+                    append_writer_source_rule(
+                        &mut content,
+                        source,
+                        &physical_source,
+                        &child.path(),
+                        "deny",
+                    );
                 }
             }
             continue;
         }
-        content.push_str(&format!(
-            "\n(deny file-write* (subpath {}))",
-            sbpl_string(&path)
-        ));
+        append_writer_source_rule(&mut content, source, &physical_source, &path, "deny");
     }
     std::fs::write(&profile.path, content)?;
     Ok(())
+}
+
+fn append_writer_source_rule(
+    content: &mut String,
+    source: &Path,
+    physical_source: &Path,
+    path: &Path,
+    decision: &str,
+) {
+    content.push_str(&format!(
+        "\n({decision} file-write* (subpath {}))",
+        sbpl_string(path)
+    ));
+    let physical_path = physical_source.join(path.strip_prefix(source).unwrap());
+    if physical_path != path {
+        content.push_str(&format!(
+            "\n({decision} file-write* (subpath {}))",
+            sbpl_string(&physical_path)
+        ));
+    }
 }
 
 /// The enclosing host could not apply Fluent's production Seatbelt profile.
@@ -1487,6 +1519,15 @@ mod tests {
             "(deny file-write* (subpath {}))",
             sbpl_string(&source.join("src"))
         );
+        let physical_source = std::fs::canonicalize(&source).unwrap();
+        let physical_denial = format!(
+            "(deny file-write* (subpath {}))",
+            sbpl_string(&physical_source.join("src"))
+        );
+        assert!(
+            content.contains(&physical_denial),
+            "physical source path must be denied"
+        );
         assert!(
             content.rfind(&denial).unwrap()
                 > content
@@ -1511,6 +1552,15 @@ mod tests {
             )) > content.rfind(&format!(
                 "(deny file-write* (subpath {}))",
                 sbpl_string(&source.join(".fluent/work"))
+            ))
+        );
+        assert!(
+            content.rfind(&format!(
+                "(allow file-write* (subpath {}))",
+                sbpl_string(&physical_source.join(".fluent/work/artifacts"))
+            )) > content.rfind(&format!(
+                "(deny file-write* (subpath {}))",
+                sbpl_string(&physical_source.join(".fluent/work"))
             ))
         );
         #[cfg(target_os = "macos")]
