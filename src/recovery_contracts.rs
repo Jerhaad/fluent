@@ -5452,7 +5452,7 @@ mod tests {
     }
 
     #[test]
-    fn corrective_writer_assignment_survives_candidate_change() {
+    fn corrective_writer_completion_uses_frozen_assignment() {
         use super::*;
         use crate::work_model::{TaskOutput, TaskStatus};
 
@@ -5507,6 +5507,28 @@ mod tests {
             .findings[0]
             .id
             .clone();
+        let contract = work_model::WriterCompletionContract {
+            version: work_model::WRITER_COMPLETION_CONTRACT_VERSION,
+            requirements: Vec::new(),
+        };
+        let mut matrix = work_model::WriterCompletionMatrix::skeleton(
+            &contract,
+            &first_task.id,
+            &first_task
+                .writer_correction_assignment
+                .as_ref()
+                .unwrap()
+                .findings,
+            None,
+        )
+        .unwrap();
+        matrix.rows[0].state = work_model::WriterCompletionState::Complete;
+        matrix.rows[0].implementation_evidence = vec!["src/lib.rs".into()];
+        matrix.rows[0].verification = vec![work_model::WriterVerificationClaim {
+            command: "cargo test focused".into(),
+            result: work_model::WriterVerificationResult::Pass,
+        }];
+        matrix.rows[0].applicable_constraints = vec!["none: correction has no planning row".into()];
         assert_eq!(
             writer_completion_findings(tmp.path(), &first_task).unwrap()[0].id,
             assigned_finding_id
@@ -5525,17 +5547,18 @@ mod tests {
             learner_canonicalization: None,
         });
         changed.attempts[0].status = work_model::AttemptStatus::Reviewing;
+        changed.attempts[0].review_state = Some(work_model::AttemptReviewState::Failed);
         store.write_work_item(&changed).unwrap();
 
         let stored = store.read_work_item("work-1").unwrap();
         let corrected = stored.attempts[0].tasks[1].clone();
-        assert_eq!(
-            writer_completion_findings(tmp.path(), &corrected)
+        let findings = writer_completion_findings(tmp.path(), &corrected).unwrap();
+        assert_eq!(findings[0].id, assigned_finding_id);
+        assert!(
+            matrix
+                .status_against(&contract, &corrected.id, &findings)
                 .unwrap()
-                .into_iter()
-                .map(|finding| finding.id)
-                .collect::<Vec<_>>(),
-            vec![assigned_finding_id]
+                .is_complete()
         );
     }
 
