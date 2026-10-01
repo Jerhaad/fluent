@@ -8460,7 +8460,7 @@ fn writer_run_kind(attempt: &Attempt, task: &Task) -> WriterRunKind {
     }
 }
 
-fn writer_session_id(path: &Path) -> Option<String> {
+pub(crate) fn writer_session_id(path: &Path) -> Option<String> {
     let file = fs::File::open(path).ok()?;
     BufReader::new(file)
         .lines()

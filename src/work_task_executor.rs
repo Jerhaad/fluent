@@ -1083,6 +1083,23 @@ fn run_write_task_with_coder(
             .join(&area.path)
             .join("transcript.jsonl")
     });
+    let source_before = match source_product_snapshot(config.project_root) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            mark_task_failed_attempt_needs_user(
+                config.store,
+                config.project_root,
+                config.work_item_id,
+                config.attempt_id,
+                config.task_id,
+                &TaskFailure::WriterCompletion(format!(
+                    "Cannot verify source checkout before Writer launch: {error:#}"
+                )),
+                &crate::notify::notify,
+            )?;
+            return Err(error);
+        }
+    };
     let mut run_result = provider_pause_error(
         run_task_coder_with_optional_coder(
             &item,
@@ -1103,10 +1120,23 @@ fn run_write_task_with_coder(
             &writer_cache,
             sandbox_profile.as_ref(),
             coder_override,
+            None,
         ),
         reservation.coder,
         transcript.clone(),
     );
+    if let Err(error) = ensure_source_product_unchanged(config.project_root, &source_before) {
+        mark_task_failed_attempt_needs_user(
+            config.store,
+            config.project_root,
+            config.work_item_id,
+            config.attempt_id,
+            config.task_id,
+            &TaskFailure::WriterCompletion(error.to_string()),
+            &crate::notify::notify,
+        )?;
+        return Err(error);
+    }
     let mut retries = 0;
     while !plan
         .task
@@ -1142,10 +1172,23 @@ fn run_write_task_with_coder(
                 &writer_cache,
                 sandbox_profile.as_ref(),
                 coder_override,
+                None,
             ),
             reservation.coder,
             transcript.clone(),
         );
+        if let Err(error) = ensure_source_product_unchanged(config.project_root, &source_before) {
+            mark_task_failed_attempt_needs_user(
+                config.store,
+                config.project_root,
+                config.work_item_id,
+                config.attempt_id,
+                config.task_id,
+                &TaskFailure::WriterCompletion(error.to_string()),
+                &crate::notify::notify,
+            )?;
+            return Err(error);
+        }
     }
 
     if let Err(error) = run_result {
@@ -1162,25 +1205,110 @@ fn run_write_task_with_coder(
         return Err(error);
     }
 
-    if let Err(error) = ensure_clean_worktree(&workspace_path) {
-        mark_task_failed(
-            config.store,
-            config.work_item_id,
-            config.attempt_id,
-            config.task_id,
-            config.store_lock.is_some(),
-        )?;
-        return Err(error);
-    }
-    let produced_count = match commits_ahead(&workspace_path, &baseline_commit) {
-        Ok(count) => count,
+    let mut handoff = match writer_handoff_result(&config, &workspace_path, &baseline_commit) {
+        Ok(state) => state,
         Err(error) => {
-            mark_task_failed(
+            mark_task_failed_attempt_needs_user(
                 config.store,
+                config.project_root,
                 config.work_item_id,
                 config.attempt_id,
                 config.task_id,
-                config.store_lock.is_some(),
+                &TaskFailure::WriterCompletion(format!(
+                    "Writer candidate state is unverifiable: {error:#}"
+                )),
+                &crate::notify::notify,
+            )?;
+            return Err(error);
+        }
+    };
+    if let Err(first_error) = &handoff {
+        let feedback = format!(
+            "The Writer handoff is incomplete: {first_error:#}. Work only in {}. Commit all intended changes, or, for an authorized follow-up with no changes, write a valid no-change declaration. Then finish this same Task.",
+            workspace_path.display()
+        );
+        run_result = provider_pause_error(
+            run_task_coder_with_optional_coder(
+                &item,
+                config.attempt_id,
+                config.task_id,
+                config.project_root,
+                &workspace_path,
+                &prior_reviews,
+                config.resolver,
+                config.extra_args,
+                reservation.coder,
+                config.no_sandbox,
+                reservation.model.as_deref(),
+                reservation.effort.as_deref(),
+                &pump_config,
+                provider_readiness.codex_worker(),
+                claude_home.as_deref(),
+                &writer_cache,
+                sandbox_profile.as_ref(),
+                coder_override,
+                Some(&feedback),
+            ),
+            reservation.coder,
+            transcript.clone(),
+        );
+        if let Err(error) = ensure_source_product_unchanged(config.project_root, &source_before) {
+            mark_task_failed_attempt_needs_user(
+                config.store,
+                config.project_root,
+                config.work_item_id,
+                config.attempt_id,
+                config.task_id,
+                &TaskFailure::WriterCompletion(error.to_string()),
+                &crate::notify::notify,
+            )?;
+            return Err(error);
+        }
+        if let Err(error) = run_result {
+            mark_task_failed_attempt_needs_user(
+                config.store,
+                config.project_root,
+                config.work_item_id,
+                config.attempt_id,
+                config.task_id,
+                &TaskFailure::WriterCompletion(format!(
+                    "Writer handoff correction failed after {first_error:#}: {error:#}"
+                )),
+                &crate::notify::notify,
+            )?;
+            return Err(error);
+        }
+        handoff = match writer_handoff_result(&config, &workspace_path, &baseline_commit) {
+            Ok(state) => state,
+            Err(error) => {
+                mark_task_failed_attempt_needs_user(
+                    config.store,
+                    config.project_root,
+                    config.work_item_id,
+                    config.attempt_id,
+                    config.task_id,
+                    &TaskFailure::WriterCompletion(format!(
+                        "Writer candidate state is unverifiable after correction: {error:#}"
+                    )),
+                    &crate::notify::notify,
+                )?;
+                return Err(error);
+            }
+        };
+    }
+    let (_produced_count, no_change) = match handoff {
+        Ok(result) => result,
+        Err(error) => {
+            mark_task_failed_attempt_needs_user(
+                config.store,
+                config.project_root,
+                config.work_item_id,
+                config.attempt_id,
+                config.task_id,
+                &TaskFailure::WriterCompletion(format!(
+                    "Writer handoff remains incomplete after one correction: {error:#}"
+                )),
+                &crate::notify::notify,
             )?;
             return Err(error);
         }
@@ -1211,25 +1339,6 @@ fn run_write_task_with_coder(
         )?;
         return Err(error);
     }
-    let no_change = if produced_count == 0 {
-        match validate_followup_no_change(&config, &workspace_path) {
-            Ok(no_change) => Some(no_change),
-            Err(error) => {
-                mark_task_failed_attempt_needs_user(
-                    config.store,
-                    config.project_root,
-                    config.work_item_id,
-                    config.attempt_id,
-                    config.task_id,
-                    &TaskFailure::WriterCompletion(error.to_string()),
-                    &crate::notify::notify,
-                )?;
-                return Err(error);
-            }
-        }
-    } else {
-        None
-    };
     // Route every post-reservation completion failure — head lookup, completion
     // read/find, and the terminal write — through one durable terminal-state
     // boundary, so no raw `?` after the reservation can leave the Task Executing.
@@ -4502,8 +4611,9 @@ fn run_task_coder_with_optional_coder(
     writer_cache: &crate::writer_cache::WriterDependencyCache,
     sandbox_profile: Option<&os::SandboxProfile>,
     coder_override: Option<&dyn Fn(CoderSandbox) -> Box<dyn crate::coder::Coder>>,
+    handoff_feedback: Option<&str>,
 ) -> Result<()> {
-    run_task_coder_with_coder(
+    run_task_coder_with_coder_with_feedback(
         item,
         attempt_id,
         task_id,
@@ -4521,6 +4631,7 @@ fn run_task_coder_with_optional_coder(
         claude_home,
         writer_cache,
         sandbox_profile,
+        handoff_feedback,
         move |sandbox, _executable| match coder_override {
             Some(make) => make(sandbox),
             None => coder_kind.boxed_with_model_and_executable(
@@ -4552,6 +4663,51 @@ fn run_task_coder_with_coder(
     claude_home: Option<&Path>,
     writer_cache: &crate::writer_cache::WriterDependencyCache,
     sandbox_profile: Option<&os::SandboxProfile>,
+    make_coder: impl FnOnce(CoderSandbox, Option<&Path>) -> Box<dyn crate::coder::Coder>,
+) -> Result<()> {
+    run_task_coder_with_coder_with_feedback(
+        item,
+        attempt_id,
+        task_id,
+        project_root,
+        workspace_path,
+        prior_reviews,
+        resolver,
+        extra_args,
+        coder_kind,
+        no_sandbox,
+        model,
+        effort,
+        pump_config,
+        codex_worker,
+        claude_home,
+        writer_cache,
+        sandbox_profile,
+        None,
+        make_coder,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_task_coder_with_coder_with_feedback(
+    item: &WorkItem,
+    attempt_id: &str,
+    task_id: &str,
+    project_root: &Path,
+    workspace_path: &Path,
+    prior_reviews: &[PathBuf],
+    resolver: &ContentResolver,
+    extra_args: &[String],
+    coder_kind: CoderKind,
+    no_sandbox: bool,
+    model: Option<&str>,
+    effort: Option<&str>,
+    pump_config: &crate::transcript_pump::TranscriptPumpConfig,
+    codex_worker: Option<&crate::codex_worker::CodexWorkerEnvironment>,
+    claude_home: Option<&Path>,
+    writer_cache: &crate::writer_cache::WriterDependencyCache,
+    sandbox_profile: Option<&os::SandboxProfile>,
+    handoff_feedback: Option<&str>,
     make_coder: impl FnOnce(CoderSandbox, Option<&Path>) -> Box<dyn crate::coder::Coder>,
 ) -> Result<()> {
     let needs_sandbox_host_preparation =
@@ -4655,6 +4811,10 @@ fn run_task_coder_with_coder(
             crate::writer_context::WriterPromptKind::Initial,
         )
     };
+    if let Some(feedback) = handoff_feedback {
+        prompt.push_str("\n\n## Writer handoff correction\n\n");
+        prompt.push_str(feedback);
+    }
 
     let attempt = item
         .attempts
@@ -4831,12 +4991,20 @@ fn run_task_coder_with_coder(
         // Injected route tests have no production worker home; preserve their
         // ability to exercise the selected session value directly.
         .unwrap_or(true);
-    let session = writer_coder_session_with_codex_snapshot(
-        item,
-        attempt_id,
-        coder_kind,
-        codex_snapshot_available,
-    );
+    let correction_session = handoff_feedback
+        .and_then(|_| transcript_path.as_deref())
+        .and_then(crate::work_attempt_loop::writer_session_id);
+    let session = correction_session
+        .as_deref()
+        .map(crate::coder::CoderSession::Resume)
+        .unwrap_or_else(|| {
+            writer_coder_session_with_codex_snapshot(
+                item,
+                attempt_id,
+                coder_kind,
+                codex_snapshot_available,
+            )
+        });
     let completion = coder.run_captured_reported_session(
         &prompt,
         &system_prompt,
@@ -8897,6 +9065,69 @@ fn ensure_clean_worktree(workspace_path: &Path) -> Result<()> {
             String::from_utf8_lossy(&output.stdout)
         )
     }
+}
+
+fn writer_handoff_result(
+    config: &WorkTaskRunConfig<'_>,
+    workspace_path: &Path,
+    baseline_commit: &str,
+) -> Result<std::result::Result<(u32, Option<NoChangeOutput>), anyhow::Error>> {
+    let status = git_status_output(workspace_path, &["--porcelain"])?;
+    anyhow::ensure!(
+        status.status.success(),
+        "cannot inspect Writer candidate status: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let count = commits_ahead(workspace_path, baseline_commit)?;
+    if !status.stdout.is_empty() {
+        return Ok(Err(anyhow::anyhow!(
+            "Task workspace has uncommitted changes; commit or remove them before completing:\n{}",
+            String::from_utf8_lossy(&status.stdout)
+        )));
+    }
+    let no_change = if count == 0 {
+        match validate_followup_no_change(config, workspace_path) {
+            Ok(declaration) => Some(declaration),
+            Err(error) => return Ok(Err(error)),
+        }
+    } else {
+        None
+    };
+    Ok(Ok((count, no_change)))
+}
+
+fn source_product_snapshot(source: &Path) -> Result<(String, Vec<u8>)> {
+    let head = head_commit(source)?;
+    let output = git_status_output(
+        source,
+        &[
+            "--porcelain",
+            "--untracked-files=all",
+            "--",
+            ".",
+            ":(exclude).fluent/work",
+        ],
+    )?;
+    anyhow::ensure!(
+        output.status.success(),
+        "cannot inspect source checkout product status: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok((head, output.stdout))
+}
+
+fn ensure_source_product_unchanged(source: &Path, before: &(String, Vec<u8>)) -> Result<()> {
+    let after = source_product_snapshot(source)?;
+    anyhow::ensure!(
+        &after == before,
+        "Writer changed source checkout {}; preserve it for inspection and stop this Task (before HEAD {}, after HEAD {}; before status {:?}, after status {:?})",
+        source.display(),
+        before.0,
+        after.0,
+        String::from_utf8_lossy(&before.1),
+        String::from_utf8_lossy(&after.1),
+    );
+    Ok(())
 }
 
 fn ensure_no_non_fluent_worktree_changes(workspace_path: &Path) -> Result<()> {
@@ -21121,6 +21352,278 @@ while time.monotonic() < deadline:
         assert!(prompt.contains("preserved Work Item input"));
         assert!(prompt.contains("0000-transcript.jsonl"));
         assert!(!prompt.contains("Read each prior correction artifact"));
+    }
+
+    #[test]
+    fn writer_prompt_distinguishes_candidate_from_source_checkout() {
+        let root = tempfile::tempdir().unwrap();
+        let candidate = root.path().join("candidate");
+        let source = root.path().join("source");
+        let prompt = build_write_task_prompt_with_workspace(
+            &review_item(),
+            "attempt-1",
+            "attempt-1-write-1",
+            &[],
+            Some(&candidate),
+            Some(&source),
+        );
+        assert!(prompt.contains(&format!(
+            "writable candidate checkout is {}",
+            candidate.display()
+        )));
+        assert!(prompt.contains(&format!("source checkout is {}", source.display())));
+        assert!(prompt.contains("product changes and commits only in the candidate checkout"));
+    }
+
+    #[test]
+    fn writer_source_checkout_drift_needs_user() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        fs::create_dir_all(&source).unwrap();
+        crate::git::run(&source, &["init", "-q", "-b", "main"], "init source").unwrap();
+        crate::git::run(&source, &["config", "user.email", "test@test"], "set email").unwrap();
+        crate::git::run(&source, &["config", "user.name", "test"], "set name").unwrap();
+        fs::write(source.join("tracked.txt"), "before\n").unwrap();
+        crate::git::run(&source, &["add", "."], "add source").unwrap();
+        crate::git::run(
+            &source,
+            &["commit", "-q", "-m", "Add fixture"],
+            "commit source",
+        )
+        .unwrap();
+        let before = source_product_snapshot(&source).unwrap();
+        fs::write(source.join("tracked.txt"), "after\n").unwrap();
+        let error = ensure_source_product_unchanged(&source, &before).unwrap_err();
+        assert!(error.to_string().contains("preserve it for inspection"));
+        assert_eq!(
+            fs::read_to_string(source.join("tracked.txt")).unwrap(),
+            "after\n"
+        );
+    }
+
+    struct HandoffCoder {
+        launches: Arc<Mutex<Vec<String>>>,
+        sessions: Arc<Mutex<Vec<String>>>,
+        first_no_output: bool,
+        second_commit: bool,
+        source_drift: Option<PathBuf>,
+    }
+
+    impl crate::coder::Coder for HandoffCoder {
+        fn run(
+            &self,
+            _: &str,
+            _: &str,
+            _: &Path,
+            _: &[String],
+            _: &[(String, String)],
+            _: Option<&Path>,
+        ) -> Result<i32> {
+            unreachable!("Writer uses the captured session route")
+        }
+        fn run_captured_reported_session(
+            &self,
+            prompt: &str,
+            _: &str,
+            working_dir: &Path,
+            _: &[String],
+            _: &[(String, String)],
+            capture: Option<&crate::coder::TranscriptCapture<'_>>,
+            session: crate::coder::CoderSession<'_>,
+        ) -> crate::coder::CoderRunCompletion {
+            self.sessions.lock().unwrap().push(match session {
+                crate::coder::CoderSession::Resume(id) => format!("resume:{id}"),
+                crate::coder::CoderSession::FreshPersistent => "fresh".into(),
+                crate::coder::CoderSession::Ephemeral => "ephemeral".into(),
+            });
+            let mut launches = self.launches.lock().unwrap();
+            launches.push(prompt.to_string());
+            let number = launches.len();
+            drop(launches);
+            if number == 1 {
+                if let Some(capture) = capture {
+                    fs::write(
+                        capture.path(),
+                        "{\"type\":\"thread.started\",\"thread_id\":\"handoff-thread\"}\n",
+                    )
+                    .unwrap();
+                }
+                if let Some(source) = &self.source_drift {
+                    fs::write(source.join("tracked.txt"), "source drift\n").unwrap();
+                }
+            }
+            if number == 1 && !self.first_no_output {
+                fs::write(working_dir.join("change.txt"), "uncommitted\n").unwrap();
+            }
+            if number == 2 && self.second_commit {
+                fs::write(working_dir.join("change.txt"), "committed\n").unwrap();
+                crate::git::run(working_dir, &["add", "."], "stage handoff").unwrap();
+                crate::git::run(
+                    working_dir,
+                    &["commit", "-q", "-m", "Add handoff"],
+                    "commit handoff",
+                )
+                .unwrap();
+            }
+            crate::coder::CoderRunCompletion {
+                terminal: Ok(0),
+                report: Default::default(),
+            }
+        }
+        fn run_interactive(
+            &self,
+            _: &str,
+            _: &Path,
+            _: &[String],
+            _: &[(String, String)],
+        ) -> Result<i32> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn writer_handoff_retries_once_for_dirty_or_missing_output() {
+        for (first_no_output, second_commit) in [(false, true), (true, false)] {
+            let root = tempfile::tempdir().unwrap();
+            let source = root.path().join("source");
+            fs::create_dir_all(source.join(".fluent/expertise")).unwrap();
+            fs::write(source.join(".fluent/expertise/INDEX.md"), "# Index\n").unwrap();
+            crate::git::run(&source, &["init", "-q", "-b", "main"], "init fixture").unwrap();
+            crate::git::run(&source, &["config", "user.email", "test@test"], "set email").unwrap();
+            crate::git::run(&source, &["config", "user.name", "test"], "set name").unwrap();
+            fs::write(source.join("tracked.txt"), "baseline\n").unwrap();
+            crate::git::run(&source, &["add", "."], "add fixture").unwrap();
+            crate::git::run(
+                &source,
+                &["commit", "-q", "-m", "Add fixture"],
+                "commit fixture",
+            )
+            .unwrap();
+            let mut item = WorkItem {
+                id: "work-1".into(),
+                title: "Handoff".into(),
+                ..Default::default()
+            };
+            item.add_initial_attempt("attempt-1").unwrap();
+            let store = WorkModelStore::new(&source);
+            store.create_work_item(&item).unwrap();
+            let resolver = ContentResolver::new(Some(&source));
+            let launches = Arc::new(Mutex::new(Vec::new()));
+            let sessions = Arc::new(Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&launches);
+            let recorded_sessions = Arc::clone(&sessions);
+            let make_coder = move |_sandbox| {
+                Box::new(HandoffCoder {
+                    launches: Arc::clone(&recorded),
+                    sessions: Arc::clone(&recorded_sessions),
+                    first_no_output,
+                    second_commit,
+                    source_drift: None,
+                }) as Box<dyn crate::coder::Coder>
+            };
+            let result = run_write_task_with_coder(
+                WorkTaskRunConfig {
+                    project_root: &source,
+                    store: &store,
+                    work_item_id: "work-1",
+                    attempt_id: "attempt-1",
+                    task_id: "attempt-1-write-1",
+                    resolver: &resolver,
+                    extra_args: &[],
+                    no_sandbox: true,
+                    store_lock: None,
+                },
+                Some(&make_coder),
+            );
+            let prompts = launches.lock().unwrap();
+            assert_eq!(prompts.len(), 2);
+            assert!(prompts[1].contains("Writer handoff correction"));
+            assert_eq!(
+                sessions.lock().unwrap().as_slice(),
+                ["fresh", "resume:handoff-thread"]
+            );
+            let stored = store.read_work_item("work-1").unwrap();
+            if second_commit {
+                assert!(result.is_ok(), "{result:?}");
+                assert_eq!(stored.attempts[0].tasks[0].status, TaskStatus::Complete);
+            } else {
+                assert!(result.is_err());
+                assert_eq!(stored.attempts[0].tasks[0].status, TaskStatus::NeedsUser);
+                assert_eq!(
+                    stored.attempts[0].pause_kind,
+                    Some(crate::work_model::PauseKind::WriterCompletion)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn writer_source_drift_pauses_without_retry_or_revert() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        fs::create_dir_all(source.join(".fluent/expertise")).unwrap();
+        fs::write(source.join(".fluent/expertise/INDEX.md"), "# Index\n").unwrap();
+        crate::git::run(&source, &["init", "-q", "-b", "main"], "init fixture").unwrap();
+        crate::git::run(&source, &["config", "user.email", "test@test"], "set email").unwrap();
+        crate::git::run(&source, &["config", "user.name", "test"], "set name").unwrap();
+        fs::write(source.join("tracked.txt"), "baseline\n").unwrap();
+        crate::git::run(&source, &["add", "."], "add fixture").unwrap();
+        crate::git::run(
+            &source,
+            &["commit", "-q", "-m", "Add fixture"],
+            "commit fixture",
+        )
+        .unwrap();
+        let mut item = WorkItem {
+            id: "work-1".into(),
+            title: "Source drift".into(),
+            ..Default::default()
+        };
+        item.add_initial_attempt("attempt-1").unwrap();
+        let store = WorkModelStore::new(&source);
+        store.create_work_item(&item).unwrap();
+        let resolver = ContentResolver::new(Some(&source));
+        let launches = Arc::new(Mutex::new(Vec::new()));
+        let sessions = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&launches);
+        let recorded_sessions = Arc::clone(&sessions);
+        let drift_source = source.clone();
+        let make_coder = move |_sandbox| {
+            Box::new(HandoffCoder {
+                launches: Arc::clone(&recorded),
+                sessions: Arc::clone(&recorded_sessions),
+                first_no_output: true,
+                second_commit: false,
+                source_drift: Some(drift_source.clone()),
+            }) as Box<dyn crate::coder::Coder>
+        };
+        let error = run_write_task_with_coder(
+            WorkTaskRunConfig {
+                project_root: &source,
+                store: &store,
+                work_item_id: "work-1",
+                attempt_id: "attempt-1",
+                task_id: "attempt-1-write-1",
+                resolver: &resolver,
+                extra_args: &[],
+                no_sandbox: true,
+                store_lock: None,
+            },
+            Some(&make_coder),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("preserve it for inspection"));
+        assert_eq!(launches.lock().unwrap().len(), 1);
+        assert_eq!(
+            fs::read_to_string(source.join("tracked.txt")).unwrap(),
+            "source drift\n"
+        );
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(stored.attempts[0].tasks[0].status, TaskStatus::NeedsUser);
+        assert_eq!(
+            stored.attempts[0].pause_kind,
+            Some(crate::work_model::PauseKind::WriterCompletion)
+        );
     }
 
     #[test]
