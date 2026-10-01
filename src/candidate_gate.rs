@@ -2299,6 +2299,27 @@ mod tests {
     }
 
     #[test]
+    fn cargo_lib_reference_validates_committed_test_source() {
+        let fixture = Fixture::new();
+        let candidate = fixture.commit(
+            "src/feature.rs",
+            "#[test]\nfn verifies_assignment() {}\n",
+            "Add assignment regression\n\n- Cover the Writer assignment",
+        );
+        let artifact = fixture.artifacts.path().join("candidate-gate.json");
+        let contract = behavior_contract("`cargo test --lib verifies_assignment`");
+
+        let evidence =
+            run_candidate_gate(fixture.request(&candidate, Some(&contract), None, &artifact))
+                .unwrap();
+
+        assert_eq!(
+            check(&evidence, "behavior-references").status,
+            CandidateCheckStatus::Passed
+        );
+    }
+
+    #[test]
     fn python_command_reference_requires_committed_script_operand() {
         let fixture = Fixture::new();
         let candidate = fixture.commit("README.md", "fixture changed\n", "Update fixture");

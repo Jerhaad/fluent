@@ -1447,6 +1447,29 @@ pub(crate) fn validate_reference_source(
     candidate: &str,
     reference: &TestReference,
 ) -> Result<()> {
+    if let ReferenceMeaning::CargoLibTest { name } = reference.meaning() {
+        let identity = references::RustTestIdentity::parse(&name)
+            .context("Cargo library test name is malformed")?;
+        let declaration = format!("fn {}(", identity.short_name());
+        let output = crate::git::run_raw(
+            workspace,
+            &[
+                "grep",
+                "-l",
+                "-F",
+                "-e",
+                &declaration,
+                candidate,
+                "--",
+                "src",
+            ],
+        )?;
+        anyhow::ensure!(
+            output.status.success() && !output.stdout.is_empty(),
+            "references missing committed Rust library test {name}"
+        );
+        return Ok(());
+    }
     if reference.path.is_empty() && reference.command.is_some() {
         return Ok(());
     }
@@ -1469,6 +1492,70 @@ pub(crate) fn validate_reference_source(
     Ok(())
 }
 
+#[cfg(test)]
+mod cargo_lib_reference_tests {
+    use super::*;
+
+    #[test]
+    fn cargo_lib_test_reference_binds_committed_source_and_native_result() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::git::run(repo.path(), &["init", "-q"], "create reference fixture").unwrap();
+        crate::git::run(
+            repo.path(),
+            &["config", "user.email", "test@example.com"],
+            "configure reference fixture",
+        )
+        .unwrap();
+        crate::git::run(
+            repo.path(),
+            &["config", "user.name", "Test"],
+            "configure reference fixture",
+        )
+        .unwrap();
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        std::fs::write(
+            repo.path().join("src/feature.rs"),
+            "#[test]\nfn verifies_assignment() {}\n",
+        )
+        .unwrap();
+        crate::git::run(
+            repo.path(),
+            &["add", "src/feature.rs"],
+            "stage reference fixture",
+        )
+        .unwrap();
+        crate::git::run(
+            repo.path(),
+            &["commit", "-qm", "Add reference fixture"],
+            "commit reference fixture",
+        )
+        .unwrap();
+        let candidate =
+            crate::git::run_stdout(repo.path(), &["rev-parse", "HEAD"], "read fixture").unwrap();
+        let reference =
+            references::parse_test_reference("`cargo test --lib verifies_assignment`").unwrap();
+        validate_reference_source(repo.path(), &candidate, &reference).unwrap();
+        let missing = references::parse_test_reference("cargo test --lib absent_test").unwrap();
+        assert!(validate_reference_source(repo.path(), &candidate, &missing).is_err());
+
+        let results: crate::tester::TesterResults = serde_json::from_value(serde_json::json!({
+            "candidate_commit": candidate,
+            "commands": [],
+            "tests": [{"id":"feature::verifies_assignment","test_harness":"cargo-nextest","status":"pass","duration_ms":1,"failure_excerpt":null}],
+            "summary": {"total":1,"pass":1,"fail":0,"skipped":0},
+            "error": null
+        }))
+        .unwrap();
+        assert!(reference_is_satisfied(&reference, &results, None));
+        let mut failed = results;
+        failed.tests[0].status = "fail".into();
+        assert!(!reference_is_satisfied(&reference, &failed, None));
+        failed.tests[0].status = "pass".into();
+        failed.tests[0].test_harness = "shell-harness".into();
+        assert!(!reference_is_satisfied(&reference, &failed, None));
+    }
+}
+
 fn reference_is_satisfied(
     reference: &TestReference,
     results: &crate::tester::TesterResults,
@@ -1485,6 +1572,24 @@ fn reference_is_satisfied(
     let mut results = results.clone();
     results.tests = normalized;
     match reference.meaning() {
+        ReferenceMeaning::CargoLibTest { name } => {
+            let Some(expected) = references::RustTestIdentity::parse(&name) else {
+                return false;
+            };
+            let tests = results
+                .tests
+                .iter()
+                .filter(|test| matches!(test.test_harness.as_str(), "cargo-nextest" | "cargo-test"))
+                .filter_map(|test| {
+                    references::RustTestIdentity::parse(&test.id)
+                        .filter(|identity| {
+                            identity.binary.is_none_or(|binary| !binary.contains("::"))
+                        })
+                        .map(|identity| (identity, test))
+                })
+                .collect::<Vec<_>>();
+            references::rust_evidence_matches_reference(&expected, &tests)
+        }
         ReferenceMeaning::Command {
             command,
             command_index,

@@ -378,6 +378,12 @@ pub(crate) fn parse_test_reference(reference: &str) -> std::result::Result<TestR
                 }
                 (String::new(), None, Some(command.clone()))
             }
+            ReferenceMeaning::CargoLibTest { name } => {
+                if RustTestIdentity::parse(name).is_none() {
+                    return Err("Cargo library test name is malformed".into());
+                }
+                (String::new(), Some(name.clone()), None)
+            }
         };
         let reference = TestReference {
             path,
@@ -396,6 +402,23 @@ pub(crate) fn parse_test_reference(reference: &str) -> std::result::Result<TestR
     let reference = reference.trim().trim_matches('`').trim();
     if reference.is_empty() {
         return Err("reference is empty".to_string());
+    }
+    if reference.starts_with("cargo ") {
+        let fields = reference.split_whitespace().collect::<Vec<_>>();
+        let ["cargo", "test", "--lib", name] = fields.as_slice() else {
+            return Err("Cargo Test: reference must be `cargo test --lib <test-name>`".into());
+        };
+        if RustTestIdentity::parse(name).is_none() {
+            return Err("Cargo library test name is malformed".into());
+        }
+        return Ok(TestReference {
+            path: String::new(),
+            selector: Some((*name).to_string()),
+            command: None,
+            declared: Some(ReferenceMeaning::CargoLibTest {
+                name: (*name).to_string(),
+            }),
+        });
     }
     if let Some(command) = parse_python_test_command(reference)? {
         return Ok(command);
@@ -603,6 +626,9 @@ pub enum ReferenceMeaning {
         command_index: Option<usize>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         description: Option<String>,
+    },
+    CargoLibTest {
+        name: String,
     },
 }
 
