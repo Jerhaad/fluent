@@ -41034,10 +41034,33 @@ fn active_writer_can_check_exact_handoff_before_exit() {
     let report = run_writer_handoff(&candidate, "attempt-1-write-1");
     assert_eq!(report["candidate_commit"], head);
     assert_eq!(report["overall"], "passed");
-    assert!(
-        report["checks"]
-            .as_array()
-            .is_some_and(|checks| !checks.is_empty())
+    let checks = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|check| {
+            (
+                check["name"].as_str().unwrap(),
+                check["status"].as_str().unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        checks,
+        [
+            ("candidate-identity", "passed"),
+            ("writer-output", "passed"),
+            ("candidate-gate/candidate-identity", "passed"),
+            ("candidate-gate/whitespace", "passed"),
+            ("candidate-gate/commit-metadata", "passed"),
+            ("candidate-gate/behavior-references", "passed"),
+            ("candidate-gate/tester-reference-evidence", "passed"),
+            ("candidate-gate/project-check", "passed"),
+            ("completion-matrix", "passed"),
+            ("required-progress", "passed"),
+            ("host-evidence", "passed"),
+            ("candidate-stability", "passed"),
+        ]
     );
     let stored = WorkModelStore::new(&project)
         .read_work_item("handoff-1")
@@ -41285,6 +41308,7 @@ fn writer_handoff_preflight_rejects_wrong_or_changed_candidate() {
             .status,
         TaskStatus::Executing
     );
+    assert_writer_handoff_rejects_changed_candidate_during_check();
 }
 
 #[test]
@@ -41327,8 +41351,7 @@ fn writer_handoff_preflight_hook_cannot_commit_to_candidate() {
     assert!(!candidate.join("hook-output.txt").exists());
 }
 
-#[test]
-fn writer_handoff_preflight_rejects_changed_candidate_during_check() {
+fn assert_writer_handoff_rejects_changed_candidate_during_check() {
     use std::os::unix::fs::PermissionsExt;
     let tmp = TempDir::new().unwrap();
     let (project, candidate, _) = setup_active_writer_handoff(&tmp);
