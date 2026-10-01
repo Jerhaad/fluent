@@ -160,3 +160,5 @@
 - [utf8-safe-diagnostic-truncation](utf8-safe-diagnostic-truncation.md) — Byte-capped diagnostic excerpts must realign truncation to a UTF-8 character boundary before slicing
 - [verification-requirements-ignore-diagnostic-wording](verification-requirements-ignore-diagnostic-wording.md) — Bind current verification obligations to approved requirements and native evidence rather than diagnostic lines or historical Task order
 - [verified-cleanup-for-bounded-host-probes](verified-cleanup-for-bounded-host-probes.md) — A timed host-side probe may report timeout only after its owned process group has been verifiably swept
+- [writer-handoff-publishes-assessed-gate](writer-handoff-publishes-assessed-gate.md) — Final Writer handoff publishes the candidate gate result it assessed instead of rerunning a project hook
+- [writer-handoff-report-status-is-data](writer-handoff-report-status-is-data.md) — Writers must read the handoff report's overall status and per-check diagnostics instead of relying on command exit status
