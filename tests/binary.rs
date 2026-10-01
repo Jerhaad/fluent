@@ -40944,6 +40944,401 @@ fn task_show_prints_task_json() {
     assert_eq!(value["status"], "complete");
 }
 
+fn setup_active_writer_handoff(tmp: &TempDir) -> (PathBuf, PathBuf, String) {
+    let project = setup_git_project(&tmp);
+    fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "work-item",
+            "create",
+            "handoff-1",
+            "--title",
+            "Check handoff",
+        ])
+        .assert()
+        .success();
+    fluent_cmd()
+        .current_dir(&project)
+        .args(["attempt", "create", "handoff-1", "attempt-1"])
+        .assert()
+        .success();
+    let candidate = tmp.path().join("work-9-handoff-1-attempt-1");
+    git::run(
+        &project,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "work/handoff-1/attempt-1/attempt-1-write-1",
+            candidate.to_str().unwrap(),
+        ],
+        "create active Writer candidate",
+    )
+    .unwrap();
+    let base = git::run_stdout(&candidate, &["rev-parse", "HEAD"], "read Writer baseline").unwrap();
+    let store = WorkModelStore::new(&project);
+    let mut item = store.read_work_item("handoff-1").unwrap();
+    let task = &mut item.attempts[0].tasks[0];
+    task.status = TaskStatus::Executing;
+    let area = project.join(&task.artifact_area.as_ref().unwrap().path);
+    fs::create_dir_all(&area).unwrap();
+    fs::write(area.join("write-baseline-commit"), &base).unwrap();
+    item.attempts[0].status = fluent::work_model::AttemptStatus::Executing;
+    store.write_work_item(&item).unwrap();
+    fs::write(candidate.join("change.txt"), "change\n").unwrap();
+    git::run(&candidate, &["add", "change.txt"], "stage Writer change").unwrap();
+    git::run(
+        &candidate,
+        &["commit", "-m", "Add change"],
+        "commit Writer change",
+    )
+    .unwrap();
+    let head =
+        git::run_stdout(&candidate, &["rev-parse", "HEAD"], "read Writer candidate").unwrap();
+
+    (project, candidate, head)
+}
+
+fn run_writer_handoff(candidate: &Path, task_id: &str) -> serde_json::Value {
+    let output = fluent_cmd()
+        .current_dir(candidate)
+        .args(["task", "check-handoff", "handoff-1", "attempt-1", task_id])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[test]
+fn active_writer_can_check_exact_handoff_before_exit() {
+    let tmp = TempDir::new().unwrap();
+    let (project, candidate, head) = setup_active_writer_handoff(&tmp);
+
+    let report = run_writer_handoff(&candidate, "attempt-1-write-1");
+    assert_eq!(report["candidate_commit"], head);
+    assert_eq!(report["overall"], "passed");
+    assert!(
+        report["checks"]
+            .as_array()
+            .is_some_and(|checks| !checks.is_empty())
+    );
+    let stored = WorkModelStore::new(&project)
+        .read_work_item("handoff-1")
+        .unwrap();
+    assert_eq!(stored.attempts[0].tasks[0].status, TaskStatus::Executing);
+}
+
+#[test]
+fn writer_handoff_preflight_reports_actionable_defects() {
+    let tmp = TempDir::new().unwrap();
+    let (_project, candidate, _) = setup_active_writer_handoff(&tmp);
+    fs::write(candidate.join("unfinished.txt"), "unfinished\n").unwrap();
+    let report = run_writer_handoff(&candidate, "attempt-1-write-1");
+    assert_eq!(report["overall"], "failed");
+    let output = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "writer-output")
+        .unwrap();
+    assert_eq!(output["status"], "failed");
+    assert!(
+        output["diagnostics"][0]
+            .as_str()
+            .unwrap()
+            .contains("uncommitted changes")
+    );
+}
+
+#[test]
+fn writer_handoff_preflight_reports_gate_and_matrix_defects() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new().unwrap();
+    let (project, candidate, _) = setup_active_writer_handoff(&tmp);
+    let hooks = project.join(".fluent/hooks");
+    fs::create_dir_all(&hooks).unwrap();
+    let hook = hooks.join("check-pre-merge");
+    fs::write(
+        &hook,
+        "#!/bin/sh\nprintf 'fix the project policy input\\n'\nexit 9\n",
+    )
+    .unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    let gate_report = run_writer_handoff(&candidate, "attempt-1-write-1");
+    let gate = gate_report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "candidate-gate/project-check")
+        .unwrap();
+    assert_eq!(gate["status"], "failed");
+    assert!(
+        gate["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| {
+                diagnostic
+                    .as_str()
+                    .unwrap()
+                    .contains("fix the project policy input")
+            })
+    );
+
+    let store = WorkModelStore::new(&project);
+    let mut item = store.read_work_item("handoff-1").unwrap();
+    item.attempts[0].writer_completion_contract =
+        Some(fluent::work_model::WriterCompletionContract {
+            version: WRITER_COMPLETION_CONTRACT_VERSION,
+            requirements: Vec::new(),
+        });
+    let area = project.join(
+        &item.attempts[0].tasks[0]
+            .artifact_area
+            .as_ref()
+            .unwrap()
+            .path,
+    );
+    fs::write(area.join("writer-completion.json"), "{broken").unwrap();
+    store.write_work_item(&item).unwrap();
+    let matrix_report = run_writer_handoff(&candidate, "attempt-1-write-1");
+    let matrix = matrix_report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "completion-matrix")
+        .unwrap();
+    assert_eq!(matrix["status"], "failed");
+    assert!(
+        matrix["diagnostics"][0]
+            .as_str()
+            .unwrap()
+            .contains("malformed")
+    );
+}
+
+#[test]
+fn writer_handoff_preflight_does_not_pass_unverifiable_host_checks() {
+    let tmp = TempDir::new().unwrap();
+    let (project, candidate, _) = setup_active_writer_handoff(&tmp);
+    let store = WorkModelStore::new(&project);
+    let mut item = store.read_work_item("handoff-1").unwrap();
+    let contract = fluent::work_model::WriterCompletionContract {
+        version: WRITER_COMPLETION_CONTRACT_VERSION,
+        requirements: vec![WriterCompletionRequirement {
+            responsibility: Some(CompletionResponsibility::Host),
+            id: "plan:step-2".into(),
+            kind: WriterCompletionRequirementKind::Plan,
+            source: "plan.md#step-2".into(),
+            requirement: "Prove live confinement".into(),
+            verification_refs: vec![
+                "cargo test writer_profile_blocks_actual_source_write_in_temporary_checkout".into(),
+            ],
+            command: Some(fluent::work_model::PlanCommand {
+                applicability: Default::default(),
+                command:
+                    "cargo test writer_profile_blocks_actual_source_write_in_temporary_checkout"
+                        .into(),
+                working_directory: ".".into(),
+                environment: Default::default(),
+                source_row: "plan:step-2".into(),
+            }),
+        }],
+    };
+    let matrix =
+        WriterCompletionMatrix::skeleton(&contract, "attempt-1-write-1", &[], None).unwrap();
+    let area = project.join(
+        &item.attempts[0].tasks[0]
+            .artifact_area
+            .as_ref()
+            .unwrap()
+            .path,
+    );
+    fs::write(
+        area.join("writer-completion.json"),
+        serde_json::to_vec_pretty(&matrix).unwrap(),
+    )
+    .unwrap();
+    item.attempts[0].writer_completion_contract = Some(contract);
+    store.write_work_item(&item).unwrap();
+    let report = run_writer_handoff(&candidate, "attempt-1-write-1");
+    assert_eq!(report["overall"], "not-verifiable");
+    assert!(
+        report["checks"].as_array().unwrap().iter().any(|check| {
+            check["name"] == "host-evidence" && check["status"] == "not-verifiable"
+        })
+    );
+}
+
+#[test]
+fn writer_handoff_preflight_does_not_advance_or_publish() {
+    let tmp = TempDir::new().unwrap();
+    let (project, candidate, head) = setup_active_writer_handoff(&tmp);
+    let store = WorkModelStore::new(&project);
+    let before = store.read_work_item("handoff-1").unwrap();
+    let artifact = project.join(".fluent/work/artifacts/handoff-1/attempt-1/candidate-gates/attempt-1-write-1/candidate-gate.json");
+    let _ = run_writer_handoff(&candidate, "attempt-1-write-1");
+    let after = store.read_work_item("handoff-1").unwrap();
+    assert_eq!(
+        serde_json::to_value(before).unwrap(),
+        serde_json::to_value(after).unwrap()
+    );
+    assert_eq!(
+        git::run_stdout(&candidate, &["rev-parse", "HEAD"], "check candidate").unwrap(),
+        head
+    );
+    assert!(!artifact.exists());
+}
+
+#[test]
+fn writer_handoff_preflight_rejects_wrong_or_changed_candidate() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new().unwrap();
+    let (project, candidate, head) = setup_active_writer_handoff(&tmp);
+    fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "task",
+            "check-handoff",
+            "handoff-1",
+            "attempt-1",
+            "attempt-1-write-1",
+        ])
+        .assert()
+        .failure();
+    fluent_cmd()
+        .current_dir(&candidate)
+        .args([
+            "task",
+            "check-handoff",
+            "handoff-1",
+            "attempt-1",
+            "other-task",
+        ])
+        .assert()
+        .failure();
+    let hooks = project.join(".fluent/hooks");
+    fs::create_dir_all(&hooks).unwrap();
+    let hook = hooks.join("check-pre-merge");
+    fs::write(&hook, "#!/bin/sh\nprintf dirty > changed-by-hook.txt\n").unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    let report = run_writer_handoff(&candidate, "attempt-1-write-1");
+    assert_ne!(report["overall"], "passed");
+    assert!(report["checks"].as_array().unwrap().iter().any(|check| {
+        check["name"] == "candidate-gate/project-check" && check["status"] == "not-verifiable"
+    }));
+    assert_eq!(
+        git::run_stdout(
+            &candidate,
+            &["rev-parse", "HEAD"],
+            "check original candidate"
+        )
+        .unwrap(),
+        head
+    );
+    assert_eq!(
+        WorkModelStore::new(&project)
+            .read_work_item("handoff-1")
+            .unwrap()
+            .attempts[0]
+            .tasks[0]
+            .status,
+        TaskStatus::Executing
+    );
+}
+
+#[test]
+fn writer_handoff_preflight_hook_cannot_commit_to_candidate() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new().unwrap();
+    let (project, candidate, head) = setup_active_writer_handoff(&tmp);
+    let hooks = project.join(".fluent/hooks");
+    fs::create_dir_all(&hooks).unwrap();
+    let hook = hooks.join("check-pre-merge");
+    fs::write(&hook, "#!/bin/sh\nprintf hook > hook-output.txt\ngit add hook-output.txt\ngit -c user.name=Hook -c user.email=hook@example.com commit -m 'Add hook output' >/dev/null\n").unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    let report = run_writer_handoff(&candidate, "attempt-1-write-1");
+    assert_ne!(report["overall"], "passed");
+    assert_eq!(
+        git::run_stdout(
+            &candidate,
+            &["rev-parse", "HEAD"],
+            "read original candidate"
+        )
+        .unwrap(),
+        head
+    );
+    assert!(!candidate.join("hook-output.txt").exists());
+    fs::write(candidate.join("unfinished.txt"), "unfinished\n").unwrap();
+    let dirty_report = run_writer_handoff(&candidate, "attempt-1-write-1");
+    assert!(
+        dirty_report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|check| {
+                check["name"] == "candidate-gate" && check["status"] == "not-verifiable"
+            })
+    );
+    assert_eq!(
+        git::run_stdout(&candidate, &["rev-parse", "HEAD"], "read dirty candidate").unwrap(),
+        head
+    );
+    assert!(!candidate.join("hook-output.txt").exists());
+}
+
+#[test]
+fn writer_preflight_and_final_handoff_have_check_parity() {
+    let tmp = TempDir::new().unwrap();
+    let (project, candidate, head) = setup_active_writer_handoff(&tmp);
+    let preflight = run_writer_handoff(&candidate, "attempt-1-write-1");
+    let store = WorkModelStore::new(&project);
+    let mut item = store.read_work_item("handoff-1").unwrap();
+    let task = &mut item.attempts[0].tasks[0];
+    task.status = TaskStatus::Complete;
+    task.output = Some(TaskOutput {
+        workspace_id: "candidate".into(),
+        workspace_path: task.workspace_access.writes[0].path.clone(),
+        source_branch: "main".into(),
+        base_commit: Some(git::run_stdout(&project, &["rev-parse", "HEAD"], "read base").unwrap()),
+        commit: head.clone(),
+        no_change: None,
+        learner_canonicalization: None,
+    });
+    item.attempts[0].status = fluent::work_model::AttemptStatus::Complete;
+    store.write_work_item(&item).unwrap();
+    let final_report = fluent::work_attempt_loop::check_completed_writer_handoff(
+        &project,
+        "handoff-1",
+        "attempt-1",
+        "attempt-1-write-1",
+    )
+    .unwrap();
+    let final_report = serde_json::to_value(final_report).unwrap();
+    let states = |report: &serde_json::Value| {
+        report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|check| {
+                (
+                    check["name"].as_str().unwrap().to_string(),
+                    check["status"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(states(&preflight), states(&final_report));
+    assert_eq!(
+        preflight["candidate_commit"],
+        final_report["candidate_commit"]
+    );
+}
+
 // -------------------------------------------------------------------------
 // Update: helpers
 // -------------------------------------------------------------------------

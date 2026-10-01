@@ -913,6 +913,16 @@ pub enum TaskCommands {
         task_id: String,
     },
 
+    /// Check the active Writer's current candidate before ending its Task
+    CheckHandoff {
+        /// Work Item ID
+        work_item_id: String,
+        /// Attempt ID
+        attempt_id: String,
+        /// Task ID
+        task_id: String,
+    },
+
     /// Run an existing Task
     Run {
         /// Work Item ID

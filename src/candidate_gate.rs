@@ -178,7 +178,10 @@ pub(crate) fn run_candidate_gate_with_prior_and_role(
         .parent()
         .context("candidate gate artifact path has no parent")?;
     fs::create_dir_all(parent).with_context(|| {
-        format!("create candidate gate artifact directory {}", parent.display())
+        format!(
+            "create candidate gate artifact directory {}",
+            parent.display()
+        )
     })?;
     let serialized = serde_json::to_vec_pretty(&evidence)?;
     crate::atomic_write::atomic_write(request.artifact_path, &serialized).with_context(|| {
@@ -2124,8 +2127,8 @@ mod tests {
         assert_eq!(assessed.disposition, CandidateGateDisposition::Passed);
         assert!(!artifact.exists());
 
-        let published = run_candidate_gate(fixture.request(&candidate, None, None, &artifact))
-            .unwrap();
+        let published =
+            run_candidate_gate(fixture.request(&candidate, None, None, &artifact)).unwrap();
         assert_eq!(assessed.checks, published.checks);
         assert!(artifact.exists());
     }

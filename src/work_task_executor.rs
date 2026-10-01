@@ -9078,7 +9078,7 @@ fn ensure_clean_worktree(workspace_path: &Path) -> Result<()> {
     }
 }
 
-fn writer_handoff_result(
+pub(crate) fn writer_handoff_result(
     config: &WorkTaskRunConfig<'_>,
     workspace_path: &Path,
     baseline_commit: &str,

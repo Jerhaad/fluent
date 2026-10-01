@@ -1777,6 +1777,19 @@ fn cmd_task(
                 })?;
             print!("{}", to_json_pretty(task)?);
         }
+        TaskCommands::CheckHandoff {
+            work_item_id,
+            attempt_id,
+            task_id,
+        } => {
+            let report = work_attempt_loop::check_writer_handoff(
+                project_root,
+                &work_item_id,
+                &attempt_id,
+                &task_id,
+            )?;
+            print!("{}", to_json_pretty(&report)?);
+        }
         TaskCommands::Run {
             work_item_id,
             attempt_id,

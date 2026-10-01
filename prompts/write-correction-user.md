@@ -4,6 +4,8 @@ Candidate checkout: {{candidate_checkout_path}}
 Source checkout: {{source_checkout_path}}
 Commit product changes only in the candidate checkout. Keep source product files read-only; declared Task artifacts under the source checkout's `.fluent/work` tree remain writable.
 
+After committing, run `fluent task check-handoff {{work_item_id}} {{attempt_id}} {{task_id}}` from the candidate checkout. Its results describe the candidate at that moment; Fluent reruns the handoff after this Task ends.
+
 Continue in the prior Writer session when Fluent provides it. The generated current context is
 the authoritative index for this correction:
 

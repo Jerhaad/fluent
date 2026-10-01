@@ -36,6 +36,663 @@ const DEFAULT_MAX_PARALLEL_REVIEWERS: usize = 5;
 const DEFAULT_MAX_TOTAL_WRITE_ROUNDS: usize = 10;
 const DEFAULT_MAX_NO_PROGRESS_ROUNDS: usize = 2;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WriterHandoffCheckStatus {
+    Passed,
+    Failed,
+    NotVerifiable,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WriterHandoffCheck {
+    pub name: String,
+    pub status: WriterHandoffCheckStatus,
+    pub diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WriterHandoffReport {
+    pub candidate_commit: String,
+    pub overall: WriterHandoffCheckStatus,
+    pub checks: Vec<WriterHandoffCheck>,
+}
+
+fn handoff_check(
+    name: impl Into<String>,
+    status: WriterHandoffCheckStatus,
+    diagnostics: Vec<String>,
+) -> WriterHandoffCheck {
+    WriterHandoffCheck {
+        name: name.into(),
+        status,
+        diagnostics,
+    }
+}
+
+fn assess_writer_completion_for_handoff(
+    project_root: &Path,
+    attempt: &Attempt,
+    task: &Task,
+    candidate_commit: &str,
+    baseline: Option<&str>,
+) -> Vec<WriterHandoffCheck> {
+    let mut checks = Vec::new();
+    let mut prospective = attempt.clone();
+    if let Some(writer) = prospective
+        .tasks
+        .iter_mut()
+        .find(|writer| writer.id == task.id)
+    {
+        writer.status = TaskStatus::Complete;
+        if let Some(base) = baseline {
+            let workspace = &task.workspace_access.writes[0];
+            writer.output = Some(TaskOutput {
+                workspace_id: workspace.id.clone(),
+                workspace_path: workspace.path.clone(),
+                source_branch: git::run_stdout(
+                    project_root,
+                    &["branch", "--show-current"],
+                    "read source branch",
+                )
+                .unwrap_or_default(),
+                base_commit: Some(base.to_string()),
+                commit: candidate_commit.to_string(),
+                no_change: None,
+                learner_canonicalization: None,
+            });
+        }
+    }
+
+    let mut matrix = None;
+    let mut matrix_artifact = None;
+    if let Some(contract) = attempt.writer_completion_contract.as_ref() {
+        let result = (|| -> Result<(crate::work_model::WriterCompletionMatrix, ArtifactRef)> {
+            let artifact = writer_completion_artifact(task)
+                .context("Writer Task has no completion-matrix artifact area")?;
+            let path = project_root.join(&artifact.path);
+            let bytes = fs::read(&path)
+                .with_context(|| format!("read Writer completion matrix {}", path.display()))?;
+            anyhow::ensure!(
+                bytes.len() <= crate::work_model::WRITER_COMPLETION_MATRIX_MAX_BYTES,
+                "Writer completion matrix exceeds the size limit"
+            );
+            let source =
+                String::from_utf8(bytes).context("Writer completion matrix is not UTF-8")?;
+            let mut parsed = match serde_json::from_str(&source) {
+                Ok(matrix) => matrix,
+                Err(_) => recover_writer_completion_result_format(&source)
+                    .map(|(matrix, _)| matrix)
+                    .map_err(anyhow::Error::msg)
+                    .context("Writer completion matrix is malformed")?,
+            };
+            let findings = work_task_executor::writer_completion_findings(project_root, task)?;
+            parsed
+                .repair_writer_claims_against(contract, &task.id, &findings)
+                .map_err(anyhow::Error::msg)?;
+            crate::host_evidence::apply_completed_plan_host_evidence(
+                project_root,
+                &prospective,
+                &prospective.tasks[prospective
+                    .tasks
+                    .iter()
+                    .position(|writer| writer.id == task.id)
+                    .unwrap()],
+                &artifact,
+                &mut parsed,
+            );
+            crate::recovery_contracts::apply_accepted_carried_findings(
+                project_root,
+                &prospective,
+                &prospective.tasks[prospective
+                    .tasks
+                    .iter()
+                    .position(|writer| writer.id == task.id)
+                    .unwrap()],
+                &mut parsed,
+            )?;
+            let status = parsed
+                .status_against(contract, &task.id, &findings)
+                .map_err(anyhow::Error::msg)?;
+            if let Some(reason) = status.incomplete_reason {
+                anyhow::bail!("{reason}");
+            }
+            Ok((parsed, artifact))
+        })();
+        match result {
+            Ok((value, artifact)) => {
+                matrix = Some(value);
+                matrix_artifact = Some(artifact);
+                checks.push(handoff_check(
+                    "completion-matrix",
+                    WriterHandoffCheckStatus::Passed,
+                    Vec::new(),
+                ));
+            }
+            Err(error) => checks.push(handoff_check(
+                "completion-matrix",
+                WriterHandoffCheckStatus::Failed,
+                vec![format!("{error:#}")],
+            )),
+        }
+    } else {
+        checks.push(handoff_check(
+            "completion-matrix",
+            WriterHandoffCheckStatus::Passed,
+            vec!["Attempt has no completion-matrix contract".into()],
+        ));
+    }
+
+    if let Some(progress_contract) = attempt.progress_contract.as_ref() {
+        let artifact = required_progress_artifact(attempt);
+        let source = match fs::read_to_string(project_root.join(&artifact.path)) {
+            Ok(source) => Ok(source),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(String::new()),
+            Err(error) => Err(error),
+        };
+        let status = source.map_err(anyhow::Error::from).and_then(|source| {
+            if attempt.writer_completion_contract.is_some() {
+                let matrix = matrix.as_ref().context(
+                    "completion matrix must pass before required progress can be checked",
+                )?;
+                let matrix_artifact = matrix_artifact.as_ref().expect("matrix has artifact");
+                let status = progress_contract
+                    .status_against_writer_matrix(matrix)
+                    .map_err(anyhow::Error::msg)?;
+                if let Some(reason) = status.incomplete_reason {
+                    anyhow::bail!("{reason}");
+                }
+                progress_contract
+                    .project_completed_required_progress(&source, matrix, &matrix_artifact.path)
+                    .map_err(anyhow::Error::msg)?;
+                Ok(())
+            } else {
+                let status = attempt
+                    .required_progress_status(&source)
+                    .map_err(anyhow::Error::msg)?;
+                if let Some(reason) = status.incomplete_reason {
+                    anyhow::bail!("{reason}");
+                }
+                Ok(())
+            }
+        });
+        match status {
+            Ok(()) => checks.push(handoff_check(
+                "required-progress",
+                WriterHandoffCheckStatus::Passed,
+                Vec::new(),
+            )),
+            Err(error) => checks.push(handoff_check(
+                "required-progress",
+                WriterHandoffCheckStatus::Failed,
+                vec![format!("{error:#}")],
+            )),
+        }
+    } else {
+        checks.push(handoff_check(
+            "required-progress",
+            WriterHandoffCheckStatus::Passed,
+            vec!["Attempt has no required-progress contract".into()],
+        ));
+    }
+
+    if attempt
+        .writer_completion_contract
+        .as_ref()
+        .is_some_and(|contract| {
+            contract.requirements.iter().any(|row| {
+                row.responsibility == Some(crate::work_model::CompletionResponsibility::Host)
+            })
+        })
+    {
+        if let Some(matrix) = matrix.as_ref() {
+            let pending = matrix
+                .rows
+                .iter()
+                .filter(|row| {
+                    row.responsibility == Some(crate::work_model::CompletionResponsibility::Host)
+                        && row.state != crate::work_model::WriterCompletionState::Complete
+                })
+                .map(|row| row.id.clone())
+                .collect::<Vec<_>>();
+            if pending.is_empty() {
+                checks.push(handoff_check(
+                    "host-evidence",
+                    WriterHandoffCheckStatus::Passed,
+                    Vec::new(),
+                ));
+            } else {
+                checks.push(handoff_check("host-evidence", WriterHandoffCheckStatus::NotVerifiable,
+                    vec![format!("Required host evidence remains pending for {}; the trusted host must run and review the candidate-bound checks", pending.join(", "))]));
+            }
+        } else {
+            checks.push(handoff_check(
+                "host-evidence",
+                WriterHandoffCheckStatus::NotVerifiable,
+                vec![
+                    "Host evidence cannot be checked until the Writer completion matrix is valid"
+                        .into(),
+                ],
+            ));
+        }
+    } else {
+        checks.push(handoff_check(
+            "host-evidence",
+            WriterHandoffCheckStatus::Passed,
+            vec!["Attempt has no required host check".into()],
+        ));
+    }
+    checks
+}
+
+/// Assess the active Writer's current candidate without changing the Task or
+/// publishing authoritative handoff artifacts.
+pub fn check_writer_handoff(
+    caller_workspace: &Path,
+    work_item_id: &str,
+    attempt_id: &str,
+    task_id: &str,
+) -> Result<WriterHandoffReport> {
+    let caller_workspace = fs::canonicalize(caller_workspace)?;
+    let common_dir = fs::canonicalize(crate::worktree::git_common_dir(&caller_workspace)?)?;
+    let project_root = common_dir
+        .parent()
+        .context("Git common directory has no project root")?;
+    let store = WorkModelStore::new(project_root);
+    let item = store.read_work_item_snapshot(work_item_id)?;
+    let attempt_index = item
+        .attempts
+        .iter()
+        .position(|attempt| attempt.id == attempt_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!("Attempt {attempt_id:?} is not assigned to Work Item {work_item_id:?}")
+        })?;
+    let attempt = &item.attempts[attempt_index];
+    let write_index = attempt
+        .tasks
+        .iter()
+        .position(|task| task.id == task_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!("Task {task_id:?} is not assigned to Attempt {attempt_id:?}")
+        })?;
+    let task = &attempt.tasks[write_index];
+    anyhow::ensure!(
+        task.kind == TaskKind::Write && task.status == TaskStatus::Executing,
+        "Task {task_id:?} is not an active Writer Task"
+    );
+    anyhow::ensure!(
+        attempt.status == AttemptStatus::Executing,
+        "Attempt {attempt_id:?} is not executing"
+    );
+    anyhow::ensure!(
+        task.workspace_access.writes.len() == 1,
+        "Writer Task {task_id:?} does not own one candidate workspace"
+    );
+    let workspace = crate::work_model::resolve_expected_candidate_workspace_path(
+        project_root,
+        &task.workspace_access.writes[0].path,
+        work_item_id,
+        attempt_id,
+        "Writer handoff workspace",
+    )?;
+    anyhow::ensure!(
+        fs::canonicalize(&workspace)? == caller_workspace,
+        "Writer handoff must run from the assigned candidate workspace {}",
+        workspace.display()
+    );
+    crate::worktree::ensure_candidate_worktree(project_root, &workspace)?;
+
+    assess_writer_handoff_candidate(
+        project_root,
+        &store,
+        &item,
+        attempt_index,
+        write_index,
+        &workspace,
+    )
+}
+
+fn assess_writer_handoff_candidate(
+    project_root: &Path,
+    store: &WorkModelStore,
+    item: &WorkItem,
+    attempt_index: usize,
+    write_index: usize,
+    workspace: &Path,
+) -> Result<WriterHandoffReport> {
+    let attempt = &item.attempts[attempt_index];
+    let task = &attempt.tasks[write_index];
+    let work_item_id = item.id.as_str();
+    let attempt_id = attempt.id.as_str();
+    let task_id = task.id.as_str();
+
+    let before_head = git::run_stdout(
+        &workspace,
+        &["rev-parse", "HEAD"],
+        "read Writer candidate HEAD",
+    )?;
+    let before_status = git::run_stdout(
+        &workspace,
+        &["status", "--porcelain", "--untracked-files=all"],
+        "read Writer candidate status",
+    )?;
+    let identity = task.output.as_ref().map(|output| output.commit.as_str());
+    let mut checks = vec![if identity.is_some_and(|commit| commit != before_head) {
+        handoff_check(
+            "candidate-identity",
+            WriterHandoffCheckStatus::Failed,
+            vec![format!(
+                "Candidate HEAD {before_head} differs from the completed Writer output {}",
+                identity.unwrap()
+            )],
+        )
+    } else {
+        handoff_check(
+            "candidate-identity",
+            WriterHandoffCheckStatus::Passed,
+            Vec::new(),
+        )
+    }];
+    let baseline = task
+        .output
+        .as_ref()
+        .and_then(|output| output.base_commit.clone())
+        .map(Ok)
+        .unwrap_or_else(|| {
+            task.artifact_area
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Writer Task {task_id:?} has no artifact area"))
+                .and_then(|area| {
+                    work_task_executor::resolve_managed_artifact_area_path(project_root, &area.path)
+                })
+                .and_then(|area| {
+                    fs::read_to_string(area.join("write-baseline-commit")).map_err(Into::into)
+                })
+        });
+    let baseline = match baseline {
+        Ok(value) if !value.trim().is_empty() => Some(value.trim().to_string()),
+        Ok(_) => {
+            checks.push(handoff_check(
+                "writer-output",
+                WriterHandoffCheckStatus::NotVerifiable,
+                vec!["Writer baseline is empty; the host-owned baseline must be restored".into()],
+            ));
+            None
+        }
+        Err(error) => {
+            checks.push(handoff_check(
+                "writer-output",
+                WriterHandoffCheckStatus::NotVerifiable,
+                vec![format!("Writer baseline cannot be read: {error:#}")],
+            ));
+            None
+        }
+    };
+    if let Some(base) = baseline.as_deref() {
+        let resolver = ContentResolver::new(Some(project_root));
+        let config = WorkTaskRunConfig {
+            project_root,
+            store,
+            work_item_id,
+            attempt_id,
+            task_id,
+            resolver: &resolver,
+            extra_args: &[],
+            no_sandbox: false,
+            store_lock: None,
+        };
+        let check = match work_task_executor::writer_handoff_result(&config, &workspace, base) {
+            Ok(Ok(_)) => handoff_check(
+                "writer-output",
+                WriterHandoffCheckStatus::Passed,
+                Vec::new(),
+            ),
+            Ok(Err(error)) => handoff_check(
+                "writer-output",
+                WriterHandoffCheckStatus::Failed,
+                vec![format!("{error:#}")],
+            ),
+            Err(error) => handoff_check(
+                "writer-output",
+                WriterHandoffCheckStatus::NotVerifiable,
+                vec![format!("Writer output cannot be checked: {error:#}")],
+            ),
+        };
+        checks.push(check);
+        let prior_gate = select_prior_writer_candidate_gate(item, attempt_index, write_index)?;
+        let prior_path = prior_gate
+            .map(|artifact| {
+                work_task_executor::resolve_managed_artifact_area_path(project_root, &artifact.path)
+            })
+            .transpose()?;
+        let authorization =
+            crate::candidate_metadata_recovery::candidate_gate_authorization_context(
+                project_root,
+                attempt,
+                task,
+            )?;
+        let scratch = tempfile::tempdir().context("create private handoff hook area")?;
+        let private_workspace = scratch.path().join("candidate");
+        let gate_workspace = if task.status == TaskStatus::Executing && !before_status.is_empty() {
+            checks.push(handoff_check("candidate-gate", WriterHandoffCheckStatus::NotVerifiable,
+                vec!["Commit or remove candidate worktree changes before checking the full candidate gate".into()]));
+            None
+        } else if task.status == TaskStatus::Executing {
+            let clone_result = git::run(
+                project_root,
+                &[
+                    "clone",
+                    "--shared",
+                    "--quiet",
+                    "--no-checkout",
+                    workspace
+                        .to_str()
+                        .context("candidate workspace is not UTF-8")?,
+                    private_workspace
+                        .to_str()
+                        .context("private workspace is not UTF-8")?,
+                ],
+                "prepare private Writer handoff candidate",
+            )
+            .and_then(|()| {
+                git::run(
+                    &private_workspace,
+                    &["checkout", "--quiet", "--detach", &before_head],
+                    "check out private Writer candidate",
+                )
+            });
+            match clone_result {
+                Ok(()) => Some(private_workspace.as_path()),
+                Err(error) => {
+                    checks.push(handoff_check(
+                        "candidate-gate",
+                        WriterHandoffCheckStatus::NotVerifiable,
+                        vec![format!("Cannot prepare private hook candidate: {error:#}")],
+                    ));
+                    None
+                }
+            }
+        } else {
+            Some(workspace)
+        };
+        let artifact_path = scratch
+            .path()
+            .join(crate::candidate_gate::CANDIDATE_GATE_FILE);
+        let gate = gate_workspace.map(|gate_workspace| {
+            crate::candidate_gate::assess_candidate_gate_with_prior_and_role(
+                crate::candidate_gate::CandidateGateRequest {
+                    project_root,
+                    workspace: gate_workspace,
+                    work_item_id,
+                    attempt_id,
+                    task_id: Some(task_id),
+                    phase: crate::candidate_gate::CandidateGatePhase::Writer,
+                    base_commit: base,
+                    candidate_commit: &before_head,
+                    completion_contract: attempt.writer_completion_contract.as_ref(),
+                    allow_tree_identical_metadata_rewrite: task.input_artifacts.iter().any(
+                        |artifact| {
+                            artifact.producer_id == "writer-completion-repair"
+                                && artifact.path.ends_with("writer-completion.json")
+                        },
+                    ),
+                    metadata_rewrite_authorization: authorization.as_ref(),
+                    tester_results_path: None,
+                    accepted_tester_commands: &[],
+                    artifact_path: &artifact_path,
+                },
+                prior_path.as_deref(),
+                Some(task.role.as_str()),
+            )
+        });
+        match gate {
+            Some(Ok(evidence)) => {
+                for evidence in evidence.checks {
+                    let status = match evidence.status {
+                        crate::candidate_gate::CandidateCheckStatus::Passed
+                        | crate::candidate_gate::CandidateCheckStatus::Skipped => {
+                            WriterHandoffCheckStatus::Passed
+                        }
+                        crate::candidate_gate::CandidateCheckStatus::Failed => {
+                            WriterHandoffCheckStatus::Failed
+                        }
+                        crate::candidate_gate::CandidateCheckStatus::Error => {
+                            WriterHandoffCheckStatus::NotVerifiable
+                        }
+                    };
+                    let mut diagnostics = evidence.diagnostics;
+                    if let Some(path) = evidence.log_path {
+                        if let Ok(log) = fs::read_to_string(path) {
+                            if !log.trim().is_empty() && status != WriterHandoffCheckStatus::Passed
+                            {
+                                diagnostics.push(log.chars().take(4096).collect());
+                            }
+                        }
+                    }
+                    checks.push(handoff_check(
+                        format!("candidate-gate/{}", evidence.name),
+                        status,
+                        diagnostics,
+                    ));
+                }
+            }
+            Some(Err(error)) => checks.push(handoff_check(
+                "candidate-gate",
+                WriterHandoffCheckStatus::NotVerifiable,
+                vec![format!("Candidate gate cannot be checked: {error:#}")],
+            )),
+            None => {}
+        }
+    } else {
+        checks.push(handoff_check(
+            "candidate-gate",
+            WriterHandoffCheckStatus::NotVerifiable,
+            vec!["Candidate gate needs the Writer's stable baseline".into()],
+        ));
+    }
+    checks.extend(assess_writer_completion_for_handoff(
+        project_root,
+        attempt,
+        task,
+        &before_head,
+        baseline.as_deref(),
+    ));
+    let after_head = git::run_stdout(
+        &workspace,
+        &["rev-parse", "HEAD"],
+        "recheck Writer candidate HEAD",
+    )?;
+    let after_status = git::run_stdout(
+        &workspace,
+        &["status", "--porcelain", "--untracked-files=all"],
+        "recheck Writer candidate status",
+    )?;
+    if before_head != after_head || before_status != after_status {
+        checks.push(handoff_check("candidate-stability", WriterHandoffCheckStatus::Failed,
+            vec!["Candidate HEAD or worktree changed during handoff check; rerun against the final committed candidate".into()]));
+    } else {
+        checks.push(handoff_check(
+            "candidate-stability",
+            WriterHandoffCheckStatus::Passed,
+            Vec::new(),
+        ));
+    }
+    let overall = if checks
+        .iter()
+        .any(|check| check.status == WriterHandoffCheckStatus::Failed)
+    {
+        WriterHandoffCheckStatus::Failed
+    } else if checks
+        .iter()
+        .any(|check| check.status == WriterHandoffCheckStatus::NotVerifiable)
+    {
+        WriterHandoffCheckStatus::NotVerifiable
+    } else {
+        WriterHandoffCheckStatus::Passed
+    };
+    Ok(WriterHandoffReport {
+        candidate_commit: before_head,
+        overall,
+        checks,
+    })
+}
+
+fn assess_completed_writer_handoff_in_item(
+    project_root: &Path,
+    store: &WorkModelStore,
+    item: &WorkItem,
+    attempt_index: usize,
+    write_index: usize,
+) -> Result<WriterHandoffReport> {
+    let attempt = &item.attempts[attempt_index];
+    let task = &attempt.tasks[write_index];
+    anyhow::ensure!(
+        task.kind == TaskKind::Write && task.status == TaskStatus::Complete,
+        "Final handoff requires a completed Writer Task"
+    );
+    let output = task
+        .output
+        .as_ref()
+        .context("Completed Writer has no output")?;
+    let workspace = resolve_managed_sibling_workspace_path(
+        project_root,
+        &output.workspace_path,
+        "completed Writer handoff workspace",
+    )?;
+    crate::worktree::ensure_candidate_worktree(project_root, &workspace)?;
+    assess_writer_handoff_candidate(
+        project_root,
+        store,
+        item,
+        attempt_index,
+        write_index,
+        &workspace,
+    )
+}
+
+/// Read the completed Writer's current candidate through the same ordered
+/// checks used by active preflight. This never reuses a prior preflight result.
+pub fn check_completed_writer_handoff(
+    project_root: &Path,
+    work_item_id: &str,
+    attempt_id: &str,
+    task_id: &str,
+) -> Result<WriterHandoffReport> {
+    let store = WorkModelStore::new(project_root);
+    let item = store.read_work_item_snapshot(work_item_id)?;
+    let attempt_index = item
+        .attempts
+        .iter()
+        .position(|attempt| attempt.id == attempt_id)
+        .context("Completed Writer Attempt is missing")?;
+    let write_index = item.attempts[attempt_index]
+        .tasks
+        .iter()
+        .position(|task| task.id == task_id)
+        .context("Completed Writer Task is missing")?;
+    assess_completed_writer_handoff_in_item(project_root, &store, &item, attempt_index, write_index)
+}
+
 fn attempt_executor_transition() -> DurableTransitionMetadata {
     DurableTransitionMetadata {
         origin: DurableTransitionOrigin::AttemptExecutor,
@@ -6920,6 +7577,35 @@ pub(crate) fn plan_after_completed_writer(
             task_ids: existing_review_ids,
         });
     }
+    if latest_write.output.as_ref().is_some_and(|output| {
+        output.base_commit.is_some()
+            && output.workspace_path
+                == crate::work_model::initial_candidate_workspace_path(&item.id, attempt_id)
+    }) {
+        let handoff = assess_completed_writer_handoff_in_item(
+            project_root,
+            store,
+            &item,
+            item.attempts
+                .iter()
+                .position(|attempt| attempt.id == attempt_id)
+                .unwrap(),
+            latest_write_index,
+        )?;
+        for check in &handoff.checks {
+            if matches!(
+                check.name.as_str(),
+                "candidate-identity" | "writer-output" | "candidate-stability"
+            ) && check.status != WriterHandoffCheckStatus::Passed
+            {
+                bail!(
+                    "Final Writer handoff {}: {}",
+                    check.name,
+                    check.diagnostics.join("; ")
+                );
+            }
+        }
+    }
     if let Some(outcome) = gate_candidate_after_writer(
         project_root,
         store,
@@ -10210,6 +10896,94 @@ mod tests {
     use crate::work_model::{
         Attempt, CoderMapping, LearningFailureKind, TaskArtifactArea, WorkspaceAccess,
     };
+
+    #[test]
+    fn final_writer_handoff_rechecks_after_preflight() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("main");
+        fs::create_dir_all(&project).unwrap();
+        git::run(
+            &project,
+            &["init", "-b", "main"],
+            "initialize handoff fixture",
+        )
+        .unwrap();
+        git::run(
+            &project,
+            &["config", "user.name", "Test Author"],
+            "set author",
+        )
+        .unwrap();
+        git::run(
+            &project,
+            &["config", "user.email", "test@example.com"],
+            "set email",
+        )
+        .unwrap();
+        fs::write(project.join("README.md"), "source\n").unwrap();
+        git::run(&project, &["add", "README.md"], "stage source").unwrap();
+        git::run(&project, &["commit", "-m", "Add source"], "commit source").unwrap();
+        let base = git::run_stdout(&project, &["rev-parse", "HEAD"], "read base").unwrap();
+        let candidate_path =
+            crate::work_model::initial_candidate_workspace_path("handoff-1", "attempt-1");
+        let candidate = project.join(&candidate_path);
+        git::run(
+            &project,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "work/handoff-1/attempt-1/attempt-1-write-1",
+                &candidate_path,
+            ],
+            "create Writer worktree",
+        )
+        .unwrap();
+        fs::write(candidate.join("change.txt"), "change\n").unwrap();
+        git::run(&candidate, &["add", "change.txt"], "stage change").unwrap();
+        git::run(&candidate, &["commit", "-m", "Add change"], "commit change").unwrap();
+        let commit = git::run_stdout(&candidate, &["rev-parse", "HEAD"], "read candidate").unwrap();
+        let store = WorkModelStore::new(&project);
+        let mut item = WorkItem::planned("handoff-1", "Check final handoff");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let task = &mut item.attempts[0].tasks[0];
+        task.status = TaskStatus::Executing;
+        let area = project.join(&task.artifact_area.as_ref().unwrap().path);
+        fs::create_dir_all(&area).unwrap();
+        fs::write(area.join("write-baseline-commit"), &base).unwrap();
+        item.attempts[0].status = AttemptStatus::Executing;
+        store.create_work_item(&item).unwrap();
+        let preflight =
+            check_writer_handoff(&candidate, "handoff-1", "attempt-1", "attempt-1-write-1")
+                .unwrap();
+        assert_eq!(preflight.candidate_commit, commit);
+        let task = &mut item.attempts[0].tasks[0];
+        task.status = TaskStatus::Complete;
+        task.output = Some(TaskOutput {
+            workspace_id: "candidate".into(),
+            workspace_path: candidate_path,
+            source_branch: "main".into(),
+            base_commit: Some(base),
+            commit,
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        item.attempts[0].status = AttemptStatus::Complete;
+        store.write_work_item(&item).unwrap();
+        fs::write(candidate.join("late.txt"), "late\n").unwrap();
+        let final_report =
+            check_completed_writer_handoff(&project, "handoff-1", "attempt-1", "attempt-1-write-1")
+                .unwrap();
+        assert_eq!(final_report.overall, WriterHandoffCheckStatus::Failed);
+        assert!(
+            final_report
+                .checks
+                .iter()
+                .any(|check| check.name == "writer-output"
+                    && check.status == WriterHandoffCheckStatus::Failed)
+        );
+        assert!(plan_after_completed_writer(&project, &store, item, "attempt-1").is_err());
+    }
 
     #[test]
     fn attempt_executor_mutations_record_the_owned_origin() {
