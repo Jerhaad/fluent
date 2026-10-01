@@ -1491,11 +1491,21 @@ mod tests {
             sbpl_string(&source.join(".fluent/work"))
         )));
         #[cfg(target_os = "macos")]
-        if std::process::Command::new("/usr/bin/sandbox-exec")
-            .args(["-p", "(version 1)(allow default)", "/usr/bin/true"])
-            .status()
-            .is_ok_and(|status| status.success())
         {
+            if let Err(error) = preflight_profile_with(&profile, |profile_path| {
+                std::process::Command::new("/usr/bin/sandbox-exec")
+                    .arg("-f")
+                    .arg(profile_path)
+                    .arg("/usr/bin/true")
+                    .output()
+            }) {
+                if std::env::var_os("FLUENT_TEST_REQUIRE_LIVE_SOURCE_CONFINEMENT").is_none()
+                    && error.to_string().contains("Operation not permitted")
+                {
+                    return;
+                }
+                panic!("live Writer source-confinement preflight failed: {error:#}");
+            }
             let output = std::process::Command::new("/usr/bin/sandbox-exec")
                 .arg("-f").arg(&profile.path)
                 .args(["/bin/sh", "-c", "if /bin/echo changed > \"$1\"; then exit 10; fi; /bin/echo candidate > \"$2\" || exit 11; /bin/echo git > \"$3\" || exit 12; /bin/echo artifact > \"$4\" || exit 13", "writer-profile-probe"])
@@ -1506,7 +1516,8 @@ mod tests {
                 .output().unwrap();
             assert!(
                 output.status.success(),
-                "{}",
+                "Writer source-confinement child exited with {} (10: source write allowed; 11: candidate write denied; 12: Git write denied; 13: Task-artifact write denied). stderr: {}",
+                output.status,
                 String::from_utf8_lossy(&output.stderr)
             );
             assert_eq!(
