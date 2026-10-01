@@ -1040,6 +1040,9 @@ pub(crate) fn ensure_owned_host_resume_ready(
     project_root: &Path,
     attempt: &work_model::Attempt,
 ) -> Result<()> {
+    if output_free_writer_completion_pause(attempt) {
+        return Ok(());
+    }
     if let Some(status) =
         crate::recovery_contracts::required_check_recovery_status(project_root, attempt)?
     {
@@ -1088,6 +1091,11 @@ pub(crate) fn required_host_verification_pending(
     project_root: &Path,
     attempt: &work_model::Attempt,
 ) -> Result<Option<PlanHostEvidenceAction>> {
+    // A failed Writer has no candidate to bind host evidence to. Its recovery
+    // must run before any candidate-scoped host check becomes actionable.
+    if output_free_writer_completion_pause(attempt) {
+        return Ok(None);
+    }
     let Some((writer, source, mut matrix)) =
         crate::recovery_contracts::owned_host_completion_matrix(project_root, attempt)?
     else {
@@ -1118,6 +1126,17 @@ pub(crate) fn required_host_verification_pending(
         })
     })
     .transpose()
+}
+
+fn output_free_writer_completion_pause(attempt: &work_model::Attempt) -> bool {
+    attempt.status == work_model::AttemptStatus::NeedsUser
+        && attempt.pause_kind == Some(work_model::PauseKind::WriterCompletion)
+        && attempt
+            .tasks
+            .iter()
+            .rev()
+            .find(|task| task.kind == TaskKind::Write)
+            .is_some_and(|task| task.output.is_none())
 }
 
 use crate::recovery_contracts::latest_plan_host_binding_paths;
@@ -4357,6 +4376,41 @@ mod tests {
         fs::write(&snapshot, saved).unwrap();
         fs::write(workspace.path().join("README.md"), "dirty\n").unwrap();
         assert!(required_host_verification_pending(project.path(), attempt).is_err());
+    }
+
+    #[test]
+    fn output_free_writer_completion_resume_does_not_require_host_evidence() {
+        let (project, _workspace, store, _candidate, _evidence) =
+            plan_host_evidence_fixture("bash tests/host.sh");
+        let mut item = store.read_work_item("work-1").unwrap();
+        let attempt = &mut item.attempts[0];
+        attempt
+            .writer_completion_contract
+            .as_mut()
+            .unwrap()
+            .requirements[0]
+            .responsibility = Some(work_model::CompletionResponsibility::Host);
+        attempt.status = work_model::AttemptStatus::NeedsUser;
+        attempt.pause_kind = Some(work_model::PauseKind::WriterCompletion);
+        let writer = attempt
+            .tasks
+            .iter_mut()
+            .rev()
+            .find(|task| task.kind == TaskKind::Write)
+            .unwrap();
+        writer.status = TaskStatus::NeedsUser;
+        writer.output = None;
+        assert!(
+            required_host_verification_pending(project.path(), attempt)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            pending_owned_host_resume_action(project.path(), attempt)
+                .unwrap()
+                .is_none()
+        );
+        ensure_owned_host_resume_ready(project.path(), attempt).unwrap();
     }
 
     #[test]
