@@ -4418,6 +4418,7 @@ fn preflight_write_sandbox_profile(
             codex_worker.map(|worker| worker.home()),
         )?
     };
+    os::deny_writer_source_entries(&profile, project_root, workspace_path)?;
     #[cfg(not(test))]
     if let Some(worker) = codex_worker {
         os::preflight_codex_launcher(&profile, worker)?;
@@ -5187,6 +5188,18 @@ fn build_write_task_prompt_with_workspace(
             ("work_item_title", &item.title),
             ("attempt_id", attempt_id),
             ("task_id", task_id),
+            (
+                "candidate_checkout_path",
+                &workspace_path
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default(),
+            ),
+            (
+                "source_checkout_path",
+                &project_root
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default(),
+            ),
             ("role", &task.role),
             ("brief_path", &brief_path),
             ("behaviors_path", &behaviors_path),

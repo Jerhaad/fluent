@@ -20,6 +20,44 @@ pub struct SandboxProfile {
     pub path: PathBuf,
 }
 
+/// Deny existing source product entries after the profile's broad temporary
+/// directory grants. Seatbelt resolves overlapping rules in declaration order.
+pub(crate) fn deny_writer_source_entries(
+    profile: &SandboxProfile,
+    source: &Path,
+    candidate: &Path,
+) -> Result<()> {
+    if source == candidate {
+        return Ok(());
+    }
+    let mut content = std::fs::read_to_string(&profile.path)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let path = entry.path();
+        if candidate.starts_with(&path) || entry.file_name() == ".git" {
+            continue;
+        }
+        if entry.file_name() == ".fluent" {
+            for child in std::fs::read_dir(&path)? {
+                let child = child?;
+                if child.file_name() != "work" {
+                    content.push_str(&format!(
+                        "\n(deny file-write* (subpath {}))",
+                        sbpl_string(&child.path())
+                    ));
+                }
+            }
+            continue;
+        }
+        content.push_str(&format!(
+            "\n(deny file-write* (subpath {}))",
+            sbpl_string(&path)
+        ));
+    }
+    std::fs::write(&profile.path, content)?;
+    Ok(())
+}
+
 /// The enclosing host could not apply Fluent's production Seatbelt profile.
 ///
 /// This is distinct from a coder failure: the workload never started, so callers
@@ -1409,6 +1447,73 @@ mod tests {
                 .contains("(allow file-write* (subpath \"/Users/test/.fluent/artifacts/tester\"))"),
             "artifact dir should be writable: {content}"
         );
+    }
+
+    #[test]
+    fn writer_profile_blocks_actual_source_write_in_temporary_checkout() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let candidate = root.path().join("candidate");
+        let artifact = source.join(".fluent/work/artifacts/task");
+        std::fs::create_dir_all(&artifact).unwrap();
+        std::fs::create_dir_all(source.join(".git")).unwrap();
+        std::fs::create_dir_all(source.join("src")).unwrap();
+        std::fs::create_dir_all(&candidate).unwrap();
+        std::fs::write(source.join("src/lib.rs"), "source").unwrap();
+        let profile = render_profile_common_only(
+            &ContentResolver::new(None),
+            "/Users/test",
+            &[candidate.clone(), source.clone(), artifact.clone()],
+            &[],
+        )
+        .unwrap();
+        deny_writer_source_entries(&profile, &source, &candidate).unwrap();
+        let content = std::fs::read_to_string(&profile.path).unwrap();
+        let denial = format!(
+            "(deny file-write* (subpath {}))",
+            sbpl_string(&source.join("src"))
+        );
+        assert!(
+            content.rfind(&denial).unwrap()
+                > content
+                    .rfind(&format!(
+                        "(allow file-write* (subpath {}))",
+                        sbpl_string(&source)
+                    ))
+                    .unwrap()
+        );
+        assert!(!content.contains(&format!(
+            "(deny file-write* (subpath {}))",
+            sbpl_string(&source.join(".git"))
+        )));
+        assert!(!content.contains(&format!(
+            "(deny file-write* (subpath {}))",
+            sbpl_string(&source.join(".fluent/work"))
+        )));
+        #[cfg(target_os = "macos")]
+        if std::process::Command::new("/usr/bin/sandbox-exec")
+            .args(["-p", "(version 1)(allow default)", "/usr/bin/true"])
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            let output = std::process::Command::new("/usr/bin/sandbox-exec")
+                .arg("-f").arg(&profile.path)
+                .args(["/bin/sh", "-c", "if /bin/echo changed > \"$1\"; then exit 10; fi; /bin/echo candidate > \"$2\" || exit 11; /bin/echo git > \"$3\" || exit 12; /bin/echo artifact > \"$4\" || exit 13", "writer-profile-probe"])
+                .arg(source.join("src/lib.rs"))
+                .arg(candidate.join("change.txt"))
+                .arg(source.join(".git/test"))
+                .arg(artifact.join("test"))
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                std::fs::read_to_string(source.join("src/lib.rs")).unwrap(),
+                "source"
+            );
+        }
     }
 
     #[test]
