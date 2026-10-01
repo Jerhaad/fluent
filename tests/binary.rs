@@ -40945,7 +40945,20 @@ fn task_show_prints_task_json() {
 }
 
 fn setup_active_writer_handoff(tmp: &TempDir) -> (PathBuf, PathBuf, String) {
-    let project = setup_git_project(&tmp);
+    let origin = setup_git_project(tmp);
+    let project = tmp.path().join("source");
+    git::run(
+        &origin,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "handoff-source",
+            project.to_str().unwrap(),
+        ],
+        "create source checkout",
+    )
+    .unwrap();
     fluent_cmd()
         .current_dir(&project)
         .args([
@@ -41171,6 +41184,29 @@ fn writer_handoff_preflight_does_not_pass_unverifiable_host_checks() {
         report["checks"].as_array().unwrap().iter().any(|check| {
             check["name"] == "host-evidence" && check["status"] == "not-verifiable"
         })
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn writer_handoff_preflight_reports_unreadable_model_binding() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new().unwrap();
+    let (project, candidate, head) = setup_active_writer_handoff(&tmp);
+    let store = WorkModelStore::new(&project);
+    let record = store.work_item_path("handoff-1").unwrap();
+    let original = fs::metadata(&record).unwrap().permissions();
+    fs::set_permissions(&record, fs::Permissions::from_mode(0o000)).unwrap();
+    let report = run_writer_handoff(&candidate, "attempt-1-write-1");
+    fs::set_permissions(&record, original).unwrap();
+    assert_eq!(report["candidate_commit"], head);
+    assert_eq!(report["overall"], "not-verifiable");
+    assert!(
+        report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|check| { check["status"] == "not-verifiable" })
     );
 }
 

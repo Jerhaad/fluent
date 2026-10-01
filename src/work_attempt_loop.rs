@@ -287,6 +287,115 @@ fn assess_writer_completion_for_handoff(
 
 /// Assess the active Writer's current candidate without changing the Task or
 /// publishing authoritative handoff artifacts.
+fn active_writer_project_root(
+    caller_workspace: &Path,
+    work_item_id: &str,
+    attempt_id: &str,
+    task_id: &str,
+) -> Result<Option<PathBuf>> {
+    let worktrees = git::run_raw(caller_workspace, &["worktree", "list", "--porcelain"])?;
+    anyhow::ensure!(
+        worktrees.status.success(),
+        "Cannot list Git worktrees for Writer handoff: {}",
+        String::from_utf8_lossy(&worktrees.stderr)
+    );
+    let mut matches = Vec::new();
+    let mut inaccessible = false;
+    for line in String::from_utf8_lossy(&worktrees.stdout).lines() {
+        let Some(path) = line.strip_prefix("worktree ") else {
+            continue;
+        };
+        let root = fs::canonicalize(path)?;
+        let store = WorkModelStore::new(&root);
+        let item = match store.read_work_item_snapshot(work_item_id) {
+            Ok(item) => item,
+            Err(WorkModelStorageError::ReadFile { source, .. })
+                if source.kind() == ErrorKind::NotFound =>
+            {
+                continue;
+            }
+            Err(WorkModelStorageError::ReadFile { source, .. })
+                if source.kind() == ErrorKind::PermissionDenied =>
+            {
+                inaccessible = true;
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let Some(attempt) = item
+            .attempts
+            .iter()
+            .find(|attempt| attempt.id == attempt_id)
+        else {
+            continue;
+        };
+        let Some(task) = attempt.tasks.iter().find(|task| task.id == task_id) else {
+            continue;
+        };
+        if task.kind != TaskKind::Write
+            || task.status != TaskStatus::Executing
+            || attempt.status != AttemptStatus::Executing
+        {
+            continue;
+        }
+        anyhow::ensure!(
+            task.workspace_access.writes.len() == 1,
+            "Active Writer Task {task_id:?} has no unique candidate workspace"
+        );
+        let assigned = crate::work_model::resolve_expected_candidate_workspace_path(
+            &root,
+            &task.workspace_access.writes[0].path,
+            work_item_id,
+            attempt_id,
+            "Writer handoff workspace",
+        )?;
+        if fs::canonicalize(&assigned).is_ok_and(|assigned| assigned == caller_workspace) {
+            matches.push(root);
+        }
+    }
+    if let [root] = matches.as_slice() {
+        return Ok(Some(root.clone()));
+    }
+    if matches.is_empty() && inaccessible {
+        return Ok(None);
+    }
+    bail!(
+        "Writer handoff requires one active Task bound to this candidate workspace; found {} matching source checkouts",
+        matches.len()
+    )
+}
+
+fn unverified_writer_handoff(candidate_commit: String, reason: String) -> WriterHandoffReport {
+    let names = [
+        "candidate-identity",
+        "writer-output",
+        "candidate-gate/candidate-identity",
+        "candidate-gate/whitespace",
+        "candidate-gate/commit-metadata",
+        "candidate-gate/behavior-references",
+        "candidate-gate/tester-reference-evidence",
+        "candidate-gate/project-check",
+        "completion-matrix",
+        "required-progress",
+        "host-evidence",
+        "candidate-stability",
+    ];
+    WriterHandoffReport {
+        candidate_commit,
+        overall: WriterHandoffCheckStatus::NotVerifiable,
+        checks: names
+            .into_iter()
+            .map(|name| {
+                handoff_check(
+                    name,
+                    WriterHandoffCheckStatus::NotVerifiable,
+                    vec![reason.clone()],
+                )
+            })
+            .collect(),
+    }
+}
+
 pub fn check_writer_handoff(
     caller_workspace: &Path,
     work_item_id: &str,
@@ -294,12 +403,36 @@ pub fn check_writer_handoff(
     task_id: &str,
 ) -> Result<WriterHandoffReport> {
     let caller_workspace = fs::canonicalize(caller_workspace)?;
-    let common_dir = fs::canonicalize(crate::worktree::git_common_dir(&caller_workspace)?)?;
-    let project_root = common_dir
-        .parent()
-        .context("Git common directory has no project root")?;
+    let project_root =
+        active_writer_project_root(&caller_workspace, work_item_id, attempt_id, task_id)?;
+    let Some(project_root) = project_root else {
+        let candidate = git::run_stdout(
+            &caller_workspace,
+            &["rev-parse", "HEAD"],
+            "read candidate for unverifiable Writer handoff",
+        )?;
+        return Ok(unverified_writer_handoff(candidate,
+            "Host-owned Work Item bindings are not readable in this Writer sandbox; the trusted host must perform the final handoff".into()));
+    };
+    let project_root = project_root.as_path();
     let store = WorkModelStore::new(project_root);
-    let item = store.read_work_item_snapshot(work_item_id)?;
+    let item = match store.read_work_item_snapshot(work_item_id) {
+        Ok(item) => item,
+        Err(WorkModelStorageError::ReadFile { source, .. })
+            if source.kind() == ErrorKind::PermissionDenied =>
+        {
+            let candidate = git::run_stdout(
+                &caller_workspace,
+                &["rev-parse", "HEAD"],
+                "read candidate for unverifiable Writer handoff",
+            )?;
+            return Ok(unverified_writer_handoff(
+                candidate,
+                "Host-owned Work Item bindings became unreadable during preflight".into(),
+            ));
+        }
+        Err(error) => return Err(error.into()),
+    };
     let attempt_index = item
         .attempts
         .iter()

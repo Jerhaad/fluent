@@ -4451,6 +4451,7 @@ fn preflight_write_sandbox_profile(
     let mut readable_roots = declared_file_readable_roots(prior_reviews, project_root)?;
     readable_roots.push(planning_files_dir(project_root, &task.work_item_id));
     readable_roots.push(general_expertise_dir(project_root));
+    readable_roots.extend(writer_handoff_model_readable_roots(project_root, task)?);
     if let Some(worker) = codex_worker {
         readable_roots.extend(worker.launcher().readable_roots().iter().cloned());
     }
@@ -4931,6 +4932,7 @@ fn run_task_coder_with_coder_with_feedback(
         let mut readable_roots = declared_file_readable_roots(prior_reviews, project_root)?;
         readable_roots.push(planning_files_dir(project_root, &item.id));
         readable_roots.push(general_expertise_dir(project_root));
+        readable_roots.extend(writer_handoff_model_readable_roots(project_root, task)?);
         if let Some(worker) = codex_worker {
             readable_roots.extend(worker.launcher().readable_roots().iter().cloned());
         }
@@ -6368,6 +6370,79 @@ impl PlanningFilePaths {
 
 fn planning_files_dir(project_root: &Path, work_item_id: &str) -> PathBuf {
     project_root.join(".fluent/work/items").join(work_item_id)
+}
+
+/// Read only this Work Item's published records and transaction marker so an
+/// active Writer can assess its host-owned binding without mutating model state.
+fn writer_handoff_model_readable_roots(project_root: &Path, task: &Task) -> Result<Vec<PathBuf>> {
+    let store = WorkModelStore::new(project_root);
+    let attempt_id = task
+        .attempt_id
+        .as_deref()
+        .context("Writer Task has no Attempt ID")?;
+    let item = store.work_item_path(&task.work_item_id)?;
+    let attempts = store
+        .work_attempt_path(&task.work_item_id, attempt_id)?
+        .parent()
+        .context("Attempt record has no item directory")?
+        .to_path_buf();
+    let tasks = store
+        .work_task_path(&task.work_item_id, attempt_id, &task.id)?
+        .parent()
+        .and_then(Path::parent)
+        .context("Task record has no item directory")?
+        .to_path_buf();
+    let candidates = store
+        .work_merge_candidate_path(&task.work_item_id, "candidate")?
+        .parent()
+        .context("Merge Candidate record has no item directory")?
+        .to_path_buf();
+    let transaction = store.work_dir().join("transactions").join(
+        item.file_name()
+            .context("Work Item record has no file name")?,
+    );
+    Ok(vec![item, attempts, tasks, candidates, transaction])
+}
+
+#[cfg(test)]
+mod writer_handoff_model_access_tests {
+    use super::*;
+
+    #[test]
+    fn writer_handoff_model_access_stays_with_assigned_work_item() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut item = WorkItem::planned("work-1", "Check handoff access");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let task = &item.attempts[0].tasks[0];
+        let store = WorkModelStore::new(tmp.path());
+        let roots = writer_handoff_model_readable_roots(tmp.path(), task).unwrap();
+        assert!(roots.contains(&store.work_item_path("work-1").unwrap()));
+        assert!(
+            roots.contains(
+                &store
+                    .work_attempt_path("work-1", "attempt-1")
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .to_path_buf()
+            )
+        );
+        assert!(
+            roots.contains(
+                &store
+                    .work_task_path("work-1", "attempt-1", &task.id)
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .to_path_buf()
+            )
+        );
+        assert!(!roots.contains(&store.work_items_dir()));
+        assert!(!roots.contains(&store.work_attempts_dir()));
+        assert!(!roots.contains(&store.work_tasks_dir()));
+    }
 }
 
 fn general_expertise_dir(project_root: &Path) -> PathBuf {
