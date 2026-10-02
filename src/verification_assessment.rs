@@ -1586,6 +1586,8 @@ mod cargo_lib_reference_tests {
         );
         for (id, accepted) in [
             ("model-gateway::model_gateway$verifies_assignment", true),
+            ("verifies_assignment", false),
+            ("model-gateway$verifies_assignment", false),
             ("model-gateway::model-gateway$verifies_assignment", false),
             (
                 "model-gateway::integration/model_gateway$verifies_assignment",
@@ -1988,6 +1990,8 @@ mod cargo_lib_reference_tests {
             Some(&library)
         ));
         for id in [
+            "feature::verifies_assignment",
+            "fluent$feature::verifies_assignment",
             "another::another$feature::verifies_assignment",
             "fluent::binary$feature::verifies_assignment",
             "fluent::bin/fluent$feature::verifies_assignment",
@@ -2067,6 +2071,8 @@ mod cargo_lib_reference_tests {
         };
         for (id, accepted) in [
             ("other-package::other_library$verifies_assignment", true),
+            ("verifies_assignment", false),
+            ("other-package$verifies_assignment", false),
             ("other-package::integration$verifies_assignment", false),
             (
                 "other-package::bin/other_library$verifies_assignment",
@@ -2118,6 +2124,24 @@ mod cargo_lib_reference_tests {
         assert!(
             !rows[0].satisfied,
             "uncommitted target metadata was credited"
+        );
+        let mut committed_results = results;
+        committed_results.tests[0].id = "other-package::other_library$verifies_assignment".into();
+        let rows = assess_references(
+            repo.path(),
+            "custom",
+            "attempt-1",
+            &candidate,
+            &contract,
+            Some(&committed_results),
+            None,
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert!(
+            rows[0].satisfied,
+            "the committed library target was lost after a worktree edit"
         );
     }
 }
@@ -2236,9 +2260,91 @@ fn candidate_library_target(
         }
         Some(None)
     }
-    bound_file(workspace, candidate, &workspace.join("Cargo.toml"))?;
+    fn committed_root_library(
+        workspace: &Path,
+        candidate: &str,
+        declaration: &str,
+    ) -> Option<CandidateLibraryTarget> {
+        let manifest = committed_file(workspace, candidate, &workspace.join("Cargo.toml"))?;
+        let manifest = std::str::from_utf8(&manifest).ok()?;
+        // A dirty workspace manifest can change member selection. This
+        // fallback applies only to a standalone package at the repository root.
+        if manifest
+            .lines()
+            .any(|line| line.trim().starts_with("[workspace]"))
+        {
+            return None;
+        }
+        let mut section = "";
+        let (mut package, mut library, mut source, mut autolib) = (None, None, None, None);
+        let mut declared_library = false;
+        for line in manifest.lines().map(str::trim) {
+            if line.starts_with('[') {
+                section = line.split('#').next()?.trim();
+                declared_library |= section == "[lib]";
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            if section == "[package]" && key.trim() == "autolib" {
+                if autolib.is_some() {
+                    return None;
+                }
+                autolib = Some(match value.split('#').next()?.trim() {
+                    "true" => true,
+                    "false" => false,
+                    _ => return None,
+                });
+                continue;
+            }
+            let slot = match (section, key.trim()) {
+                ("[package]", "name") => &mut package,
+                ("[lib]", "name") => &mut library,
+                ("[lib]", "path") => &mut source,
+                _ => continue,
+            };
+            if slot.is_some() {
+                return None;
+            }
+            *slot = Some(manifest_string(value.trim())?);
+        }
+        if autolib == Some(false) && !declared_library {
+            return None;
+        }
+        let package: String = package?;
+        let library = library.unwrap_or_else(|| package.replace('-', "_"));
+        let source = source.unwrap_or_else(|| "src/lib.rs".into());
+        let source = Path::new(&source);
+        if !source
+            .extension()
+            .is_some_and(|extension| extension == "rs")
+            || !source
+                .components()
+                .all(|component| matches!(component, Component::Normal(_)))
+        {
+            return None;
+        }
+        let source = workspace.join(source);
+        let sources = library_sources(workspace, candidate, &[source])?;
+        for path in &sources {
+            bound_file(workspace, candidate, path)?;
+        }
+        sources
+            .iter()
+            .any(|path| {
+                committed_file(workspace, candidate, path)
+                    .is_some_and(|bytes| String::from_utf8_lossy(&bytes).contains(declaration))
+            })
+            .then_some(CandidateLibraryTarget { package, library })
+    }
     let test = references::RustTestIdentity::parse(name)?;
     let declaration = format!("fn {}(", test.short_name());
+    if bound_file(workspace, candidate, &workspace.join("Cargo.toml")).is_none() {
+        // Resolve a standalone package from the commit when an unrelated
+        // worktree manifest edit would make live Cargo metadata misleading.
+        return committed_root_library(workspace, candidate, &declaration);
+    }
     let output = Command::new("cargo")
         .args([
             "metadata",
@@ -2388,6 +2494,29 @@ fn candidate_library_target(
     (matches.len() == 1).then(|| matches.remove(0))
 }
 
+fn manifest_string(value: &str) -> Option<String> {
+    let quote = value.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let mut escaped = false;
+    for (index, character) in value.char_indices().skip(1) {
+        if character == quote && !escaped {
+            let remainder = value[index + character.len_utf8()..].trim();
+            if !remainder.is_empty() && !remainder.starts_with('#') {
+                return None;
+            }
+            return if quote == '"' {
+                serde_json::from_str(&value[..=index]).ok()
+            } else {
+                Some(value[1..index].to_owned())
+            };
+        }
+        escaped = character == '\\' && !escaped && quote == '"';
+    }
+    None
+}
+
 fn reference_is_satisfied(
     reference: &TestReference,
     results: &crate::tester::TesterResults,
@@ -2419,9 +2548,8 @@ fn reference_is_satisfied(
                 .filter_map(|test| {
                     references::RustTestIdentity::parse(&test.id)
                         .filter(|identity| {
-                            identity.binary.is_none_or(|binary| {
-                                binary == library.package
-                                    || binary == format!("{}::{}", library.package, library.library)
+                            identity.binary.is_some_and(|binary| {
+                                binary == format!("{}::{}", library.package, library.library)
                             })
                         })
                         .map(|identity| (identity, test))
