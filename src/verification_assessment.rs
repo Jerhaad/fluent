@@ -1575,6 +1575,15 @@ mod cargo_lib_reference_tests {
     #[test]
     fn cargo_lib_reference_selects_virtual_workspace_member() {
         let (repo, candidate) = virtual_workspace_fixture();
+        assert!(
+            candidate_library_target_with_metadata(
+                repo.path(),
+                &candidate,
+                "verifies_assignment",
+                || None,
+            )
+            .is_none()
+        );
         let reference =
             references::parse_test_reference("cargo test --lib verifies_assignment").unwrap();
         validate_reference_source(repo.path(), &candidate, &reference).unwrap();
@@ -1815,6 +1824,15 @@ mod cargo_lib_reference_tests {
         let ambiguous =
             crate::git::run_stdout(repo.path(), &["rev-parse", "HEAD"], "read fixture").unwrap();
         assert!(candidate_library_target(repo.path(), &ambiguous, "verifies_assignment").is_none());
+        assert!(
+            candidate_library_target_with_metadata(
+                repo.path(),
+                &ambiguous,
+                "verifies_assignment",
+                || None,
+            )
+            .is_none()
+        );
         assert!(!assess_virtual_reference(repo.path(), &ambiguous, native));
         std::fs::write(second.join("src/other.rs"), "pub fn other() {}\n").unwrap();
         crate::git::run(repo.path(), &["add", "."], "stage alternate library source").unwrap();
