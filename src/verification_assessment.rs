@@ -1541,7 +1541,7 @@ mod cargo_lib_reference_tests {
         let results: crate::tester::TesterResults = serde_json::from_value(serde_json::json!({
             "candidate_commit": candidate,
             "commands": [],
-            "tests": [{"id":"feature::verifies_assignment","test_harness":"cargo-nextest","status":"pass","duration_ms":1,"failure_excerpt":null}],
+            "tests": [{"id":"fluent::fluent$feature::verifies_assignment","test_harness":"cargo-nextest","status":"pass","duration_ms":1,"failure_excerpt":null}],
             "summary": {"total":1,"pass":1,"fail":0,"skipped":0},
             "error": null
         }))
@@ -1553,6 +1553,47 @@ mod cargo_lib_reference_tests {
         failed.tests[0].status = "pass".into();
         failed.tests[0].test_harness = "shell-harness".into();
         assert!(!reference_is_satisfied(&reference, &failed, None));
+    }
+
+    #[test]
+    fn cargo_lib_test_reference_matches_nextest_library_target() {
+        let reference =
+            references::parse_test_reference("cargo test --lib verifies_assignment").unwrap();
+        let result = |id: &str, status: &str| -> crate::tester::TesterResults {
+            serde_json::from_value(serde_json::json!({
+                "candidate_commit": "candidate",
+                "commands": [],
+                "tests": [{"id": id, "test_harness": "cargo-nextest", "status": status, "duration_ms": 1, "failure_excerpt": null}],
+                "summary": {"total": 1, "pass": 1, "fail": 0, "skipped": 0},
+                "error": null
+            })).unwrap()
+        };
+        assert!(reference_is_satisfied(
+            &reference,
+            &result("fluent::fluent$feature::verifies_assignment", "pass"),
+            None
+        ));
+        for id in [
+            "another::another$feature::verifies_assignment",
+            "fluent::binary$feature::verifies_assignment",
+            "fluent::bin/fluent$feature::verifies_assignment",
+            "fluent::integration/fluent$feature::verifies_assignment",
+        ] {
+            assert!(
+                !reference_is_satisfied(&reference, &result(id, "pass"), None),
+                "{id}"
+            );
+        }
+        assert!(!reference_is_satisfied(
+            &reference,
+            &result("fluent::fluent$feature::verifies_assignment", "fail"),
+            None
+        ));
+        let mut mixed = result("fluent::fluent$feature::verifies_assignment", "pass");
+        mixed
+            .tests
+            .extend(result("fluent::binary$feature::verifies_assignment", "fail").tests);
+        assert!(reference_is_satisfied(&reference, &mixed, None));
     }
 }
 
@@ -1583,7 +1624,15 @@ fn reference_is_satisfied(
                 .filter_map(|test| {
                     references::RustTestIdentity::parse(&test.id)
                         .filter(|identity| {
-                            identity.binary.is_none_or(|binary| !binary.contains("::"))
+                            identity.binary.is_none_or(|binary| {
+                                binary == env!("CARGO_PKG_NAME")
+                                    || binary
+                                        == format!(
+                                            "{}::{}",
+                                            env!("CARGO_PKG_NAME"),
+                                            env!("CARGO_CRATE_NAME")
+                                        )
+                            })
                         })
                         .map(|identity| (identity, test))
                 })
