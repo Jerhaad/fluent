@@ -54299,8 +54299,15 @@ fi
             !failed
         );
         assert_eq!(
-            context["verification"]["references"][0]["satisfied"],
-            present
+            context["verification"]["satisfied_references"],
+            usize::from(present)
+        );
+        assert_eq!(
+            context["verification"]["references"]
+                .as_array()
+                .unwrap()
+                .len(),
+            usize::from(!present)
         );
     }
 }
@@ -54474,10 +54481,7 @@ print(json.dumps([{'id':line.removeprefix('not ').removeprefix('ok '), 'status':
             assert_eq!(&ids, previous);
         }
         previous_ids = Some(ids);
-        assert_eq!(
-            context["verification"],
-            serde_json::to_value(&view).unwrap()
-        );
+        assert_compact_verification(&context, &view);
         assert_eq!(context["current-findings"].as_array().unwrap().len(), 1);
         let history = context["historical-artifacts"].as_array().unwrap();
         assert!(
@@ -54520,11 +54524,47 @@ print(json.dumps([{'id':line.removeprefix('not ').removeprefix('ok '), 'status':
         &item.attempts[0],
         &workspace,
     );
-    assert_eq!(
-        context["verification"],
-        serde_json::to_value(&invalid).unwrap()
-    );
+    assert_compact_verification(&context, &invalid);
     assert_eq!(fs::read(results).unwrap(), raw_results);
+}
+
+fn assert_compact_verification(
+    context: &serde_json::Value,
+    full: &fluent::verification_assessment::VerificationAssessment,
+) {
+    let compact = &context["verification"];
+    assert_eq!(compact["candidate_commit"], full.candidate_commit);
+    assert_eq!(
+        compact["satisfied_references"],
+        full.references.iter().filter(|row| row.satisfied).count()
+    );
+    assert_eq!(
+        compact["satisfied_commands"],
+        full.commands.iter().filter(|row| row.satisfied).count()
+    );
+    assert_eq!(
+        compact["references"],
+        serde_json::json!(
+            full.references
+                .iter()
+                .filter(|row| !row.satisfied)
+                .collect::<Vec<_>>()
+        )
+    );
+    assert_eq!(
+        compact["commands"],
+        serde_json::json!(
+            full.commands
+                .iter()
+                .filter(|row| !row.satisfied)
+                .collect::<Vec<_>>()
+        )
+    );
+    let saved = fs::read(compact["full_assessment"]["path"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&saved).unwrap(),
+        serde_json::to_value(full).unwrap()
+    );
 }
 
 #[test]

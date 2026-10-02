@@ -102,7 +102,7 @@ struct ReviewArtifactUsage {
 #[serde(rename_all = "kebab-case")]
 struct ExecutionContextV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    verification: Option<crate::verification_assessment::VerificationAssessment>,
+    verification: Option<ExecutionContextVerification>,
     schema_version: u32,
     candidate_commit: String,
     base_commit: Option<String>,
@@ -117,6 +117,16 @@ struct ExecutionContextV1 {
     executed_commands: Vec<String>,
     historical_artifacts: Vec<String>,
     omitted: ExecutionContextOmitted,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct ExecutionContextVerification {
+    candidate_commit: String,
+    references: Vec<crate::verification_assessment::RequirementAssessment>,
+    commands: Vec<crate::verification_assessment::RequirementAssessment>,
+    satisfied_references: usize,
+    satisfied_commands: usize,
+    full_assessment: crate::work_model::BoundRecheckArtifact,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -6074,7 +6084,9 @@ fn write_execution_context_with_finding_policy(
         artifact: finding.source,
     })
     .collect();
-    let verification = current.map(|(_, view)| view);
+    let verification = current
+        .map(|(_, view)| compact_execution_verification(artifact_dir, view))
+        .transpose()?;
     let (passing_evidence, executed_commands) =
         execution_context_evidence(input_artifacts, candidate_commit);
     let historical_artifacts = input_artifacts
@@ -6135,6 +6147,46 @@ fn bounded_vec<T>(mut values: Vec<T>, max: usize) -> (Vec<T>, usize) {
     (values, omitted)
 }
 
+fn compact_execution_verification(
+    artifact_dir: &Path,
+    assessment: crate::verification_assessment::VerificationAssessment,
+) -> Result<ExecutionContextVerification> {
+    let bytes = to_json_pretty(&assessment)?.into_bytes();
+    fs::create_dir_all(artifact_dir)?;
+    let path = artifact_dir.join("verification-assessment.json");
+    crate::atomic_write::atomic_write(&path, &bytes)?;
+    let full_assessment = crate::work_model::BoundRecheckArtifact {
+        path: std::path::absolute(&path)?.display().to_string(),
+        digest: format!("sha256:{:x}", Sha256::digest(&bytes)),
+    };
+    let satisfied_references = assessment
+        .references
+        .iter()
+        .filter(|row| row.satisfied)
+        .count();
+    let satisfied_commands = assessment
+        .commands
+        .iter()
+        .filter(|row| row.satisfied)
+        .count();
+    Ok(ExecutionContextVerification {
+        candidate_commit: assessment.candidate_commit,
+        references: assessment
+            .references
+            .into_iter()
+            .filter(|row| !row.satisfied)
+            .collect(),
+        commands: assessment
+            .commands
+            .into_iter()
+            .filter(|row| !row.satisfied)
+            .collect(),
+        satisfied_references,
+        satisfied_commands,
+        full_assessment,
+    })
+}
+
 fn bounded_execution_context_json(context: &mut ExecutionContextV1) -> Result<String> {
     loop {
         let serialized = to_json_pretty(context)?;
@@ -6148,7 +6200,10 @@ fn bounded_execution_context_json(context: &mut ExecutionContextV1) -> Result<St
         } else if context.passing_evidence.pop().is_some() {
             context.omitted.passing_evidence += 1;
         } else {
-            anyhow::bail!("execution context core exceeds {EXECUTION_CONTEXT_MAX_BYTES} bytes");
+            anyhow::bail!(
+                "execution context core exceeds {EXECUTION_CONTEXT_MAX_BYTES} bytes (actual: {} bytes)",
+                serialized.len()
+            );
         }
     }
 }
@@ -20546,6 +20601,98 @@ while time.monotonic() < deadline:
 
         assert_eq!(context["current-findings"].as_array().unwrap().len(), 40);
         assert_eq!(context["omitted"]["current-findings"], 0);
+    }
+
+    #[test]
+    fn corrective_context_compacts_passing_verification() {
+        let artifact = tempfile::tempdir().unwrap();
+        let row = |id: String, satisfied: bool| {
+            serde_json::from_value::<crate::verification_assessment::RequirementAssessment>(
+                serde_json::json!({
+                    "id": id, "source": "canonical Tester", "meaning": null,
+                    "check": null, "satisfied": satisfied,
+                    "cause": if satisfied { serde_json::Value::Null } else { serde_json::json!("candidate-defect") },
+                    "owner": "writer", "next_action": if satisfied { None } else { Some("repair candidate") },
+                    "bindings": [{"path": "tester-results.json", "digest": "sha256:fixture"}],
+                    "diagnostics": if satisfied { Vec::new() } else { vec!["assertion failed".to_string()] }
+                }),
+            )
+            .unwrap()
+        };
+        let mut assessment = crate::verification_assessment::VerificationAssessment {
+            candidate_commit: "candidate".into(),
+            references: (0..700)
+                .map(|i| row(format!("reference-{i}"), true))
+                .collect(),
+            commands: (0..700)
+                .map(|i| row(format!("command-{i}"), true))
+                .collect(),
+        };
+        assessment
+            .references
+            .push(row("failed-reference".into(), false));
+        assessment
+            .commands
+            .push(row("failed-command".into(), false));
+        let full = serde_json::to_value(&assessment).unwrap();
+        assert!(
+            serde_json::to_vec_pretty(&assessment).unwrap().len() > EXECUTION_CONTEXT_MAX_BYTES
+        );
+
+        let compact = compact_execution_verification(artifact.path(), assessment).unwrap();
+        let encoded = serde_json::to_vec_pretty(&compact).unwrap();
+        assert!(encoded.len() < EXECUTION_CONTEXT_MAX_BYTES);
+        assert_eq!(compact.satisfied_references, 700);
+        assert_eq!(compact.satisfied_commands, 700);
+        assert_eq!(compact.references.len(), 1);
+        assert_eq!(compact.commands.len(), 1);
+        assert_eq!(compact.references[0].id, "failed-reference");
+        assert_eq!(compact.commands[0].id, "failed-command");
+        assert_eq!(compact.commands[0].diagnostics, ["assertion failed"]);
+        let saved = fs::read(&compact.full_assessment.path).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&saved).unwrap(),
+            full
+        );
+        assert_eq!(
+            compact.full_assessment.digest,
+            format!("sha256:{:x}", Sha256::digest(&saved))
+        );
+        let mut context = ExecutionContextV1 {
+            verification: Some(compact),
+            schema_version: 2,
+            candidate_commit: "candidate".into(),
+            base_commit: None,
+            correction_lineage: None,
+            changed_files: Vec::new(),
+            unresolved_steps: Vec::new(),
+            pending_writer_rows: Vec::new(),
+            current_findings: vec![ExecutionContextFinding {
+                role: "tests".into(),
+                identity: "failed-command".into(),
+                title: "assertion failed".into(),
+                artifact: "tester-results.json".into(),
+            }],
+            passing_evidence: Vec::new(),
+            executed_commands: Vec::new(),
+            historical_artifacts: vec!["tester-results.json".into()],
+            omitted: ExecutionContextOmitted::default(),
+        };
+        let serialized = bounded_execution_context_json(&mut context).unwrap();
+        assert!(serialized.len() <= EXECUTION_CONTEXT_MAX_BYTES);
+        assert!(serialized.contains("failed-reference"));
+        assert!(serialized.contains("failed-command"));
+        assert!(serialized.contains("verification-assessment.json"));
+
+        context
+            .verification
+            .as_mut()
+            .unwrap()
+            .commands
+            .extend((0..700).map(|i| row(format!("additional-failure-{i}"), false)));
+        let error = bounded_execution_context_json(&mut context).unwrap_err();
+        assert!(error.to_string().contains("execution context core exceeds"));
+        assert!(error.to_string().contains("actual:"));
     }
 
     #[test]
