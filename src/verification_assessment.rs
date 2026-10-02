@@ -2057,6 +2057,17 @@ mod cargo_lib_reference_tests {
         .unwrap();
         let candidate =
             crate::git::run_stdout(repo.path(), &["rev-parse", "HEAD"], "read fixture").unwrap();
+        let unavailable = candidate_library_target_with_metadata(
+            repo.path(),
+            &candidate,
+            "verifies_assignment",
+            || None,
+        )
+        .expect("committed package-root library resolves without Cargo metadata");
+        assert_eq!(
+            (&*unavailable.package, &*unavailable.library),
+            ("other-package", "other_library")
+        );
         let contract = work_model::WriterCompletionContract {
             version: work_model::WRITER_COMPLETION_CONTRACT_VERSION,
             requirements: vec![work_model::WriterCompletionRequirement {
@@ -2087,6 +2098,13 @@ mod cargo_lib_reference_tests {
                 "summary": {"total": 1, "pass": 1, "fail": 0, "skipped": 0},
                 "error": null
             })).unwrap();
+            let reference =
+                references::parse_test_reference("cargo test --lib verifies_assignment").unwrap();
+            assert_eq!(
+                reference_is_satisfied(&reference, &results, None, Some(&unavailable)),
+                accepted,
+                "metadata unavailable: {id}"
+            );
             let rows = assess_references(
                 repo.path(),
                 "custom",
@@ -2148,6 +2166,15 @@ mod cargo_lib_reference_tests {
             "#[test]\nfn verifies_assignment() { panic!(); }\n",
         )
         .unwrap();
+        assert!(
+            candidate_library_target_with_metadata(
+                repo.path(),
+                &candidate,
+                "verifies_assignment",
+                || None,
+            )
+            .is_none()
+        );
         let rows = assess_references(
             repo.path(),
             "custom",
@@ -2174,6 +2201,32 @@ fn candidate_library_target(
     workspace: &Path,
     candidate: &str,
     name: &str,
+) -> Option<CandidateLibraryTarget> {
+    candidate_library_target_with_metadata(workspace, candidate, name, || {
+        let output = Command::new("cargo")
+            .args([
+                "metadata",
+                "--no-deps",
+                "--format-version",
+                "1",
+                "--offline",
+                "--manifest-path",
+            ])
+            .arg(workspace.join("Cargo.toml"))
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| serde_json::from_slice(&output.stdout).ok())?
+    })
+}
+
+fn candidate_library_target_with_metadata(
+    workspace: &Path,
+    candidate: &str,
+    name: &str,
+    load_metadata: impl FnOnce() -> Option<serde_json::Value>,
 ) -> Option<CandidateLibraryTarget> {
     fn committed_file(workspace: &Path, candidate: &str, path: &Path) -> Option<Vec<u8>> {
         let relative = path.strip_prefix(workspace).ok()?.to_str()?;
@@ -2363,22 +2416,9 @@ fn candidate_library_target(
         // worktree manifest edit would make live Cargo metadata misleading.
         return committed_root_library(workspace, candidate, &declaration);
     }
-    let output = Command::new("cargo")
-        .args([
-            "metadata",
-            "--no-deps",
-            "--format-version",
-            "1",
-            "--offline",
-            "--manifest-path",
-        ])
-        .arg(workspace.join("Cargo.toml"))
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let metadata: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let Some(metadata) = load_metadata() else {
+        return committed_root_library(workspace, candidate, &declaration);
+    };
     let members = metadata.get("workspace_members")?.as_array()?;
     let mut matches = Vec::new();
     for package in metadata.get("packages")?.as_array()? {
@@ -2509,7 +2549,9 @@ fn candidate_library_target(
             }
         }
     }
-    (matches.len() == 1).then(|| matches.remove(0))
+    (matches.len() == 1)
+        .then(|| matches.remove(0))
+        .or_else(|| committed_root_library(workspace, candidate, &declaration))
 }
 
 fn manifest_string(value: &str) -> Option<String> {
