@@ -15,6 +15,21 @@ and keeps that shape if rewritten. Contexts without verification use schema 1.
 
 ---
 
+## Bind library references without rejecting unrelated workspace members
+
+Cargo metadata comes from the live candidate workspace, so the root manifest
+must match the candidate commit. A member selected for a `cargo test --lib`
+reference must also have a committed manifest and bound Rust sources. A dirty
+manifest in another member disqualifies the reference when committed Rust files
+under that member, or its committed explicit library source and literal
+inclusions, contain the referenced declaration: live metadata could otherwise
+hide an ambiguous library. Fluent allows a dirty member with no such committed
+declaration so unrelated member edits do not discard valid library evidence.
+This text scan can reject an ambiguous looking declaration conservatively;
+native package and target identities still determine which result may pass.
+
+---
+
 ## Writer handoff hooks run in a detached private candidate copy
 
 Active preflight and final handoff run the Writer-phase project hook against a

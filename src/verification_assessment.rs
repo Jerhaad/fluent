@@ -1728,6 +1728,59 @@ mod cargo_lib_reference_tests {
             "restore fixture",
         )
         .unwrap();
+        std::fs::write(member.join("src/lib.rs"), "#[cfg_attr(unix, path = \"../shared.rs\")] mod helper;\n#[test]\nfn verifies_assignment() { helper::run(); }\n").unwrap();
+        crate::git::run(
+            repo.path(),
+            &["add", "."],
+            "stage conditional source fixture",
+        )
+        .unwrap();
+        crate::git::run(
+            repo.path(),
+            &["commit", "-qm", "Use conditional library source"],
+            "commit conditional source fixture",
+        )
+        .unwrap();
+        let conditional_candidate =
+            crate::git::run_stdout(repo.path(), &["rev-parse", "HEAD"], "read fixture").unwrap();
+        assert!(assess_virtual_reference(
+            repo.path(),
+            &conditional_candidate,
+            native
+        ));
+        std::fs::write(member.join("shared.rs"), "pub fn run() { panic!(); }\n").unwrap();
+        assert!(!assess_virtual_reference(
+            repo.path(),
+            &conditional_candidate,
+            native
+        ));
+        crate::git::run(
+            repo.path(),
+            &["restore", "crates/model-gateway/shared.rs"],
+            "restore fixture",
+        )
+        .unwrap();
+
+        std::fs::write(member.join("src/lib.rs"), "include!(\"../shared.rs\");\n").unwrap();
+        std::fs::write(
+            member.join("shared.rs"),
+            "#[test]\nfn verifies_assignment() {}\n",
+        )
+        .unwrap();
+        crate::git::run(repo.path(), &["add", "."], "stage included test fixture").unwrap();
+        crate::git::run(
+            repo.path(),
+            &["commit", "-qm", "Include library test"],
+            "commit included test fixture",
+        )
+        .unwrap();
+        let included_candidate =
+            crate::git::run_stdout(repo.path(), &["rev-parse", "HEAD"], "read fixture").unwrap();
+        assert!(assess_virtual_reference(
+            repo.path(),
+            &included_candidate,
+            native
+        ));
         std::fs::remove_file(member.join("src/lib.rs")).unwrap();
         assert!(candidate_library_target(repo.path(), &candidate, "verifies_assignment").is_none());
         crate::git::run(
@@ -1775,6 +1828,33 @@ mod cargo_lib_reference_tests {
         assert!(!assess_virtual_reference(
             repo.path(),
             &ambiguous_with_alternate,
+            native
+        ));
+        std::fs::write(second.join("Cargo.toml"), "[package]\nname = \"other\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[lib] # external test source\npath = \"../../shared-other.rs\"\n").unwrap();
+        std::fs::write(second.join("src/lib.rs"), "pub fn old_library() {}\n").unwrap();
+        std::fs::write(
+            repo.path().join("shared-other.rs"),
+            "#[test]\nfn verifies_assignment() {}\n",
+        )
+        .unwrap();
+        crate::git::run(repo.path(), &["add", "."], "stage external second library").unwrap();
+        crate::git::run(
+            repo.path(),
+            &["commit", "-qm", "Add external second library"],
+            "commit external second library",
+        )
+        .unwrap();
+        let external_ambiguous =
+            crate::git::run_stdout(repo.path(), &["rev-parse", "HEAD"], "read fixture").unwrap();
+        assert!(!assess_virtual_reference(
+            repo.path(),
+            &external_ambiguous,
+            native
+        ));
+        std::fs::write(second.join("Cargo.toml"), "[package]\nname = \"other\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[lib]\npath = \"src/other.rs\"\n").unwrap();
+        assert!(!assess_virtual_reference(
+            repo.path(),
+            &external_ambiguous,
             native
         ));
         std::fs::write(
@@ -2062,11 +2142,16 @@ fn candidate_library_target(
     fn bound_file(workspace: &Path, candidate: &str, path: &Path) -> Option<()> {
         (std::fs::read(path).ok()? == committed_file(workspace, candidate, path)?).then_some(())
     }
-    fn bind_explicit_rust_sources(
+    fn workspace_path(workspace: &Path, path: &Path) -> Option<PathBuf> {
+        let path = path.canonicalize().ok()?;
+        let relative = path.strip_prefix(workspace.canonicalize().ok()?).ok()?;
+        Some(workspace.join(relative))
+    }
+    fn library_sources(
         workspace: &Path,
         candidate: &str,
         roots: &[PathBuf],
-    ) -> Option<()> {
+    ) -> Option<Vec<PathBuf>> {
         fn literal_paths<'a>(
             text: &'a str,
             marker: &str,
@@ -2085,6 +2170,29 @@ fn candidate_library_target(
                 })
                 .collect()
         }
+        fn attribute_paths(text: &str) -> Option<Vec<&str>> {
+            let mut paths = Vec::new();
+            let mut remaining = text;
+            while let Some(index) = remaining.find("#[") {
+                let attribute = &remaining[index + 2..];
+                let end = attribute.find(']')?;
+                let body = &attribute[..end];
+                for (offset, _) in body.match_indices("path") {
+                    let preceding = body[..offset].chars().next_back();
+                    if preceding.is_some_and(|c| c == '_' || c.is_alphanumeric()) {
+                        continue;
+                    }
+                    let rest = body[offset + 4..].trim_start();
+                    if let Some(rest) = rest.strip_prefix('=') {
+                        let rest = rest.trim_start().strip_prefix('"')?;
+                        let (path, _) = rest.split_once('"')?;
+                        paths.push(path);
+                    }
+                }
+                remaining = &attribute[end + 1..];
+            }
+            Some(paths)
+        }
         let mut pending = roots.to_vec();
         let mut seen = std::collections::HashSet::new();
         while let Some(source) = pending.pop() {
@@ -2092,21 +2200,41 @@ fn candidate_library_target(
                 continue;
             }
             let bytes = committed_file(workspace, candidate, &source)?;
-            if std::fs::read(&source).ok()? != bytes {
-                return None;
-            }
             let text = std::str::from_utf8(&bytes).ok()?;
-            for path in literal_paths(text, "#[path", "=", "]")?
+            for path in attribute_paths(text)?
                 .into_iter()
                 .chain(literal_paths(text, "include!", "(", ")")?)
             {
                 let path = source.parent()?.join(path);
-                let path = path.canonicalize().ok()?;
-                let relative = path.strip_prefix(workspace.canonicalize().ok()?).ok()?;
-                pending.push(workspace.join(relative));
+                pending.push(workspace_path(workspace, &path)?);
             }
         }
-        Some(())
+        Some(seen.into_iter().collect())
+    }
+    fn committed_explicit_library_source(
+        workspace: &Path,
+        candidate: &str,
+        manifest: &Path,
+    ) -> Option<Option<PathBuf>> {
+        let bytes = committed_file(workspace, candidate, manifest)?;
+        let text = std::str::from_utf8(&bytes).ok()?;
+        let mut in_library = false;
+        for line in text.lines().map(str::trim) {
+            if line.starts_with('[') {
+                in_library = line.starts_with("[lib]");
+            } else if in_library && let Some((key, value)) = line.split_once('=') {
+                if key.trim() == "path" {
+                    let value = value.trim();
+                    let quote = value.chars().next()?;
+                    if quote != '"' && quote != '\'' {
+                        return None;
+                    }
+                    let path = value[1..].split_once(quote)?.0;
+                    return workspace_path(workspace, &manifest.parent()?.join(path)).map(Some);
+                }
+            }
+        }
+        Some(None)
     }
     bound_file(workspace, candidate, &workspace.join("Cargo.toml"))?;
     let test = references::RustTestIdentity::parse(name)?;
@@ -2165,6 +2293,16 @@ fn candidate_library_target(
             {
                 return None;
             }
+            if let Some(source) = committed_explicit_library_source(workspace, candidate, manifest)?
+            {
+                let sources = library_sources(workspace, candidate, &[source])?;
+                if sources.iter().any(|path| {
+                    committed_file(workspace, candidate, path)
+                        .is_some_and(|bytes| String::from_utf8_lossy(&bytes).contains(&declaration))
+                }) {
+                    return None;
+                }
+            }
         }
         let other_targets = package
             .get("targets")?
@@ -2176,7 +2314,7 @@ fn candidate_library_target(
                     .is_some_and(|kinds| kinds.iter().any(|kind| kind == "lib"))
             })
             .map(|target| {
-                PathBuf::from(target.get("src_path")?.as_str()?)
+                workspace_path(workspace, Path::new(target.get("src_path")?.as_str()?))?
                     .strip_prefix(workspace)
                     .ok()
                     .map(Path::to_path_buf)
@@ -2187,52 +2325,59 @@ fn candidate_library_target(
                 .as_array()
                 .is_some_and(|kinds| kinds.iter().any(|kind| kind == "lib"))
         }) {
-            let source = Path::new(library.get("src_path")?.as_str()?);
+            let source = workspace_path(workspace, Path::new(library.get("src_path")?.as_str()?))?;
             let source_relative = source.strip_prefix(workspace).ok()?;
             let source_dir = source.parent()?;
-            let relative_dir = source_dir.strip_prefix(workspace).ok()?.to_str()?;
-            let files = crate::git::run_raw(
-                workspace,
-                &[
-                    "ls-tree",
-                    "-r",
-                    "--name-only",
-                    candidate,
-                    "--",
-                    relative_dir,
-                ],
-            )
-            .ok()?;
-            if !files.status.success() {
-                return None;
-            }
-            let library_files = String::from_utf8(files.stdout)
-                .ok()?
-                .lines()
-                .filter(|relative| {
-                    let path = Path::new(relative);
-                    path.extension().is_some_and(|extension| extension == "rs")
-                        && (path == source_relative
-                            || path
-                                .file_name()
-                                .is_none_or(|file| file != "lib.rs" && file != "main.rs"))
-                        && !path.components().any(|part| part.as_os_str() == "bin")
-                        && !other_targets.iter().any(|target| {
-                            target == path
-                                || target.file_stem().is_some_and(|stem| {
-                                    path.starts_with(target.with_file_name(stem))
-                                })
-                        })
-                })
-                .map(|relative| workspace.join(relative))
-                .collect::<Vec<_>>();
-            let declared = library_files.iter().any(|path| {
+            let library_files = if source.starts_with(manifest.parent()?) {
+                let relative_dir = source_dir.strip_prefix(workspace).ok()?.to_str()?;
+                let files = crate::git::run_raw(
+                    workspace,
+                    &[
+                        "ls-tree",
+                        "-r",
+                        "--name-only",
+                        candidate,
+                        "--",
+                        relative_dir,
+                    ],
+                )
+                .ok()?;
+                if !files.status.success() {
+                    return None;
+                }
+                String::from_utf8(files.stdout)
+                    .ok()?
+                    .lines()
+                    .filter(|relative| {
+                        let path = Path::new(relative);
+                        path.extension().is_some_and(|extension| extension == "rs")
+                            && (path == source_relative
+                                || path
+                                    .file_name()
+                                    .is_none_or(|file| file != "lib.rs" && file != "main.rs"))
+                            && !path.components().any(|part| part.as_os_str() == "bin")
+                            && !other_targets.iter().any(|target| {
+                                target == path
+                                    || target.file_stem().is_some_and(|stem| {
+                                        path.starts_with(target.with_file_name(stem))
+                                    })
+                            })
+                    })
+                    .map(|relative| workspace.join(relative))
+                    .collect::<Vec<_>>()
+            } else {
+                vec![source.to_path_buf()]
+            };
+            let sources = library_sources(workspace, candidate, &library_files)?;
+            let declared = sources.iter().any(|path| {
                 committed_file(workspace, candidate, path)
                     .is_some_and(|content| String::from_utf8_lossy(&content).contains(&declaration))
             });
             if declared {
                 bound_file(workspace, candidate, manifest)?;
-                bind_explicit_rust_sources(workspace, candidate, &library_files)?;
+                for path in &sources {
+                    bound_file(workspace, candidate, path)?;
+                }
                 matches.push(CandidateLibraryTarget {
                     package: package.get("name")?.as_str()?.to_owned(),
                     library: library.get("name")?.as_str()?.to_owned(),
