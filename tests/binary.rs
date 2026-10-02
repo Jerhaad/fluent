@@ -54293,11 +54293,24 @@ fi
             &item.attempts[0],
             &workspace,
         );
-        assert_eq!(findings.is_empty(), !failed, "{findings:?}");
+        assert!(
+            findings.is_empty(),
+            "initial Writer assignment changed: {findings:?}"
+        );
         assert_eq!(
             context["current-findings"].as_array().unwrap().is_empty(),
             !failed
         );
+        if failed {
+            assert_eq!(context["current-findings"][0]["role"], "verification");
+            assert!(
+                context["current-findings"][0]["title"]
+                    .as_str()
+                    .unwrap()
+                    .contains("tests/native.sh::stops")
+            );
+        }
+        assert_compact_verification(&context, &assessment);
         assert_eq!(
             context["verification"]["satisfied_references"],
             usize::from(present)
@@ -54562,6 +54575,10 @@ fn assert_compact_verification(
         )
     );
     let saved = fs::read(compact["full_assessment"]["path"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        compact["full_assessment"]["digest"],
+        format!("sha256:{:x}", Sha256::digest(&saved))
+    );
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&saved).unwrap(),
         serde_json::to_value(full).unwrap()
