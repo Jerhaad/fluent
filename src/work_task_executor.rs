@@ -102,7 +102,7 @@ struct ReviewArtifactUsage {
 #[serde(rename_all = "kebab-case")]
 struct ExecutionContextV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    verification: Option<ExecutionContextVerification>,
+    verification: Option<ExecutionContextVerificationRecord>,
     schema_version: u32,
     candidate_commit: String,
     base_commit: Option<String>,
@@ -117,6 +117,21 @@ struct ExecutionContextV1 {
     executed_commands: Vec<String>,
     historical_artifacts: Vec<String>,
     omitted: ExecutionContextOmitted,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+enum ExecutionContextVerificationRecord {
+    Compact(ExecutionContextVerification),
+    Legacy(LegacyExecutionContextVerification),
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyExecutionContextVerification {
+    candidate_commit: String,
+    references: Vec<crate::verification_assessment::RequirementAssessment>,
+    commands: Vec<crate::verification_assessment::RequirementAssessment>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -6085,7 +6100,10 @@ fn write_execution_context_with_finding_policy(
     })
     .collect();
     let verification = current
-        .map(|(_, view)| compact_execution_verification(artifact_dir, view))
+        .map(|(_, view)| {
+            compact_execution_verification(artifact_dir, view)
+                .map(ExecutionContextVerificationRecord::Compact)
+        })
         .transpose()?;
     let (passing_evidence, executed_commands) =
         execution_context_evidence(input_artifacts, candidate_commit);
@@ -6100,7 +6118,7 @@ fn write_execution_context_with_finding_policy(
     let (executed_commands, omitted_executed_commands) =
         bounded_vec(executed_commands, EXECUTION_CONTEXT_MAX_COMMANDS);
     let mut context = ExecutionContextV1 {
-        schema_version: if verification.is_some() { 2 } else { 1 },
+        schema_version: if verification.is_some() { 3 } else { 1 },
         verification,
         candidate_commit: truncate_utf8(candidate_commit, 128),
         base_commit: base_commit
@@ -20604,6 +20622,52 @@ while time.monotonic() < deadline:
     }
 
     #[test]
+    fn saved_schema_two_execution_context_remains_readable() {
+        let artifact = tempfile::tempdir().unwrap();
+        let path = artifact.path().join("execution-context.json");
+        let saved = serde_json::json!({
+            "schema-version": 2,
+            "candidate-commit": "candidate",
+            "base-commit": null,
+            "changed-files": [],
+            "unresolved-steps": [],
+            "current-findings": [],
+            "passing-evidence": [],
+            "executed-commands": [],
+            "historical-artifacts": [],
+            "omitted": {"changed-files": 0, "unresolved-steps": 0, "current-findings": 0,
+                "passing-evidence": 0, "executed-commands": 0, "historical-artifacts": 0},
+            "verification": {
+                "candidate_commit": "candidate",
+                "references": [{
+                    "id": "failed-reference", "source": "behaviors.md#b1", "meaning": null,
+                    "check": null, "satisfied": false, "cause": "candidate-defect",
+                    "owner": "writer", "next_action": "repair candidate",
+                    "bindings": [{"path": "tester-results.json", "digest": "sha256:fixture"}],
+                    "diagnostics": ["assertion failed"]
+                }],
+                "commands": []
+            }
+        });
+        fs::write(&path, serde_json::to_vec_pretty(&saved).unwrap()).unwrap();
+
+        let mut context: ExecutionContextV1 =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        context.current_findings.push(ExecutionContextFinding {
+            role: "tests".into(),
+            identity: "failed-reference".into(),
+            title: "assertion failed".into(),
+            artifact: "tester-results.json".into(),
+        });
+        let resumed: serde_json::Value =
+            serde_json::from_str(&bounded_execution_context_json(&mut context).unwrap()).unwrap();
+
+        assert_eq!(resumed["schema-version"], 2);
+        assert_eq!(resumed["verification"], saved["verification"]);
+        assert_eq!(resumed["current-findings"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
     fn corrective_context_compacts_passing_verification() {
         let artifact = tempfile::tempdir().unwrap();
         let row = |id: String, satisfied: bool| {
@@ -20659,8 +20723,8 @@ while time.monotonic() < deadline:
             format!("sha256:{:x}", Sha256::digest(&saved))
         );
         let mut context = ExecutionContextV1 {
-            verification: Some(compact),
-            schema_version: 2,
+            verification: Some(ExecutionContextVerificationRecord::Compact(compact)),
+            schema_version: 3,
             candidate_commit: "candidate".into(),
             base_commit: None,
             correction_lineage: None,
@@ -20680,14 +20744,20 @@ while time.monotonic() < deadline:
         };
         let serialized = bounded_execution_context_json(&mut context).unwrap();
         assert!(serialized.len() <= EXECUTION_CONTEXT_MAX_BYTES);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&serialized).unwrap()["schema-version"],
+            3
+        );
         assert!(serialized.contains("failed-reference"));
         assert!(serialized.contains("failed-command"));
         assert!(serialized.contains("verification-assessment.json"));
 
-        context
-            .verification
-            .as_mut()
-            .unwrap()
+        let Some(ExecutionContextVerificationRecord::Compact(verification)) =
+            context.verification.as_mut()
+        else {
+            panic!("new context must use compact verification");
+        };
+        verification
             .commands
             .extend((0..700).map(|i| row(format!("additional-failure-{i}"), false)));
         let error = bounded_execution_context_json(&mut context).unwrap_err();

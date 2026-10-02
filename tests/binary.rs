@@ -54481,6 +54481,7 @@ print(json.dumps([{'id':line.removeprefix('not ').removeprefix('ok '), 'status':
             assert_eq!(&ids, previous);
         }
         previous_ids = Some(ids);
+        assert_eq!(context["schema-version"], 3);
         assert_compact_verification(&context, &view);
         assert_eq!(context["current-findings"].as_array().unwrap().len(), 1);
         let history = context["historical-artifacts"].as_array().unwrap();
