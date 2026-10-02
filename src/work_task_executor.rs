@@ -20696,7 +20696,7 @@ while time.monotonic() < deadline:
     }
 
     #[test]
-    fn execution_context_rejects_authoritative_findings_that_cannot_fit() {
+    fn execution_context_rejects_review_findings_that_cannot_fit() {
         let project = tempfile::TempDir::new().unwrap();
         let workspace = tempfile::TempDir::new().unwrap();
         crate::git::run(
@@ -20730,6 +20730,80 @@ while time.monotonic() < deadline:
 
         assert!(error.to_string().contains("execution context core exceeds"));
         assert!(!project.path().join("execution-context.json").exists());
+    }
+
+    #[test]
+    fn execution_context_rejects_authoritative_findings_that_cannot_fit() {
+        let project = tempfile::TempDir::new().unwrap();
+        let workspace = project.path().join("candidate");
+        fs::create_dir_all(&workspace).unwrap();
+        for args in [
+            &["init", "-q"] as &[&str],
+            &["config", "user.name", "Fluent Test"],
+            &["config", "user.email", "fluent@example.test"],
+            &["commit", "-q", "--allow-empty", "-m", "candidate"],
+        ] {
+            crate::git::run(&workspace, args, "prepare oversized candidate").unwrap();
+        }
+        let candidate = git_stdout(&workspace, &["rev-parse", "HEAD"]);
+        let mut item = review_item();
+        let output = item.attempts[0].tasks[0].output.as_mut().unwrap();
+        output.commit = candidate.clone();
+        output.workspace_path = "candidate".into();
+        let task_id = item.add_next_write_round("attempt-1", Vec::new()).unwrap();
+        item.attempts[0].writer_completion_contract =
+            Some(crate::work_model::WriterCompletionContract {
+                version: crate::work_model::WRITER_COMPLETION_CONTRACT_VERSION,
+                requirements: (0..500)
+                    .map(|index| crate::work_model::WriterCompletionRequirement {
+                        responsibility: None,
+                        id: format!("behavior:oversized:b{index}"),
+                        kind: crate::work_model::WriterCompletionRequirementKind::Behavior,
+                        source: format!("behaviors.md#oversized:b{index}"),
+                        requirement: "Verify the candidate behavior.".into(),
+                        verification_refs: if index == 0 {
+                            vec!["cargo test --lib work_task_executor::tests::missing_case".into()]
+                        } else {
+                            Vec::new()
+                        },
+                        command: None,
+                    })
+                    .collect(),
+            });
+        WorkModelStore::new(project.path())
+            .create_work_item(&item)
+            .unwrap();
+
+        let error = build_writer_continuation_prompt(
+            &item,
+            "attempt-1",
+            &task_id,
+            &[],
+            &workspace,
+            project.path(),
+        )
+        .unwrap_err();
+        let artifact_dir = project
+            .path()
+            .join(work_artifact_path("work-1", "attempt-1", &task_id));
+        let assessment: crate::verification_assessment::VerificationAssessment =
+            serde_json::from_slice(
+                &fs::read(artifact_dir.join("verification-assessment.json")).unwrap(),
+            )
+            .unwrap();
+
+        assert_eq!(assessment.candidate_commit, candidate);
+        assert_eq!(assessment.unresolved().count(), 500);
+        assert_eq!(assessment.candidate_defects().len(), 1);
+        assert!(
+            serde_json::to_vec_pretty(&assessment.references)
+                .unwrap()
+                .len()
+                > EXECUTION_CONTEXT_MAX_BYTES
+        );
+        assert!(error.to_string().contains("execution context core exceeds"));
+        assert!(error.to_string().contains("actual:"));
+        assert!(!artifact_dir.join("execution-context.json").exists());
     }
 
     #[test]
