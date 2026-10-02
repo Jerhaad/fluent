@@ -4563,6 +4563,7 @@ fn preflight_write_sandbox_profile(
         project_root,
         workspace_path,
         &project_root.join(&task_artifact.path),
+        writer_cache.root(),
     )?;
     #[cfg(not(test))]
     if let Some(worker) = codex_worker {

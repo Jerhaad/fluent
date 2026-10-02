@@ -28,6 +28,7 @@ pub(crate) fn deny_writer_source_entries(
     source: &Path,
     candidate: &Path,
     task_artifact: &Path,
+    writer_cache: &Path,
 ) -> Result<()> {
     let physical_source = std::fs::canonicalize(source)?;
     // The Writer profile is rendered before the worktree is created. Resolve
@@ -56,6 +57,19 @@ pub(crate) fn deny_writer_source_entries(
                 .components()
                 .all(|component| matches!(component, std::path::Component::Normal(_))),
         "Writer artifact grant must name one Task artifact area"
+    );
+    let mut identity = relative_artifact.components();
+    let work_item = identity
+        .next()
+        .context("Writer artifact has no Work Item")?;
+    let attempt = identity.next().context("Writer artifact has no Attempt")?;
+    let expected_cache = source
+        .join(".fluent/work/cache/writers")
+        .join(work_item.as_os_str())
+        .join(attempt.as_os_str());
+    anyhow::ensure!(
+        writer_cache == expected_cache,
+        "Writer cache grant must name the exact current Attempt"
     );
     if physical_source == physical_candidate {
         return Ok(());
@@ -95,6 +109,13 @@ pub(crate) fn deny_writer_source_entries(
                         source,
                         &physical_source,
                         task_artifact,
+                        "allow",
+                    );
+                    append_writer_source_rule(
+                        &mut content,
+                        source,
+                        &physical_source,
+                        writer_cache,
                         "allow",
                     );
                 } else {
@@ -1532,12 +1553,16 @@ mod tests {
         let source = root.path().join("source");
         let candidate = root.path().join("candidate");
         let artifact = source.join(".fluent/work/artifacts/work/attempt/task");
+        let cache = source.join(".fluent/work/cache/writers/work/attempt");
+        let sibling_cache = source.join(".fluent/work/cache/writers/work/other-attempt");
         let sibling_artifact = source.join(".fluent/work/artifacts/work/attempt/other-task");
         let gate_artifact = source.join(".fluent/work/artifacts/work/attempt/candidate-gates");
         let model = source.join(".fluent/work/items/work.json");
         std::fs::create_dir_all(&artifact).unwrap();
         std::fs::create_dir_all(&sibling_artifact).unwrap();
         std::fs::create_dir_all(&gate_artifact).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::create_dir_all(&sibling_cache).unwrap();
         std::fs::create_dir_all(model.parent().unwrap()).unwrap();
         std::fs::write(&model, "host-owned").unwrap();
         std::fs::create_dir_all(source.join(".git")).unwrap();
@@ -1551,7 +1576,7 @@ mod tests {
             &[],
         )
         .unwrap();
-        deny_writer_source_entries(&profile, &source, &candidate, &artifact).unwrap();
+        deny_writer_source_entries(&profile, &source, &candidate, &artifact, &cache).unwrap();
         let content = std::fs::read_to_string(&profile.path).unwrap();
         let denial = format!(
             "(deny file-write* (subpath {}))",
@@ -1592,6 +1617,14 @@ mod tests {
                 "(allow file-write* (subpath {}))",
                 sbpl_string(&root.join(".fluent/work/artifacts/work/attempt/task"))
             )));
+            assert!(content.contains(&format!(
+                "(allow file-write* (subpath {}))",
+                sbpl_string(&root.join(".fluent/work/cache/writers/work/attempt"))
+            )));
+            assert!(!content.contains(&format!(
+                "(allow file-write* (subpath {}))",
+                sbpl_string(&root.join(".fluent/work/cache/writers/work/other-attempt"))
+            )));
         }
         #[cfg(target_os = "macos")]
         {
@@ -1611,7 +1644,7 @@ mod tests {
             }
             let output = std::process::Command::new("/usr/bin/sandbox-exec")
                 .arg("-f").arg(&profile.path)
-                .args(["/bin/sh", "-c", "if /bin/echo changed > \"$1\"; then exit 10; fi; /bin/echo candidate > \"$2\" || exit 11; /bin/echo git > \"$3\" || exit 12; /bin/echo artifact > \"$4\" || exit 13; if /bin/echo model > \"$5\"; then exit 14; fi; if /bin/echo sibling > \"$6\"; then exit 15; fi; if /bin/echo gate > \"$7\"; then exit 16; fi", "writer-profile-probe"])
+                .args(["/bin/sh", "-c", "if /bin/echo changed > \"$1\"; then exit 10; fi; /bin/echo candidate > \"$2\" || exit 11; /bin/echo git > \"$3\" || exit 12; /bin/echo artifact > \"$4\" || exit 13; if /bin/echo model > \"$5\"; then exit 14; fi; if /bin/echo sibling > \"$6\"; then exit 15; fi; if /bin/echo gate > \"$7\"; then exit 16; fi; /bin/echo cache > \"$8\" || exit 17; if /bin/echo sibling-cache > \"$9\"; then exit 18; fi", "writer-profile-probe"])
                 .arg(source.join("src/lib.rs"))
                 .arg(candidate.join("change.txt"))
                 .arg(source.join(".git/test"))
@@ -1619,6 +1652,8 @@ mod tests {
                 .arg(&model)
                 .arg(sibling_artifact.join("test"))
                 .arg(gate_artifact.join("test"))
+                .arg(cache.join("test"))
+                .arg(sibling_cache.join("test"))
                 .output().unwrap();
             assert!(
                 output.status.success(),
