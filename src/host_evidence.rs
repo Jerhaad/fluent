@@ -1085,6 +1085,24 @@ pub(crate) fn ensure_owned_host_resume_ready(
     Ok(())
 }
 
+/// A landed candidate has already passed its checker gate. Its retained
+/// workspace is cleanup state and may have broken Git metadata, so do not
+/// reconstruct candidate-bound checks before retrying that cleanup.
+pub(crate) fn ensure_owned_host_resume_ready_for_item(
+    project_root: &Path,
+    item: &work_model::WorkItem,
+    attempt: &work_model::Attempt,
+) -> Result<()> {
+    if item.merge_candidates.iter().any(|candidate| {
+        candidate.attempt_id == attempt.id
+            && candidate.merge_state.status == work_model::MergeCandidateMergeStatus::Merged
+            && candidate.merge_state.merged_commit.is_some()
+    }) {
+        return Ok(());
+    }
+    ensure_owned_host_resume_ready(project_root, attempt)
+}
+
 /// Keep every explicitly assigned host check required until its exact evidence
 /// and targeted Tests Review pass. Errors also block advancement.
 pub(crate) fn required_host_verification_pending(

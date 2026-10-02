@@ -1232,7 +1232,11 @@ fn run_attempt_inner(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunR
         .iter()
         .find(|attempt| attempt.id == config.attempt_id)
     {
-        crate::host_evidence::ensure_owned_host_resume_ready(config.project_root, attempt)?;
+        crate::host_evidence::ensure_owned_host_resume_ready_for_item(
+            config.project_root,
+            &initial_item,
+            attempt,
+        )?;
     }
     if let Some(inputs) = config.coder_mapping_inputs {
         if crate::lifecycle_recovery::usage_limit_writer_resume_ready(
@@ -1508,7 +1512,11 @@ fn run_attempt_inner(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunR
             })?;
             continue;
         }
-        crate::host_evidence::ensure_owned_host_resume_ready(config.project_root, attempt)?;
+        crate::host_evidence::ensure_owned_host_resume_ready_for_item(
+            config.project_root,
+            &item,
+            attempt,
+        )?;
         match reject_terminal_attempt(attempt)? {
             TerminalCheck::Reopen => {
                 if candidate_gate_pause {

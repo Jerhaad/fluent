@@ -20612,13 +20612,21 @@ fn post_land_retry_ignores_a_malformed_retained_candidate() {
         !retry.status.success(),
         "malformed retained Git metadata may defer cleanup but must not affect Learning"
     );
+    assert!(
+        !String::from_utf8_lossy(&retry.stderr)
+            .contains("cannot read committed checker configuration"),
+        "landed cleanup must not reconstruct checker inputs: {}",
+        String::from_utf8_lossy(&retry.stderr)
+    );
     if !real_sandbox_exec_is_usable() {
         assert!(candidate.exists());
         return;
     }
     assert!(
         String::from_utf8_lossy(&retry.stdout).contains("cleanup-workspace"),
-        "cleanup failure remains explicitly retryable"
+        "cleanup failure remains explicitly retryable; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&retry.stdout),
+        String::from_utf8_lossy(&retry.stderr)
     );
 
     assert!(

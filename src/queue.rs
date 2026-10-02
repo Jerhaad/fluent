@@ -805,7 +805,11 @@ pub fn resume_with_tester_no_sandbox(
                 .iter()
                 .find(|attempt| attempt.id == attempt_id)
             {
-                crate::host_evidence::ensure_owned_host_resume_ready(project_root, attempt)?;
+                crate::host_evidence::ensure_owned_host_resume_ready_for_item(
+                    project_root,
+                    &item,
+                    attempt,
+                )?;
             }
         } else {
             ensure_tester_no_sandbox_eligible(&item, id, attempt_id, tester_no_sandbox)?;
@@ -1276,7 +1280,7 @@ fn ensure_resume_eligible(
         return Ok(());
     }
     ensure_writer_assignment_resume_ready(project_root, item, attempt_id)?;
-    crate::host_evidence::ensure_owned_host_resume_ready(project_root, attempt)?;
+    crate::host_evidence::ensure_owned_host_resume_ready_for_item(project_root, item, attempt)?;
     #[cfg(test)]
     crate::test_lock_probe::reach("queue-lifecycle", id, "resume", "EVIDENCE");
     let allows_planned_approach_correction =
