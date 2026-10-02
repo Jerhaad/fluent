@@ -1577,6 +1577,65 @@ mod cargo_lib_reference_tests {
     }
 
     #[test]
+    fn cargo_lib_reference_rejects_unbound_workspace_member() {
+        let (repo, candidate) = virtual_workspace_fixture();
+        let member = repo.path().join("crates/model-gateway");
+        assert!(candidate_library_target(repo.path(), &candidate, "verifies_assignment").is_some());
+        for (path, dirty) in [
+            (
+                repo.path().join("Cargo.toml"),
+                "[workspace]\nmembers = []\n",
+            ),
+            (
+                member.join("Cargo.toml"),
+                "[package]\nname = \"changed\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            ),
+            (member.join("src/lib.rs"), "#[test]\nfn changed() {}\n"),
+        ] {
+            let original = std::fs::read(&path).unwrap();
+            std::fs::write(&path, dirty).unwrap();
+            assert!(
+                candidate_library_target(repo.path(), &candidate, "verifies_assignment").is_none(),
+                "{}",
+                path.display()
+            );
+            std::fs::write(&path, original).unwrap();
+        }
+        std::fs::remove_file(member.join("src/lib.rs")).unwrap();
+        assert!(candidate_library_target(repo.path(), &candidate, "verifies_assignment").is_none());
+        crate::git::run(
+            repo.path(),
+            &["restore", "crates/model-gateway/src/lib.rs"],
+            "restore fixture",
+        )
+        .unwrap();
+
+        let second = repo.path().join("crates/other");
+        std::fs::create_dir_all(second.join("src")).unwrap();
+        std::fs::write(repo.path().join("Cargo.toml"), "[workspace]\nmembers = [\"crates/model-gateway\", \"crates/other\"]\nresolver = \"2\"\n").unwrap();
+        std::fs::write(
+            second.join("Cargo.toml"),
+            "[package]\nname = \"other\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            second.join("src/lib.rs"),
+            "#[test]\nfn verifies_assignment() {}\n",
+        )
+        .unwrap();
+        crate::git::run(repo.path(), &["add", "."], "stage ambiguous fixture").unwrap();
+        crate::git::run(
+            repo.path(),
+            &["commit", "-qm", "Add second library"],
+            "commit ambiguous fixture",
+        )
+        .unwrap();
+        let ambiguous =
+            crate::git::run_stdout(repo.path(), &["rev-parse", "HEAD"], "read fixture").unwrap();
+        assert!(candidate_library_target(repo.path(), &ambiguous, "verifies_assignment").is_none());
+    }
+
+    #[test]
     fn cargo_lib_test_reference_binds_committed_source_and_native_result() {
         let repo = tempfile::tempdir().unwrap();
         crate::git::run(repo.path(), &["init", "-q"], "create reference fixture").unwrap();
