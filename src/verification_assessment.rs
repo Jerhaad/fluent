@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 /// Credit only errors produced by the candidate's configuration or extractor.
 pub(crate) fn tester_error_is_candidate_defect(error: &crate::tester::TesterError) -> bool {
     matches!(
@@ -1252,6 +1253,7 @@ pub(crate) fn assess_references(
     accepted: &[AcceptedCommandProof],
 ) -> Result<Vec<RequirementAssessment>> {
     let mut rows = Vec::new();
+    let candidate_library = std::cell::OnceCell::new();
     for requirement in contract
         .requirements
         .iter()
@@ -1355,8 +1357,16 @@ pub(crate) fn assess_references(
                 true
             };
             row.satisfied = declared_command_is_bound
-                && result
-                    .is_some_and(|results| reference_is_satisfied(&reference, results, canonical));
+                && result.is_some_and(|results| {
+                    let library =
+                        matches!(reference.meaning(), ReferenceMeaning::CargoLibTest { .. })
+                            .then(|| {
+                                candidate_library
+                                    .get_or_init(|| candidate_library_target(workspace, candidate))
+                            })
+                            .and_then(|target| target.as_ref());
+                    reference_is_satisfied(&reference, results, canonical, library)
+                });
             // A configured legacy command shares the canonical occurrence's
             // ambiguity, applicability, and comparison checks. The historical
             // adapter applies only after a current run proves the command lies
@@ -1546,19 +1556,42 @@ mod cargo_lib_reference_tests {
             "error": null
         }))
         .unwrap();
-        assert!(reference_is_satisfied(&reference, &results, None));
+        let library = CandidateLibraryTarget {
+            package: "fluent".into(),
+            library: "fluent".into(),
+        };
+        assert!(reference_is_satisfied(
+            &reference,
+            &results,
+            None,
+            Some(&library)
+        ));
         let mut failed = results;
         failed.tests[0].status = "fail".into();
-        assert!(!reference_is_satisfied(&reference, &failed, None));
+        assert!(!reference_is_satisfied(
+            &reference,
+            &failed,
+            None,
+            Some(&library)
+        ));
         failed.tests[0].status = "pass".into();
         failed.tests[0].test_harness = "shell-harness".into();
-        assert!(!reference_is_satisfied(&reference, &failed, None));
+        assert!(!reference_is_satisfied(
+            &reference,
+            &failed,
+            None,
+            Some(&library)
+        ));
     }
 
     #[test]
     fn cargo_lib_test_reference_matches_nextest_library_target() {
         let reference =
             references::parse_test_reference("cargo test --lib verifies_assignment").unwrap();
+        let library = CandidateLibraryTarget {
+            package: "fluent".into(),
+            library: "fluent".into(),
+        };
         let result = |id: &str, status: &str| -> crate::tester::TesterResults {
             serde_json::from_value(serde_json::json!({
                 "candidate_commit": "candidate",
@@ -1571,7 +1604,8 @@ mod cargo_lib_reference_tests {
         assert!(reference_is_satisfied(
             &reference,
             &result("fluent::fluent$feature::verifies_assignment", "pass"),
-            None
+            None,
+            Some(&library)
         ));
         for id in [
             "another::another$feature::verifies_assignment",
@@ -1580,27 +1614,193 @@ mod cargo_lib_reference_tests {
             "fluent::integration/fluent$feature::verifies_assignment",
         ] {
             assert!(
-                !reference_is_satisfied(&reference, &result(id, "pass"), None),
+                !reference_is_satisfied(&reference, &result(id, "pass"), None, Some(&library)),
                 "{id}"
             );
         }
         assert!(!reference_is_satisfied(
             &reference,
             &result("fluent::fluent$feature::verifies_assignment", "fail"),
-            None
+            None,
+            Some(&library)
         ));
         let mut mixed = result("fluent::fluent$feature::verifies_assignment", "pass");
         mixed
             .tests
             .extend(result("fluent::binary$feature::verifies_assignment", "fail").tests);
-        assert!(reference_is_satisfied(&reference, &mixed, None));
+        assert!(reference_is_satisfied(
+            &reference,
+            &mixed,
+            None,
+            Some(&library)
+        ));
     }
+
+    #[test]
+    fn cargo_lib_reference_uses_candidate_package_and_library_target() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::git::run(repo.path(), &["init", "-q"], "create candidate fixture").unwrap();
+        crate::git::run(
+            repo.path(),
+            &["config", "user.email", "test@example.com"],
+            "configure fixture",
+        )
+        .unwrap();
+        crate::git::run(
+            repo.path(),
+            &["config", "user.name", "Test"],
+            "configure fixture",
+        )
+        .unwrap();
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        std::fs::write(repo.path().join("Cargo.toml"), "[package]\nname = \"other-package\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[lib]\nname = \"other_library\"\n").unwrap();
+        std::fs::write(
+            repo.path().join("src/lib.rs"),
+            "#[test]\nfn verifies_assignment() {}\n",
+        )
+        .unwrap();
+        crate::git::run(
+            repo.path(),
+            &["add", "Cargo.toml", "src/lib.rs"],
+            "stage fixture",
+        )
+        .unwrap();
+        crate::git::run(
+            repo.path(),
+            &["commit", "-qm", "Add candidate fixture"],
+            "commit fixture",
+        )
+        .unwrap();
+        let candidate =
+            crate::git::run_stdout(repo.path(), &["rev-parse", "HEAD"], "read fixture").unwrap();
+        let contract = work_model::WriterCompletionContract {
+            version: work_model::WRITER_COMPLETION_CONTRACT_VERSION,
+            requirements: vec![work_model::WriterCompletionRequirement {
+                responsibility: None,
+                id: "behavior:custom:b1".into(),
+                kind: work_model::WriterCompletionRequirementKind::Behavior,
+                source: "behaviors.md#custom:b1".into(),
+                requirement: "THE SYSTEM SHALL verify the library test.".into(),
+                command: None,
+                verification_refs: vec!["cargo test --lib verifies_assignment".into()],
+            }],
+        };
+        for (id, accepted) in [
+            ("other-package::other_library$verifies_assignment", true),
+            ("other-package::integration$verifies_assignment", false),
+            (
+                "other-package::bin/other_library$verifies_assignment",
+                false,
+            ),
+            ("fluent::fluent$verifies_assignment", false),
+        ] {
+            let results: crate::tester::TesterResults = serde_json::from_value(serde_json::json!({
+                "candidate_commit": candidate,
+                "commands": [],
+                "tests": [{"id": id, "test_harness": "cargo-nextest", "status": "pass", "duration_ms": 1, "failure_excerpt": null}],
+                "summary": {"total": 1, "pass": 1, "fail": 0, "skipped": 0},
+                "error": null
+            })).unwrap();
+            let rows = assess_references(
+                repo.path(),
+                "custom",
+                "attempt-1",
+                &candidate,
+                &contract,
+                Some(&results),
+                None,
+                &[],
+                &[],
+            )
+            .unwrap();
+            assert_eq!(rows[0].satisfied, accepted, "{id}");
+        }
+        std::fs::write(repo.path().join("Cargo.toml"), "[package]\nname = \"other-package\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[lib]\nname = \"uncommitted_library\"\n").unwrap();
+        let results: crate::tester::TesterResults = serde_json::from_value(serde_json::json!({
+            "candidate_commit": candidate,
+            "commands": [],
+            "tests": [{"id": "other-package::uncommitted_library$verifies_assignment", "test_harness": "cargo-nextest", "status": "pass", "duration_ms": 1, "failure_excerpt": null}],
+            "summary": {"total": 1, "pass": 1, "fail": 0, "skipped": 0},
+            "error": null
+        })).unwrap();
+        let rows = assess_references(
+            repo.path(),
+            "custom",
+            "attempt-1",
+            &candidate,
+            &contract,
+            Some(&results),
+            None,
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert!(
+            !rows[0].satisfied,
+            "uncommitted target metadata was credited"
+        );
+    }
+}
+
+#[derive(Debug)]
+struct CandidateLibraryTarget {
+    package: String,
+    library: String,
+}
+
+fn candidate_library_target(workspace: &Path, candidate: &str) -> Option<CandidateLibraryTarget> {
+    // Cargo reads the workspace, so require its manifest and chosen library
+    // source to belong to the candidate before trusting the target metadata.
+    let manifest =
+        crate::git::run_raw(workspace, &["show", &format!("{candidate}:Cargo.toml")]).ok()?;
+    if !manifest.status.success()
+        || std::fs::read(workspace.join("Cargo.toml")).ok()? != manifest.stdout
+    {
+        return None;
+    }
+    let output = Command::new("cargo")
+        .args(["read-manifest", "--manifest-path"])
+        .arg(workspace.join("Cargo.toml"))
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let metadata: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let package = metadata.get("name")?.as_str()?.to_owned();
+    let libraries = metadata
+        .get("targets")?
+        .as_array()?
+        .iter()
+        .filter(|target| {
+            target["kind"]
+                .as_array()
+                .is_some_and(|kinds| kinds.iter().any(|kind| kind == "lib"))
+        })
+        .collect::<Vec<_>>();
+    let [library] = libraries.as_slice() else {
+        return None;
+    };
+    let source = Path::new(library.get("src_path")?.as_str()?);
+    let relative = source.strip_prefix(workspace).ok()?;
+    let relative = relative.to_str()?;
+    let committed = crate::git::run_raw(
+        workspace,
+        &["cat-file", "-e", &format!("{candidate}:{relative}")],
+    )
+    .ok()?;
+    let library = library.get("name")?.as_str()?.to_owned();
+    committed
+        .status
+        .success()
+        .then(|| CandidateLibraryTarget { package, library })
 }
 
 fn reference_is_satisfied(
     reference: &TestReference,
     results: &crate::tester::TesterResults,
     canonical: Option<&CanonicalCheckAssessment>,
+    candidate_library: Option<&CandidateLibraryTarget>,
 ) -> bool {
     let normalized = results
         .tests
@@ -1614,6 +1814,9 @@ fn reference_is_satisfied(
     results.tests = normalized;
     match reference.meaning() {
         ReferenceMeaning::CargoLibTest { name } => {
+            let Some(library) = candidate_library else {
+                return false;
+            };
             let Some(expected) = references::RustTestIdentity::parse(&name) else {
                 return false;
             };
@@ -1625,13 +1828,8 @@ fn reference_is_satisfied(
                     references::RustTestIdentity::parse(&test.id)
                         .filter(|identity| {
                             identity.binary.is_none_or(|binary| {
-                                binary == env!("CARGO_PKG_NAME")
-                                    || binary
-                                        == format!(
-                                            "{}::{}",
-                                            env!("CARGO_PKG_NAME"),
-                                            env!("CARGO_CRATE_NAME")
-                                        )
+                                binary == library.package
+                                    || binary == format!("{}::{}", library.package, library.library)
                             })
                         })
                         .map(|identity| (identity, test))
