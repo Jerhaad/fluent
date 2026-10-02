@@ -1495,6 +1495,39 @@ pub(crate) fn validate_reference_source(
 mod cargo_lib_reference_tests {
     use super::*;
 
+    fn assess_virtual_reference(repo: &Path, candidate: &str, id: &str) -> bool {
+        let contract = work_model::WriterCompletionContract {
+            version: work_model::WRITER_COMPLETION_CONTRACT_VERSION,
+            requirements: vec![work_model::WriterCompletionRequirement {
+                responsibility: None,
+                id: "behavior:custom:b1".into(),
+                kind: work_model::WriterCompletionRequirementKind::Behavior,
+                source: "behaviors.md#custom:b1".into(),
+                requirement: "Verify the library test.".into(),
+                command: None,
+                verification_refs: vec!["cargo test --lib verifies_assignment".into()],
+            }],
+        };
+        let results: crate::tester::TesterResults = serde_json::from_value(serde_json::json!({
+            "candidate_commit": candidate, "commands": [],
+            "tests": [{"id": id, "test_harness": "cargo-nextest", "status": "pass", "duration_ms": 1, "failure_excerpt": null}],
+            "summary": {"total": 1, "pass": 1, "fail": 0, "skipped": 0}, "error": null
+        })).unwrap();
+        assess_references(
+            repo,
+            "custom",
+            "attempt-1",
+            candidate,
+            &contract,
+            Some(&results),
+            None,
+            &[],
+            &[],
+        )
+        .unwrap()[0]
+            .satisfied
+    }
+
     fn virtual_workspace_fixture() -> (tempfile::TempDir, String) {
         let repo = tempfile::tempdir().unwrap();
         crate::git::run(repo.path(), &["init", "-q"], "create workspace fixture").unwrap();
@@ -1573,13 +1606,42 @@ mod cargo_lib_reference_tests {
                 accepted,
                 "{id}"
             );
+            assert_eq!(
+                assess_virtual_reference(repo.path(), &candidate, id),
+                accepted,
+                "assess_references: {id}"
+            );
         }
+
+        let member = repo.path().join("crates/model-gateway");
+        std::fs::write(member.join("Cargo.toml"), "[package]\nname = \"model-gateway\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[[bin]]\nname = \"tool\"\npath = \"src/tool.rs\"\n").unwrap();
+        std::fs::write(member.join("src/lib.rs"), "pub fn library() {}\n").unwrap();
+        std::fs::write(
+            member.join("src/tool.rs"),
+            "#[test]\nfn verifies_assignment() {}\nfn main() {}\n",
+        )
+        .unwrap();
+        crate::git::run(repo.path(), &["add", "."], "stage binary-only fixture").unwrap();
+        crate::git::run(
+            repo.path(),
+            &["commit", "-qm", "Move test to binary"],
+            "commit binary-only fixture",
+        )
+        .unwrap();
+        let binary_only =
+            crate::git::run_stdout(repo.path(), &["rev-parse", "HEAD"], "read fixture").unwrap();
+        assert!(!assess_virtual_reference(
+            repo.path(),
+            &binary_only,
+            "model-gateway::model_gateway$verifies_assignment"
+        ));
     }
 
     #[test]
     fn cargo_lib_reference_rejects_unbound_workspace_member() {
         let (repo, candidate) = virtual_workspace_fixture();
         let member = repo.path().join("crates/model-gateway");
+        let native = "model-gateway::model_gateway$verifies_assignment";
         assert!(candidate_library_target(repo.path(), &candidate, "verifies_assignment").is_some());
         for (path, dirty) in [
             (
@@ -1599,8 +1661,41 @@ mod cargo_lib_reference_tests {
                 "{}",
                 path.display()
             );
+            assert!(!assess_virtual_reference(repo.path(), &candidate, native));
             std::fs::write(&path, original).unwrap();
         }
+        std::fs::write(
+            member.join("src/lib.rs"),
+            "mod helper;\n#[test]\nfn verifies_assignment() { helper::run(); }\n",
+        )
+        .unwrap();
+        std::fs::write(member.join("src/helper.rs"), "pub fn run() {}\n").unwrap();
+        crate::git::run(repo.path(), &["add", "."], "stage module fixture").unwrap();
+        crate::git::run(
+            repo.path(),
+            &["commit", "-qm", "Add library helper"],
+            "commit module fixture",
+        )
+        .unwrap();
+        let module_candidate =
+            crate::git::run_stdout(repo.path(), &["rev-parse", "HEAD"], "read fixture").unwrap();
+        assert!(assess_virtual_reference(
+            repo.path(),
+            &module_candidate,
+            native
+        ));
+        std::fs::write(member.join("src/helper.rs"), "pub fn run() { panic!(); }\n").unwrap();
+        assert!(!assess_virtual_reference(
+            repo.path(),
+            &module_candidate,
+            native
+        ));
+        crate::git::run(
+            repo.path(),
+            &["restore", "crates/model-gateway/src/helper.rs"],
+            "restore fixture",
+        )
+        .unwrap();
         std::fs::remove_file(member.join("src/lib.rs")).unwrap();
         assert!(candidate_library_target(repo.path(), &candidate, "verifies_assignment").is_none());
         crate::git::run(
@@ -1633,6 +1728,34 @@ mod cargo_lib_reference_tests {
         let ambiguous =
             crate::git::run_stdout(repo.path(), &["rev-parse", "HEAD"], "read fixture").unwrap();
         assert!(candidate_library_target(repo.path(), &ambiguous, "verifies_assignment").is_none());
+        assert!(!assess_virtual_reference(repo.path(), &ambiguous, native));
+        std::fs::write(
+            second.join("Cargo.toml"),
+            "[package]\nname = \"other\"\nversion = \"0.2.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        std::fs::write(second.join("src/lib.rs"), "#[test]\nfn changed() {}\n").unwrap();
+        let unique = repo.path().join("Cargo.toml");
+        std::fs::write(&unique, "[workspace]\nmembers = [\"crates/model-gateway\", \"crates/other\"]\nresolver = \"2\"\n").unwrap();
+        crate::git::run(repo.path(), &["add", "."], "stage unique fixture").unwrap();
+        crate::git::run(
+            repo.path(),
+            &["commit", "-qm", "Remove duplicate test"],
+            "commit unique fixture",
+        )
+        .unwrap();
+        let unique_candidate =
+            crate::git::run_stdout(repo.path(), &["rev-parse", "HEAD"], "read fixture").unwrap();
+        std::fs::write(
+            second.join("Cargo.toml"),
+            "[package]\nname = \"other\"\nversion = \"0.3.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        assert!(assess_virtual_reference(
+            repo.path(),
+            &unique_candidate,
+            native
+        ));
     }
 
     #[test]
@@ -1882,11 +2005,14 @@ fn candidate_library_target(
     candidate: &str,
     name: &str,
 ) -> Option<CandidateLibraryTarget> {
-    fn bound_file(workspace: &Path, candidate: &str, path: &Path) -> Option<()> {
+    fn committed_file(workspace: &Path, candidate: &str, path: &Path) -> Option<Vec<u8>> {
         let relative = path.strip_prefix(workspace).ok()?.to_str()?;
         let committed =
             crate::git::run_raw(workspace, &["show", &format!("{candidate}:{relative}")]).ok()?;
-        (committed.status.success() && std::fs::read(path).ok()? == committed.stdout).then_some(())
+        committed.status.success().then_some(committed.stdout)
+    }
+    fn bound_file(workspace: &Path, candidate: &str, path: &Path) -> Option<()> {
+        (std::fs::read(path).ok()? == committed_file(workspace, candidate, path)?).then_some(())
     }
     bound_file(workspace, candidate, &workspace.join("Cargo.toml"))?;
     let test = references::RustTestIdentity::parse(name)?;
@@ -1914,46 +2040,71 @@ fn candidate_library_target(
             continue;
         }
         let manifest = Path::new(package.get("manifest_path")?.as_str()?);
-        bound_file(workspace, candidate, manifest)?;
+        let other_targets = package
+            .get("targets")?
+            .as_array()?
+            .iter()
+            .filter(|target| {
+                !target["kind"]
+                    .as_array()
+                    .is_some_and(|kinds| kinds.iter().any(|kind| kind == "lib"))
+            })
+            .map(|target| {
+                PathBuf::from(target.get("src_path")?.as_str()?)
+                    .strip_prefix(workspace)
+                    .ok()
+                    .map(Path::to_path_buf)
+            })
+            .collect::<Option<Vec<_>>>()?;
         for library in package.get("targets")?.as_array()?.iter().filter(|target| {
             target["kind"]
                 .as_array()
                 .is_some_and(|kinds| kinds.iter().any(|kind| kind == "lib"))
         }) {
             let source = Path::new(library.get("src_path")?.as_str()?);
-            bound_file(workspace, candidate, source)?;
             let source_dir = source.parent()?;
             let relative_dir = source_dir.strip_prefix(workspace).ok()?.to_str()?;
-            let grep = crate::git::run_raw(
+            let files = crate::git::run_raw(
                 workspace,
                 &[
-                    "grep",
-                    "-l",
-                    "-F",
-                    "-e",
-                    &declaration,
+                    "ls-tree",
+                    "-r",
+                    "--name-only",
                     candidate,
                     "--",
                     relative_dir,
                 ],
             )
             .ok()?;
-            if !grep.status.success() {
-                continue;
+            if !files.status.success() {
+                return None;
             }
-            let prefix = format!("{candidate}:");
-            let declared = String::from_utf8(grep.stdout)
+            let library_files = String::from_utf8(files.stdout)
                 .ok()?
                 .lines()
-                .filter_map(|line| line.strip_prefix(&prefix))
-                .any(|relative| {
+                .filter(|relative| {
                     let path = Path::new(relative);
                     path.extension().is_some_and(|extension| extension == "rs")
                         && path.file_name().is_some_and(|file| file != "main.rs")
                         && !path.components().any(|part| part.as_os_str() == "bin")
-                        && bound_file(workspace, candidate, &workspace.join(path)).is_some()
-                });
+                        && !other_targets.iter().any(|target| {
+                            target == path
+                                || target.file_stem().is_some_and(|stem| {
+                                    path.starts_with(target.with_file_name(stem))
+                                })
+                        })
+                })
+                .map(|relative| workspace.join(relative))
+                .collect::<Vec<_>>();
+            let declared = library_files.iter().any(|path| {
+                committed_file(workspace, candidate, path)
+                    .is_some_and(|content| String::from_utf8_lossy(&content).contains(&declaration))
+            });
             if declared {
+                bound_file(workspace, candidate, manifest)?;
+                for path in &library_files {
+                    bound_file(workspace, candidate, path)?;
+                }
                 matches.push(CandidateLibraryTarget {
                     package: package.get("name")?.as_str()?.to_owned(),
                     library: library.get("name")?.as_str()?.to_owned(),
