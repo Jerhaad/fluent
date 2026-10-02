@@ -11189,6 +11189,52 @@ mod tests {
         Attempt, CoderMapping, LearningFailureKind, TaskArtifactArea, WorkspaceAccess,
     };
 
+    #[cfg(feature = "test-support")]
+    fn assert_compact_verification_context(
+        context: &serde_json::Value,
+        full: &crate::verification_assessment::VerificationAssessment,
+    ) {
+        let compact = &context["verification"];
+        assert_eq!(compact["candidate_commit"], full.candidate_commit);
+        assert_eq!(
+            compact["satisfied_references"],
+            full.references.iter().filter(|row| row.satisfied).count()
+        );
+        assert_eq!(
+            compact["satisfied_commands"],
+            full.commands.iter().filter(|row| row.satisfied).count()
+        );
+        assert_eq!(
+            compact["references"],
+            serde_json::to_value(
+                full.references
+                    .iter()
+                    .filter(|row| !row.satisfied)
+                    .collect::<Vec<_>>()
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            compact["commands"],
+            serde_json::to_value(
+                full.commands
+                    .iter()
+                    .filter(|row| !row.satisfied)
+                    .collect::<Vec<_>>()
+            )
+            .unwrap()
+        );
+        let saved = fs::read(compact["full_assessment"]["path"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            compact["full_assessment"]["digest"],
+            format!("sha256:{:x}", Sha256::digest(&saved))
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&saved).unwrap(),
+            serde_json::to_value(full).unwrap()
+        );
+    }
+
     #[test]
     fn final_writer_handoff_rechecks_after_preflight() {
         let tmp = tempfile::tempdir().unwrap();
@@ -14076,10 +14122,7 @@ mod tests {
                         _workspace.path(),
                     );
                 assert_eq!(context_findings, findings);
-                assert_eq!(
-                    context["verification"],
-                    serde_json::to_value(&view).unwrap()
-                );
+                assert_compact_verification_context(&context, &view);
                 assert_eq!(
                     context["current-findings"].as_array().unwrap().len(),
                     findings.len()
@@ -14226,10 +14269,7 @@ mod tests {
                             _workspace.path(),
                         );
                     assert_eq!(context_findings, findings);
-                    assert_eq!(
-                        context["verification"],
-                        serde_json::to_value(&view).unwrap()
-                    );
+                    assert_compact_verification_context(&context, &view);
                     assert_eq!(
                         context["current-findings"].as_array().unwrap().len(),
                         findings.len()
