@@ -2143,6 +2143,24 @@ mod cargo_lib_reference_tests {
             rows[0].satisfied,
             "the committed library target was lost after a worktree edit"
         );
+        std::fs::write(
+            repo.path().join("src/lib.rs"),
+            "#[test]\nfn verifies_assignment() { panic!(); }\n",
+        )
+        .unwrap();
+        let rows = assess_references(
+            repo.path(),
+            "custom",
+            "attempt-1",
+            &candidate,
+            &contract,
+            Some(&committed_results),
+            None,
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert!(!rows[0].satisfied, "a dirty library source was credited");
     }
 }
 
