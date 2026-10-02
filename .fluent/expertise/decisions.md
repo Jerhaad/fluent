@@ -4,6 +4,17 @@ Architectural and design decisions that are intentional and should not be flagge
 
 ---
 
+## Keep compact execution contexts linked to complete verification
+
+New contexts with verification use schema 3. They keep unresolved reference and
+command rows and satisfied-row counts inline, and bind the complete assessment
+in a sibling `verification-assessment.json` by path and SHA-256 digest. This
+keeps the Writer context within its size limit while retaining all passing rows
+for audit. A saved schema-2 context with inline verification remains readable
+and keeps that shape if rewritten. Contexts without verification use schema 1.
+
+---
+
 ## Writer handoff hooks run in a detached private candidate copy
 
 Active preflight and final handoff run the Writer-phase project hook against a

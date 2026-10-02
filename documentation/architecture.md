@@ -743,10 +743,17 @@ Pre-review continuation and reviewed-correction prompts contain only the paths
 needed for current work, including a generated `execution-context.json`. The
 versioned context records candidate/base commits, changed files, unresolved
 steps, current findings deduplicated by role and stable identity, passing Tester
-evidence, executed commands, and historical artifact paths. Its collections and
-serialized size are bounded. Fluent may omit advisory commands, evidence
-summaries, or changed-file rows and records those counts, but it never silently
-omits an unresolved step, current finding, or input-artifact path. Fluent
+evidence, executed commands, and historical artifact paths. When verification
+is available, new contexts use schema 3: `verification` contains unresolved
+reference and command rows, counts of satisfied rows, and a path and SHA-256
+digest for the complete `verification-assessment.json` beside the context.
+The complete assessment retains passing rows for audit. Saved schema-2 contexts
+with inline verification rows remain readable; rewriting one preserves its
+schema and verification shape. Contexts without verification use schema 1.
+The context's collections and serialized size are bounded. Fluent may omit
+advisory commands, evidence summaries, or changed-file rows and records those
+counts, but it never silently omits an unresolved step, current finding,
+verification failure, or input-artifact path. Fluent
 preserves historical artifact paths exactly, including paths longer than the
 240-byte prose truncation threshold, because they identify evidence. If the
 authoritative core cannot fit within the 128 KiB context limit, Fluent rejects
