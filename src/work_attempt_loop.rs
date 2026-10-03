@@ -22562,6 +22562,7 @@ print(json.dumps([json.loads(line) for line in (pathlib.Path(sys.argv[1])/'comma
         let handoff = fs::read_to_string(project.path().join(handoff_path)).unwrap();
         assert!(handoff.contains("writer-completion.json"));
         assert!(handoff.contains("Writer completion matrix is malformed"));
+        assert!(handoff.contains("invalid type: string"), "{handoff}");
     }
 
     #[test]
@@ -22624,6 +22625,38 @@ print(json.dumps([json.loads(line) for line in (pathlib.Path(sys.argv[1])/'comma
             .unwrap()
             .clone();
         let gate_bytes = fs::read(project.path().join(&gate.path)).unwrap();
+        let resolver = ContentResolver::new(None);
+        let resume = || {
+            run_attempt(WorkAttemptRunConfig {
+                project_root: project.path(),
+                store: &store,
+                work_item_id: "work-1",
+                attempt_id: "attempt-1",
+                resolver: &resolver,
+                extra_args: &[],
+                no_sandbox: true,
+                tester_no_sandbox: false,
+                resume_cancellation_requested_at: None,
+                coder_mapping_inputs: None,
+                learner_run_coder: None,
+            })
+        };
+        let before_repair = resume().expect_err("malformed matrix must block operator resume");
+        assert!(before_repair.to_string().contains("remains malformed"));
+        let still_paused = store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            still_paused.attempts[0].pause_kind,
+            Some(PauseKind::WriterCompletion)
+        );
+        assert_eq!(still_paused.attempts[0].tasks, paused.attempts[0].tasks);
+        assert_eq!(
+            still_paused.attempts[0].artifacts,
+            paused.attempts[0].artifacts
+        );
+        assert_eq!(
+            fs::read(project.path().join(&gate.path)).unwrap(),
+            gate_bytes
+        );
         let matrix = project.path().join(
             ".fluent/work/artifacts/work-1/attempt-1/attempt-1-write-1/writer-completion.json",
         );
@@ -22632,9 +22665,8 @@ print(json.dumps([json.loads(line) for line in (pathlib.Path(sys.argv[1])/'comma
         value["rows"][0]["verification"] =
             serde_json::json!([{"command":"cargo test missing_case","result":"pass"}]);
         fs::write(&matrix, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
-        let resumed =
-            reopen_candidate_gate_attempt(project.path(), &store, "work-1", "attempt-1").unwrap();
-        assert!(matches!(resumed, CandidateGateResume::PlannedWriter { .. }));
+        let launched = resume().expect_err("the fixture has no source Git repository");
+        assert!(launched.to_string().contains("git"), "{launched:#}");
         let current = store.read_work_item("work-1").unwrap();
         let attempt = &current.attempts[0];
         assert_eq!(attempt.tasks.len(), 2);
@@ -22644,9 +22676,7 @@ print(json.dumps([json.loads(line) for line in (pathlib.Path(sys.argv[1])/'comma
             fs::read(project.path().join(&gate.path)).unwrap(),
             gate_bytes
         );
-        assert!(
-            reopen_candidate_gate_attempt(project.path(), &store, "work-1", "attempt-1").is_err()
-        );
+        let _ = resume().expect_err("repeat resume must reach the same planned Writer");
         assert_eq!(
             store.read_work_item("work-1").unwrap().attempts[0]
                 .tasks
