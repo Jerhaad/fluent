@@ -1371,7 +1371,8 @@ fn run_attempt_inner(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunR
                 continue;
             }
         }
-        let candidate_gate_pause = attempt.is_candidate_gate_pause();
+        let candidate_gate_pause = attempt.is_candidate_gate_pause()
+            || is_rejected_gate_writer_completion_pause(config.project_root, attempt)?;
         let uncertain_review_pause = attempt.is_uncertain_review_pause();
 
         if attempt.status == AttemptStatus::NeedsUser
@@ -2824,7 +2825,8 @@ fn reopen_candidate_gate_attempt(
         .find(|attempt| attempt.id == attempt_id)
         .ok_or_else(|| anyhow::anyhow!("Attempt {attempt_id:?} not found"))?;
     attempt.ensure_resume_ready()?;
-    if !attempt.is_candidate_gate_pause() {
+    let matrix_pause = is_rejected_gate_writer_completion_pause(project_root, attempt)?;
+    if !attempt.is_candidate_gate_pause() && !matrix_pause {
         bail!("Attempt {attempt_id:?} is not paused at a candidate gate");
     }
     let latest_writer = attempt
@@ -2837,6 +2839,16 @@ fn reopen_candidate_gate_attempt(
         .output
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("candidate-gate Writer has no candidate output"))?;
+    if matrix_pause {
+        if let Some((artifact, reason)) =
+            prior_writer_matrix_parse_error(project_root, attempt, latest_writer)?
+        {
+            bail!(
+                "Writer completion matrix {} remains malformed: {reason}",
+                artifact.path
+            );
+        }
+    }
     let gate = attempt
         .artifacts
         .iter()
@@ -2922,7 +2934,11 @@ fn reopen_candidate_gate_attempt(
         {
             let current = &fresh.attempts[attempt_index];
             current.ensure_resume_ready()?;
-            if !current.is_candidate_gate_pause() {
+            if !current.is_candidate_gate_pause()
+                && !(matrix_pause
+                    && current.pause_kind == Some(PauseKind::WriterCompletion)
+                    && current.review_state == Some(AttemptReviewState::NotReviewed))
+            {
                 return Err(WorkModelError::AttemptResumeIneligible {
                     attempt_id: attempt_id.to_string(),
                     reason: "the candidate-gate pause changed before recovery".to_string(),
@@ -7609,6 +7625,91 @@ fn writer_completion_artifact(task: &Task) -> Option<ArtifactRef> {
     })
 }
 
+fn prior_writer_matrix_parse_error(
+    project_root: &Path,
+    attempt: &Attempt,
+    writer: &Task,
+) -> Result<Option<(ArtifactRef, String)>> {
+    let Some(contract) = attempt.writer_completion_contract.as_ref() else {
+        return Ok(None);
+    };
+    let artifact =
+        crate::host_evidence::writer_completion_matrix_ref(project_root, attempt, writer)
+            .or_else(|| writer_completion_artifact(writer))
+            .context("completed Writer has no completion matrix artifact")?;
+    let path = project_root.join(&artifact.path);
+    let source = match fs::read_to_string(&path) {
+        Ok(source) => source,
+        Err(error) => {
+            return Ok(Some((
+                artifact,
+                format!("read {}: {error}", path.display()),
+            )));
+        }
+    };
+    let mut matrix: crate::work_model::WriterCompletionMatrix = match serde_json::from_str(&source)
+    {
+        Ok(matrix) => matrix,
+        Err(error) => match recover_writer_completion_result_format(&source) {
+            Ok((matrix, _)) => matrix,
+            Err(_) => {
+                return Ok(Some((
+                    artifact,
+                    format!("parse {}: {error}", path.display()),
+                )));
+            }
+        },
+    };
+    let findings = crate::work_task_executor::writer_completion_findings(project_root, writer)?;
+    if let Err(reason) = matrix.repair_writer_claims_against(contract, &writer.id, &findings) {
+        return Ok(Some((artifact, reason)));
+    }
+    if let Err(reason) = matrix.status_against(contract, &writer.id, &findings) {
+        return Ok(Some((artifact, reason)));
+    }
+    Ok(None)
+}
+
+fn is_rejected_gate_writer_completion_pause(
+    project_root: &Path,
+    attempt: &Attempt,
+) -> Result<bool> {
+    if attempt.status != AttemptStatus::NeedsUser
+        || attempt.pause_kind != Some(PauseKind::WriterCompletion)
+        || attempt.review_state != Some(AttemptReviewState::NotReviewed)
+    {
+        return Ok(false);
+    }
+    let Some(writer) = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+    else {
+        return Ok(false);
+    };
+    let Some(gate) = attempt.artifacts.iter().find(|artifact| {
+        artifact.producer_id == writer.id
+            && artifact
+                .path
+                .ends_with(crate::candidate_gate::CANDIDATE_GATE_FILE)
+    }) else {
+        return Ok(false);
+    };
+    let path =
+        crate::work_task_executor::resolve_managed_artifact_area_path(project_root, &gate.path)?;
+    let evidence = crate::candidate_gate::read_prior_writer_gate(&path)
+        .map_err(|reason| anyhow::anyhow!(reason))?;
+    Ok(
+        evidence.phase == crate::candidate_gate::CandidateGatePhase::Writer
+            && evidence.disposition == crate::candidate_gate::CandidateGateDisposition::Rejected
+            && writer
+                .output
+                .as_ref()
+                .is_some_and(|output| output.commit == evidence.candidate_commit),
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
 struct WriterCompletionFormatRepair {
@@ -8257,6 +8358,29 @@ fn gate_candidate_after_writer(
                     attempt_id,
                     &artifact,
                     &evidence,
+                )
+                .map(Some);
+            }
+            if !item.attempts[attempt_index].artifacts.contains(&artifact) {
+                item.attempts[attempt_index]
+                    .artifacts
+                    .push(artifact.clone());
+            }
+            if let Some((matrix, reason)) = prior_writer_matrix_parse_error(
+                project_root,
+                &item.attempts[attempt_index],
+                &item.attempts[attempt_index].tasks[write_index],
+            )? {
+                return pause_writer_completion_before_reviews(
+                    project_root,
+                    store,
+                    item,
+                    attempt_index,
+                    attempt_id,
+                    &matrix,
+                    &format!("Writer completion matrix is malformed: {reason}"),
+                    0,
+                    0,
                 )
                 .map(Some);
             }
@@ -22378,6 +22502,183 @@ print(json.dumps([json.loads(line) for line in (pathlib.Path(sys.argv[1])/'comma
                 .as_deref()
                 .unwrap()
         );
+    }
+
+    fn rejected_gate_matrix_fixture(
+        project_root: &Path,
+        malformed: bool,
+    ) -> (WorkModelStore, tempfile::TempDir) {
+        let (store, workspace) =
+            make_candidate_gate_fixture(project_root, "pub fn value() {}\n", None);
+        let mut item = store.read_work_item("work-1").unwrap();
+        let context = crate::work_model::PlanningContext {
+            behaviors: Some("### B1\nWHEN called, THE SYSTEM SHALL work.\nTest: tests/missing.rs (missing_case)\n".into()),
+            ..Default::default()
+        };
+        item.planning_context = Some(context.clone());
+        item.attempts[0].writer_completion_contract =
+            crate::work_model::WriterCompletionContract::from_planning_context(&context);
+        crate::work_task_executor::materialize_writer_completion_before_writer(
+            project_root,
+            &item,
+            "attempt-1",
+            "attempt-1-write-1",
+        )
+        .unwrap();
+        let matrix = project_root.join(
+            ".fluent/work/artifacts/work-1/attempt-1/attempt-1-write-1/writer-completion.json",
+        );
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&matrix).unwrap()).unwrap();
+        value["rows"][0]["state"] = "complete".into();
+        value["rows"][0]["implementation-evidence"] = serde_json::json!(["src/lib.rs: candidate"]);
+        value["rows"][0]["verification"] = if malformed {
+            serde_json::json!(["cargo test missing_case: 8/8 pass including regression"])
+        } else {
+            serde_json::json!([{"command":"cargo test missing_case","result":"pass"}])
+        };
+        fs::write(matrix, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        store.write_work_item(&item).unwrap();
+        (store, workspace)
+    }
+
+    #[test]
+    fn malformed_prior_matrix_after_candidate_gate_pauses_before_correction() {
+        let project = tempfile::tempdir().unwrap();
+        let (store, _workspace) = rejected_gate_matrix_fixture(project.path(), true);
+        let outcome = plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+        let WorkAttemptRunOutcome::NeedsUser { handoff_path } = outcome else {
+            panic!("malformed prior matrix must pause: {outcome:?}");
+        };
+        let attempt = &store.read_work_item("work-1").unwrap().attempts[0];
+        assert_eq!(attempt.pause_kind, Some(PauseKind::WriterCompletion));
+        assert_eq!(attempt.tasks.len(), 1);
+        let handoff = fs::read_to_string(project.path().join(handoff_path)).unwrap();
+        assert!(handoff.contains("writer-completion.json"));
+        assert!(handoff.contains("Writer completion matrix is malformed"));
+    }
+
+    #[test]
+    fn malformed_prior_matrix_pause_preserves_candidate_and_gate() {
+        let project = tempfile::tempdir().unwrap();
+        let (store, _workspace) = rejected_gate_matrix_fixture(project.path(), true);
+        let original = store.read_work_item("work-1").unwrap().attempts[0].tasks[0]
+            .output
+            .as_ref()
+            .unwrap()
+            .commit
+            .clone();
+        let _ = plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+        let attempt = &store.read_work_item("work-1").unwrap().attempts[0];
+        assert_eq!(attempt.tasks[0].output.as_ref().unwrap().commit, original);
+        let gate = attempt
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.path.ends_with("candidate-gate.json"))
+            .unwrap();
+        let bytes = fs::read(project.path().join(&gate.path)).unwrap();
+        let evidence: CandidateGateEvidence = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(evidence.candidate_commit, original);
+        assert_eq!(evidence.disposition, CandidateGateDisposition::Rejected);
+        assert_eq!(
+            evidence
+                .checks
+                .iter()
+                .find(|check| check.name == "behavior-references")
+                .unwrap()
+                .status,
+            CandidateCheckStatus::Failed
+        );
+    }
+
+    #[test]
+    fn repaired_prior_matrix_resumes_candidate_gate_correction_once() {
+        let project = tempfile::tempdir().unwrap();
+        let (store, _workspace) = rejected_gate_matrix_fixture(project.path(), true);
+        let _ = plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+        let paused = store.read_work_item("work-1").unwrap();
+        let attempt = &paused.attempts[0];
+        let candidate = attempt.tasks[0].output.as_ref().unwrap().commit.clone();
+        let gate = attempt
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.path.ends_with("candidate-gate.json"))
+            .unwrap()
+            .clone();
+        let gate_bytes = fs::read(project.path().join(&gate.path)).unwrap();
+        let matrix = project.path().join(
+            ".fluent/work/artifacts/work-1/attempt-1/attempt-1-write-1/writer-completion.json",
+        );
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&matrix).unwrap()).unwrap();
+        value["rows"][0]["verification"] =
+            serde_json::json!([{"command":"cargo test missing_case","result":"pass"}]);
+        fs::write(&matrix, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        let resumed =
+            reopen_candidate_gate_attempt(project.path(), &store, "work-1", "attempt-1").unwrap();
+        assert!(matches!(resumed, CandidateGateResume::PlannedWriter { .. }));
+        let current = store.read_work_item("work-1").unwrap();
+        let attempt = &current.attempts[0];
+        assert_eq!(attempt.tasks.len(), 2);
+        assert_eq!(attempt.tasks[0].output.as_ref().unwrap().commit, candidate);
+        assert!(attempt.tasks[1].input_artifacts.contains(&gate));
+        assert_eq!(
+            fs::read(project.path().join(&gate.path)).unwrap(),
+            gate_bytes
+        );
+        assert!(
+            reopen_candidate_gate_attempt(project.path(), &store, "work-1", "attempt-1").is_err()
+        );
+        assert_eq!(
+            store.read_work_item("work-1").unwrap().attempts[0]
+                .tasks
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn valid_prior_matrix_preserves_candidate_gate_correction() {
+        let project = tempfile::tempdir().unwrap();
+        let (store, _workspace) = rejected_gate_matrix_fixture(project.path(), false);
+        let outcome = plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedWriteRound { .. }
+        ));
+        let current = store.read_work_item("work-1").unwrap();
+        let attempt = &current.attempts[0];
+        assert_eq!(attempt.tasks.len(), 2);
+        let gate = attempt
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.path.ends_with("candidate-gate.json"))
+            .unwrap();
+        assert!(attempt.tasks[1].input_artifacts.contains(gate));
     }
 
     #[test]
