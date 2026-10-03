@@ -2839,16 +2839,24 @@ fn reopen_candidate_gate_attempt(
         .output
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("candidate-gate Writer has no candidate output"))?;
-    if matrix_pause {
-        if let Some((artifact, reason)) =
-            prior_writer_matrix_parse_error(project_root, attempt, latest_writer)?
-        {
+    let matrix_repairs = if matrix_pause {
+        let check = check_prior_writer_matrix_for_correction(
+            project_root,
+            work_item_id,
+            attempt_id,
+            attempt,
+            latest_writer,
+        )?;
+        if let Some((artifact, reason)) = check.issue {
             bail!(
                 "Writer completion matrix {} remains malformed: {reason}",
                 artifact.path
             );
         }
-    }
+        check.repairs
+    } else {
+        Vec::new()
+    };
     let gate = attempt
         .artifacts
         .iter()
@@ -2980,6 +2988,11 @@ fn reopen_candidate_gate_attempt(
 
         match disposition {
             crate::candidate_gate::CandidateGateDisposition::Rejected => {
+                for repair in &matrix_repairs {
+                    if !fresh.attempts[attempt_index].artifacts.contains(repair) {
+                        fresh.attempts[attempt_index].artifacts.push(repair.clone());
+                    }
+                }
                 let task_id = if let Some(task_id) = retry_task_id.clone() {
                     let attempt = &mut fresh.attempts[attempt_index];
                     let task = attempt
@@ -7625,13 +7638,27 @@ fn writer_completion_artifact(task: &Task) -> Option<ArtifactRef> {
     })
 }
 
-fn prior_writer_matrix_parse_error(
+struct PriorWriterMatrixCheck {
+    issue: Option<(ArtifactRef, String)>,
+    repairs: Vec<ArtifactRef>,
+}
+
+/// Publish accepted matrix repairs before correction setup reads the prior
+/// Writer's authoritative matrix. The caller records the repair references in
+/// the same Attempt transition that pauses or schedules correction.
+fn check_prior_writer_matrix_for_correction(
     project_root: &Path,
+    work_item_id: &str,
+    attempt_id: &str,
     attempt: &Attempt,
     writer: &Task,
-) -> Result<Option<(ArtifactRef, String)>> {
+) -> Result<PriorWriterMatrixCheck> {
+    let mut check = PriorWriterMatrixCheck {
+        issue: None,
+        repairs: Vec::new(),
+    };
     let Some(contract) = attempt.writer_completion_contract.as_ref() else {
-        return Ok(None);
+        return Ok(check);
     };
     let artifact =
         crate::host_evidence::writer_completion_matrix_ref(project_root, attempt, writer)
@@ -7641,33 +7668,59 @@ fn prior_writer_matrix_parse_error(
     let source = match fs::read_to_string(&path) {
         Ok(source) => source,
         Err(error) => {
-            return Ok(Some((
-                artifact,
-                format!("read {}: {error}", path.display()),
-            )));
+            check.issue = Some((artifact, format!("read {}: {error}", path.display())));
+            return Ok(check);
         }
     };
     let mut matrix: crate::work_model::WriterCompletionMatrix = match serde_json::from_str(&source)
     {
         Ok(matrix) => matrix,
         Err(error) => match recover_writer_completion_result_format(&source) {
-            Ok((matrix, _)) => matrix,
+            Ok((matrix, repairs)) => {
+                let (normalized, evidence) = write_writer_completion_format_repair(
+                    project_root,
+                    work_item_id,
+                    attempt_id,
+                    &writer.id,
+                    &artifact,
+                    &source,
+                    &matrix,
+                    &repairs,
+                )?;
+                check.repairs.extend([normalized, evidence]);
+                matrix
+            }
             Err(_) => {
-                return Ok(Some((
-                    artifact,
-                    format!("parse {}: {error}", path.display()),
-                )));
+                check.issue = Some((artifact, format!("parse {}: {error}", path.display())));
+                return Ok(check);
             }
         },
     };
     let findings = crate::work_task_executor::writer_completion_findings(project_root, writer)?;
-    if let Err(reason) = matrix.repair_writer_claims_against(contract, &writer.id, &findings) {
-        return Ok(Some((artifact, reason)));
+    let claim_repairs = match matrix.repair_writer_claims_against(contract, &writer.id, &findings) {
+        Ok(repairs) => repairs,
+        Err(reason) => {
+            check.issue = Some((artifact, reason));
+            return Ok(check);
+        }
+    };
+    if !claim_repairs.is_empty() {
+        let (normalized, evidence) = write_writer_completion_repair(
+            project_root,
+            work_item_id,
+            attempt_id,
+            &writer.id,
+            &artifact,
+            &source,
+            &matrix,
+            &claim_repairs,
+        )?;
+        check.repairs.extend([normalized, evidence]);
     }
     if let Err(reason) = matrix.status_against(contract, &writer.id, &findings) {
-        return Ok(Some((artifact, reason)));
+        check.issue = Some((artifact, reason));
     }
-    Ok(None)
+    Ok(check)
 }
 
 fn is_rejected_gate_writer_completion_pause(
@@ -8366,11 +8419,19 @@ fn gate_candidate_after_writer(
                     .artifacts
                     .push(artifact.clone());
             }
-            if let Some((matrix, reason)) = prior_writer_matrix_parse_error(
+            let check = check_prior_writer_matrix_for_correction(
                 project_root,
+                &item.id,
+                attempt_id,
                 &item.attempts[attempt_index],
                 &item.attempts[attempt_index].tasks[write_index],
-            )? {
+            )?;
+            for repair in check.repairs {
+                if !item.attempts[attempt_index].artifacts.contains(&repair) {
+                    item.attempts[attempt_index].artifacts.push(repair);
+                }
+            }
+            if let Some((matrix, reason)) = check.issue {
                 return pause_writer_completion_before_reviews(
                     project_root,
                     store,
@@ -22594,18 +22655,58 @@ print(json.dumps([json.loads(line) for line in (pathlib.Path(sys.argv[1])/'comma
     #[test]
     fn malformed_prior_matrix_pause_preserves_candidate_and_gate() {
         let project = tempfile::tempdir().unwrap();
-        let (store, _workspace) = rejected_gate_matrix_fixture(project.path(), true);
-        let original = store.read_work_item("work-1").unwrap().attempts[0].tasks[0]
+        let (store, workspace) = rejected_gate_matrix_fixture(project.path(), true);
+        let mut item = store.read_work_item("work-1").unwrap();
+        let original = item.attempts[0].tasks[0]
             .output
             .as_ref()
             .unwrap()
             .commit
             .clone();
-        let _ = plan_after_completed_writer(
+        let output = item.attempts[0].tasks[0].output.as_ref().unwrap();
+        let base = output.base_commit.as_deref().unwrap().to_string();
+        let assessment_path = project.path().join("private/candidate-gate.json");
+        let evidence = crate::candidate_gate::assess_candidate_gate_with_prior_and_role(
+            crate::candidate_gate::CandidateGateRequest {
+                project_root: project.path(),
+                workspace: workspace.path(),
+                work_item_id: "work-1",
+                attempt_id: "attempt-1",
+                task_id: Some("attempt-1-write-1"),
+                phase: CandidateGatePhase::Writer,
+                base_commit: &base,
+                candidate_commit: &original,
+                completion_contract: item.attempts[0].writer_completion_contract.as_ref(),
+                allow_tree_identical_metadata_rewrite: false,
+                metadata_rewrite_authorization: None,
+                tester_results_path: None,
+                accepted_tester_commands: &[],
+                artifact_path: &assessment_path,
+            },
+            None,
+            Some("writer"),
+        )
+        .unwrap();
+        let assessed = WriterGateAssessment {
+            evidence,
+            requested_base_commit: base,
+            logs: Vec::new(),
+        };
+        assert!(
+            assessed
+                .evidence
+                .checks
+                .iter()
+                .all(|check| check.log_path.is_none())
+        );
+        let expected_gate_bytes = serde_json::to_vec_pretty(&assessed.evidence).unwrap();
+        let _ = gate_candidate_after_writer(
             project.path(),
             &store,
-            store.read_work_item("work-1").unwrap(),
+            &mut item,
             "attempt-1",
+            0,
+            Some(&assessed),
         )
         .unwrap();
         let attempt = &store.read_work_item("work-1").unwrap().attempts[0];
@@ -22616,6 +22717,7 @@ print(json.dumps([json.loads(line) for line in (pathlib.Path(sys.argv[1])/'comma
             .find(|artifact| artifact.path.ends_with("candidate-gate.json"))
             .unwrap();
         let bytes = fs::read(project.path().join(&gate.path)).unwrap();
+        assert_eq!(bytes, expected_gate_bytes);
         let evidence: CandidateGateEvidence = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(evidence.candidate_commit, original);
         assert_eq!(evidence.disposition, CandidateGateDisposition::Rejected);
@@ -22735,6 +22837,53 @@ print(json.dumps([json.loads(line) for line in (pathlib.Path(sys.argv[1])/'comma
             .find(|artifact| artifact.path.ends_with("candidate-gate.json"))
             .unwrap();
         assert!(attempt.tasks[1].input_artifacts.contains(gate));
+    }
+
+    #[test]
+    fn repairable_prior_matrix_is_persisted_before_gate_correction() {
+        let project = tempfile::tempdir().unwrap();
+        let (store, _workspace) = rejected_gate_matrix_fixture(project.path(), false);
+        let source = project.path().join(
+            ".fluent/work/artifacts/work-1/attempt-1/attempt-1-write-1/writer-completion.json",
+        );
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&source).unwrap()).unwrap();
+        value["rows"][0]["verification"][0]["result"] = "pass: focused run".into();
+        fs::write(&source, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        let outcome = plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedWriteRound { .. }
+        ));
+        let item = store.read_work_item("work-1").unwrap();
+        let attempt = &item.attempts[0];
+        let repair = attempt
+            .artifacts
+            .iter()
+            .find(|artifact| {
+                artifact.producer_id == "writer-completion-repair"
+                    && artifact.path.ends_with("/format/writer-completion.json")
+            })
+            .expect("accepted normalization must be authoritative before correction");
+        let repaired: crate::work_model::WriterCompletionMatrix =
+            serde_json::from_slice(&fs::read(project.path().join(&repair.path)).unwrap()).unwrap();
+        assert_eq!(
+            repaired.rows[0].verification[0].result,
+            crate::work_model::WriterVerificationResult::Pass
+        );
+        crate::work_task_executor::materialize_writer_completion_before_writer(
+            project.path(),
+            &item,
+            "attempt-1",
+            &attempt.tasks[1].id,
+        )
+        .unwrap();
     }
 
     #[test]
