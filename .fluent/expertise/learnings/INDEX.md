@@ -103,6 +103,7 @@
 - [provider-standard-streams-are-task-artifacts](provider-standard-streams-are-task-artifacts.md) — Captured providers receive task-owned standard streams so scheduler log placement cannot break sandboxed runtime startup
 - [public-api-surface-test](public-api-surface-test.md) — A capability for external callers gets a tests/public_api.rs test that compiles only against the public API, proving it is usable without private internals
 - [publish-managed-inputs-with-model-record](publish-managed-inputs-with-model-record.md) — Publish managed files and the Work-model record that references them under one per-item lock, and retain files whenever a record or recovery journal became durable
+- [publish-writer-matrix-repairs-before-correction](publish-writer-matrix-repairs-before-correction.md) — Publish accepted Writer matrix repairs as authoritative Attempt artifacts before preparing a corrective Writer
 - [pure-domain-keeps-filesystem-authority-at-edges](pure-domain-keeps-filesystem-authority-at-edges.md) — Keep collaboration domain state path-free and resolve filesystem authority in interfaces and adapters
 - [python-test-selectors-use-static-class-ownership](python-test-selectors-use-static-class-ownership.md) — Resolve Python selectors from committed declarations with exact class ownership and space/tab keyword boundaries
 - [queue-admission-rechecks-after-evidence-preflight](queue-admission-rechecks-after-evidence-preflight.md) — Queue admission runs evidence checks outside the queue lock and rechecks the ledger before creating or reusing a dispatch
