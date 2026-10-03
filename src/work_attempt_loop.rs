@@ -2808,10 +2808,10 @@ enum CandidateGateResume {
     PlannedWriter { task_id: String },
 }
 
-/// Recover one explicitly approved candidate-gate pause. A rejected candidate
-/// receives one new Writer task with the exact gate evidence. A blocked gate
-/// simply reopens so the host rechecks the unchanged candidate after the
-/// operator repairs its environment.
+/// Recover a candidate-gate pause or a Writer-completion pause that retained a
+/// rejected gate. After the operator repairs that matrix, schedule one Writer
+/// with the saved gate evidence. A blocked gate reopens so the host rechecks
+/// the unchanged candidate after the operator repairs its environment.
 fn reopen_candidate_gate_attempt(
     project_root: &Path,
     store: &WorkModelStore,
@@ -9637,6 +9637,13 @@ fn write_writer_completion_handoff(
             "required-progress contract",
             "restore its entries to the approved Plan",
         )
+    };
+    let repair = if matrix && reason.contains("expected struct WriterVerificationClaim") {
+        format!(
+            "correct the malformed verification claim to a structured verification entry with `command` and `result`, preserve the host-generated row identities and requirements, then resume the Attempt with `fluent queue resume {work_item_id} --attempt {attempt_id}`"
+        )
+    } else {
+        repair.to_string()
     };
     let body = crate::work_status::append_pause_record_to_handoff(
         project_root,
@@ -22563,6 +22570,18 @@ print(json.dumps([json.loads(line) for line in (pathlib.Path(sys.argv[1])/'comma
         assert!(handoff.contains("writer-completion.json"));
         assert!(handoff.contains("Writer completion matrix is malformed"));
         assert!(handoff.contains("invalid type: string"), "{handoff}");
+        assert!(
+            handoff.contains("structured verification entry"),
+            "{handoff}"
+        );
+        assert!(
+            handoff.contains("preserve the host-generated row identities and requirements"),
+            "{handoff}"
+        );
+        assert!(
+            handoff.contains("fluent queue resume work-1 --attempt attempt-1"),
+            "{handoff}"
+        );
     }
 
     #[test]
