@@ -14174,6 +14174,13 @@ mod tests {
                         ..Default::default()
                     },
                 );
+            crate::work_task_executor::materialize_writer_completion_before_writer(
+                project.path(),
+                &item,
+                "attempt-1",
+                "attempt-1-write-1",
+            )
+            .unwrap();
             store.write_work_item(&item).unwrap();
             let view = crate::verification_assessment::assess_current_verification(
                 project.path(),
