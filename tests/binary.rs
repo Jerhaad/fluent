@@ -1849,6 +1849,7 @@ fn output_free_context_predecessor_preserves_completed_recovery() {
         let mut root = read_json_path(&root_path);
         root["schema_version"] = 8.into();
         root["model_writer_version"]["schema_version"] = 7.into();
+        root["model_writer_version"]["version"] = "0.4.0".into();
         write_json_path(&root_path, &root);
         let attempt_path = project.join(format!(".fluent/work/attempts/{work}/attempt-1.json"));
         let mut attempt = read_json_path(&attempt_path);
@@ -2501,6 +2502,9 @@ fn combined_recovery_import_predecessor(project: &Path, work: &str, name: &str) 
     } else {
         5.into()
     };
+    // These pinned predecessors were built from 0.4.0. Their imported records
+    // must carry that writer version before the predecessor can mutate them.
+    record["model_writer_version"]["version"] = "0.4.0".into();
     write_json_path(&path, &record);
     let path = project.join(format!(".fluent/work/attempts/{work}/attempt-1.json"));
     let mut record = read_json_path(&path);
