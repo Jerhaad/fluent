@@ -628,13 +628,24 @@ fn scheduler_host_upgrade_managed_start_checks_observed_build() {
         version: "0.2.0-test".into(),
         hash: fake_build().hash,
     };
-    assert!(
-        scheduler_service::start_or_reuse_service(home.path(), &different, &manager)
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("stop --all")
-    );
+    let error = scheduler_service::start_or_reuse_service(home.path(), &different, &manager)
+        .err()
+        .unwrap()
+        .to_string();
+    let running = fake_build();
+    for expected in [
+        running.version.as_str(),
+        running.hash.as_str(),
+        different.version.as_str(),
+        different.hash.as_str(),
+        "fluent scheduler stop --all",
+        "fluent scheduler run",
+    ] {
+        assert!(
+            error.contains(expected),
+            "missing {expected:?} from {error}"
+        );
+    }
     assert_eq!(manager.starts.load(Ordering::SeqCst), 1);
     scheduler_service::stop_service(home.path()).unwrap();
     manager.join();
@@ -652,7 +663,20 @@ fn scheduler_host_upgrade_managed_start_checks_observed_build() {
             scheduler_service::start_or_reuse_service(wrong_home.path(), &requested, &wrong)
                 .err()
                 .unwrap();
-        assert!(error.to_string().contains("stop --all"));
+        let message = error.to_string();
+        for expected in [
+            running.version.as_str(),
+            running.hash.as_str(),
+            requested.version.as_str(),
+            requested.hash.as_str(),
+            "fluent scheduler stop --all",
+            "fluent scheduler run",
+        ] {
+            assert!(
+                message.contains(expected),
+                "missing {expected:?} from {message}"
+            );
+        }
         assert_eq!(
             scheduler_service::read_observed_build(wrong_home.path()).unwrap(),
             None
@@ -730,6 +754,7 @@ fn scheduler_host_upgrade_upgrade_rejects_mismatched_build() {
     let original = scheduler_service::send_health_request(&socket)
         .unwrap()
         .instance_id;
+    let running = fake_build();
     for (version, hash) in [("0.2.0-test", "abc123def456"), ("0.1.0-test", "different")] {
         let requested = BuildIdentity {
             version: version.into(),
@@ -737,12 +762,25 @@ fn scheduler_host_upgrade_upgrade_rejects_mismatched_build() {
         };
         let error = scheduler_service::run_service_with_socket_test_runner(
             home.path(),
-            requested,
+            requested.clone(),
             1,
             Arc::new(NeedsUserRunner::default()),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("stop --all"));
+        let message = error.to_string();
+        for expected in [
+            running.version.as_str(),
+            running.hash.as_str(),
+            requested.version.as_str(),
+            requested.hash.as_str(),
+            "fluent scheduler stop --all",
+            "fluent scheduler run",
+        ] {
+            assert!(
+                message.contains(expected),
+                "missing {expected:?} from {message}"
+            );
+        }
         assert_eq!(
             scheduler_service::send_health_request(&socket)
                 .unwrap()
@@ -769,7 +807,20 @@ fn scheduler_host_upgrade_upgrade_preserves_unverified_owner() {
         Arc::new(NeedsUserRunner::default()),
     )
     .unwrap_err();
-    assert!(error.to_string().contains("supervised process"));
+    let message = error.to_string();
+    let running = fake_build();
+    for expected in [
+        running.version.as_str(),
+        running.hash.as_str(),
+        "stop its original supervised process",
+        "wait for active work to finish",
+        "fluent scheduler run",
+    ] {
+        assert!(
+            message.contains(expected),
+            "missing {expected:?} from {message}"
+        );
+    }
     assert!(socket.exists());
 }
 

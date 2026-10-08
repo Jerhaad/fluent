@@ -5896,10 +5896,13 @@ scheduler_host_upgrade_preserves_settled_worker_after_child_crash)
 Test: src/scheduler_service.rs (stop_result_tests::rejects_published_result_when_lease_identity_is_unreadable)
 
 WHEN a stop request repeats for the same instance, THE SYSTEM SHALL return its
-retained result after ownership release. IF a request names an earlier
-instance, THE SYSTEM SHALL leave its replacement running.
+retained result after ownership release.
 Test: tests/scheduler_service.rs (scheduler_host_upgrade_drain_restart_and_replay,
-scheduler_host_upgrade_replays_published_result_after_child_crash,
+scheduler_host_upgrade_replays_published_result_after_child_crash)
+
+IF a stop request names an earlier instance, THEN THE SYSTEM SHALL leave its
+replacement running.
+Test: tests/scheduler_service.rs (scheduler_host_upgrade_drain_restart_and_replay,
 scheduler_host_upgrade_rejects_old_drain_after_ack_crash)
 
 WHEN the old instance completes its drain and the operator starts a new build,
@@ -5912,7 +5915,8 @@ identify the running build and direct the operator to stop its original
 supervised process, wait for active work to settle, then start the new build.
 Test: tests/scheduler_service.rs (scheduler_host_upgrade_upgrade_preserves_unverified_owner)
 
-Ordinary `fluent scheduler stop` continues to stop only its project coordinator.
+WHEN an operator runs `fluent scheduler stop` without `--all`, THE SYSTEM SHALL
+stop only that project's coordinator.
 Test: tests/scheduler_service.rs (scheduler_upgrade_project_stop_scope)
 
 ### B1
