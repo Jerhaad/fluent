@@ -2,8 +2,9 @@
 
 `QueueHandoff.tla`, `GenerationFence.tla`, `ServiceIsolation.tla`, and the eight
 top-level configurations are exact copies of the approved state-transition
-audit inputs. `check.py --suite=recovery --jar=target/fluent-tools/tla2tools-1.7.4.jar`
-runs those inputs and checks each expected result. It requires the official TLC
+audit inputs. From the repository root, run
+`python3 tests/formal/scheduler/check.py --suite=recovery --jar=target/fluent-tools/tla2tools-1.7.4.jar`.
+This checks each expected result. It requires the official TLC
 1.7.4 JAR (SHA-256
 `936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88`)
 and Java 21. It downloads nothing and stores full logs under
@@ -15,7 +16,8 @@ failures; the corresponding `*-proposed.cfg` checks the proposed protocols.
 Generation fencing already worked at that commit: `generation-current.cfg` is
 a passing control, while `generation-mutant-no-fence.cfg` deliberately removes
 the fence. The queue mutants independently disable the lease check and bound
-Attempt reuse. The audit's selected TLC results and hashes are preserved in
+Attempt reuse. The audit's selected TLC results and hashes were supplied as
+local execution input for this Attempt at
 `.fluent/drafts/20261007-state-transition-assurance/model/approved-execution-inputs.txt`.
 
 | Model action | Production boundary |

@@ -1432,31 +1432,71 @@ fn scheduler_recovery_uncreated_attempt() {
 
 #[test]
 fn scheduler_isolation_continues_healthy_projects() {
-    let root = TempDir::new().unwrap();
-    let home = root.path().join("home");
-    let bad = root.path().join("00-bad");
-    let good = root.path().join("10-good");
-    fs::create_dir_all(&home).unwrap();
-    fs::create_dir_all(&bad).unwrap();
-    fs::create_dir_all(&good).unwrap();
-    let runner = Arc::new(NeedsUserRunner::default());
-    let mut service = registered_service(&home, &bad, runner.clone());
-    let identity = scheduler_service::assign_checkout_identity(&good).unwrap();
-    scheduler_service::register_checkout(&home, &good, &identity).unwrap();
-    fs::create_dir_all(&bad.join(".fluent")).unwrap();
-    fs::write(
-        &bad.join(".fluent/config.yaml"),
-        "scheduler:\n  local-concurrency: invalid\n",
-    )
-    .unwrap();
-    create_execution_ready_work(&good, "wi-good");
-    fluent::queue::add(&good, "wi-good", Some(0)).unwrap();
-    service.poll_once().unwrap();
-    service.join_workers().unwrap();
-    assert_eq!(
-        fluent::queue::show(&good, "wi-good").unwrap().status,
-        fluent::queue::DispatchStatus::NeedsUser
-    );
+    for fault in ["configuration", "corrupt-work", "coordinator"] {
+        let root = TempDir::new().unwrap();
+        let home = root.path().join("home");
+        let bad = root.path().join("00-bad");
+        let good = root.path().join("10-good");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&bad).unwrap();
+        fs::create_dir_all(&good).unwrap();
+        let runner = Arc::new(NeedsUserRunner::default());
+        let mut service = registered_service(&home, &bad, runner.clone());
+        let identity = scheduler_service::assign_checkout_identity(&good).unwrap();
+        scheduler_service::register_checkout(&home, &good, &identity).unwrap();
+        fs::create_dir_all(&bad.join(".fluent")).unwrap();
+        create_execution_ready_work(&bad, "wi-bad");
+        fluent::queue::add(&bad, "wi-bad", Some(0)).unwrap();
+        match fault {
+            "configuration" => fs::write(
+                bad.join(".fluent/config.yaml"),
+                "scheduler:\n  local-concurrency: invalid\n",
+            )
+            .unwrap(),
+            "corrupt-work" => {
+                let path = fluent::work_model::WorkModelStore::new(&bad)
+                    .work_item_path("wi-bad")
+                    .unwrap();
+                fs::write(path, "invalid json").unwrap();
+            }
+            "coordinator" => {
+                let path = bad.join(".fluent/work/scheduler/coordinator.lock");
+                fs::create_dir_all(&path).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        create_execution_ready_work(&good, "wi-good");
+        fluent::queue::add(&good, "wi-good", Some(0)).unwrap();
+        service.poll_once().unwrap();
+        service.join_workers().unwrap();
+        assert_eq!(
+            fluent::queue::show(&good, "wi-good").unwrap().status,
+            fluent::queue::DispatchStatus::NeedsUser
+        );
+        let bad_dispatch = fluent::queue::show(&bad, "wi-bad").unwrap();
+        assert_eq!(
+            bad_dispatch.status,
+            if fault == "corrupt-work" {
+                fluent::queue::DispatchStatus::Blocked
+            } else {
+                fluent::queue::DispatchStatus::Queued
+            },
+            "{fault}"
+        );
+        if fault == "corrupt-work" {
+            let path = fluent::work_model::WorkModelStore::new(&bad)
+                .work_item_path("wi-bad")
+                .unwrap();
+            assert_eq!(fs::read_to_string(path).unwrap(), "invalid json");
+        } else {
+            assert!(
+                service
+                    .last_poll_failures()
+                    .iter()
+                    .any(|error| error.contains(&bad.display().to_string()))
+            );
+        }
+    }
 }
 
 fn create_bound_attempt(
@@ -1567,23 +1607,20 @@ fn scheduler_service_fences_recovery() {
     let after = fluent::queue::show(project.path(), "wi-live").unwrap();
     assert_eq!(after.status, fluent::queue::DispatchStatus::Claimed);
     assert_eq!(after.generation, token.generation);
-    let newer = fluent::queue::mark_running(project.path(), &token).unwrap();
-    assert!(
-        !fluent::queue::requeue_if_current(
-            project.path(),
-            "wi-live",
-            &token.dispatch_id,
-            token.generation,
-            true,
-        )
-        .unwrap()
-    );
-    assert_eq!(
-        fluent::queue::show(project.path(), "wi-live")
-            .unwrap()
-            .generation,
-        newer.generation
-    );
+    drop(_lease);
+    let newer_generation = Arc::new(Mutex::new(None));
+    let observed = newer_generation.clone();
+    service.set_recovery_observer(Arc::new(move |root, dispatch| {
+        if dispatch.work_item_id == "wi-live" {
+            let newer = fluent::queue::mark_running(root, &token).unwrap();
+            *observed.lock().unwrap() = Some(newer.generation);
+        }
+    }));
+    service.poll_once().unwrap();
+    let newer_generation = newer_generation.lock().unwrap().unwrap();
+    let after = fluent::queue::show(project.path(), "wi-live").unwrap();
+    assert_eq!(after.status, fluent::queue::DispatchStatus::Running);
+    assert_eq!(after.generation, newer_generation);
 }
 
 #[test]
@@ -1629,6 +1666,22 @@ fn scheduler_isolation_reports_failure_context() {
     let diagnostic = &service.last_poll_failures()[0];
     assert!(diagnostic.contains(&project.path().display().to_string()));
     assert!(diagnostic.contains("read scheduler capacity"));
+
+    #[cfg(feature = "test-support")]
+    {
+        let known = TempDir::new().unwrap();
+        create_execution_ready_work(known.path(), "wi-worker-fail");
+        fluent::queue::add(known.path(), "wi-worker-fail", Some(0)).unwrap();
+        let mut service =
+            registered_service(home.path(), known.path(), Arc::new(HostFailureRunner));
+        service.poll_once().unwrap();
+        let dispatch = fluent::queue::show(known.path(), "wi-worker-fail").unwrap();
+        let diagnostic = format!("{:#}", service.join_workers().unwrap_err());
+        assert!(diagnostic.contains(&known.path().display().to_string()));
+        assert!(diagnostic.contains("worker"));
+        assert!(diagnostic.contains("wi-worker-fail"));
+        assert!(diagnostic.contains(&dispatch.dispatch_id));
+    }
 }
 
 #[test]
@@ -1672,6 +1725,53 @@ fn scheduler_isolation_bounds_retries_by_poll() {
             .status,
         fluent::queue::DispatchStatus::NeedsUser
     );
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn scheduler_isolation_bounds_failed_stop_checks_by_poll() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let mut service = registered_service(
+        home.path(),
+        project.path(),
+        Arc::new(NeedsUserRunner::default()),
+    );
+    service.poll_once().unwrap();
+    let checks = Arc::new(AtomicUsize::new(0));
+    let observed = checks.clone();
+    service.set_stop_check(Arc::new(move |_| {
+        observed.fetch_add(1, Ordering::SeqCst);
+        anyhow::bail!("fixture stop check failure")
+    }));
+    let start = std::time::Instant::now();
+    let interval = Duration::from_secs(1);
+    let mut next_poll = start + interval;
+    for iteration in 0..5 {
+        service
+            .tick_for_test(
+                start + Duration::from_millis(iteration * 50),
+                &mut next_poll,
+                interval,
+            )
+            .unwrap();
+    }
+    assert_eq!(checks.load(Ordering::SeqCst), 1);
+    service
+        .tick_for_test(start + interval, &mut next_poll, interval)
+        .unwrap();
+    assert_eq!(checks.load(Ordering::SeqCst), 2);
+    for iteration in 1..5 {
+        service
+            .tick_for_test(
+                start + interval + Duration::from_millis(iteration * 50),
+                &mut next_poll,
+                interval,
+            )
+            .unwrap();
+    }
+    assert_eq!(checks.load(Ordering::SeqCst), 2);
 }
 
 #[test]
@@ -1807,7 +1907,15 @@ fn scheduler_workers_preserve_others_after_failure() {
 #[cfg(feature = "test-support")]
 fn __scheduler_service_process_fixture() {
     let home = std::env::var_os("FLUENT_SCHEDULER_TEST_HOME").expect("fixture home");
-    if std::env::var_os("FLUENT_SCHEDULER_TEST_WORKER_ERROR").is_some() {
+    if std::env::var_os("FLUENT_SCHEDULER_TEST_CRASH_PREFIX").is_some() {
+        scheduler_service::run_service_with_test_runner(
+            std::path::Path::new(&home),
+            fake_build(),
+            1,
+            Arc::new(CrashPrefixRunner),
+        )
+        .unwrap();
+    } else if std::env::var_os("FLUENT_SCHEDULER_TEST_WORKER_ERROR").is_some() {
         scheduler_service::run_service_with_test_runner(
             std::path::Path::new(&home),
             fake_build(),
@@ -1824,6 +1932,108 @@ fn __scheduler_service_process_fixture() {
         )
         .unwrap();
     }
+}
+
+#[cfg(feature = "test-support")]
+struct CrashPrefixRunner;
+
+#[cfg(feature = "test-support")]
+impl fluent::scheduler::AttemptRunner for CrashPrefixRunner {
+    fn run(
+        &self,
+        _project: &std::path::Path,
+        _work_item_id: &str,
+        _attempt_id: &str,
+        _tester_no_sandbox: bool,
+    ) -> anyhow::Result<fluent::scheduler::AttemptOutcome> {
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+}
+
+#[cfg(unix)]
+#[cfg(feature = "test-support")]
+#[test]
+fn scheduler_recovery_restarts_after_owned_child_crash() {
+    let root = TempDir::new().unwrap();
+    let home = root.path().join("home");
+    let project = root.path().join("project");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&project).unwrap();
+    let identity = scheduler_service::assign_checkout_identity(&project).unwrap();
+    scheduler_service::register_checkout(&home, &project, &identity).unwrap();
+    create_execution_ready_work(&project, "wi-owned-crash");
+    fluent::queue::add(&project, "wi-owned-crash", Some(0)).unwrap();
+
+    let spawn = |crash: bool| {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("__scheduler_service_process_fixture")
+            .env("FLUENT_SCHEDULER_TEST_HOME", &home)
+            .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "1");
+        if crash {
+            command.env("FLUENT_SCHEDULER_TEST_CRASH_PREFIX", "1");
+        } else {
+            command.env_remove("FLUENT_SCHEDULER_TEST_CRASH_PREFIX");
+        }
+        command.spawn().unwrap()
+    };
+    let mut first = spawn(true);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let running = loop {
+        match fluent::queue::show(&project, "wi-owned-crash") {
+            Ok(dispatch) if dispatch.status == fluent::queue::DispatchStatus::Running => {
+                break dispatch;
+            }
+            _ if std::time::Instant::now() >= deadline => {
+                first.kill().unwrap();
+                first.wait().unwrap();
+                panic!("first service did not own a running dispatch");
+            }
+            _ => std::thread::sleep(Duration::from_millis(10)),
+        }
+    };
+    assert!(
+        fluent::lease::is_leased_checked(&fluent::queue::dispatch_lease_path(
+            &project,
+            "wi-owned-crash"
+        ))
+        .unwrap()
+    );
+    let attempt_id = running.bound_attempt_id.clone().unwrap();
+    first.kill().unwrap();
+    first.wait().unwrap();
+
+    let mut replacement = spawn(false);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let settled = loop {
+        match fluent::queue::show(&project, "wi-owned-crash") {
+            Ok(dispatch) if dispatch.status == fluent::queue::DispatchStatus::NeedsUser => {
+                break dispatch;
+            }
+            _ if std::time::Instant::now() >= deadline => {
+                replacement.kill().unwrap();
+                replacement.wait().unwrap();
+                panic!("replacement service did not recover the owned dispatch");
+            }
+            _ => std::thread::sleep(Duration::from_millis(10)),
+        }
+    };
+    replacement.kill().unwrap();
+    replacement.wait().unwrap();
+    assert_eq!(settled.dispatch_id, running.dispatch_id);
+    assert_eq!(
+        settled.bound_attempt_id.as_deref(),
+        Some(attempt_id.as_str())
+    );
+    let item = fluent::work_model::WorkModelStore::new(&project)
+        .read_work_item("wi-owned-crash")
+        .unwrap();
+    assert_eq!(item.attempts.len(), 1);
+    assert_eq!(item.attempts[0].id, attempt_id);
 }
 
 #[cfg(feature = "test-support")]

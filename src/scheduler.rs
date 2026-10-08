@@ -411,11 +411,19 @@ pub fn project_local_capacity_used(project_root: &Path) -> Result<usize> {
 /// references, and reflects human-resumed suspensions. One bad entry never
 /// stalls the others.
 pub fn recover_and_reconcile(project_root: &Path) -> Result<()> {
+    recover_and_reconcile_with_observer(project_root, &|_, _| {})
+}
+
+pub(crate) fn recover_and_reconcile_with_observer(
+    project_root: &Path,
+    observer: &dyn Fn(&Path, &Dispatch),
+) -> Result<()> {
     for ledger in queue::list_ledgers(project_root)? {
         let work_item_id = ledger.work_item_id.clone();
         let Some(dispatch) = ledger.latest() else {
             continue;
         };
+        observer(project_root, dispatch);
         let result = match dispatch.status {
             DispatchStatus::Queued => reconcile_queued(project_root, dispatch),
             DispatchStatus::Claimed | DispatchStatus::Running => {

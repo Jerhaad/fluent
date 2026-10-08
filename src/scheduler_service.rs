@@ -793,6 +793,11 @@ pub struct SchedulerService {
     coordinators: HashMap<PathBuf, crate::scheduler::CoordinatorLease>,
     prepared_projects: HashSet<PathBuf>,
     stopping_projects: HashSet<PathBuf>,
+    failed_stop_projects: HashSet<PathBuf>,
+    #[cfg(feature = "test-support")]
+    recovery_observer: Option<Arc<dyn Fn(&Path, &crate::queue::Dispatch) + Send + Sync>>,
+    #[cfg(feature = "test-support")]
+    stop_check: Option<Arc<dyn Fn(&Path) -> Result<()> + Send + Sync>>,
     prepare_host_execution: bool,
     reused_coordinator: Option<crate::scheduler::CoordinatorMetadata>,
     poll_failures: Vec<String>,
@@ -818,6 +823,11 @@ impl SchedulerService {
             coordinators: HashMap::new(),
             prepared_projects: HashSet::new(),
             stopping_projects: HashSet::new(),
+            failed_stop_projects: HashSet::new(),
+            #[cfg(feature = "test-support")]
+            recovery_observer: None,
+            #[cfg(feature = "test-support")]
+            stop_check: None,
             prepare_host_execution: false,
             reused_coordinator: None,
             poll_failures: Vec::new(),
@@ -953,6 +963,7 @@ impl SchedulerService {
     /// the real queue and launch those claims on service-owned workers.
     pub fn poll_once(&mut self) -> Result<()> {
         self.poll_failures.clear();
+        self.failed_stop_projects.clear();
         self.reconcile_stops()?;
         let mut projects = read_registry(&self.home_dir)?
             .into_keys()
@@ -1000,6 +1011,15 @@ impl SchedulerService {
                 }
             }
         }
+        #[cfg(feature = "test-support")]
+        if let Some(observer) = &self.recovery_observer {
+            crate::scheduler::recover_and_reconcile_with_observer(project, observer.as_ref())
+                .with_context(|| format!("recover project {}", project.display()))?;
+        } else {
+            crate::scheduler::recover_and_reconcile(project)
+                .with_context(|| format!("recover project {}", project.display()))?;
+        }
+        #[cfg(not(feature = "test-support"))]
         crate::scheduler::recover_and_reconcile(project)
             .with_context(|| format!("recover project {}", project.display()))?;
         let capacity =
@@ -1051,6 +1071,20 @@ impl SchedulerService {
         self.reap_finished()?;
         let projects = self.coordinators.keys().cloned().collect::<Vec<_>>();
         for project in projects {
+            if self.failed_stop_projects.contains(&project) {
+                continue;
+            }
+            #[cfg(feature = "test-support")]
+            if let Some(check) = &self.stop_check {
+                if let Err(error) = check(&project) {
+                    eprintln!(
+                        "[scheduler] project {} check stop: {error:#}",
+                        project.display()
+                    );
+                    self.failed_stop_projects.insert(project.clone());
+                    continue;
+                }
+            }
             let stop_requested = match crate::scheduler::service_stop_requested(
                 &project,
                 self.coordinators
@@ -1063,6 +1097,7 @@ impl SchedulerService {
                         "[scheduler] project {} check stop: {error:#}",
                         project.display()
                     );
+                    self.failed_stop_projects.insert(project.clone());
                     continue;
                 }
             };
@@ -1077,12 +1112,27 @@ impl SchedulerService {
                             "[scheduler] project {} finish execution: {error:#}",
                             project.display()
                         );
+                        self.failed_stop_projects.insert(project.clone());
                         continue;
                     }
                     self.prepared_projects.remove(&project);
                 }
                 self.coordinators.remove(&project);
             }
+        }
+        Ok(())
+    }
+
+    fn tick(
+        &mut self,
+        now: Instant,
+        next_poll: &mut Instant,
+        poll_interval: Duration,
+    ) -> Result<()> {
+        self.reconcile_stops()?;
+        if now >= *next_poll {
+            self.poll_once()?;
+            *next_poll = now + poll_interval;
         }
         Ok(())
     }
@@ -1105,6 +1155,29 @@ impl SchedulerService {
     #[cfg(feature = "test-support")]
     fn take_reused_coordinator(&mut self) -> Option<crate::scheduler::CoordinatorMetadata> {
         self.reused_coordinator.take()
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn set_recovery_observer(
+        &mut self,
+        observer: Arc<dyn Fn(&Path, &crate::queue::Dispatch) + Send + Sync>,
+    ) {
+        self.recovery_observer = Some(observer);
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn set_stop_check(&mut self, check: Arc<dyn Fn(&Path) -> Result<()> + Send + Sync>) {
+        self.stop_check = Some(check);
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn tick_for_test(
+        &mut self,
+        now: Instant,
+        next_poll: &mut Instant,
+        poll_interval: Duration,
+    ) -> Result<()> {
+        self.tick(now, next_poll, poll_interval)
     }
 
     #[cfg(feature = "test-support")]
@@ -1216,11 +1289,7 @@ fn run_service_with_runner(
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
             Err(error) => return Err(error).context("accept scheduler service connection"),
         }
-        service.reconcile_stops()?;
-        if Instant::now() >= next_poll {
-            service.poll_once()?;
-            next_poll = Instant::now() + poll_interval;
-        }
+        service.tick(Instant::now(), &mut next_poll, poll_interval)?;
         std::thread::sleep(Duration::from_millis(50));
     }
 }
@@ -1247,22 +1316,18 @@ fn run_transportless_service(
         if SERVICE_SHUTDOWN.load(Ordering::Acquire) {
             return Ok(());
         }
-        service.reconcile_stops()?;
+        service.tick(Instant::now(), &mut next_poll, poll_interval)?;
         if owned_coordinator && !service.owns_coordinator() {
             return Ok(());
         }
-        if Instant::now() >= next_poll {
-            service.poll_once()?;
-            if let Some(metadata) = service.take_reused_coordinator() {
-                eprintln!(
-                    "[scheduler] reusing live coordinator {} running {} ({})",
-                    metadata.instance_id, metadata.build.version, metadata.build.hash
-                );
-                return Ok(());
-            }
-            owned_coordinator |= service.owns_coordinator();
-            next_poll = Instant::now() + poll_interval;
+        if let Some(metadata) = service.take_reused_coordinator() {
+            eprintln!(
+                "[scheduler] reusing live coordinator {} running {} ({})",
+                metadata.instance_id, metadata.build.version, metadata.build.hash
+            );
+            return Ok(());
         }
+        owned_coordinator |= service.owns_coordinator();
         std::thread::sleep(Duration::from_millis(50));
     }
 }
