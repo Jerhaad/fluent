@@ -5866,27 +5866,54 @@ work_queue_remove_unknown_errors)
 
 WHEN a shared service answers health with a compatible protocol, a verifiable
 current lease and metadata, and the requested version and executable SHA-256,
-THE SYSTEM SHALL reuse that service. IF either build field differs, THE SYSTEM
-SHALL reject reuse, report both builds, and direct the operator to run
-`fluent scheduler stop --all` before explicitly starting the new build.
+THE SYSTEM SHALL reuse that service through both direct and managed startup.
+Test: tests/scheduler_service.rs (scheduler_host_upgrade_upgrade_reuses_matching_service,
+scheduler_host_upgrade_managed_start_checks_observed_build)
+
+IF either build field differs, THE SYSTEM SHALL reject reuse, report both
+builds, and direct the operator to run `fluent scheduler stop --all` before
+explicitly starting the new build. These checks also apply after a newly
+started managed service answers health.
+Test: tests/scheduler_service.rs (scheduler_host_upgrade_upgrade_rejects_mismatched_build,
+scheduler_host_upgrade_managed_start_checks_observed_build)
+
 IF the live service is draining or its identity cannot be verified, THE SYSTEM
 SHALL reject reuse without replacing its socket or starting another owner.
-These checks apply both to `fluent scheduler run` and to a managed start after
-the new service answers health.
+Test: tests/scheduler_service.rs (scheduler_host_upgrade_upgrade_preserves_unverified_owner,
+scheduler_host_upgrade_preserves_bad_health_socket,
+scheduler_host_upgrade_simultaneous_starts_preserve_owner)
 
 WHEN the identified service accepts `fluent scheduler stop --all`, THE SYSTEM
 SHALL stop claims across all registered projects and reject new socket
-submissions without persisting requests or dispatches. It SHALL let all owned
-workers settle and reconcile their results before publishing an
-instance-specific stop result and releasing ownership. A repeated request for
-the same instance SHALL return the retained result. A request naming an
-earlier instance SHALL leave its replacement running. A new build MAY start
-after the old instance completes its drain; queued work remains available.
+submissions without persisting requests or dispatches.
+Test: tests/scheduler_service.rs (scheduler_host_upgrade_drains_two_projects_through_socket)
+
+WHEN every worker owned by the draining service has settled, THE SYSTEM SHALL
+reconcile their results before publishing an instance-specific stop result and
+releasing ownership.
+Test: tests/scheduler_service.rs (scheduler_host_upgrade_drains_two_projects_through_socket,
+scheduler_host_upgrade_preserves_settled_worker_after_child_crash)
+Test: src/scheduler_service.rs (stop_result_tests::rejects_published_result_when_lease_identity_is_unreadable)
+
+WHEN a stop request repeats for the same instance, THE SYSTEM SHALL return its
+retained result after ownership release. IF a request names an earlier
+instance, THE SYSTEM SHALL leave its replacement running.
+Test: tests/scheduler_service.rs (scheduler_host_upgrade_drain_restart_and_replay,
+scheduler_host_upgrade_replays_published_result_after_child_crash,
+scheduler_host_upgrade_rejects_old_drain_after_ack_crash)
+
+WHEN the old instance completes its drain and the operator starts a new build,
+THE SYSTEM SHALL keep queued work available for that new instance.
+Test: tests/scheduler_service.rs (scheduler_host_upgrade_drain_restart_and_replay,
+scheduler_host_upgrade_drains_two_projects_through_socket)
 
 IF a reachable legacy service lacks verifiable drain control, THE SYSTEM SHALL
 identify the running build and direct the operator to stop its original
 supervised process, wait for active work to settle, then start the new build.
+Test: tests/scheduler_service.rs (scheduler_host_upgrade_upgrade_preserves_unverified_owner)
+
 Ordinary `fluent scheduler stop` continues to stop only its project coordinator.
+Test: tests/scheduler_service.rs (scheduler_upgrade_project_stop_scope)
 
 ### B1
 

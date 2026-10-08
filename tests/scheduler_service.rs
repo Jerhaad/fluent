@@ -582,6 +582,11 @@ fn scheduler_upgrade_project_stop_scope() {
 fn scheduler_host_upgrade_upgrade_reuses_matching_service() {
     let home = TempDir::new().unwrap();
     let handle = start_upgrade_service(home.path(), fake_build());
+    let socket = scheduler_service::socket_path(home.path());
+    let original = scheduler_service::send_health_request(&socket)
+        .unwrap()
+        .instance_id
+        .unwrap();
     scheduler_service::run_service_with_socket_test_runner(
         home.path(),
         fake_build(),
@@ -589,10 +594,9 @@ fn scheduler_host_upgrade_upgrade_reuses_matching_service() {
         Arc::new(NeedsUserRunner::default()),
     )
     .unwrap();
-    let health =
-        scheduler_service::send_health_request(&scheduler_service::socket_path(home.path()))
-            .unwrap();
-    assert!(health.instance_id.is_some());
+    let health = scheduler_service::send_health_request(&socket).unwrap();
+    assert_eq!(health.instance_id.as_deref(), Some(original.as_str()));
+    assert!(socket.exists());
     scheduler_service::stop_service(home.path()).unwrap();
     handle.join().unwrap().unwrap();
 }
@@ -722,6 +726,10 @@ fn scheduler_host_upgrade_simultaneous_starts_preserve_owner() {
 fn scheduler_host_upgrade_upgrade_rejects_mismatched_build() {
     let home = TempDir::new().unwrap();
     let handle = start_upgrade_service(home.path(), fake_build());
+    let socket = scheduler_service::socket_path(home.path());
+    let original = scheduler_service::send_health_request(&socket)
+        .unwrap()
+        .instance_id;
     for (version, hash) in [("0.2.0-test", "abc123def456"), ("0.1.0-test", "different")] {
         let requested = BuildIdentity {
             version: version.into(),
@@ -735,6 +743,13 @@ fn scheduler_host_upgrade_upgrade_rejects_mismatched_build() {
         )
         .unwrap_err();
         assert!(error.to_string().contains("stop --all"));
+        assert_eq!(
+            scheduler_service::send_health_request(&socket)
+                .unwrap()
+                .instance_id,
+            original
+        );
+        assert!(socket.exists());
     }
     scheduler_service::stop_service(home.path()).unwrap();
     handle.join().unwrap().unwrap();
@@ -869,11 +884,13 @@ fn scheduler_host_upgrade_drains_two_projects_through_socket() {
         .unwrap()
         .instance_id
         .unwrap();
+    let stopping_instance = instance.clone();
     let home_path = home.path().to_owned();
     let (tx, rx) = std::sync::mpsc::channel();
     let stopping = std::thread::spawn(move || {
         tx.send(scheduler_service::stop_service_instance(
-            &home_path, &instance,
+            &home_path,
+            &stopping_instance,
         ))
         .unwrap()
     });
@@ -884,6 +901,20 @@ fn scheduler_host_upgrade_drains_two_projects_through_socket() {
         assert!(Instant::now() < deadline, "drain was not acknowledged");
         std::thread::sleep(Duration::from_millis(20));
     }
+    let rejected_reuse = scheduler_service::run_service_with_socket_test_runner(
+        home.path(),
+        fake_build(),
+        1,
+        Arc::new(NeedsUserRunner::default()),
+    )
+    .unwrap_err();
+    assert!(rejected_reuse.to_string().contains("draining"));
+    assert_eq!(
+        scheduler_service::send_health_request(&socket)
+            .unwrap()
+            .instance_id,
+        Some(instance.clone())
+    );
     for project in [first.path(), second.path()] {
         let before = fluent::queue::list(project).unwrap();
         let request =

@@ -1958,6 +1958,27 @@ mod stop_result_tests {
     use super::*;
 
     #[test]
+    fn rejects_published_result_when_lease_identity_is_unreadable() {
+        let home = tempfile::tempdir().unwrap();
+        let instance_id = "0123456789abcdef0123456789abcdef";
+        fs::create_dir_all(service_state_root(home.path())).unwrap();
+        let result = ServiceStopRecord {
+            schema: SERVICE_METADATA_SCHEMA,
+            instance_id: instance_id.to_owned(),
+            build: BuildIdentity {
+                version: "test".to_owned(),
+                hash: "test".to_owned(),
+            },
+            failures: Vec::new(),
+        };
+        write_stop_record(&service_result_path(home.path(), instance_id), &result).unwrap();
+        fs::create_dir(service_lock_path(home.path())).unwrap();
+
+        assert!(released_stop_result(home.path(), instance_id).is_err());
+        assert!(stop_service_instance(home.path(), instance_id).is_err());
+    }
+
+    #[test]
     fn accepts_result_published_before_owner_exit_check() {
         let home = tempfile::tempdir().unwrap();
         let instance_id = "0123456789abcdef0123456789abcdef";
@@ -2003,7 +2024,7 @@ fn settled_stop_result(result: ServiceStopRecord) -> Result<ServiceStopRecord> {
 }
 
 fn stop_result_released(home: &Path, instance_id: &str) -> Result<bool> {
-    if lock_identity(home).ok().as_deref() != Some(instance_id) {
+    if lock_identity(home)? != instance_id {
         return Ok(true);
     }
     Ok(!service_lease_live(home)?)
