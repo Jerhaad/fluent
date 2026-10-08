@@ -3,6 +3,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -55,6 +56,83 @@ fn start_upgrade_service_with_runner(
         std::thread::sleep(Duration::from_millis(20));
     }
     panic!("shared service did not answer health");
+}
+
+#[cfg(feature = "test-support")]
+struct SocketServiceManager {
+    home: PathBuf,
+    actual_build: BuildIdentity,
+    starts: AtomicUsize,
+    worker: Mutex<Option<std::thread::JoinHandle<anyhow::Result<()>>>>,
+}
+
+#[cfg(feature = "test-support")]
+impl SocketServiceManager {
+    fn new(home: &std::path::Path, actual_build: BuildIdentity) -> Self {
+        Self {
+            home: home.to_owned(),
+            actual_build,
+            starts: AtomicUsize::new(0),
+            worker: Mutex::new(None),
+        }
+    }
+
+    fn join(&self) {
+        if let Some(worker) = self.worker.lock().unwrap().take() {
+            worker.join().unwrap().unwrap();
+        }
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl ServiceManager for SocketServiceManager {
+    fn install_or_update(
+        &self,
+        _: &std::path::Path,
+        _: &BuildIdentity,
+        _: &std::path::Path,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn enable(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn disable(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn start(&self) -> anyhow::Result<()> {
+        self.starts.fetch_add(1, Ordering::SeqCst);
+        let home = self.home.clone();
+        let build = self.actual_build.clone();
+        *self.worker.lock().unwrap() = Some(std::thread::spawn(move || {
+            let result = scheduler_service::run_service_with_socket_test_runner(
+                &home,
+                build,
+                1,
+                Arc::new(NeedsUserRunner::default()),
+            );
+            if let Err(error) = &result {
+                eprintln!("managed test service: {error:#}");
+            }
+            result
+        }));
+        Ok(())
+    }
+    fn stop(&self) -> anyhow::Result<()> {
+        scheduler_service::stop_service(&self.home).map(|_| ())
+    }
+    fn drain(&self) -> anyhow::Result<()> {
+        self.stop()
+    }
+    fn is_installed(&self) -> bool {
+        true
+    }
+    fn is_enabled(&self) -> bool {
+        true
+    }
+    fn is_running(&self) -> bool {
+        self.worker.lock().unwrap().is_some()
+    }
 }
 
 #[cfg(feature = "test-support")]
@@ -290,19 +368,19 @@ fn scheduler_drain_replays_completed_result() {
 #[cfg(feature = "test-support")]
 fn scheduler_drain_waits_for_all_owned_workers() {
     let home = TempDir::new().unwrap();
-    let project = TempDir::new().unwrap();
-    fs::create_dir_all(project.path().join(".fluent")).unwrap();
-    fs::write(
-        project.path().join(".fluent/config.yaml"),
-        "scheduler:\n  local-concurrency: 2\n",
-    )
-    .unwrap();
+    let first = TempDir::new().unwrap();
+    let second = TempDir::new().unwrap();
     let runner = Arc::new(BlockingRunner::default());
-    let mut service = registered_service(home.path(), project.path(), runner.clone());
+    let mut service = registered_service(home.path(), first.path(), runner.clone());
+    let identity = scheduler_service::assign_checkout_identity(second.path()).unwrap();
+    scheduler_service::register_checkout(home.path(), second.path(), &identity).unwrap();
     service.set_service_identity_for_test("0123456789abcdef0123456789abcdef");
-    for work in ["wi-drain-first", "wi-drain-second"] {
-        create_execution_ready_work(project.path(), work);
-        fluent::queue::add(project.path(), work, None).unwrap();
+    for (project, work) in [
+        (first.path(), "wi-drain-first"),
+        (second.path(), "wi-drain-second"),
+    ] {
+        create_execution_ready_work(project, work);
+        fluent::queue::add(project, work, None).unwrap();
     }
     service.poll_once().unwrap();
     runner.wait_for_started(2);
@@ -327,6 +405,15 @@ fn scheduler_drain_waits_for_all_owned_workers() {
     runner.release_one();
     service.join_workers().unwrap();
     assert_eq!(service.worker_count_for_test(), 0);
+    for (project, work) in [
+        (first.path(), "wi-drain-first"),
+        (second.path(), "wi-drain-second"),
+    ] {
+        assert_eq!(
+            fluent::queue::show(project, work).unwrap().status,
+            fluent::queue::DispatchStatus::NeedsUser
+        );
+    }
 }
 
 #[test]
@@ -427,8 +514,17 @@ fn scheduler_upgrade_starts_after_completed_drain() {
     assert_eq!(old.worker_count_for_test(), 0);
     drop(old);
     let runner = Arc::new(NeedsUserRunner::default());
+    let new_build = BuildIdentity {
+        version: "0.2.0-test".into(),
+        hash: "new-build".into(),
+    };
     let mut replacement =
-        scheduler_service::SchedulerService::new(home.path(), fake_build(), runner.clone());
+        scheduler_service::SchedulerService::new(home.path(), new_build.clone(), runner.clone());
+    let health = framed_exchange(
+        &mut replacement,
+        serde_json::json!({"kind":"health", "generation": scheduler_service::PROTOCOL_GENERATION}),
+    );
+    assert_eq!(health["build"], serde_json::to_value(&new_build).unwrap());
     replacement.poll_once().unwrap();
     replacement.join_workers().unwrap();
     assert_eq!(runner.calls.lock().unwrap().as_slice(), ["wi-retained"]);
@@ -499,6 +595,116 @@ fn scheduler_host_upgrade_upgrade_reuses_matching_service() {
     assert!(health.instance_id.is_some());
     scheduler_service::stop_service(home.path()).unwrap();
     handle.join().unwrap().unwrap();
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "test-support")]
+fn scheduler_host_upgrade_managed_start_checks_observed_build() {
+    let home = TempDir::new().unwrap();
+    let manager = SocketServiceManager::new(home.path(), fake_build());
+    let outcome =
+        scheduler_service::start_or_reuse_service(home.path(), &fake_build(), &manager).unwrap();
+    assert!(matches!(
+        outcome,
+        scheduler_service::ServiceStartOutcome::Started(_)
+    ));
+    assert_eq!(
+        scheduler_service::read_observed_build(home.path()).unwrap(),
+        Some(fake_build())
+    );
+    let reused =
+        scheduler_service::start_or_reuse_service(home.path(), &fake_build(), &manager).unwrap();
+    assert!(matches!(
+        reused,
+        scheduler_service::ServiceStartOutcome::Reused(_)
+    ));
+    assert_eq!(manager.starts.load(Ordering::SeqCst), 1);
+    let different = BuildIdentity {
+        version: "0.2.0-test".into(),
+        hash: fake_build().hash,
+    };
+    assert!(
+        scheduler_service::start_or_reuse_service(home.path(), &different, &manager)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("stop --all")
+    );
+    assert_eq!(manager.starts.load(Ordering::SeqCst), 1);
+    scheduler_service::stop_service(home.path()).unwrap();
+    manager.join();
+
+    let wrong_home = TempDir::new().unwrap();
+    let wrong = SocketServiceManager::new(wrong_home.path(), fake_build());
+    let error = scheduler_service::start_or_reuse_service(wrong_home.path(), &different, &wrong)
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("stop --all"));
+    assert_eq!(
+        scheduler_service::read_observed_build(wrong_home.path()).unwrap(),
+        None
+    );
+    assert_eq!(wrong.starts.load(Ordering::SeqCst), 1);
+    scheduler_service::stop_service(wrong_home.path()).unwrap();
+    wrong.join();
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "test-support")]
+fn scheduler_host_upgrade_simultaneous_starts_preserve_owner() {
+    let home = TempDir::new().unwrap();
+    let gate = Arc::new(std::sync::Barrier::new(3));
+    let mut starters = Vec::new();
+    for _ in 0..2 {
+        let home_path = home.path().to_owned();
+        let gate = gate.clone();
+        starters.push(std::thread::spawn(move || {
+            gate.wait();
+            let result = scheduler_service::run_service_with_socket_test_runner(
+                &home_path,
+                fake_build(),
+                1,
+                Arc::new(NeedsUserRunner::default()),
+            );
+            if let Err(error) = &result {
+                eprintln!("concurrent test service: {error:#}");
+            }
+            result
+        }));
+    }
+    gate.wait();
+    let socket = scheduler_service::socket_path(home.path());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let owner = loop {
+        if let Ok(health) = scheduler_service::send_health_request(&socket) {
+            break health.instance_id.unwrap();
+        }
+        assert!(Instant::now() < deadline, "neither starter answered health");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    while starters.iter().all(|thread| !thread.is_finished()) {
+        assert!(Instant::now() < deadline, "losing start did not finish");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        scheduler_service::send_health_request(&socket)
+            .unwrap()
+            .instance_id
+            .as_deref(),
+        Some(owner.as_str())
+    );
+    let metadata: scheduler_service::ServiceMetadata = serde_json::from_slice(
+        &fs::read(scheduler_service::service_state_root(home.path()).join("service.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(metadata.instance_id, owner);
+    assert!(socket.exists());
+    scheduler_service::stop_service(home.path()).unwrap();
+    for starter in starters {
+        starter.join().unwrap().unwrap();
+    }
 }
 
 #[test]
@@ -620,6 +826,108 @@ fn scheduler_host_upgrade_drain_restart_and_replay() {
             .instance_id
             .unwrap();
     assert_ne!(result.instance_id, new_instance);
+    scheduler_service::stop_service(home.path()).unwrap();
+    replacement.join().unwrap().unwrap();
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "test-support")]
+fn scheduler_host_upgrade_drains_two_projects_through_socket() {
+    let home = TempDir::new().unwrap();
+    let first = TempDir::new().unwrap();
+    let second = TempDir::new().unwrap();
+    for project in [first.path(), second.path()] {
+        fs::create_dir_all(project.join(".fluent")).unwrap();
+        fs::write(
+            project.join(".fluent/config.yaml"),
+            "scheduler:\n  local-concurrency: 1\n",
+        )
+        .unwrap();
+        let identity = scheduler_service::assign_checkout_identity(project).unwrap();
+        scheduler_service::register_checkout(home.path(), project, &identity).unwrap();
+        for (work, priority) in [("wi-active", 2), ("wi-queued", 1)] {
+            create_execution_ready_work(project, work);
+            fluent::queue::add(project, work, Some(priority)).unwrap();
+        }
+        create_execution_ready_work(project, "wi-rejected");
+    }
+    let runner = Arc::new(BlockingRunner::default());
+    let service = start_upgrade_service_with_runner(home.path(), fake_build(), runner.clone());
+    runner.wait_for_started(2);
+    let socket = scheduler_service::socket_path(home.path());
+    let instance = scheduler_service::send_health_request(&socket)
+        .unwrap()
+        .instance_id
+        .unwrap();
+    let home_path = home.path().to_owned();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let stopping = std::thread::spawn(move || {
+        tx.send(scheduler_service::stop_service_instance(
+            &home_path, &instance,
+        ))
+        .unwrap()
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !scheduler_service::send_health_request(&socket)
+        .is_ok_and(|health| health.state == Some(scheduler_service::ServiceState::Draining))
+    {
+        assert!(Instant::now() < deadline, "drain was not acknowledged");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    for project in [first.path(), second.path()] {
+        let before = fluent::queue::list(project).unwrap();
+        let request =
+            scheduler_service::AttemptExecutionRequest::new("wi-rejected", "attempt-rejected")
+                .unwrap();
+        assert!(scheduler_service::send_execution_request(&socket, project, &request).is_err());
+        assert!(
+            !project
+                .join(".fluent/work/scheduler/requests")
+                .join(format!("{}.json", request.id))
+                .exists()
+        );
+        assert_eq!(fluent::queue::list(project).unwrap(), before);
+        assert_eq!(
+            fluent::queue::show(project, "wi-queued").unwrap().status,
+            fluent::queue::DispatchStatus::Queued
+        );
+    }
+    assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+    runner.release_one();
+    runner.release_one();
+    let result = rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+    stopping.join().unwrap();
+    service.join().unwrap().unwrap();
+    assert!(result.failures.is_empty());
+    for project in [first.path(), second.path()] {
+        assert_eq!(
+            fluent::queue::show(project, "wi-active").unwrap().status,
+            fluent::queue::DispatchStatus::NeedsUser
+        );
+        assert_eq!(
+            fluent::queue::show(project, "wi-queued").unwrap().status,
+            fluent::queue::DispatchStatus::Queued
+        );
+    }
+    let replacement = start_upgrade_service(
+        home.path(),
+        BuildIdentity {
+            version: "0.2.0-test".into(),
+            hash: "new-hash".into(),
+        },
+    );
+    for project in [first.path(), second.path()] {
+        while fluent::queue::show(project, "wi-queued").unwrap().status
+            != fluent::queue::DispatchStatus::NeedsUser
+        {
+            assert!(
+                Instant::now() < deadline + Duration::from_secs(5),
+                "replacement did not process queued work"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
     scheduler_service::stop_service(home.path()).unwrap();
     replacement.join().unwrap().unwrap();
 }
@@ -758,6 +1066,157 @@ fn scheduler_host_upgrade_rejects_old_drain_after_ack_crash() {
             .instance_id
             .as_deref(),
         Some(current.as_str())
+    );
+    scheduler_service::stop_service(&home).unwrap();
+    replacement.join().unwrap().unwrap();
+}
+
+#[test]
+#[ignore]
+#[cfg(all(unix, feature = "test-support"))]
+fn scheduler_host_upgrade_retries_request_after_pre_ack_crash() {
+    let home = TempDir::new().unwrap();
+    let marker = home.path().join("before-ack");
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "__scheduler_service_process_fixture",
+        ])
+        .env("FLUENT_SCHEDULER_TEST_HOME", home.path())
+        .env("FLUENT_SCHEDULER_TEST_PAUSE_BEFORE_DRAIN_ACK", &marker)
+        .env_remove("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT")
+        .spawn()
+        .unwrap();
+    let socket = scheduler_service::socket_path(home.path());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let instance = loop {
+        if let Ok(health) = scheduler_service::send_health_request(&socket) {
+            break health.instance_id.unwrap();
+        }
+        assert!(Instant::now() < deadline, "child did not start");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let root = scheduler_service::service_state_root(home.path());
+    fs::create_dir_all(root.join("stop-requests")).unwrap();
+    let request =
+        serde_json::json!({"schema":1,"instance_id":instance,"build":fake_build(),"failures":[]});
+    for path in [
+        root.join("stop-request.json"),
+        root.join("stop-requests").join(format!("{instance}.json")),
+    ] {
+        fs::write(path, serde_json::to_vec(&request).unwrap()).unwrap();
+    }
+    while !marker.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "child did not observe durable request"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(scheduler_service::stop_service_instance(home.path(), &instance).is_err());
+    let replacement = start_upgrade_service(home.path(), fake_build());
+    let current = scheduler_service::send_health_request(&socket)
+        .unwrap()
+        .instance_id
+        .unwrap();
+    assert_ne!(current, instance);
+    assert!(scheduler_service::stop_service_instance(home.path(), &instance).is_err());
+    assert_eq!(
+        scheduler_service::send_health_request(&socket)
+            .unwrap()
+            .instance_id
+            .as_deref(),
+        Some(current.as_str())
+    );
+    scheduler_service::stop_service(home.path()).unwrap();
+    replacement.join().unwrap().unwrap();
+}
+
+#[test]
+#[ignore]
+#[cfg(all(unix, feature = "test-support"))]
+fn scheduler_host_upgrade_preserves_settled_worker_after_child_crash() {
+    let root = TempDir::new().unwrap();
+    let home = root.path().join("home");
+    let project = root.path().join("project");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&project).unwrap();
+    let identity = scheduler_service::assign_checkout_identity(&project).unwrap();
+    scheduler_service::register_checkout(&home, &project, &identity).unwrap();
+    create_execution_ready_work(&project, "wi-settle-crash");
+    fluent::queue::add(&project, "wi-settle-crash", None).unwrap();
+    let release = root.path().join("release-worker");
+    let marker = root.path().join("settled-worker");
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "__scheduler_service_process_fixture",
+        ])
+        .env("FLUENT_SCHEDULER_TEST_HOME", &home)
+        .env("FLUENT_SCHEDULER_TEST_WORKER_RELEASE", &release)
+        .env("FLUENT_SCHEDULER_TEST_PAUSE_AFTER_SETTLEMENT", &marker)
+        .env_remove("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT")
+        .spawn()
+        .unwrap();
+    let socket = scheduler_service::socket_path(&home);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let instance = loop {
+        if fluent::queue::show(&project, "wi-settle-crash")
+            .is_ok_and(|dispatch| dispatch.status == fluent::queue::DispatchStatus::Running)
+        {
+            if let Ok(health) = scheduler_service::send_health_request(&socket) {
+                break health.instance_id.unwrap();
+            }
+        }
+        assert!(Instant::now() < deadline, "child did not claim work");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let home_path = home.clone();
+    let stopped_instance = instance.clone();
+    let stopping = std::thread::spawn(move || {
+        scheduler_service::stop_service_instance(&home_path, &stopped_instance)
+    });
+    while !scheduler_service::send_health_request(&socket)
+        .is_ok_and(|health| health.state == Some(scheduler_service::ServiceState::Draining))
+    {
+        assert!(Instant::now() < deadline, "drain was not acknowledged");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    fs::write(&release, b"release").unwrap();
+    while !marker.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "worker did not settle before publication"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        fluent::queue::show(&project, "wi-settle-crash")
+            .unwrap()
+            .status,
+        fluent::queue::DispatchStatus::NeedsUser
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(stopping.join().unwrap().is_err());
+    let replacement = start_upgrade_service(&home, fake_build());
+    assert_ne!(
+        scheduler_service::send_health_request(&socket)
+            .unwrap()
+            .instance_id
+            .as_deref(),
+        Some(instance.as_str())
+    );
+    assert!(scheduler_service::stop_service_instance(&home, &instance).is_err());
+    assert_eq!(
+        fluent::queue::show(&project, "wi-settle-crash")
+            .unwrap()
+            .status,
+        fluent::queue::DispatchStatus::NeedsUser
     );
     scheduler_service::stop_service(&home).unwrap();
     replacement.join().unwrap().unwrap();
@@ -2881,7 +3340,18 @@ fn __scheduler_service_process_fixture() {
             Arc::new(CrashPrefixRunner),
         )
         .unwrap();
-    } else if std::env::var_os("FLUENT_SCHEDULER_TEST_PAUSE_AFTER_RESULT").is_some() {
+    } else if let Some(release) = std::env::var_os("FLUENT_SCHEDULER_TEST_WORKER_RELEASE") {
+        scheduler_service::run_service_with_socket_test_runner(
+            std::path::Path::new(&home),
+            fake_build(),
+            1,
+            Arc::new(FileGateRunner(PathBuf::from(release))),
+        )
+        .unwrap();
+    } else if std::env::var_os("FLUENT_SCHEDULER_TEST_PAUSE_AFTER_RESULT").is_some()
+        || std::env::var_os("FLUENT_SCHEDULER_TEST_PAUSE_BEFORE_DRAIN_ACK").is_some()
+        || std::env::var_os("FLUENT_SCHEDULER_TEST_PAUSE_AFTER_SETTLEMENT").is_some()
+    {
         scheduler_service::run_service_with_socket_test_runner(
             std::path::Path::new(&home),
             fake_build(),
@@ -2910,6 +3380,26 @@ fn __scheduler_service_process_fixture() {
 
 #[cfg(feature = "test-support")]
 struct CrashPrefixRunner;
+
+#[cfg(feature = "test-support")]
+struct FileGateRunner(PathBuf);
+
+#[cfg(feature = "test-support")]
+impl fluent::scheduler::AttemptRunner for FileGateRunner {
+    fn run(
+        &self,
+        project: &std::path::Path,
+        work: &str,
+        attempt: &str,
+        _: bool,
+    ) -> anyhow::Result<fluent::scheduler::AttemptOutcome> {
+        while !self.0.exists() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        persist_runner_needs_user(project, work, attempt);
+        Ok(fluent::scheduler::AttemptOutcome::NeedsUser)
+    }
+}
 
 #[cfg(feature = "test-support")]
 impl fluent::scheduler::AttemptRunner for CrashPrefixRunner {

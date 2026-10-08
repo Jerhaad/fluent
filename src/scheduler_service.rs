@@ -1132,6 +1132,15 @@ impl SchedulerService {
                 &self.home_dir,
                 &identity.instance_id,
             ))? {
+                #[cfg(feature = "test-support")]
+                if let Some(marker) =
+                    std::env::var_os("FLUENT_SCHEDULER_TEST_PAUSE_BEFORE_DRAIN_ACK")
+                {
+                    fs::write(marker, b"requested")?;
+                    loop {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                }
                 self.accept_drain(&record.instance_id)?;
             }
         }
@@ -1738,6 +1747,13 @@ fn run_service_with_runner(
         }
         service.tick(Instant::now(), &mut next_poll, poll_interval)?;
         if service.draining && service.workers.is_empty() {
+            #[cfg(feature = "test-support")]
+            if let Some(marker) = std::env::var_os("FLUENT_SCHEDULER_TEST_PAUSE_AFTER_SETTLEMENT") {
+                fs::write(marker, b"settled")?;
+                loop {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
             service.finish_prepared_projects();
             let result = ServiceStopRecord {
                 schema: SERVICE_METADATA_SCHEMA,

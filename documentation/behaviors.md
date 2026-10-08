@@ -5862,6 +5862,32 @@ work_queue_remove_unknown_errors)
 
 ## Scheduler
 
+### Shared service lifecycle
+
+WHEN a shared service answers health with a compatible protocol, a verifiable
+current lease and metadata, and the requested version and executable SHA-256,
+THE SYSTEM SHALL reuse that service. IF either build field differs, THE SYSTEM
+SHALL reject reuse, report both builds, and direct the operator to run
+`fluent scheduler stop --all` before explicitly starting the new build.
+IF the live service is draining or its identity cannot be verified, THE SYSTEM
+SHALL reject reuse without replacing its socket or starting another owner.
+These checks apply both to `fluent scheduler run` and to a managed start after
+the new service answers health.
+
+WHEN the identified service accepts `fluent scheduler stop --all`, THE SYSTEM
+SHALL stop claims across all registered projects and reject new socket
+submissions without persisting requests or dispatches. It SHALL let all owned
+workers settle and reconcile their results before publishing an
+instance-specific stop result and releasing ownership. A repeated request for
+the same instance SHALL return the retained result. A request naming an
+earlier instance SHALL leave its replacement running. A new build MAY start
+after the old instance completes its drain; queued work remains available.
+
+IF a reachable legacy service lacks verifiable drain control, THE SYSTEM SHALL
+identify the running build and direct the operator to stop its original
+supervised process, wait for active work to settle, then start the new build.
+Ordinary `fluent scheduler stop` continues to stop only its project coordinator.
+
 ### B1
 
 WHEN `fluent scheduler run` is invoked,

@@ -4414,6 +4414,26 @@ on disk for operator inspection.
 
 ### Local scheduler coordinator
 
+The shared scheduler service elects one owner across registered projects with
+`~/.config/fluent/scheduler/service.lock`. Its socket health response and
+`service.json` metadata must name that lease's instance, protocol generation,
+running state, version, and executable SHA-256 before a start can reuse it.
+Both startup entry paths check these fields, including after a managed start
+answers health. A different build requires `fluent scheduler stop --all`,
+followed by an explicit `fluent scheduler run` with the new build. A reachable
+service whose identity cannot be verified is preserved for manual inspection.
+
+`fluent scheduler stop --all` addresses the current service instance. It
+durably records the request, stops new claims across every registered project,
+rejects new socket submissions without persisting them, and waits for owned
+workers and result reconciliation. It publishes an instance-specific stop
+result before releasing the socket and lease. Repeated requests for that
+instance replay its result; an old request cannot drain a replacement. A
+crash before the result leaves an interrupted drain to inspect and retry. If
+the old service lacks verifiable drain control, stop its original supervised
+process, wait for active work to settle, then run the new build. Ordinary
+`fluent scheduler stop` remains scoped to one project.
+
 `fluent scheduler run` elects a single coordinator per project using a
 lifetime `flock` lease. Immediately after election, the coordinator atomically
 writes `coordinator.json` beside the lease. This schema-versioned record contains
