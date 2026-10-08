@@ -22,6 +22,10 @@ CASES = (
 )
 
 
+def is_java_21_version(output: str) -> bool:
+    return bool(re.search(r'(?:\bversion "21(?:\.|"))|(?:\bopenjdk 21(?:\.|\s|$))', output))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--suite", choices=["recovery"], required=True)
@@ -37,7 +41,7 @@ def main() -> int:
         version = subprocess.run(["java", "-version"], capture_output=True, text=True, check=True)
     except (OSError, subprocess.CalledProcessError) as error:
         parser.error(f"Java 21 is required: {error}")
-    if not re.search(r'(?:version "21\.|openjdk 21\.)', version.stderr + version.stdout):
+    if not is_java_21_version(version.stderr + version.stdout):
         parser.error(f"Java 21 is required: {version.stderr.strip()}")
 
     source = Path(__file__).resolve().parent

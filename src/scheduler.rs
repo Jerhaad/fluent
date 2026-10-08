@@ -535,12 +535,12 @@ fn reconcile_queued(project_root: &Path, dispatch: &Dispatch) -> Result<()> {
                 if let BoundAttemptState::Terminal(status) =
                     bound_attempt_terminal_status_for_item(&item, attempt_id)
                 {
-                    // A queued explicit resume is still waiting for the
-                    // scheduler when the Attempt remains paused. A normal
-                    // dispatch, however, may have been run in the foreground
-                    // and then paused again; record that outcome instead of
-                    // trying to launch it a second time.
-                    if status != DispatchStatus::NeedsUser || dispatch.intent == DispatchIntent::Run
+                    // A queued explicit resume may still have the previous
+                    // pause or failed Learner outcome. Let that resume run;
+                    // a normal dispatch may instead have finished in the
+                    // foreground and must publish its durable outcome.
+                    if dispatch.intent == DispatchIntent::Run
+                        || !matches!(status, DispatchStatus::NeedsUser | DispatchStatus::Blocked)
                     {
                         let _ = queue::reconcile_if_current(
                             project_root,
