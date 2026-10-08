@@ -970,7 +970,9 @@ impl SchedulerService {
             .collect::<Vec<_>>();
         projects.sort();
         for project in projects {
-            if self.stopping_projects.contains(&project) {
+            if self.stopping_projects.contains(&project)
+                || self.failed_stop_projects.contains(&project)
+            {
                 continue;
             }
             if let Err(error) = self.poll_project(&project) {

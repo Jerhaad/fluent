@@ -931,8 +931,11 @@ impl CoordinatorLease {
         if self.metadata.state == CoordinatorState::Draining {
             return Ok(());
         }
-        self.metadata.state = CoordinatorState::Draining;
-        write_coordinator_metadata(&self.project_root, &self.metadata)
+        let mut draining = self.metadata.clone();
+        draining.state = CoordinatorState::Draining;
+        write_coordinator_metadata(&self.project_root, &draining)?;
+        self.metadata = draining;
+        Ok(())
     }
 }
 

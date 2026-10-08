@@ -1729,6 +1729,64 @@ fn scheduler_isolation_bounds_retries_by_poll() {
 
 #[test]
 #[cfg(feature = "test-support")]
+fn scheduler_stop_acknowledgement_failure_blocks_queued_work() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let mut service = registered_service(
+        home.path(),
+        project.path(),
+        Arc::new(NeedsUserRunner::default()),
+    );
+    service.poll_once().unwrap();
+
+    create_execution_ready_work(project.path(), "wi-after-stop");
+    fluent::queue::add(project.path(), "wi-after-stop", Some(0)).unwrap();
+    let scheduler_dir = project.path().join(".fluent/work/scheduler");
+    let metadata_path = scheduler_dir.join("coordinator.json");
+    let metadata = fs::read(&metadata_path).unwrap();
+    let instance_id =
+        serde_json::from_slice::<serde_json::Value>(&metadata).unwrap()["instance_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+    fs::write(
+        scheduler_dir.join("stop-request.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema": 1,
+            "instance_id": instance_id,
+            "requested_at": chrono::Utc::now().to_rfc3339(),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::remove_file(&metadata_path).unwrap();
+    fs::create_dir(&metadata_path).unwrap();
+
+    service.poll_once().unwrap();
+    assert_eq!(
+        fluent::queue::show(project.path(), "wi-after-stop")
+            .unwrap()
+            .status,
+        fluent::queue::DispatchStatus::Queued
+    );
+
+    fs::remove_dir(&metadata_path).unwrap();
+    fs::write(&metadata_path, metadata).unwrap();
+    service.poll_once().unwrap();
+    assert_eq!(
+        fluent::queue::show(project.path(), "wi-after-stop")
+            .unwrap()
+            .status,
+        fluent::queue::DispatchStatus::Queued
+    );
+    assert!(matches!(
+        fluent::scheduler::status(project.path()).unwrap(),
+        fluent::scheduler::SchedulerStatus::Stopped
+    ));
+}
+
+#[test]
+#[cfg(feature = "test-support")]
 fn scheduler_isolation_bounds_failed_stop_checks_by_poll() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let home = TempDir::new().unwrap();
