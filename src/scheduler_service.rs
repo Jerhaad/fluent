@@ -1129,10 +1129,11 @@ impl SchedulerService {
         next_poll: &mut Instant,
         poll_interval: Duration,
     ) -> Result<()> {
-        self.reconcile_stops()?;
         if now >= *next_poll {
             self.poll_once()?;
             *next_poll = now + poll_interval;
+        } else {
+            self.reconcile_stops()?;
         }
         Ok(())
     }

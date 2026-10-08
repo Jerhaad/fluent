@@ -1775,6 +1775,42 @@ fn scheduler_isolation_bounds_failed_stop_checks_by_poll() {
 }
 
 #[test]
+#[cfg(feature = "test-support")]
+fn scheduler_isolation_checks_new_stop_failure_once_on_due_tick() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let mut service = registered_service(
+        home.path(),
+        project.path(),
+        Arc::new(NeedsUserRunner::default()),
+    );
+    service.poll_once().unwrap();
+    let checks = Arc::new(AtomicUsize::new(0));
+    let observed = checks.clone();
+    service.set_stop_check(Arc::new(move |_| {
+        observed.fetch_add(1, Ordering::SeqCst);
+        anyhow::bail!("fixture stop check failure")
+    }));
+
+    let due = std::time::Instant::now();
+    let interval = Duration::from_secs(1);
+    let mut next_poll = due;
+    service
+        .tick_for_test(due, &mut next_poll, interval)
+        .unwrap();
+    assert_eq!(checks.load(Ordering::SeqCst), 1);
+    service
+        .tick_for_test(due + Duration::from_millis(50), &mut next_poll, interval)
+        .unwrap();
+    assert_eq!(checks.load(Ordering::SeqCst), 1);
+    service
+        .tick_for_test(due + interval, &mut next_poll, interval)
+        .unwrap();
+    assert_eq!(checks.load(Ordering::SeqCst), 2);
+}
+
+#[test]
 fn scheduler_isolation_keeps_prior_claim_with_bad_sibling() {
     let home = TempDir::new().unwrap();
     let project = TempDir::new().unwrap();
