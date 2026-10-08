@@ -2246,39 +2246,72 @@ fn scheduler_host_recovery_crash_restart_and_project_isolation() {
     scheduler_service::register_checkout(&home, &healthy, &healthy_identity).unwrap();
     create_execution_ready_work(&healthy, "wi-crash");
     fluent::queue::add(&healthy, "wi-crash", Some(0)).unwrap();
-    fluent::queue::claim(&healthy, "wi-crash", "attempt-crash")
-        .unwrap()
-        .unwrap();
-    create_bound_attempt(
-        &healthy,
-        "wi-crash",
-        "attempt-crash",
-        fluent::work_model::AttemptStatus::Failed,
-    );
-
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .arg("--ignored")
-        .arg("--exact")
-        .arg("__scheduler_service_process_fixture")
-        .env("FLUENT_SCHEDULER_TEST_HOME", &home)
-        .env_remove("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT")
-        .spawn()
-        .unwrap();
+    let spawn = |crash: bool| {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("__scheduler_service_process_fixture")
+            .env("FLUENT_SCHEDULER_TEST_HOME", &home)
+            .env_remove("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT");
+        if crash {
+            command.env("FLUENT_SCHEDULER_TEST_CRASH_PREFIX", "1");
+        } else {
+            command.env_remove("FLUENT_SCHEDULER_TEST_CRASH_PREFIX");
+        }
+        command.spawn().unwrap()
+    };
+    let mut child = spawn(true);
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let result = loop {
         match fluent::queue::show(&healthy, "wi-crash") {
-            Ok(dispatch) if dispatch.status == fluent::queue::DispatchStatus::Failed => {
-                break Ok(());
+            Ok(dispatch) if dispatch.status == fluent::queue::DispatchStatus::Running => {
+                break Ok(dispatch);
             }
             _ if std::time::Instant::now() >= deadline => {
-                break Err("real service did not reconcile crash claim");
+                break Err("real service did not own the running dispatch");
             }
             _ => std::thread::sleep(Duration::from_millis(10)),
         }
     };
+    let owned = result.as_ref().ok().is_some_and(|dispatch| {
+        fluent::lease::is_leased_checked(&fluent::queue::dispatch_lease_path(&healthy, "wi-crash"))
+            .unwrap()
+            && dispatch.bound_attempt_id.is_some()
+            && child.try_wait().unwrap().is_none()
+    });
     child.kill().unwrap();
     child.wait().unwrap();
-    result.unwrap();
+    let running = result.unwrap();
+    assert!(owned, "first service did not own the dispatch lease");
+    let attempt_id = running.bound_attempt_id.unwrap();
+
+    let mut replacement = spawn(false);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let result = loop {
+        match fluent::queue::show(&healthy, "wi-crash") {
+            Ok(dispatch) if dispatch.status == fluent::queue::DispatchStatus::NeedsUser => {
+                break Ok(dispatch);
+            }
+            _ if std::time::Instant::now() >= deadline => {
+                break Err("replacement service did not settle the crashed dispatch");
+            }
+            _ => std::thread::sleep(Duration::from_millis(10)),
+        }
+    };
+    replacement.kill().unwrap();
+    replacement.wait().unwrap();
+    let settled = result.unwrap();
+    assert_eq!(settled.dispatch_id, running.dispatch_id);
+    assert_eq!(
+        settled.bound_attempt_id.as_deref(),
+        Some(attempt_id.as_str())
+    );
+    let item = fluent::work_model::WorkModelStore::new(&healthy)
+        .read_work_item("wi-crash")
+        .unwrap();
+    assert_eq!(item.attempts.len(), 1);
+    assert_eq!(item.attempts[0].id, attempt_id);
     assert!(matches!(
         fluent::scheduler::status(&healthy).unwrap(),
         fluent::scheduler::SchedulerStatus::Stopped
