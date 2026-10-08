@@ -4415,9 +4415,10 @@ on disk for operator inspection.
 ### Local scheduler coordinator
 
 The shared scheduler service elects one owner across registered projects with
-`~/.config/fluent/scheduler/service.lock`. Its socket health response and
-`service.json` metadata must name that lease's instance, protocol generation,
-running state, version, and executable SHA-256 before a start can reuse it.
+`~/.config/fluent/scheduler/service.lock`. Socket health reports the protocol
+generation. Before a start can reuse the service, health and `service.json`
+metadata must agree on the current lease's instance, running state, version,
+and executable SHA-256.
 Both startup entry paths check these fields, including after a managed start
 answers health. A different build requires `fluent scheduler stop --all`,
 followed by an explicit `fluent scheduler run` with the new build. A reachable
