@@ -1816,7 +1816,13 @@ fn __scheduler_service_process_fixture() {
         )
         .unwrap();
     } else {
-        scheduler_service::run_service(std::path::Path::new(&home), fake_build(), 1).unwrap();
+        scheduler_service::run_service_with_test_runner(
+            std::path::Path::new(&home),
+            fake_build(),
+            1,
+            Arc::new(NeedsUserRunner::default()),
+        )
+        .unwrap();
     }
 }
 

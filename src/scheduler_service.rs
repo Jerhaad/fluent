@@ -1141,6 +1141,7 @@ pub fn run_service(home_dir: &Path, build: BuildIdentity, poll_seconds: u64) -> 
         build,
         poll_seconds,
         Arc::new(crate::scheduler::CliAttemptRunner),
+        true,
     )
 }
 
@@ -1153,7 +1154,7 @@ pub fn run_service_with_test_runner(
     poll_seconds: u64,
     runner: Arc<dyn crate::scheduler::AttemptRunner>,
 ) -> Result<()> {
-    run_service_with_runner(home_dir, build, poll_seconds, runner)
+    run_service_with_runner(home_dir, build, poll_seconds, runner, false)
 }
 
 fn run_service_with_runner(
@@ -1161,13 +1162,20 @@ fn run_service_with_runner(
     build: BuildIdentity,
     poll_seconds: u64,
     runner: Arc<dyn crate::scheduler::AttemptRunner>,
+    prepare_host_execution: bool,
 ) -> Result<()> {
     if SERVICE_SHUTDOWN.load(Ordering::Acquire) {
         return Ok(());
     }
     #[cfg(feature = "test-support")]
     if std::env::var_os("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT").is_some() {
-        return run_transportless_service(home_dir, build, poll_seconds, runner);
+        return run_transportless_service(
+            home_dir,
+            build,
+            poll_seconds,
+            runner,
+            prepare_host_execution,
+        );
     }
     let path = socket_path(home_dir);
     if let Ok(health) = send_health_request(&path) {
@@ -1189,6 +1197,7 @@ fn run_service_with_runner(
     #[cfg(unix)]
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
     let mut service = SchedulerService::new_production(home_dir, build, runner);
+    service.prepare_host_execution = prepare_host_execution;
     let poll_interval = Duration::from_secs(poll_seconds.max(1));
     let mut next_poll = Instant::now();
     loop {
@@ -1222,8 +1231,10 @@ fn run_transportless_service(
     build: BuildIdentity,
     poll_seconds: u64,
     runner: Arc<dyn crate::scheduler::AttemptRunner>,
+    prepare_host_execution: bool,
 ) -> Result<()> {
     let mut service = SchedulerService::new_production(home_dir, build, runner);
+    service.prepare_host_execution = prepare_host_execution;
     let poll_interval = Duration::from_secs(poll_seconds.max(1));
     let mut next_poll = Instant::now();
     let mut owned_coordinator = false;
