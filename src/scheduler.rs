@@ -367,7 +367,7 @@ pub fn claim_available(
 
 /// Claim the next eligible queued dispatch, binding an Attempt id and acquiring
 /// its whole-Attempt lease before returning.
-fn claim_next(project_root: &Path) -> Result<Option<(DispatchToken, TaskLease)>> {
+pub(crate) fn claim_next(project_root: &Path) -> Result<Option<(DispatchToken, TaskLease)>> {
     let Some(dispatch) = pick_next_queued(project_root)? else {
         return Ok(None);
     };
@@ -392,10 +392,10 @@ pub fn project_local_capacity_used(project_root: &Path) -> Result<usize> {
         if matches!(
             active.status,
             DispatchStatus::Claimed | DispatchStatus::Running
-        ) && lease::is_leased(&queue::dispatch_lease_path(
+        ) && lease::is_leased_checked(&queue::dispatch_lease_path(
             project_root,
             &ledger.work_item_id,
-        )) {
+        ))? {
             used += 1;
         }
     }
@@ -425,7 +425,13 @@ pub fn recover_and_reconcile(project_root: &Path) -> Result<()> {
             _ => Ok(()),
         };
         if let Err(error) = result {
-            eprintln!("[scheduler] recovery skipped {work_item_id}: {error}");
+            eprintln!(
+                "[scheduler] project {} recovery work item {} dispatch {} generation {}: {error:#}",
+                project_root.display(),
+                work_item_id,
+                dispatch.dispatch_id,
+                dispatch.generation,
+            );
         }
     }
     Ok(())
@@ -578,7 +584,7 @@ fn reconcile_queued(project_root: &Path, dispatch: &Dispatch) -> Result<()> {
 /// resumes.
 fn reconcile_claim(project_root: &Path, dispatch: &Dispatch) -> Result<()> {
     let work_item_id = &dispatch.work_item_id;
-    if lease::is_leased(&queue::dispatch_lease_path(project_root, work_item_id)) {
+    if lease::is_leased_checked(&queue::dispatch_lease_path(project_root, work_item_id))? {
         return Ok(());
     }
 
@@ -588,7 +594,7 @@ fn reconcile_claim(project_root: &Path, dispatch: &Dispatch) -> Result<()> {
         dispatch.bound_attempt_id.as_deref(),
     )? {
         BoundAttemptState::Unbound => {
-            if lease::is_leased(&queue::dispatch_lease_path(project_root, work_item_id)) {
+            if lease::is_leased_checked(&queue::dispatch_lease_path(project_root, work_item_id))? {
                 return Ok(());
             }
             let _ = queue::requeue_if_current(
@@ -600,7 +606,7 @@ fn reconcile_claim(project_root: &Path, dispatch: &Dispatch) -> Result<()> {
             )?;
         }
         BoundAttemptState::Nonterminal => {
-            if lease::is_leased(&queue::dispatch_lease_path(project_root, work_item_id)) {
+            if lease::is_leased_checked(&queue::dispatch_lease_path(project_root, work_item_id))? {
                 return Ok(());
             }
             let _ = queue::requeue_if_current(
@@ -612,7 +618,7 @@ fn reconcile_claim(project_root: &Path, dispatch: &Dispatch) -> Result<()> {
             )?;
         }
         BoundAttemptState::Terminal(status) => {
-            if lease::is_leased(&queue::dispatch_lease_path(project_root, work_item_id)) {
+            if lease::is_leased_checked(&queue::dispatch_lease_path(project_root, work_item_id))? {
                 return Ok(());
             }
             let _ = queue::reconcile_if_current(

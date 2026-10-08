@@ -4482,6 +4482,17 @@ another one. Coordinator restart leaves an unclaimed resume queued. A resumed
 Attempt that pauses again terminalizes only the new dispatch at `needs-user`,
 preserving every earlier dispatch and requiring another explicit resume command.
 
+The shared scheduler service reads its registered checkouts on each poll. For
+each checkout it owns, it calls `recover_and_reconcile` before claiming fresh
+work, then starts a tracked worker for each claim before trying another claim.
+An error in one checkout's configuration, queue, coordinator, or worker is
+reported with its project and available dispatch identity while the service
+continues to later checkouts. Registry errors still stop the poll because the
+service cannot establish its project set. Automatic recovery retries on a later
+configured poll; it does not create a new pause or infer an Attempt outcome
+from a worker error. Reaping joins only finished workers, and shutdown joins
+every remaining worker before reporting collected failures.
+
 Before each poll, `recover_and_reconcile` reads model state first and
 then applies a generation-checked queue update, so recovery never nests
 the queue lock with Work, lineage, candidate, or follow-up locks. A

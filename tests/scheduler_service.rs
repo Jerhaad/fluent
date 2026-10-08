@@ -53,6 +53,24 @@ fn create_execution_ready_work(project: &std::path::Path, id: &str) {
         .unwrap();
 }
 
+fn persist_runner_needs_user(project: &std::path::Path, work_item_id: &str, attempt_id: &str) {
+    fluent::work_model::WorkModelStore::new(project)
+        .mutate_work_item(work_item_id, |item| {
+            let attempt = item
+                .attempts
+                .iter_mut()
+                .find(|a| a.id == attempt_id)
+                .unwrap();
+            attempt.status = fluent::work_model::AttemptStatus::NeedsUser;
+            attempt.pause_kind = Some(fluent::work_model::PauseKind::WriterCompletion);
+            if let Some(task) = attempt.tasks.first_mut() {
+                task.status = fluent::work_model::TaskStatus::NeedsUser;
+            }
+            Ok(())
+        })
+        .unwrap();
+}
+
 fn registered_service(
     home: &std::path::Path,
     project: &std::path::Path,
@@ -110,12 +128,13 @@ struct NeedsUserRunner {
 impl fluent::scheduler::AttemptRunner for NeedsUserRunner {
     fn run(
         &self,
-        _project_root: &std::path::Path,
+        project_root: &std::path::Path,
         work_item_id: &str,
-        _attempt_id: &str,
+        attempt_id: &str,
         _tester_no_sandbox: bool,
     ) -> anyhow::Result<fluent::scheduler::AttemptOutcome> {
         self.calls.lock().unwrap().push(work_item_id.into());
+        persist_runner_needs_user(project_root, work_item_id, attempt_id);
         Ok(fluent::scheduler::AttemptOutcome::NeedsUser)
     }
 }
@@ -154,9 +173,9 @@ impl BlockingRunner {
 impl fluent::scheduler::AttemptRunner for BlockingRunner {
     fn run(
         &self,
-        _project_root: &std::path::Path,
-        _work_item_id: &str,
-        _attempt_id: &str,
+        project_root: &std::path::Path,
+        work_item_id: &str,
+        attempt_id: &str,
         _tester_no_sandbox: bool,
     ) -> anyhow::Result<fluent::scheduler::AttemptOutcome> {
         let (lock, changed) = &*self.state;
@@ -167,6 +186,8 @@ impl fluent::scheduler::AttemptRunner for BlockingRunner {
             state = changed.wait(state).unwrap();
         }
         state.releases -= 1;
+        drop(state);
+        persist_runner_needs_user(project_root, work_item_id, attempt_id);
         Ok(fluent::scheduler::AttemptOutcome::NeedsUser)
     }
 }
@@ -1379,6 +1400,561 @@ fn execution_status_reads_authoritative_queue_outcome() {
             .as_str()
             .unwrap()
             .starts_with("attempt-")
+    );
+}
+
+#[test]
+fn scheduler_recovery_uncreated_attempt() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    create_execution_ready_work(project.path(), "wi-orphan");
+    fluent::queue::add(project.path(), "wi-orphan", Some(0)).unwrap();
+    let claimed = fluent::queue::claim(project.path(), "wi-orphan", "attempt-orphan")
+        .unwrap()
+        .unwrap();
+    let runner = Arc::new(NeedsUserRunner::default());
+    let mut service = registered_service(home.path(), project.path(), runner.clone());
+    service.poll_once().unwrap();
+    service.join_workers().unwrap();
+    let dispatch = fluent::queue::show(project.path(), "wi-orphan").unwrap();
+    assert_eq!(dispatch.dispatch_id, claimed.dispatch_id);
+    assert_eq!(dispatch.status, fluent::queue::DispatchStatus::NeedsUser);
+    assert_eq!(runner.calls.lock().unwrap().as_slice(), &["wi-orphan"]);
+    assert_eq!(
+        fluent::work_model::WorkModelStore::new(project.path())
+            .read_work_item("wi-orphan")
+            .unwrap()
+            .attempts
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn scheduler_isolation_continues_healthy_projects() {
+    let root = TempDir::new().unwrap();
+    let home = root.path().join("home");
+    let bad = root.path().join("00-bad");
+    let good = root.path().join("10-good");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&bad).unwrap();
+    fs::create_dir_all(&good).unwrap();
+    let runner = Arc::new(NeedsUserRunner::default());
+    let mut service = registered_service(&home, &bad, runner.clone());
+    let identity = scheduler_service::assign_checkout_identity(&good).unwrap();
+    scheduler_service::register_checkout(&home, &good, &identity).unwrap();
+    fs::create_dir_all(&bad.join(".fluent")).unwrap();
+    fs::write(
+        &bad.join(".fluent/config.yaml"),
+        "scheduler:\n  local-concurrency: invalid\n",
+    )
+    .unwrap();
+    create_execution_ready_work(&good, "wi-good");
+    fluent::queue::add(&good, "wi-good", Some(0)).unwrap();
+    service.poll_once().unwrap();
+    service.join_workers().unwrap();
+    assert_eq!(
+        fluent::queue::show(&good, "wi-good").unwrap().status,
+        fluent::queue::DispatchStatus::NeedsUser
+    );
+}
+
+fn create_bound_attempt(
+    project: &std::path::Path,
+    work_item_id: &str,
+    attempt_id: &str,
+    status: fluent::work_model::AttemptStatus,
+) {
+    let store = fluent::work_model::WorkModelStore::new(project);
+    let mut item = store.read_work_item(work_item_id).unwrap();
+    item.add_initial_attempt(attempt_id).unwrap();
+    item.attempts[0].status = status;
+    store.write_work_item(&item).unwrap();
+}
+
+#[derive(Default)]
+struct RecordingRunner(Mutex<Vec<String>>);
+
+impl fluent::scheduler::AttemptRunner for RecordingRunner {
+    fn run(
+        &self,
+        project: &std::path::Path,
+        work_item_id: &str,
+        attempt_id: &str,
+        _tester_no_sandbox: bool,
+    ) -> anyhow::Result<fluent::scheduler::AttemptOutcome> {
+        self.0.lock().unwrap().push(attempt_id.into());
+        persist_runner_needs_user(project, work_item_id, attempt_id);
+        Ok(fluent::scheduler::AttemptOutcome::NeedsUser)
+    }
+}
+
+#[test]
+fn scheduler_recovery_preserves_bound_attempt() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    create_execution_ready_work(project.path(), "wi-resume");
+    fluent::queue::add(project.path(), "wi-resume", Some(0)).unwrap();
+    fluent::queue::claim(project.path(), "wi-resume", "attempt-preserved")
+        .unwrap()
+        .unwrap();
+    create_bound_attempt(
+        project.path(),
+        "wi-resume",
+        "attempt-preserved",
+        fluent::work_model::AttemptStatus::Executing,
+    );
+    let runner = Arc::new(RecordingRunner::default());
+    let mut service = registered_service(home.path(), project.path(), runner.clone());
+    service.poll_once().unwrap();
+    service.join_workers().unwrap();
+    assert_eq!(runner.0.lock().unwrap().as_slice(), &["attempt-preserved"]);
+    let item = fluent::work_model::WorkModelStore::new(project.path())
+        .read_work_item("wi-resume")
+        .unwrap();
+    assert_eq!(item.attempts.len(), 1);
+    assert_eq!(item.attempts[0].id, "attempt-preserved");
+}
+
+#[test]
+fn scheduler_recovery_publishes_existing_outcome() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    create_execution_ready_work(project.path(), "wi-finished");
+    fluent::queue::add(project.path(), "wi-finished", Some(0)).unwrap();
+    fluent::queue::claim(project.path(), "wi-finished", "attempt-finished")
+        .unwrap()
+        .unwrap();
+    create_bound_attempt(
+        project.path(),
+        "wi-finished",
+        "attempt-finished",
+        fluent::work_model::AttemptStatus::Failed,
+    );
+    let runner = Arc::new(RecordingRunner::default());
+    let mut service = registered_service(home.path(), project.path(), runner.clone());
+    service.poll_once().unwrap();
+    service.join_workers().unwrap();
+    assert_eq!(
+        fluent::queue::show(project.path(), "wi-finished")
+            .unwrap()
+            .status,
+        fluent::queue::DispatchStatus::Failed
+    );
+    assert!(runner.0.lock().unwrap().is_empty());
+}
+
+#[test]
+fn scheduler_service_fences_recovery() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    create_execution_ready_work(project.path(), "wi-live");
+    fluent::queue::add(project.path(), "wi-live", Some(0)).unwrap();
+    let token = fluent::queue::claim(project.path(), "wi-live", "attempt-live")
+        .unwrap()
+        .unwrap();
+    let _lease = fluent::lease::acquire(&fluent::queue::dispatch_lease_path(
+        project.path(),
+        "wi-live",
+    ))
+    .unwrap();
+    let mut service = registered_service(
+        home.path(),
+        project.path(),
+        Arc::new(NeedsUserRunner::default()),
+    );
+    service.poll_once().unwrap();
+    let after = fluent::queue::show(project.path(), "wi-live").unwrap();
+    assert_eq!(after.status, fluent::queue::DispatchStatus::Claimed);
+    assert_eq!(after.generation, token.generation);
+    let newer = fluent::queue::mark_running(project.path(), &token).unwrap();
+    assert!(
+        !fluent::queue::requeue_if_current(
+            project.path(),
+            "wi-live",
+            &token.dispatch_id,
+            token.generation,
+            true,
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        fluent::queue::show(project.path(), "wi-live")
+            .unwrap()
+            .generation,
+        newer.generation
+    );
+}
+
+#[test]
+fn scheduler_service_fences_unverified_ownership() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    create_execution_ready_work(project.path(), "wi-unverified");
+    fluent::queue::add(project.path(), "wi-unverified", Some(0)).unwrap();
+    let token = fluent::queue::claim(project.path(), "wi-unverified", "attempt-unverified")
+        .unwrap()
+        .unwrap();
+    let lease_path = fluent::queue::dispatch_lease_path(project.path(), "wi-unverified");
+    fs::create_dir_all(lease_path.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&lease_path, &lease_path).unwrap();
+    assert!(fluent::lease::is_leased_checked(&lease_path).is_err());
+    let mut service = registered_service(
+        home.path(),
+        project.path(),
+        Arc::new(NeedsUserRunner::default()),
+    );
+    service.poll_once().unwrap();
+    let after = fluent::queue::show(project.path(), "wi-unverified").unwrap();
+    assert_eq!(after.status, fluent::queue::DispatchStatus::Claimed);
+    assert_eq!(after.generation, token.generation);
+}
+
+#[test]
+fn scheduler_isolation_reports_failure_context() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    fs::create_dir_all(project.path().join(".fluent")).unwrap();
+    fs::write(
+        project.path().join(".fluent/config.yaml"),
+        "scheduler:\n  local-concurrency: invalid\n",
+    )
+    .unwrap();
+    let mut service = registered_service(
+        home.path(),
+        project.path(),
+        Arc::new(NeedsUserRunner::default()),
+    );
+    service.poll_once().unwrap();
+    let diagnostic = &service.last_poll_failures()[0];
+    assert!(diagnostic.contains(&project.path().display().to_string()));
+    assert!(diagnostic.contains("read scheduler capacity"));
+}
+
+#[test]
+fn scheduler_isolation_bounds_retries_by_poll() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    fs::create_dir_all(project.path().join(".fluent")).unwrap();
+    fs::write(
+        project.path().join(".fluent/config.yaml"),
+        "scheduler:\n  local-concurrency: invalid\n",
+    )
+    .unwrap();
+    create_execution_ready_work(project.path(), "wi-repair");
+    fluent::queue::add(project.path(), "wi-repair", Some(0)).unwrap();
+    let mut service = registered_service(
+        home.path(),
+        project.path(),
+        Arc::new(NeedsUserRunner::default()),
+    );
+    for _ in 0..2 {
+        service.poll_once().unwrap();
+        assert_eq!(service.last_poll_failures().len(), 1);
+        assert_eq!(
+            fluent::queue::show(project.path(), "wi-repair")
+                .unwrap()
+                .status,
+            fluent::queue::DispatchStatus::Queued
+        );
+    }
+    fs::write(
+        project.path().join(".fluent/config.yaml"),
+        "scheduler:\n  local-concurrency: 1\n",
+    )
+    .unwrap();
+    service.poll_once().unwrap();
+    service.join_workers().unwrap();
+    assert!(service.last_poll_failures().is_empty());
+    assert_eq!(
+        fluent::queue::show(project.path(), "wi-repair")
+            .unwrap()
+            .status,
+        fluent::queue::DispatchStatus::NeedsUser
+    );
+}
+
+#[test]
+fn scheduler_isolation_keeps_prior_claim_with_bad_sibling() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    fs::create_dir_all(project.path().join(".fluent")).unwrap();
+    fs::write(
+        project.path().join(".fluent/config.yaml"),
+        "scheduler:\n  local-concurrency: 2\n",
+    )
+    .unwrap();
+    create_execution_ready_work(project.path(), "wi-first");
+    create_execution_ready_work(project.path(), "wi-bad");
+    fluent::queue::add(project.path(), "wi-first", Some(2)).unwrap();
+    fluent::queue::add(project.path(), "wi-bad", Some(1)).unwrap();
+    let bad_work = fluent::work_model::WorkModelStore::new(project.path())
+        .work_item_path("wi-bad")
+        .unwrap();
+    assert!(bad_work.exists());
+    fs::write(&bad_work, "invalid json").unwrap();
+    let runner = Arc::new(BlockingRunner::default());
+    let mut service = registered_service(home.path(), project.path(), runner.clone());
+    service.poll_once().unwrap();
+    runner.wait_for_started(1);
+    assert_eq!(
+        fluent::queue::show(project.path(), "wi-first")
+            .unwrap()
+            .status,
+        fluent::queue::DispatchStatus::Running
+    );
+    runner.release_one();
+    service.join_workers().unwrap();
+    assert_eq!(
+        fluent::queue::show(project.path(), "wi-first")
+            .unwrap()
+            .status,
+        fluent::queue::DispatchStatus::NeedsUser
+    );
+}
+
+struct MixedWorkerRunner {
+    blocked: BlockingRunner,
+    failure_started: Arc<(Mutex<bool>, Condvar)>,
+    panic_worker: bool,
+}
+
+impl fluent::scheduler::AttemptRunner for MixedWorkerRunner {
+    fn run(
+        &self,
+        project: &std::path::Path,
+        work_item_id: &str,
+        attempt_id: &str,
+        tester_no_sandbox: bool,
+    ) -> anyhow::Result<fluent::scheduler::AttemptOutcome> {
+        if work_item_id == "wi-fail" {
+            let (lock, changed) = &*self.failure_started;
+            *lock.lock().unwrap() = true;
+            changed.notify_all();
+            if self.panic_worker {
+                panic!("fixture worker panic");
+            }
+            anyhow::bail!("fixture worker error");
+        }
+        fluent::scheduler::AttemptRunner::run(
+            &self.blocked,
+            project,
+            work_item_id,
+            attempt_id,
+            tester_no_sandbox,
+        )
+    }
+}
+
+#[test]
+fn scheduler_workers_preserve_others_after_failure() {
+    for panic_worker in [false, true] {
+        let home = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        fs::create_dir_all(project.path().join(".fluent")).unwrap();
+        fs::write(
+            project.path().join(".fluent/config.yaml"),
+            "scheduler:\n  local-concurrency: 2\n",
+        )
+        .unwrap();
+        for (id, priority) in [("wi-fail", 2), ("wi-healthy", 1)] {
+            create_execution_ready_work(project.path(), id);
+            fluent::queue::add(project.path(), id, Some(priority)).unwrap();
+        }
+        let runner = Arc::new(MixedWorkerRunner {
+            blocked: BlockingRunner::default(),
+            failure_started: Arc::new((Mutex::new(false), Condvar::new())),
+            panic_worker,
+        });
+        let mut service = registered_service(home.path(), project.path(), runner.clone());
+        service.poll_once().unwrap();
+        runner.blocked.wait_for_started(1);
+        let (lock, changed) = &*runner.failure_started;
+        let (failed, timeout) = changed
+            .wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(2), |failed| {
+                !*failed
+            })
+            .unwrap();
+        assert!(!timeout.timed_out() && *failed);
+        drop(failed);
+        let release = runner.clone();
+        let joiner = std::thread::spawn(move || service.join_workers());
+        release.blocked.release_one();
+        let error = joiner.join().unwrap().unwrap_err().to_string();
+        assert!(error.contains("wi-fail"));
+        assert!(error.contains("worker"));
+        assert!(error.contains(&project.path().display().to_string()));
+        let failed_dispatch = fluent::queue::show(project.path(), "wi-fail").unwrap();
+        assert!(error.contains(&failed_dispatch.dispatch_id));
+        assert_eq!(
+            fluent::queue::show(project.path(), "wi-healthy")
+                .unwrap()
+                .status,
+            fluent::queue::DispatchStatus::NeedsUser
+        );
+        assert!(
+            !fluent::lease::is_leased_checked(&fluent::queue::dispatch_lease_path(
+                project.path(),
+                "wi-healthy"
+            ))
+            .unwrap()
+        );
+    }
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "test-support")]
+fn __scheduler_service_process_fixture() {
+    let home = std::env::var_os("FLUENT_SCHEDULER_TEST_HOME").expect("fixture home");
+    if std::env::var_os("FLUENT_SCHEDULER_TEST_WORKER_ERROR").is_some() {
+        scheduler_service::run_service_with_test_runner(
+            std::path::Path::new(&home),
+            fake_build(),
+            1,
+            Arc::new(HostFailureRunner),
+        )
+        .unwrap();
+    } else {
+        scheduler_service::run_service(std::path::Path::new(&home), fake_build(), 1).unwrap();
+    }
+}
+
+#[cfg(feature = "test-support")]
+struct HostFailureRunner;
+
+#[cfg(feature = "test-support")]
+impl fluent::scheduler::AttemptRunner for HostFailureRunner {
+    fn run(
+        &self,
+        project: &std::path::Path,
+        work_item_id: &str,
+        attempt_id: &str,
+        _tester_no_sandbox: bool,
+    ) -> anyhow::Result<fluent::scheduler::AttemptOutcome> {
+        if work_item_id == "wi-worker-fail" {
+            anyhow::bail!("fixture worker failure");
+        }
+        persist_runner_needs_user(project, work_item_id, attempt_id);
+        Ok(fluent::scheduler::AttemptOutcome::NeedsUser)
+    }
+}
+
+#[cfg(unix)]
+#[cfg(feature = "test-support")]
+#[test]
+#[ignore]
+fn scheduler_host_recovery_crash_restart_and_project_isolation() {
+    let root = TempDir::new().unwrap();
+    let home = root.path().join("home");
+    let bad = root.path().join("00-bad");
+    let healthy = root.path().join("10-healthy");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(bad.join(".fluent")).unwrap();
+    fs::create_dir_all(&healthy).unwrap();
+    fs::write(
+        bad.join(".fluent/config.yaml"),
+        "scheduler:\n  local-concurrency: invalid\n",
+    )
+    .unwrap();
+    let bad_identity = scheduler_service::assign_checkout_identity(&bad).unwrap();
+    scheduler_service::register_checkout(&home, &bad, &bad_identity).unwrap();
+    let healthy_identity = scheduler_service::assign_checkout_identity(&healthy).unwrap();
+    scheduler_service::register_checkout(&home, &healthy, &healthy_identity).unwrap();
+    create_execution_ready_work(&healthy, "wi-crash");
+    fluent::queue::add(&healthy, "wi-crash", Some(0)).unwrap();
+    fluent::queue::claim(&healthy, "wi-crash", "attempt-crash")
+        .unwrap()
+        .unwrap();
+    create_bound_attempt(
+        &healthy,
+        "wi-crash",
+        "attempt-crash",
+        fluent::work_model::AttemptStatus::Failed,
+    );
+
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--ignored")
+        .arg("--exact")
+        .arg("__scheduler_service_process_fixture")
+        .env("FLUENT_SCHEDULER_TEST_HOME", &home)
+        .env_remove("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT")
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let result = loop {
+        match fluent::queue::show(&healthy, "wi-crash") {
+            Ok(dispatch) if dispatch.status == fluent::queue::DispatchStatus::Failed => {
+                break Ok(());
+            }
+            _ if std::time::Instant::now() >= deadline => {
+                break Err("real service did not reconcile crash claim");
+            }
+            _ => std::thread::sleep(Duration::from_millis(10)),
+        }
+    };
+    child.kill().unwrap();
+    child.wait().unwrap();
+    result.unwrap();
+    assert!(matches!(
+        fluent::scheduler::status(&healthy).unwrap(),
+        fluent::scheduler::SchedulerStatus::Stopped
+    ));
+}
+
+#[cfg(unix)]
+#[cfg(feature = "test-support")]
+#[test]
+#[ignore]
+fn scheduler_host_recovery_worker_error_keeps_other_work() {
+    let root = TempDir::new().unwrap();
+    let home = root.path().join("home");
+    let project = root.path().join("project");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(project.join(".fluent")).unwrap();
+    fs::write(
+        project.join(".fluent/config.yaml"),
+        "scheduler:\n  local-concurrency: 2\n",
+    )
+    .unwrap();
+    let identity = scheduler_service::assign_checkout_identity(&project).unwrap();
+    scheduler_service::register_checkout(&home, &project, &identity).unwrap();
+    for id in ["wi-worker-fail", "wi-worker-healthy"] {
+        create_execution_ready_work(&project, id);
+        fluent::queue::add(&project, id, Some(0)).unwrap();
+    }
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--ignored")
+        .arg("--exact")
+        .arg("__scheduler_service_process_fixture")
+        .env("FLUENT_SCHEDULER_TEST_HOME", &home)
+        .env("FLUENT_SCHEDULER_TEST_WORKER_ERROR", "1")
+        .env_remove("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT")
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let result = loop {
+        match fluent::queue::show(&project, "wi-worker-healthy") {
+            Ok(dispatch) if dispatch.status == fluent::queue::DispatchStatus::NeedsUser => {
+                break Ok(());
+            }
+            _ if std::time::Instant::now() >= deadline => {
+                break Err("healthy worker did not settle");
+            }
+            _ => std::thread::sleep(Duration::from_millis(10)),
+        }
+    };
+    let alive = child.try_wait().unwrap().is_none();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    result.unwrap();
+    assert!(alive, "worker failure terminated shared service");
+    assert!(
+        !fluent::lease::is_leased_checked(&fluent::queue::dispatch_lease_path(
+            &project,
+            "wi-worker-healthy"
+        ))
+        .unwrap()
     );
 }
 

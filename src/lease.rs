@@ -97,6 +97,29 @@ pub fn is_leased(lock_path: &Path) -> bool {
     }
 }
 
+/// Check ownership without treating an unreadable lease as an absent owner.
+pub fn is_leased_checked(lock_path: &Path) -> io::Result<bool> {
+    let file = match OpenOptions::new().read(true).open(lock_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    match flock(&file, FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => {
+            flock(&file, FlockOperation::Unlock).map_err(io::Error::from)?;
+            Ok(false)
+        }
+        Err(errno) => {
+            let error = io::Error::from(errno);
+            if error.kind() == io::ErrorKind::WouldBlock {
+                Ok(true)
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

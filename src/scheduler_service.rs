@@ -789,12 +789,19 @@ pub struct SchedulerService {
     home_dir: PathBuf,
     build: BuildIdentity,
     runner: Arc<dyn crate::scheduler::AttemptRunner>,
-    workers: Vec<(PathBuf, JoinHandle<Result<()>>)>,
+    workers: Vec<ServiceWorker>,
     coordinators: HashMap<PathBuf, crate::scheduler::CoordinatorLease>,
     prepared_projects: HashSet<PathBuf>,
     stopping_projects: HashSet<PathBuf>,
     prepare_host_execution: bool,
     reused_coordinator: Option<crate::scheduler::CoordinatorMetadata>,
+    poll_failures: Vec<String>,
+}
+
+struct ServiceWorker {
+    project: PathBuf,
+    token: crate::queue::DispatchToken,
+    handle: JoinHandle<Result<()>>,
 }
 
 impl SchedulerService {
@@ -813,6 +820,7 @@ impl SchedulerService {
             stopping_projects: HashSet::new(),
             prepare_host_execution: false,
             reused_coordinator: None,
+            poll_failures: Vec::new(),
         }
     }
 
@@ -944,6 +952,7 @@ impl SchedulerService {
     /// Fill every registered project's configured capacity with claims from
     /// the real queue and launch those claims on service-owned workers.
     pub fn poll_once(&mut self) -> Result<()> {
+        self.poll_failures.clear();
         self.reconcile_stops()?;
         let mut projects = read_registry(&self.home_dir)?
             .into_keys()
@@ -953,48 +962,80 @@ impl SchedulerService {
             if self.stopping_projects.contains(&project) {
                 continue;
             }
-            if !self.coordinators.contains_key(&project) {
-                match crate::scheduler::start_or_reuse(&project, &self.build)? {
-                    crate::scheduler::CoordinatorStart::Elected(coordinator) => {
-                        if self.prepare_host_execution {
-                            crate::scheduler::prepare_service_execution(&project)?;
-                            self.prepared_projects.insert(project.clone());
-                        }
-                        self.coordinators.insert(project.clone(), coordinator);
+            if let Err(error) = self.poll_project(&project) {
+                let diagnostic = format!("project {} poll: {error:#}", project.display());
+                eprintln!("[scheduler] {diagnostic}");
+                self.poll_failures.push(diagnostic);
+            }
+        }
+        Ok(())
+    }
+
+    /// Diagnostics from the most recent poll, including its project context.
+    pub fn last_poll_failures(&self) -> &[String] {
+        &self.poll_failures
+    }
+
+    fn poll_project(&mut self, project: &Path) -> Result<()> {
+        if !self.coordinators.contains_key(project) {
+            match crate::scheduler::start_or_reuse(&project, &self.build)
+                .context("start coordinator")?
+            {
+                crate::scheduler::CoordinatorStart::Elected(coordinator) => {
+                    if self.prepare_host_execution {
+                        crate::scheduler::prepare_service_execution(&project)
+                            .context("prepare execution")?;
+                        self.prepared_projects.insert(project.to_path_buf());
                     }
-                    crate::scheduler::CoordinatorStart::Reused(metadata) => {
-                        self.reused_coordinator = Some(metadata);
-                        continue;
-                    }
+                    self.coordinators.insert(project.to_path_buf(), coordinator);
+                }
+                crate::scheduler::CoordinatorStart::Reused(metadata) => {
+                    self.reused_coordinator = Some(metadata);
+                    return Ok(());
                 }
             }
-            let capacity = crate::scheduler::configured_capacity(&project)?;
-            for (token, lease) in crate::scheduler::claim_available(&project, capacity)? {
-                let runner = self.runner.clone();
-                let worker_project = project.clone();
-                let worker = std::thread::spawn(move || {
-                    crate::scheduler::run_claimed_dispatch(
-                        &worker_project,
-                        token,
-                        lease,
-                        runner.as_ref(),
-                    )
-                });
-                self.workers.push((project.clone(), worker));
-            }
+        }
+        crate::scheduler::recover_and_reconcile(project)
+            .with_context(|| format!("recover project {}", project.display()))?;
+        let capacity =
+            crate::scheduler::configured_capacity(&project).context("read scheduler capacity")?;
+        while crate::scheduler::project_local_capacity_used(project).context("count live claims")?
+            < capacity
+        {
+            let Some((token, lease)) =
+                crate::scheduler::claim_next(project).context("claim next dispatch")?
+            else {
+                break;
+            };
+            let runner = self.runner.clone();
+            let worker_project = project.to_path_buf();
+            let worker_token = token.clone();
+            let worker = std::thread::spawn(move || {
+                crate::scheduler::run_claimed_dispatch(
+                    &worker_project,
+                    worker_token,
+                    lease,
+                    runner.as_ref(),
+                )
+            });
+            self.workers.push(ServiceWorker {
+                project: project.to_path_buf(),
+                token,
+                handle: worker,
+            });
         }
         Ok(())
     }
 
     fn reap_finished(&mut self) -> Result<()> {
         let mut pending = Vec::new();
-        for (project, worker) in self.workers.drain(..) {
-            if worker.is_finished() {
-                worker
-                    .join()
-                    .map_err(|_| anyhow::anyhow!("scheduler worker panicked"))??;
+        for worker in self.workers.drain(..) {
+            if worker.handle.is_finished() {
+                if let Err(error) = settle_worker(worker) {
+                    eprintln!("[scheduler] {error:#}");
+                }
             } else {
-                pending.push((project, worker));
+                pending.push(worker);
             }
         }
         self.workers = pending;
@@ -1005,22 +1046,35 @@ impl SchedulerService {
         self.reap_finished()?;
         let projects = self.coordinators.keys().cloned().collect::<Vec<_>>();
         for project in projects {
-            let stop_requested = crate::scheduler::service_stop_requested(
+            let stop_requested = match crate::scheduler::service_stop_requested(
                 &project,
                 self.coordinators
                     .get_mut(&project)
                     .expect("known coordinator"),
-            )?;
-            let has_workers = self
-                .workers
-                .iter()
-                .any(|(worker_project, _)| worker_project == &project);
+            ) {
+                Ok(requested) => requested,
+                Err(error) => {
+                    eprintln!(
+                        "[scheduler] project {} check stop: {error:#}",
+                        project.display()
+                    );
+                    continue;
+                }
+            };
+            let has_workers = self.workers.iter().any(|worker| worker.project == project);
             if stop_requested {
                 self.stopping_projects.insert(project.clone());
             }
             if self.stopping_projects.contains(&project) && !has_workers {
-                if self.prepared_projects.remove(&project) {
-                    crate::scheduler::finish_service_execution(&project)?;
+                if self.prepared_projects.contains(&project) {
+                    if let Err(error) = crate::scheduler::finish_service_execution(&project) {
+                        eprintln!(
+                            "[scheduler] project {} finish execution: {error:#}",
+                            project.display()
+                        );
+                        continue;
+                    }
+                    self.prepared_projects.remove(&project);
                 }
                 self.coordinators.remove(&project);
             }
@@ -1031,10 +1085,14 @@ impl SchedulerService {
     /// Join all current workers. Integration tests use this to observe the
     /// durable terminal dispatch after a deterministic fake runner returns.
     pub fn join_workers(&mut self) -> Result<()> {
-        for (_, worker) in self.workers.drain(..) {
-            worker
-                .join()
-                .map_err(|_| anyhow::anyhow!("scheduler worker panicked"))??;
+        let mut failures = Vec::new();
+        for worker in self.workers.drain(..) {
+            if let Err(error) = settle_worker(worker) {
+                failures.push(format!("{error:#}"));
+            }
+        }
+        if !failures.is_empty() {
+            bail!("{}", failures.join("; "));
         }
         Ok(())
     }
@@ -1050,6 +1108,22 @@ impl SchedulerService {
     }
 }
 
+fn settle_worker(worker: ServiceWorker) -> Result<()> {
+    let context = format!(
+        "project {} work item {} dispatch {} generation {} attempt {} worker",
+        worker.project.display(),
+        worker.token.work_item_id,
+        worker.token.dispatch_id,
+        worker.token.generation,
+        worker.token.bound_attempt_id,
+    );
+    worker
+        .handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("{context} panicked"))?
+        .with_context(|| format!("{context} failed"))
+}
+
 impl Drop for SchedulerService {
     fn drop(&mut self) {
         let _ = self.join_workers();
@@ -1062,12 +1136,38 @@ impl Drop for SchedulerService {
 /// Serve the production scheduler socket until the owning process exits.
 /// The scheduler command runs this listener alongside its queue coordinator.
 pub fn run_service(home_dir: &Path, build: BuildIdentity, poll_seconds: u64) -> Result<()> {
+    run_service_with_runner(
+        home_dir,
+        build,
+        poll_seconds,
+        Arc::new(crate::scheduler::CliAttemptRunner),
+    )
+}
+
+/// Run the production listener with an injected external Attempt runner in
+/// host tests. The registry, poll loop, claims, and worker settlement are shared.
+#[cfg(feature = "test-support")]
+pub fn run_service_with_test_runner(
+    home_dir: &Path,
+    build: BuildIdentity,
+    poll_seconds: u64,
+    runner: Arc<dyn crate::scheduler::AttemptRunner>,
+) -> Result<()> {
+    run_service_with_runner(home_dir, build, poll_seconds, runner)
+}
+
+fn run_service_with_runner(
+    home_dir: &Path,
+    build: BuildIdentity,
+    poll_seconds: u64,
+    runner: Arc<dyn crate::scheduler::AttemptRunner>,
+) -> Result<()> {
     if SERVICE_SHUTDOWN.load(Ordering::Acquire) {
         return Ok(());
     }
     #[cfg(feature = "test-support")]
     if std::env::var_os("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT").is_some() {
-        return run_transportless_service(home_dir, build, poll_seconds);
+        return run_transportless_service(home_dir, build, poll_seconds, runner);
     }
     let path = socket_path(home_dir);
     if let Ok(health) = send_health_request(&path) {
@@ -1088,11 +1188,7 @@ pub fn run_service(home_dir: &Path, build: BuildIdentity, poll_seconds: u64) -> 
     listener.set_nonblocking(true)?;
     #[cfg(unix)]
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-    let mut service = SchedulerService::new_production(
-        home_dir,
-        build,
-        Arc::new(crate::scheduler::CliAttemptRunner),
-    );
+    let mut service = SchedulerService::new_production(home_dir, build, runner);
     let poll_interval = Duration::from_secs(poll_seconds.max(1));
     let mut next_poll = Instant::now();
     loop {
@@ -1125,12 +1221,9 @@ fn run_transportless_service(
     home_dir: &Path,
     build: BuildIdentity,
     poll_seconds: u64,
+    runner: Arc<dyn crate::scheduler::AttemptRunner>,
 ) -> Result<()> {
-    let mut service = SchedulerService::new_production(
-        home_dir,
-        build,
-        Arc::new(crate::scheduler::CliAttemptRunner),
-    );
+    let mut service = SchedulerService::new_production(home_dir, build, runner);
     let poll_interval = Duration::from_secs(poll_seconds.max(1));
     let mut next_poll = Instant::now();
     let mut owned_coordinator = false;
