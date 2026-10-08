@@ -1,8 +1,9 @@
 -------------------------- MODULE ServiceLifecycle --------------------------
 EXTENDS Naturals, FiniteSets, TLC
 
-CONSTANTS CheckBuild, BindInstance, GuardAdmission
+CONSTANTS CheckBuild, BindInstance, GuardAdmission, ProtocolCompatible, DrainCapable
 ASSUME CheckBuild \in BOOLEAN /\ BindInstance \in BOOLEAN /\ GuardAdmission \in BOOLEAN
+       /\ ProtocolCompatible \in BOOLEAN /\ DrainCapable \in BOOLEAN
 Instances == {1, 2}
 Projects == {"A", "B"}
 
@@ -23,7 +24,7 @@ Start(i) == /\ i \in Instances /\ lease = 0
                            badReuse, badAdmission, staleStop>>
 
 Reuse(i) == /\ i \in Instances /\ lease = owner /\ owner # 0
-            /\ state = "running"
+            /\ state = "running" /\ ProtocolCompatible /\ DrainCapable
             /\ (CheckBuild => i = build)
             /\ badReuse' = badReuse \/ (i # build)
             /\ UNCHANGED <<owner, lease, state, build, workers, queued,
@@ -50,6 +51,7 @@ RequestStop(i) == /\ i \in Instances /\ owner # 0
                                  ack, result, crashed, badReuse, badAdmission, staleStop>>
 
 Acknowledge == /\ request # 0 /\ owner # 0 /\ state = "running"
+               /\ ProtocolCompatible /\ DrainCapable
                /\ (BindInstance => request = owner)
                /\ state' = "draining" /\ ack' = TRUE
                /\ staleStop' = staleStop \/ (request # owner)
@@ -72,8 +74,8 @@ Crash == /\ ~crashed /\ owner # 0
          /\ UNCHANGED <<build, queued, request, ack, result,
                         badReuse, badAdmission, staleStop>>
 
-Next == \/ \E i \in Instances: Start(i) \/ Reuse(i) \/ RequestStop(i)
-        \/ \E p \in Projects: Submit(p) \/ Claim(p) \/ Settle(p)
+Next == \/ \E i \in Instances: (Start(i) \/ Reuse(i) \/ RequestStop(i))
+        \/ \E p \in Projects: (Submit(p) \/ Claim(p) \/ Settle(p))
         \/ Acknowledge \/ Finish \/ Crash
 
 Spec == Init /\ [][Next]_vars
@@ -84,5 +86,6 @@ NoMismatchedReuse == ~badReuse
 NoAdmissionAfterDrain == ~badAdmission
 NoStaleStop == ~staleStop
 NoStoppedWithWorkers == state = "stopped" => \A p \in Projects: workers[p] = 0
+NoLegacyDrain == (~ProtocolCompatible \/ ~DrainCapable) => state # "draining"
 ReplayStable == result # 0 => result \in Instances
 =============================================================================

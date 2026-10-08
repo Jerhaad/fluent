@@ -22,6 +22,7 @@ RECOVERY_CASES = (
 )
 LIFECYCLE_CASES = (
     ("ServiceLifecycle", "lifecycle-proposed.cfg", None),
+    ("ServiceLifecycle", "lifecycle-legacy.cfg", None),
     ("ServiceLifecycle", "lifecycle-negative-build.cfg", "Invariant NoMismatchedReuse is violated"),
     ("ServiceLifecycle", "lifecycle-negative-instance.cfg", "Invariant NoStaleStop is violated"),
     ("ServiceLifecycle", "lifecycle-negative-admission.cfg", "Invariant NoAdmissionAfterDrain is violated"),

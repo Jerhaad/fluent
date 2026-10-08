@@ -40,7 +40,7 @@ unbounded concurrency safe.
 
 ## Shared service lifecycle
 
-Run `python3 tests/formal/scheduler/check.py --suite=lifecycle --jar=target/fluent-tools/tla2tools-1.7.4.jar` on the candidate host. `ServiceLifecycle.tla` bounds ownership to two service instances, two builds, two projects, one worker and one queued dispatch per project, and one crash. The proposed configuration checks one owner, matching build reuse, guarded admission after drain, instance-bound stop, and no stopped result with a live worker. Three negative controls separately remove the build, instance, and admission guards. The checker retains each TLC log under `target/formal/scheduler/`.
+Run `python3 tests/formal/scheduler/check.py --suite=lifecycle --jar=target/fluent-tools/tla2tools-1.7.4.jar` on the candidate host. `ServiceLifecycle.tla` bounds ownership to two service instances, two builds, two projects, one worker and one queued dispatch per project, and one crash. The proposed configuration checks one owner, matching build reuse, guarded admission after drain, instance-bound stop, and no stopped result with a live worker. A legacy configuration disables protocol compatibility and drain capability and checks that no drain is acknowledged. Three negative controls separately remove the build, instance, and admission guards. The checker retains each TLC log under `target/formal/scheduler/`.
 
 | Model action | Production boundary |
 | --- | --- |
