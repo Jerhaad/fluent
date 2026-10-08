@@ -963,6 +963,11 @@ impl SchedulerService {
                 continue;
             }
             if let Err(error) = self.poll_project(&project) {
+                if error.is::<crate::os::HostSandboxPreflightError>() {
+                    return Err(error).with_context(|| {
+                        format!("project {} prepare host execution", project.display())
+                    });
+                }
                 let diagnostic = format!("project {} poll: {error:#}", project.display());
                 eprintln!("[scheduler] {diagnostic}");
                 self.poll_failures.push(diagnostic);

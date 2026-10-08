@@ -6,20 +6,19 @@ import hashlib
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 JAR_SHA256 = "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
 CASES = (
-    ("QueueHandoff", "queue-candidate.cfg", None),
-    ("QueueHandoff", "queue-historical-6875b409.cfg", "Recoverable"),
-    ("QueueHandoff", "queue-negative-duplicate.cfg", "OneAttempt"),
-    ("GenerationFence", "generation-candidate.cfg", None),
-    ("GenerationFence", "generation-historical-6875b409.cfg", "StaleOperationRejected"),
-    ("GenerationFence", "generation-negative-identity.cfg", "StaleOperationRejected"),
-    ("ServiceIsolation", "isolation-candidate.cfg", None),
-    ("ServiceIsolation", "isolation-historical-6875b409.cfg", "HealthyProgress"),
-    ("ServiceIsolation", "isolation-negative-spin.cfg", "PollBound"),
-    ("ServiceIsolation", "isolation-negative-drop.cfg", "WorkerRetained"),
+    ("QueueHandoff", "queue-current.cfg", "Temporal properties were violated"),
+    ("QueueHandoff", "queue-proposed.cfg", None),
+    ("QueueHandoff", "queue-mutant-no-lease-check.cfg", "Invariant OwnerTokenCurrent is violated"),
+    ("QueueHandoff", "queue-mutant-new-attempt.cfg", "Invariant OneAttempt is violated"),
+    ("GenerationFence", "generation-current.cfg", None),
+    ("GenerationFence", "generation-mutant-no-fence.cfg", "Invariant NoStaleCommit is violated"),
+    ("ServiceIsolation", "isolation-current.cfg", "Temporal properties were violated"),
+    ("ServiceIsolation", "isolation-proposed.cfg", None),
 )
 
 
@@ -46,20 +45,23 @@ def main() -> int:
     logs.mkdir(parents=True, exist_ok=True)
     failed = False
     for module, config, expected_invariant in CASES:
-        command = ["java", "-cp", str(jar), "tlc2.TLC", "-workers", "1", "-deadlock", "-config", config, module]
-        try:
-            result = subprocess.run(command, cwd=source, capture_output=True, text=True, timeout=120)
-            output = result.stdout + result.stderr
-        except subprocess.TimeoutExpired as error:
-            output = f"TLC timed out after 120 seconds: {error}\n"
-            result = None
+        with tempfile.TemporaryDirectory(prefix="tlc-", dir=logs) as metadir:
+            command = ["java", "-XX:+UseParallelGC", "-Xmx256m", "-cp", str(jar),
+                       "tlc2.TLC", "-workers", "1", "-fp", "0", "-seed", "1",
+                       "-metadir", metadir, "-config", config, module + ".tla"]
+            try:
+                result = subprocess.run(command, cwd=source, capture_output=True, text=True, timeout=180)
+                output = result.stdout + result.stderr
+            except subprocess.TimeoutExpired as error:
+                output = f"TLC timed out after 180 seconds: {error}\n"
+                result = None
         log = logs / f"{config}.log"
         log.write_text("$ " + " ".join(command) + "\n" + output)
         if expected_invariant is None:
             passed = result is not None and result.returncode == 0 and "Model checking completed" in output
         else:
             passed = (result is not None and result.returncode != 0
-                      and re.search(rf"Invariant {re.escape(expected_invariant)} is violated", output) is not None)
+                      and expected_invariant in output)
         label = "PASS" if passed else "FAIL"
         print(f"{label} {module} {config} -> {log}")
         failed |= not passed

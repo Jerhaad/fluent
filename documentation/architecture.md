@@ -4492,6 +4492,8 @@ service cannot establish its project set. Automatic recovery retries on a later
 configured poll; it does not create a new pause or infer an Attempt outcome
 from a worker error. Reaping joins only finished workers, and shutdown joins
 every remaining worker before reporting collected failures.
+The host sandbox preflight is a service-wide capability gate: its typed failure
+stops the service before baseline preparation, queue claims, or provider launch.
 
 Before each poll, `recover_and_reconcile` reads model state first and
 then applies a generation-checked queue update, so recovery never nests

@@ -34282,14 +34282,24 @@ fn scheduler_checks_host_sandbox_before_claiming_queued_work() {
         .assert()
         .success();
 
-    fluent_cmd()
+    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("fluent"));
+    command
         .current_dir(tmp.path())
         .env("HOME", &inaccessible_home)
         .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "fail")
         .args(["scheduler", "run", "--poll-seconds", "1"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("FLUENT_HOST_SANDBOX_BLOCKED"));
+        .stderr(std::process::Stdio::piped());
+    let mut child = OwnedFixtureProcess::spawn(&mut command);
+    let exited = poll_until(std::time::Duration::from_secs(5), || {
+        child.try_wait().unwrap().is_some()
+    });
+    if !exited {
+        child.terminate_and_wait();
+        panic!("scheduler did not reject the blocked host sandbox");
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("FLUENT_HOST_SANDBOX_BLOCKED"));
 
     assert_eq!(
         latest_dispatch_status(tmp.path(), "host-boundary"),
@@ -49222,13 +49232,31 @@ fn host_plan_recovery_public_commands_are_idempotent_recheck_changed_evidence() 
             .assert()
             .failure();
         let bin = tmp.path().join("unused-provider");
-        write_scheduler_claude(&bin, "#!/bin/bash\nexit 89\n");
-        fluent_cmd()
+        write_scheduler_claude(
+            &bin,
+            "#!/bin/bash\nprintf launched > \"$PROVIDER_LOG\"\nexit 89\n",
+        );
+        let provider_log = tmp.path().join("provider-launched");
+        let scheduler_log = tmp.path().join("scheduler-stderr");
+        let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("fluent"));
+        command
             .current_dir(&project)
             .env("PATH", mock_path(&bin))
+            .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "pass")
+            .env("PROVIDER_LOG", &provider_log)
             .args(["scheduler", "run", "--poll-seconds", "1"])
-            .assert()
-            .failure();
+            .stderr(std::process::Stdio::from(
+                fs::File::create(&scheduler_log).unwrap(),
+            ));
+        let mut child = OwnedFixtureProcess::spawn(&mut command);
+        assert!(poll_until(std::time::Duration::from_secs(3), || {
+            fs::read_to_string(&scheduler_log)
+                .unwrap_or_default()
+                .contains("[scheduler] project")
+        }));
+        assert!(child.try_wait().unwrap().is_none());
+        child.terminate_and_wait();
+        assert!(!provider_log.exists(), "{drift}: provider must not launch");
         assert_eq!(latest_dispatch_status(&project, &id), "queued");
         assert_eq!(
             work_item_value(&project, &id)["attempts"][0]["tasks"],

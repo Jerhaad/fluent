@@ -1,38 +1,37 @@
-# Scheduler protocol models
+# Scheduler protocol checks
 
-`check.py --suite=recovery --jar=target/fluent-tools/tla2tools-1.7.4.jar`
-checks the candidate configurations and confirms that each historical or
-negative control violates its named invariant. It requires the official TLC
-1.7.4 JAR with SHA-256
-`936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88`
-and Java 21. The checker never downloads a tool. It writes complete TLC output
-under `target/formal/scheduler/`.
+`QueueHandoff.tla`, `GenerationFence.tla`, `ServiceIsolation.tla`, and the eight
+top-level configurations are exact copies of the approved state-transition
+audit inputs. `check.py --suite=recovery --jar=target/fluent-tools/tla2tools-1.7.4.jar`
+runs those inputs and checks each expected result. It requires the official TLC
+1.7.4 JAR (SHA-256
+`936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88`)
+and Java 21. It downloads nothing and stores full logs under
+`target/formal/scheduler/`. A missing tool fails the selected host check.
 
-The `*-historical-6875b409.cfg` configurations represent the missing recovery,
-generation fence, and per-project isolation at audit commit `6875b409`. The
-negative configurations independently allow duplicate Attempt creation, stale
-identity writes, immediate retries, or lost worker handles. The candidate
-configurations enable recovery and fences while retaining all workers.
+The audit at commit `6875b409` found missing claim recovery and project error
+containment. `queue-current.cfg` and `isolation-current.cfg` reproduce those
+failures; the corresponding `*-proposed.cfg` checks the proposed protocols.
+Generation fencing already worked at that commit: `generation-current.cfg` is
+a passing control, while `generation-mutant-no-fence.cfg` deliberately removes
+the fence. The queue mutants independently disable the lease check and bound
+Attempt reuse. The audit's selected TLC results and hashes are preserved in
+`.fluent/drafts/20261007-state-transition-assurance/model/approved-execution-inputs.txt`.
 
-These bounded sources reconstruct the audit scenarios from the approved Brief
-and Approach. The original pilot model files were not accessible in this
-Writer workspace; compare these sources with the pilot before treating them
-as a verbatim promotion.
-
-| Model action | Production action |
+| Model action | Production boundary |
 | --- | --- |
-| `QueueHandoff.Claim`, `Acquire` | `scheduler::claim_next` claims then acquires the dispatch lease |
-| `CreateAttempt`, `Run` | `scheduler::run_claimed_dispatch` ensures the bound Attempt and marks it running |
-| `DurableFinish`, `Publish` | The Attempt runner persists its outcome; `queue::reconcile` publishes it |
-| `Crash`, `Recover` | Process loss releases the lease; `SchedulerService::poll_project` invokes `recover_and_reconcile` |
-| `GenerationFence.AdvanceGeneration`, `ReplaceIdentity` | A newer queue mutation changes the dispatch generation or identity |
-| `StaleRecover` | `queue::*_if_current` rejects an old dispatch ID or generation |
-| `ServiceIsolation.Poll` | `SchedulerService::poll_once` visits every registered project |
-| `Spin` | An unsupported immediate retry between configured polls |
-| `SettleBad`, `SettleGood` | `reap_finished`, `join_workers`, and `settle_worker` join owned handles |
+| `QueueHandoff.Claim`, `AcquireLease` | `scheduler::claim_next` publishes the claim and acquires the dispatch lease in the coordinator frame |
+| `EnsureAttempt`, `MarkRunning` | `scheduler::run_claimed_dispatch` binds the existing or newly created Attempt and publishes running state |
+| `CompleteAttempt`, `Settle` | The Attempt runner stores its outcome; the worker settles the dispatch |
+| `Crash`, `CrashAll`, `Restart`, `Recover` | A lost process releases its lease; `SchedulerService::poll_project` calls `recover_and_reconcile` before fresh claims |
+| `GenerationFence.Read`, `Commit` | Recovery reads a dispatch generation, then `queue::*_if_current` accepts only the current dispatch and generation |
+| `ServiceIsolation.PollProject`, `NextPoll` | `SchedulerService::poll_once` visits registered projects once per configured poll and contains project-local failures |
+| `Repair`, `Restart` | A repaired project becomes eligible on a later poll; a restarted service continues polling |
 
-The queue model uses one logical dispatch, one possible crash, and generations
-0–8. The isolation model uses two projects, two polls, and two workers. These
-models check the listed invariants for their finite state spaces. Rust service
-tests supply the production-boundary conformance checks; the models do not
-establish behavior under arbitrary filesystem failures or power loss.
+`extensions/` preserves the Writer's earlier reconstructed models and their
+additional controls separately. They are exploratory extensions, not the audit
+sources or historical counterexamples, and the approved host command does not
+run them. The Rust service tests check the production entry path, worker
+ownership, and dispatch fencing that the abstract models cannot establish.
+The bounded models do not prove arbitrary filesystem errors, power loss, or
+unbounded concurrency safe.
