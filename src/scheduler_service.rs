@@ -1517,6 +1517,17 @@ impl SchedulerService {
         Ok(())
     }
 
+    fn finish_prepared_projects(&mut self) {
+        for project in self.prepared_projects.drain() {
+            if let Err(error) = crate::scheduler::finish_service_execution(&project) {
+                self.worker_failures.push(format!(
+                    "project {} finish execution: {error:#}",
+                    project.display()
+                ));
+            }
+        }
+    }
+
     #[cfg(feature = "test-support")]
     fn take_reused_coordinator(&mut self) -> Option<crate::scheduler::CoordinatorMetadata> {
         self.reused_coordinator.take()
@@ -1727,6 +1738,7 @@ fn run_service_with_runner(
         }
         service.tick(Instant::now(), &mut next_poll, poll_interval)?;
         if service.draining && service.workers.is_empty() {
+            service.finish_prepared_projects();
             let result = ServiceStopRecord {
                 schema: SERVICE_METADATA_SCHEMA,
                 instance_id: lease.metadata.instance_id.clone(),
