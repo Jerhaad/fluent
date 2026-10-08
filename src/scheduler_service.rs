@@ -1832,14 +1832,21 @@ pub fn stop_service_instance(home: &Path, instance_id: &str) -> Result<ServiceSt
     }
     if let Some(result) = read_stop_record(&service_result_path(home, instance_id))? {
         if result.instance_id == instance_id {
-            while !stop_result_released(home, instance_id)? {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            return settled_stop_result(result);
+            return wait_for_stop_result(home, instance_id);
         }
     }
-    let health =
-        send_health_request(&socket_path(home)).context("inspect shared scheduler before drain")?;
+    let health = match send_health_request(&socket_path(home)) {
+        Ok(health) => health,
+        Err(error) => {
+            if read_stop_record(&service_instance_stop_path(home, instance_id))?.is_some()
+                && lock_identity(home)?.as_str() == instance_id
+                && service_lease_live(home)?
+            {
+                return wait_for_stop_result(home, instance_id);
+            }
+            return Err(error).context("inspect shared scheduler before drain");
+        }
+    };
     let observed = inspect_service_with_state(home, &health.build, true)?
         .context("shared scheduler is not running")?;
     if observed.instance_id.as_deref() != Some(instance_id) {
@@ -1866,6 +1873,10 @@ pub fn stop_service_instance(home: &Path, instance_id: &str) -> Result<ServiceSt
             },
         );
     }
+    wait_for_stop_result(home, instance_id)
+}
+
+fn wait_for_stop_result(home: &Path, instance_id: &str) -> Result<ServiceStopRecord> {
     loop {
         if let Some(result) = read_stop_record(&service_result_path(home, instance_id))? {
             if result.instance_id == instance_id && stop_result_released(home, instance_id)? {
@@ -1879,7 +1890,7 @@ pub fn stop_service_instance(home: &Path, instance_id: &str) -> Result<ServiceSt
                     current.instance_id.unwrap_or_default()
                 );
             }
-        } else if !service_lease_live(home)? {
+        } else if !service_lease_live(home)? || lock_identity(home)?.as_str() != instance_id {
             bail!(
                 "scheduler service {instance_id} exited without a settled drain result; inspect its work before replacement"
             );

@@ -254,6 +254,40 @@ fn scheduler_drain_replays_same_instance() {
 
 #[test]
 #[cfg(feature = "test-support")]
+fn scheduler_drain_replays_completed_result() {
+    let home = TempDir::new().unwrap();
+    let root = scheduler_service::service_state_root(home.path());
+    let instance = "0123456789abcdef0123456789abcdef";
+    fs::create_dir_all(root.join("stop-results")).unwrap();
+    fs::write(root.join("service.lock"), instance).unwrap();
+    let record = serde_json::json!({"schema":1, "instance_id":instance,
+        "build":fake_build(), "failures":[]});
+    fs::write(
+        root.join("stop-request.json"),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        root.join("stop-results").join(format!("{instance}.json")),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        scheduler_service::stop_service_instance(home.path(), instance)
+            .unwrap()
+            .instance_id,
+        instance
+    );
+    assert_eq!(
+        scheduler_service::stop_service(home.path())
+            .unwrap()
+            .instance_id,
+        instance
+    );
+}
+
+#[test]
+#[cfg(feature = "test-support")]
 fn scheduler_drain_waits_for_all_owned_workers() {
     let home = TempDir::new().unwrap();
     let project = TempDir::new().unwrap();
