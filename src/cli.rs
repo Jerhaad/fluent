@@ -1073,8 +1073,12 @@ pub enum SchedulerCommands {
     },
     /// Show the elected coordinator and its exact Fluent build
     Status,
-    /// Stop new claims, drain running Work, and stop the elected coordinator
-    Stop,
+    /// Stop new claims and drain running Work in this project (or all registered projects)
+    Stop {
+        /// Drain the shared scheduler service across all registered projects
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 // ---------------------------------------------------------------------------

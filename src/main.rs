@@ -1985,12 +1985,21 @@ fn cmd_scheduler(project_root: &Path, command: SchedulerCommands) -> Result<()> 
                 println!("PID:       {} (display only)", metadata.pid);
             }
         },
-        SchedulerCommands::Stop => {
-            let stopped = fluent::scheduler::stop(project_root)?;
-            println!(
-                "Stopped scheduler {} running {} ({})",
-                stopped.instance_id, stopped.build.version, stopped.build.hash
-            );
+        SchedulerCommands::Stop { all } => {
+            if all {
+                let home = fluent::scheduler_service::runtime_home(project_root)?;
+                let stopped = fluent::scheduler_service::stop_service(&home)?;
+                println!(
+                    "Stopped shared scheduler {} running {} ({})",
+                    stopped.instance_id, stopped.build.version, stopped.build.hash
+                );
+            } else {
+                let stopped = fluent::scheduler::stop(project_root)?;
+                println!(
+                    "Stopped scheduler {} running {} ({})",
+                    stopped.instance_id, stopped.build.version, stopped.build.hash
+                );
+            }
         }
     }
     Ok(())

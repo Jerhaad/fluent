@@ -29,6 +29,627 @@ fn fake_build() -> BuildIdentity {
     }
 }
 
+#[cfg(feature = "test-support")]
+fn start_upgrade_service(
+    home: &std::path::Path,
+    build: BuildIdentity,
+) -> std::thread::JoinHandle<anyhow::Result<()>> {
+    start_upgrade_service_with_runner(home, build, Arc::new(NeedsUserRunner::default()))
+}
+
+#[cfg(feature = "test-support")]
+fn start_upgrade_service_with_runner(
+    home: &std::path::Path,
+    build: BuildIdentity,
+    runner: Arc<dyn fluent::scheduler::AttemptRunner>,
+) -> std::thread::JoinHandle<anyhow::Result<()>> {
+    let home = home.to_owned();
+    let worker_home = home.clone();
+    let handle = std::thread::spawn(move || {
+        scheduler_service::run_service_with_socket_test_runner(&worker_home, build, 1, runner)
+    });
+    for _ in 0..100 {
+        if scheduler_service::send_health_request(&scheduler_service::socket_path(&home)).is_ok() {
+            return handle;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("shared service did not answer health");
+}
+
+#[cfg(feature = "test-support")]
+fn upgrade_identity() -> (
+    scheduler_service::HealthResponse,
+    scheduler_service::ServiceMetadata,
+) {
+    let build = fake_build();
+    let id = "0123456789abcdef0123456789abcdef".to_string();
+    (
+        scheduler_service::HealthResponse {
+            generation: scheduler_service::PROTOCOL_GENERATION,
+            build: build.clone(),
+            instance_id: Some(id.clone()),
+            state: Some(scheduler_service::ServiceState::Running),
+        },
+        scheduler_service::ServiceMetadata {
+            schema: 1,
+            instance_id: id,
+            state: scheduler_service::ServiceState::Running,
+            build,
+        },
+    )
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn scheduler_upgrade_reuses_matching_service() {
+    let (health, metadata) = upgrade_identity();
+    scheduler_service::validate_service_reuse(&health, &metadata, &fake_build(), false).unwrap();
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn scheduler_upgrade_rejects_mismatched_build() {
+    let (health, metadata) = upgrade_identity();
+    for (version, hash) in [("new-version", "abc123def456"), ("0.1.0-test", "new-hash")] {
+        let requested = BuildIdentity {
+            version: version.into(),
+            hash: hash.into(),
+        };
+        assert!(
+            scheduler_service::validate_service_reuse(&health, &metadata, &requested, false)
+                .unwrap_err()
+                .to_string()
+                .contains("stop --all")
+        );
+    }
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn scheduler_upgrade_preserves_unverified_owner() {
+    let (mut health, mut metadata) = upgrade_identity();
+    health.instance_id = None;
+    assert!(
+        scheduler_service::validate_service_reuse(&health, &metadata, &fake_build(), false)
+            .is_err()
+    );
+    health.instance_id = Some(metadata.instance_id.clone());
+    metadata.state = scheduler_service::ServiceState::Draining;
+    health.state = Some(metadata.state);
+    assert!(
+        scheduler_service::validate_service_reuse(&health, &metadata, &fake_build(), false)
+            .unwrap_err()
+            .to_string()
+            .contains("draining")
+    );
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn scheduler_drain_stops_claiming_all_projects() {
+    let home = TempDir::new().unwrap();
+    let first = TempDir::new().unwrap();
+    let second = TempDir::new().unwrap();
+    let mut service = registered_service(
+        home.path(),
+        first.path(),
+        Arc::new(NeedsUserRunner::default()),
+    );
+    let identity = scheduler_service::assign_checkout_identity(second.path()).unwrap();
+    scheduler_service::register_checkout(home.path(), second.path(), &identity).unwrap();
+    service.set_service_identity_for_test("0123456789abcdef0123456789abcdef");
+    for (project, work) in [(first.path(), "wi-first"), (second.path(), "wi-second")] {
+        create_execution_ready_work(project, work);
+        let response = framed_exchange(
+            &mut service,
+            execution_request(
+                scheduler_service::PROTOCOL_GENERATION,
+                project,
+                &fake_build(),
+                work,
+                work,
+            ),
+        );
+        assert_eq!(response["kind"], "execution_submitted");
+    }
+    let before = (
+        fluent::queue::list(first.path()).unwrap(),
+        fluent::queue::list(second.path()).unwrap(),
+    );
+    let response = framed_exchange(
+        &mut service,
+        serde_json::json!({
+        "kind":"drain", "generation": scheduler_service::PROTOCOL_GENERATION,
+        "instance_id":"0123456789abcdef0123456789abcdef"}),
+    );
+    assert_eq!(response["kind"], "drain_accepted");
+    service.poll_once().unwrap();
+    assert_eq!(fluent::queue::list(first.path()).unwrap(), before.0);
+    assert_eq!(fluent::queue::list(second.path()).unwrap(), before.1);
+    assert_eq!(service.worker_count_for_test(), 0);
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn scheduler_drain_rejects_new_submissions() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let mut service = registered_service(
+        home.path(),
+        project.path(),
+        Arc::new(NeedsUserRunner::default()),
+    );
+    service.set_service_identity_for_test("0123456789abcdef0123456789abcdef");
+    create_execution_ready_work(project.path(), "wi-draining");
+    framed_exchange(
+        &mut service,
+        serde_json::json!({
+        "kind":"drain", "generation": scheduler_service::PROTOCOL_GENERATION,
+        "instance_id":"0123456789abcdef0123456789abcdef"}),
+    );
+    let response = framed_exchange(
+        &mut service,
+        execution_request(
+            scheduler_service::PROTOCOL_GENERATION,
+            project.path(),
+            &fake_build(),
+            "request-draining",
+            "wi-draining",
+        ),
+    );
+    assert_eq!(response["kind"], "error");
+    assert!(response["message"].as_str().unwrap().contains("draining"));
+    assert!(
+        !project
+            .path()
+            .join(".fluent/work/scheduler/requests/request-draining.json")
+            .exists()
+    );
+    assert!(fluent::queue::list(project.path()).unwrap().is_empty());
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn scheduler_drain_rejects_stale_instance() {
+    let home = TempDir::new().unwrap();
+    let mut service = scheduler_service::SchedulerService::new(
+        home.path(),
+        fake_build(),
+        Arc::new(NeedsUserRunner::default()),
+    );
+    service.set_service_identity_for_test("0123456789abcdef0123456789abcdef");
+    let response = framed_exchange(
+        &mut service,
+        serde_json::json!({
+        "kind":"drain", "generation": scheduler_service::PROTOCOL_GENERATION,
+        "instance_id":"ffffffffffffffffffffffffffffffff"}),
+    );
+    assert_eq!(response["kind"], "error");
+    let health = framed_exchange(
+        &mut service,
+        serde_json::json!({
+        "kind":"health", "generation": scheduler_service::PROTOCOL_GENERATION}),
+    );
+    assert_eq!(health["state"], "running");
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn scheduler_drain_replays_same_instance() {
+    let home = TempDir::new().unwrap();
+    let mut service = scheduler_service::SchedulerService::new(
+        home.path(),
+        fake_build(),
+        Arc::new(NeedsUserRunner::default()),
+    );
+    service.set_service_identity_for_test("0123456789abcdef0123456789abcdef");
+    let request = serde_json::json!({"kind":"drain", "generation": scheduler_service::PROTOCOL_GENERATION,
+        "instance_id":"0123456789abcdef0123456789abcdef"});
+    let first = framed_exchange(&mut service, request.clone());
+    let replay = framed_exchange(&mut service, request);
+    assert_eq!(first, replay);
+    assert_eq!(first["state"], "draining");
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn scheduler_drain_waits_for_all_owned_workers() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    fs::create_dir_all(project.path().join(".fluent")).unwrap();
+    fs::write(
+        project.path().join(".fluent/config.yaml"),
+        "scheduler:\n  local-concurrency: 2\n",
+    )
+    .unwrap();
+    let runner = Arc::new(BlockingRunner::default());
+    let mut service = registered_service(home.path(), project.path(), runner.clone());
+    service.set_service_identity_for_test("0123456789abcdef0123456789abcdef");
+    for work in ["wi-drain-first", "wi-drain-second"] {
+        create_execution_ready_work(project.path(), work);
+        fluent::queue::add(project.path(), work, None).unwrap();
+    }
+    service.poll_once().unwrap();
+    runner.wait_for_started(2);
+    let accepted = framed_exchange(
+        &mut service,
+        serde_json::json!({
+        "kind":"drain", "generation": scheduler_service::PROTOCOL_GENERATION,
+        "instance_id":"0123456789abcdef0123456789abcdef"}),
+    );
+    assert_eq!(accepted["kind"], "drain_accepted");
+    runner.release_one();
+    let interval = Duration::from_secs(60);
+    let mut next_poll = Instant::now() + interval;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while service.worker_count_for_test() == 2 && Instant::now() < deadline {
+        service
+            .tick_for_test(Instant::now(), &mut next_poll, interval)
+            .unwrap();
+        std::thread::yield_now();
+    }
+    assert_eq!(service.worker_count_for_test(), 1);
+    runner.release_one();
+    service.join_workers().unwrap();
+    assert_eq!(service.worker_count_for_test(), 0);
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn scheduler_drain_waits_after_worker_error() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    fs::create_dir_all(project.path().join(".fluent")).unwrap();
+    fs::write(
+        project.path().join(".fluent/config.yaml"),
+        "scheduler:\n  local-concurrency: 2\n",
+    )
+    .unwrap();
+    for (work, priority) in [("wi-fail", 2), ("wi-healthy", 1)] {
+        create_execution_ready_work(project.path(), work);
+        fluent::queue::add(project.path(), work, Some(priority)).unwrap();
+    }
+    let runner = Arc::new(MixedWorkerRunner {
+        blocked: BlockingRunner::default(),
+        failure_started: Arc::new((Mutex::new(false), Condvar::new())),
+        panic_worker: false,
+    });
+    let mut service = registered_service(home.path(), project.path(), runner.clone());
+    service.set_service_identity_for_test("0123456789abcdef0123456789abcdef");
+    service.poll_once().unwrap();
+    runner.blocked.wait_for_started(1);
+    framed_exchange(
+        &mut service,
+        serde_json::json!({"kind":"drain",
+        "generation":scheduler_service::PROTOCOL_GENERATION,
+        "instance_id":"0123456789abcdef0123456789abcdef"}),
+    );
+    let interval = Duration::from_secs(60);
+    let mut next_poll = Instant::now() + interval;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while service.worker_count_for_test() == 2 && Instant::now() < deadline {
+        service
+            .tick_for_test(Instant::now(), &mut next_poll, interval)
+            .unwrap();
+        std::thread::yield_now();
+    }
+    assert_eq!(service.worker_count_for_test(), 1);
+    assert_eq!(service.worker_failures_for_test().len(), 1);
+    runner.blocked.release_one();
+    service.join_workers().unwrap();
+    assert_eq!(
+        fluent::queue::show(project.path(), "wi-healthy")
+            .unwrap()
+            .status,
+        fluent::queue::DispatchStatus::NeedsUser
+    );
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn scheduler_upgrade_reports_legacy_cutover() {
+    let (mut health, metadata) = upgrade_identity();
+    health.instance_id = None;
+    health.state = None;
+    let message =
+        scheduler_service::validate_service_reuse(&health, &metadata, &fake_build(), false)
+            .unwrap_err()
+            .to_string();
+    assert!(message.contains("original supervised process"));
+    assert!(message.contains("active work to finish"));
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn scheduler_upgrade_starts_after_completed_drain() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    create_execution_ready_work(project.path(), "wi-retained");
+    let mut old = registered_service(
+        home.path(),
+        project.path(),
+        Arc::new(NeedsUserRunner::default()),
+    );
+    old.set_service_identity_for_test("0123456789abcdef0123456789abcdef");
+    let queued = framed_exchange(
+        &mut old,
+        execution_request(
+            scheduler_service::PROTOCOL_GENERATION,
+            project.path(),
+            &fake_build(),
+            "request-retained",
+            "wi-retained",
+        ),
+    );
+    assert_eq!(queued["kind"], "execution_submitted");
+    framed_exchange(
+        &mut old,
+        serde_json::json!({"kind":"drain",
+        "generation": scheduler_service::PROTOCOL_GENERATION,
+        "instance_id":"0123456789abcdef0123456789abcdef"}),
+    );
+    old.poll_once().unwrap();
+    assert_eq!(old.worker_count_for_test(), 0);
+    drop(old);
+    let runner = Arc::new(NeedsUserRunner::default());
+    let mut replacement =
+        scheduler_service::SchedulerService::new(home.path(), fake_build(), runner.clone());
+    replacement.poll_once().unwrap();
+    replacement.join_workers().unwrap();
+    assert_eq!(runner.calls.lock().unwrap().as_slice(), ["wi-retained"]);
+    assert_eq!(
+        fluent::queue::show(project.path(), "wi-retained")
+            .unwrap()
+            .status,
+        fluent::queue::DispatchStatus::NeedsUser
+    );
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn scheduler_upgrade_project_stop_scope() {
+    let home = TempDir::new().unwrap();
+    let first = TempDir::new().unwrap();
+    let second = TempDir::new().unwrap();
+    let mut service = registered_service(
+        home.path(),
+        first.path(),
+        Arc::new(NeedsUserRunner::default()),
+    );
+    let identity = scheduler_service::assign_checkout_identity(second.path()).unwrap();
+    scheduler_service::register_checkout(home.path(), second.path(), &identity).unwrap();
+    service.poll_once().unwrap();
+    let first_path = first.path().to_owned();
+    let stop = std::thread::spawn(move || fluent::scheduler::stop(&first_path).unwrap());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !matches!(
+        fluent::scheduler::status(first.path()).unwrap(),
+        fluent::scheduler::SchedulerStatus::Stopped
+    ) {
+        service.poll_once().unwrap();
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    stop.join().unwrap();
+    assert!(matches!(
+        fluent::scheduler::status(second.path()).unwrap(),
+        fluent::scheduler::SchedulerStatus::Running(_)
+    ));
+    let help = std::process::Command::new(env!("CARGO_BIN_EXE_fluent"))
+        .args(["scheduler", "stop", "--help"])
+        .output()
+        .unwrap();
+    assert!(help.status.success());
+    let text = String::from_utf8(help.stdout).unwrap();
+    assert!(text.contains("--all"));
+    assert!(text.contains("all registered projects"));
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "test-support")]
+fn scheduler_host_upgrade_upgrade_reuses_matching_service() {
+    let home = TempDir::new().unwrap();
+    let handle = start_upgrade_service(home.path(), fake_build());
+    scheduler_service::run_service_with_socket_test_runner(
+        home.path(),
+        fake_build(),
+        1,
+        Arc::new(NeedsUserRunner::default()),
+    )
+    .unwrap();
+    let health =
+        scheduler_service::send_health_request(&scheduler_service::socket_path(home.path()))
+            .unwrap();
+    assert!(health.instance_id.is_some());
+    scheduler_service::stop_service(home.path()).unwrap();
+    handle.join().unwrap().unwrap();
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "test-support")]
+fn scheduler_host_upgrade_upgrade_rejects_mismatched_build() {
+    let home = TempDir::new().unwrap();
+    let handle = start_upgrade_service(home.path(), fake_build());
+    for (version, hash) in [("0.2.0-test", "abc123def456"), ("0.1.0-test", "different")] {
+        let requested = BuildIdentity {
+            version: version.into(),
+            hash: hash.into(),
+        };
+        let error = scheduler_service::run_service_with_socket_test_runner(
+            home.path(),
+            requested,
+            1,
+            Arc::new(NeedsUserRunner::default()),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("stop --all"));
+    }
+    scheduler_service::stop_service(home.path()).unwrap();
+    handle.join().unwrap().unwrap();
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "test-support")]
+fn scheduler_host_upgrade_upgrade_preserves_unverified_owner() {
+    let home = TempDir::new().unwrap();
+    let socket = scheduler_service::socket_path(home.path());
+    let _legacy = scheduler_service::FakeSocketListener::start(&socket, fake_build()).unwrap();
+    let error = scheduler_service::run_service_with_socket_test_runner(
+        home.path(),
+        fake_build(),
+        1,
+        Arc::new(NeedsUserRunner::default()),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("supervised process"));
+    assert!(socket.exists());
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "test-support")]
+fn scheduler_host_upgrade_drain_restart_and_replay() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    fs::create_dir_all(project.path().join(".fluent")).unwrap();
+    fs::write(
+        project.path().join(".fluent/config.yaml"),
+        "scheduler:\n  local-concurrency: 1\n",
+    )
+    .unwrap();
+    let identity = scheduler_service::assign_checkout_identity(project.path()).unwrap();
+    scheduler_service::register_checkout(home.path(), project.path(), &identity).unwrap();
+    for (work, priority) in [("wi-active", 2), ("wi-queued", 1)] {
+        create_execution_ready_work(project.path(), work);
+        fluent::queue::add(project.path(), work, Some(priority)).unwrap();
+    }
+    let runner = Arc::new(BlockingRunner::default());
+    let old = start_upgrade_service_with_runner(home.path(), fake_build(), runner.clone());
+    runner.wait_for_started(1);
+    let instance =
+        scheduler_service::send_health_request(&scheduler_service::socket_path(home.path()))
+            .unwrap()
+            .instance_id
+            .unwrap();
+    let home_path = home.path().to_owned();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let stopping = std::thread::spawn(move || {
+        tx.send(scheduler_service::stop_service_instance(
+            &home_path, &instance,
+        ))
+        .unwrap()
+    });
+    assert!(rx.recv_timeout(Duration::from_millis(250)).is_err());
+    runner.release_one();
+    let result = rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+    stopping.join().unwrap();
+    old.join().unwrap().unwrap();
+    assert_eq!(
+        scheduler_service::stop_service_instance(home.path(), &result.instance_id)
+            .unwrap()
+            .instance_id,
+        result.instance_id
+    );
+    assert_eq!(
+        scheduler_service::stop_service(home.path())
+            .unwrap()
+            .instance_id,
+        result.instance_id
+    );
+    assert_eq!(
+        fluent::queue::show(project.path(), "wi-queued")
+            .unwrap()
+            .status,
+        fluent::queue::DispatchStatus::Queued
+    );
+    let replacement_build = BuildIdentity {
+        version: "new-version".into(),
+        hash: "new-hash".into(),
+    };
+    let replacement = start_upgrade_service(home.path(), replacement_build);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while fluent::queue::show(project.path(), "wi-queued")
+        .unwrap()
+        .status
+        != fluent::queue::DispatchStatus::NeedsUser
+    {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let new_instance =
+        scheduler_service::send_health_request(&scheduler_service::socket_path(home.path()))
+            .unwrap()
+            .instance_id
+            .unwrap();
+    assert_ne!(result.instance_id, new_instance);
+    scheduler_service::stop_service(home.path()).unwrap();
+    replacement.join().unwrap().unwrap();
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "test-support")]
+fn scheduler_host_upgrade_public_cli() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let service = start_upgrade_service(home.path(), fake_build());
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_fluent"))
+        .args(["scheduler", "stop", "--all"])
+        .current_dir(project.path())
+        .env("HOME", home.path())
+        .env_remove("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Stopped shared scheduler"));
+    service.join().unwrap().unwrap();
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "test-support")]
+fn scheduler_host_upgrade_preserves_bad_health_socket() {
+    use std::os::unix::net::UnixListener;
+    for timeout in [false, true] {
+        let home = TempDir::new().unwrap();
+        let socket = scheduler_service::socket_path(home.path());
+        fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            if timeout {
+                std::thread::sleep(Duration::from_secs(3));
+            } else {
+                let mut length = [0; 4];
+                stream.read_exact(&mut length).unwrap();
+                let mut request = vec![0; u32::from_le_bytes(length) as usize];
+                stream.read_exact(&mut request).unwrap();
+                stream.write_all(&9_u32.to_le_bytes()).unwrap();
+                stream.write_all(b"{bad json").unwrap();
+            }
+        });
+        assert!(
+            scheduler_service::run_service_with_socket_test_runner(
+                home.path(),
+                fake_build(),
+                1,
+                Arc::new(NeedsUserRunner::default())
+            )
+            .is_err()
+        );
+        assert!(socket.exists());
+        server.join().unwrap();
+    }
+}
+
 fn make_event(seq: u64, attempt_id: &str, kind: &str) -> fluent::scheduler_service::AttemptEvent {
     fluent::scheduler_service::AttemptEvent {
         seq,

@@ -5,6 +5,8 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
+use std::io::{Seek, SeekFrom};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -22,6 +24,172 @@ use crate::atomic_write::atomic_write;
 /// Integer protocol generation. Bump when the request/response schema changes
 /// incompatibly.
 pub const PROTOCOL_GENERATION: u32 = 1;
+const SERVICE_METADATA_SCHEMA: u32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceState {
+    Running,
+    Draining,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceMetadata {
+    pub schema: u32,
+    pub instance_id: String,
+    pub state: ServiceState,
+    pub build: BuildIdentity,
+}
+
+fn service_lock_path(home: &Path) -> PathBuf {
+    service_state_root(home).join("service.lock")
+}
+fn service_metadata_path(home: &Path) -> PathBuf {
+    service_state_root(home).join("service.json")
+}
+fn service_stop_path(home: &Path) -> PathBuf {
+    service_state_root(home).join("stop-request.json")
+}
+fn service_instance_stop_path(home: &Path, instance_id: &str) -> PathBuf {
+    service_state_root(home)
+        .join("stop-requests")
+        .join(format!("{instance_id}.json"))
+}
+fn service_result_path(home: &Path, instance_id: &str) -> PathBuf {
+    service_state_root(home)
+        .join("stop-results")
+        .join(format!("{instance_id}.json"))
+}
+
+struct ServiceLease {
+    file: fs::File,
+    home: PathBuf,
+    metadata: ServiceMetadata,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceStopRecord {
+    pub schema: u32,
+    pub instance_id: String,
+    pub build: BuildIdentity,
+    #[serde(default)]
+    pub failures: Vec<String>,
+}
+
+fn read_stop_record(path: &Path) -> Result<Option<ServiceStopRecord>> {
+    match fs::read(path) {
+        Ok(bytes) => {
+            let record: ServiceStopRecord =
+                serde_json::from_slice(&bytes).context("parse service stop record")?;
+            if record.schema != SERVICE_METADATA_SCHEMA || record.instance_id.len() != 32 {
+                bail!("invalid service stop record");
+            }
+            Ok(Some(record))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).context("read service stop record"),
+    }
+}
+
+fn write_stop_record(path: &Path, record: &ServiceStopRecord) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    atomic_write(path, &serde_json::to_vec_pretty(record)?).context("publish service stop record")
+}
+
+fn read_service_metadata(home: &Path) -> Result<Option<ServiceMetadata>> {
+    match fs::read(service_metadata_path(home)) {
+        Ok(bytes) => {
+            let metadata: ServiceMetadata =
+                serde_json::from_slice(&bytes).context("parse service identity")?;
+            if metadata.schema != SERVICE_METADATA_SCHEMA
+                || metadata.instance_id.len() != 32
+                || !metadata.instance_id.bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                bail!("invalid scheduler service identity metadata");
+            }
+            Ok(Some(metadata))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).context("read service identity"),
+    }
+}
+
+fn publish_service_metadata(home: &Path, metadata: &ServiceMetadata) -> Result<()> {
+    fs::create_dir_all(service_state_root(home))?;
+    atomic_write(
+        &service_metadata_path(home),
+        &serde_json::to_vec_pretty(metadata)?,
+    )
+    .context("publish service identity")
+}
+
+fn lock_identity(home: &Path) -> Result<String> {
+    Ok(fs::read_to_string(service_lock_path(home))?
+        .trim()
+        .to_owned())
+}
+
+fn service_lease_live(home: &Path) -> Result<bool> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(service_lock_path(home))?;
+    match flock(&file, FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => {
+            flock(&file, FlockOperation::Unlock)?;
+            Ok(false)
+        }
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(true),
+        Err(error) => Err(error).context("inspect service lease"),
+    }
+}
+
+fn try_service_lease(home: &Path, build: &BuildIdentity) -> Result<Option<ServiceLease>> {
+    fs::create_dir_all(service_state_root(home))?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(service_lock_path(home))?;
+    match flock(&file, FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => {
+            let metadata = ServiceMetadata {
+                schema: SERVICE_METADATA_SCHEMA,
+                instance_id: generate_random_hex(16)?,
+                state: ServiceState::Running,
+                build: build.clone(),
+            };
+            file.set_len(0)?;
+            file.seek(SeekFrom::Start(0))?;
+            file.write_all(metadata.instance_id.as_bytes())?;
+            file.sync_data()?;
+            Ok(Some(ServiceLease {
+                file,
+                home: home.to_owned(),
+                metadata,
+            }))
+        }
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) => Err(error).context("elect scheduler service"),
+    }
+}
+
+impl Drop for ServiceLease {
+    fn drop(&mut self) {
+        if read_service_metadata(&self.home)
+            .ok()
+            .flatten()
+            .is_some_and(|m| m.instance_id == self.metadata.instance_id)
+        {
+            let _ = fs::remove_file(service_metadata_path(&self.home));
+        }
+        let _ = flock(&self.file, FlockOperation::Unlock);
+    }
+}
 
 /// Maximum size of a single protocol frame in bytes (64 KiB). Frames that
 /// declare or carry more than this many bytes are rejected before allocation.
@@ -544,6 +712,10 @@ enum SocketRequest {
     Health {
         generation: u32,
     },
+    Drain {
+        generation: u32,
+        instance_id: String,
+    },
     SubmitExecution {
         generation: u32,
         build: BuildIdentity,
@@ -564,6 +736,15 @@ enum SocketResponse {
     HealthOk {
         generation: u32,
         build: BuildIdentity,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instance_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        state: Option<ServiceState>,
+    },
+    DrainAccepted {
+        generation: u32,
+        instance_id: String,
+        state: ServiceState,
     },
     ExecutionSubmitted {
         generation: u32,
@@ -588,6 +769,8 @@ enum SocketResponse {
 pub struct HealthResponse {
     pub generation: u32,
     pub build: BuildIdentity,
+    pub instance_id: Option<String>,
+    pub state: Option<ServiceState>,
 }
 
 /// Authoritative state of the real queue dispatch created for one service
@@ -605,16 +788,126 @@ pub struct ExecutionStatus {
 pub fn send_health_request(sock_path: &Path) -> Result<HealthResponse> {
     let mut stream = UnixStream::connect(sock_path)
         .with_context(|| format!("connect to {}", sock_path.display()))?;
+    health_on_stream(&mut stream)
+}
+
+fn health_on_stream(stream: &mut UnixStream) -> Result<HealthResponse> {
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
     let req = SocketRequest::Health {
         generation: PROTOCOL_GENERATION,
     };
-    frame_write(&mut stream, &serde_json::to_vec(&req)?)?;
-    let resp_bytes = frame_read(&mut stream)?;
+    frame_write(stream, &serde_json::to_vec(&req)?)?;
+    let resp_bytes = frame_read(stream)?;
     match serde_json::from_slice::<SocketResponse>(&resp_bytes).context("parse health response")? {
-        SocketResponse::HealthOk { generation, build } => Ok(HealthResponse { generation, build }),
+        SocketResponse::HealthOk {
+            generation,
+            build,
+            instance_id,
+            state,
+        } => Ok(HealthResponse {
+            generation,
+            build,
+            instance_id,
+            state,
+        }),
         SocketResponse::Error { message, .. } => bail!("scheduler service: {message}"),
         _ => bail!("scheduler service returned an unexpected health response"),
     }
+}
+
+fn inspect_service(home: &Path, requested: &BuildIdentity) -> Result<Option<HealthResponse>> {
+    inspect_service_with_state(home, requested, false)
+}
+
+fn inspect_service_with_state(
+    home: &Path,
+    requested: &BuildIdentity,
+    allow_draining: bool,
+) -> Result<Option<HealthResponse>> {
+    let path = socket_path(home);
+    let mut stream = match UnixStream::connect(&path) {
+        Ok(stream) => stream,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error).context("inspect scheduler service socket"),
+    };
+    // Once connected, a malformed reply or timeout is an unverified live owner.
+    let health = health_on_stream(&mut stream).context(
+        "reachable scheduler service cannot be inspected; stop its owning process manually",
+    )?;
+    if health.generation != PROTOCOL_GENERATION
+        || health.instance_id.is_none()
+        || health.state.is_none()
+    {
+        bail!(
+            "live scheduler service running {} ({}) lacks verifiable drain control; stop its original supervised process, wait for active work to finish, then run `fluent scheduler run`",
+            health.build.version,
+            health.build.hash
+        );
+    }
+    let metadata = read_service_metadata(home)?.context(
+        "live scheduler service lacks identity metadata; stop its owning process manually",
+    )?;
+    if health.instance_id.as_deref() != Some(metadata.instance_id.as_str())
+        || lock_identity(home)? != metadata.instance_id
+        || health.build != metadata.build
+        || health.state != Some(metadata.state)
+    {
+        bail!(
+            "live scheduler service ownership cannot be validated; stop its owning process manually"
+        );
+    }
+    if !service_lease_live(home)? {
+        bail!("live scheduler service has no ownership lease; stop its owning process manually");
+    }
+    validate_service_reuse(&health, &metadata, requested, allow_draining)?;
+    Ok(Some(health))
+}
+
+/// Apply the shared build and lifecycle decision after ownership has been checked.
+pub fn validate_service_reuse(
+    health: &HealthResponse,
+    metadata: &ServiceMetadata,
+    requested: &BuildIdentity,
+    allow_draining: bool,
+) -> Result<()> {
+    if health.instance_id.is_none() || health.state.is_none() {
+        bail!(
+            "live scheduler service running {} ({}) lacks verifiable drain control; stop its original supervised process, wait for active work to finish, then run `fluent scheduler run`",
+            health.build.version,
+            health.build.hash
+        );
+    }
+    if health.generation != PROTOCOL_GENERATION
+        || health.instance_id.as_deref() != Some(&metadata.instance_id)
+        || health.build != metadata.build
+        || health.state != Some(metadata.state)
+    {
+        bail!("scheduler service identity or protocol does not match its lease");
+    }
+    if metadata.state == ServiceState::Draining && !allow_draining {
+        bail!(
+            "scheduler service {} is draining; wait for `fluent scheduler stop --all` to finish",
+            metadata.instance_id
+        );
+    }
+    if health.build != *requested {
+        bail!(
+            "a live scheduler service is running {} ({}), but this Fluent build is {} ({}); run `fluent scheduler stop --all`, then `fluent scheduler run`",
+            health.build.version,
+            health.build.hash,
+            requested.version,
+            requested.hash
+        );
+    }
+    Ok(())
 }
 
 /// Submit one immutable execution request through the versioned scheduler
@@ -767,6 +1060,8 @@ fn serve_health_connection(stream: &mut UnixStream, build: &BuildIdentity) -> Re
             SocketResponse::HealthOk {
                 generation: PROTOCOL_GENERATION,
                 build: build.clone(),
+                instance_id: None,
+                state: None,
             }
         }
         Ok(_) => SocketResponse::Error {
@@ -801,6 +1096,9 @@ pub struct SchedulerService {
     prepare_host_execution: bool,
     reused_coordinator: Option<crate::scheduler::CoordinatorMetadata>,
     poll_failures: Vec<String>,
+    worker_failures: Vec<String>,
+    service_identity: Option<ServiceMetadata>,
+    draining: bool,
 }
 
 struct ServiceWorker {
@@ -810,6 +1108,35 @@ struct ServiceWorker {
 }
 
 impl SchedulerService {
+    fn accept_drain(&mut self, instance_id: &str) -> Result<()> {
+        let identity = self
+            .service_identity
+            .as_mut()
+            .context("service has no lifecycle identity")?;
+        if identity.instance_id != instance_id {
+            bail!("service instance changed; stale drain request rejected");
+        }
+        if !self.draining {
+            let mut draining = identity.clone();
+            draining.state = ServiceState::Draining;
+            publish_service_metadata(&self.home_dir, &draining)?;
+            *identity = draining;
+            self.draining = true;
+        }
+        Ok(())
+    }
+
+    fn read_drain_request(&mut self) -> Result<()> {
+        if let Some(identity) = &self.service_identity {
+            if let Some(record) = read_stop_record(&service_instance_stop_path(
+                &self.home_dir,
+                &identity.instance_id,
+            ))? {
+                self.accept_drain(&record.instance_id)?;
+            }
+        }
+        Ok(())
+    }
     pub fn new(
         home_dir: &Path,
         build: BuildIdentity,
@@ -831,6 +1158,9 @@ impl SchedulerService {
             prepare_host_execution: false,
             reused_coordinator: None,
             poll_failures: Vec::new(),
+            worker_failures: Vec::new(),
+            service_identity: None,
+            draining: false,
         }
     }
 
@@ -852,8 +1182,33 @@ impl SchedulerService {
                 SocketResponse::HealthOk {
                     generation: PROTOCOL_GENERATION,
                     build: self.build.clone(),
+                    instance_id: self
+                        .service_identity
+                        .as_ref()
+                        .map(|m| m.instance_id.clone()),
+                    state: self.service_identity.as_ref().map(|m| {
+                        if self.draining {
+                            ServiceState::Draining
+                        } else {
+                            m.state
+                        }
+                    }),
                 }
             }
+            Ok(SocketRequest::Drain {
+                generation,
+                instance_id,
+            }) if generation == PROTOCOL_GENERATION => match self.accept_drain(&instance_id) {
+                Ok(()) => SocketResponse::DrainAccepted {
+                    generation,
+                    instance_id,
+                    state: ServiceState::Draining,
+                },
+                Err(error) => SocketResponse::Error {
+                    generation,
+                    message: error.to_string(),
+                },
+            },
             Ok(SocketRequest::SubmitExecution {
                 generation,
                 build,
@@ -861,6 +1216,9 @@ impl SchedulerService {
                 request,
             }) if generation == PROTOCOL_GENERATION => {
                 let submission = (|| {
+                    if self.draining {
+                        bail!("scheduler service is draining");
+                    }
                     let project = self.validate_project(&project_root, &build)?;
                     persist_request(&project, &request)?;
                     let token = submit_dispatch(&project, &request)?;
@@ -965,6 +1323,9 @@ impl SchedulerService {
         self.poll_failures.clear();
         self.failed_stop_projects.clear();
         self.reconcile_stops()?;
+        if self.draining {
+            return Ok(());
+        }
         let mut projects = read_registry(&self.home_dir)?
             .into_keys()
             .collect::<Vec<_>>();
@@ -1060,6 +1421,7 @@ impl SchedulerService {
             if worker.handle.is_finished() {
                 if let Err(error) = settle_worker(worker) {
                     eprintln!("[scheduler] {error:#}");
+                    self.worker_failures.push(format!("{error:#}"));
                 }
             } else {
                 pending.push(worker);
@@ -1189,6 +1551,21 @@ impl SchedulerService {
     }
 
     #[cfg(feature = "test-support")]
+    pub fn worker_failures_for_test(&self) -> &[String] {
+        &self.worker_failures
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn set_service_identity_for_test(&mut self, instance_id: &str) {
+        self.service_identity = Some(ServiceMetadata {
+            schema: SERVICE_METADATA_SCHEMA,
+            instance_id: instance_id.to_owned(),
+            state: ServiceState::Running,
+            build: self.build.clone(),
+        });
+    }
+
+    #[cfg(feature = "test-support")]
     fn owns_coordinator(&self) -> bool {
         !self.coordinators.is_empty()
     }
@@ -1230,6 +1607,7 @@ pub fn run_service(home_dir: &Path, build: BuildIdentity, poll_seconds: u64) -> 
         poll_seconds,
         Arc::new(crate::scheduler::CliAttemptRunner),
         true,
+        false,
     )
 }
 
@@ -1242,7 +1620,17 @@ pub fn run_service_with_test_runner(
     poll_seconds: u64,
     runner: Arc<dyn crate::scheduler::AttemptRunner>,
 ) -> Result<()> {
-    run_service_with_runner(home_dir, build, poll_seconds, runner, false)
+    run_service_with_runner(home_dir, build, poll_seconds, runner, false, false)
+}
+
+#[cfg(feature = "test-support")]
+pub fn run_service_with_socket_test_runner(
+    home_dir: &Path,
+    build: BuildIdentity,
+    poll_seconds: u64,
+    runner: Arc<dyn crate::scheduler::AttemptRunner>,
+) -> Result<()> {
+    run_service_with_runner(home_dir, build, poll_seconds, runner, false, true)
 }
 
 fn run_service_with_runner(
@@ -1251,12 +1639,13 @@ fn run_service_with_runner(
     poll_seconds: u64,
     runner: Arc<dyn crate::scheduler::AttemptRunner>,
     prepare_host_execution: bool,
+    force_socket: bool,
 ) -> Result<()> {
     if SERVICE_SHUTDOWN.load(Ordering::Acquire) {
         return Ok(());
     }
     #[cfg(feature = "test-support")]
-    if std::env::var_os("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT").is_some() {
+    if !force_socket && std::env::var_os("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT").is_some() {
         return run_transportless_service(
             home_dir,
             build,
@@ -1266,14 +1655,46 @@ fn run_service_with_runner(
         );
     }
     let path = socket_path(home_dir);
-    if let Ok(health) = send_health_request(&path) {
+    if let Some(health) = inspect_service(home_dir, &build)? {
         eprintln!(
-            "[scheduler] reusing live coordinator running {} ({})",
-            health.build.version, health.build.hash
+            "[scheduler] reusing live service {} running {} ({})",
+            health.instance_id.as_deref().unwrap_or("unknown"),
+            health.build.version,
+            health.build.hash
         );
         return Ok(());
     }
-    let _ = fs::remove_file(&path);
+    let lease = loop {
+        if let Some(lease) = try_service_lease(home_dir, &build)? {
+            break lease;
+        }
+        if let Some(health) = inspect_service(home_dir, &build)? {
+            eprintln!(
+                "[scheduler] reusing live service {} running {} ({})",
+                health.instance_id.as_deref().unwrap_or("unknown"),
+                health.build.version,
+                health.build.hash
+            );
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    // A reachable socket without this lease is a legacy or unverified owner.
+    match UnixStream::connect(&path) {
+        Ok(_) => bail!(
+            "scheduler socket became reachable during election; stop its owning process manually"
+        ),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) => {}
+        Err(error) => return Err(error).context("inspect socket after service election"),
+    }
+    publish_service_metadata(home_dir, &lease.metadata)?;
+    if path.exists() {
+        fs::remove_file(&path).context("remove inactive service socket")?;
+    }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
         #[cfg(unix)]
@@ -1281,25 +1702,46 @@ fn run_service_with_runner(
     }
     let listener = UnixListener::bind(&path)
         .with_context(|| format!("bind scheduler service {}", path.display()))?;
+    let bound_inode = fs::metadata(&path)?.ino();
     listener.set_nonblocking(true)?;
     #[cfg(unix)]
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
     let mut service = SchedulerService::new_production(home_dir, build, runner);
+    service.service_identity = Some(lease.metadata.clone());
     service.prepare_host_execution = prepare_host_execution;
     let poll_interval = Duration::from_secs(poll_seconds.max(1));
     let mut next_poll = Instant::now();
     loop {
         if SERVICE_SHUTDOWN.load(Ordering::Acquire) {
-            return service.join_workers().context("shutdown scheduler workers");
+            service.accept_drain(&lease.metadata.instance_id)?;
         }
+        service.read_drain_request()?;
         match listener.accept() {
             Ok((mut stream, _)) => {
+                stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+                stream.set_write_timeout(Some(Duration::from_secs(2)))?;
                 let _ = service.serve_connection(&mut stream);
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
             Err(error) => return Err(error).context("accept scheduler service connection"),
         }
         service.tick(Instant::now(), &mut next_poll, poll_interval)?;
+        if service.draining && service.workers.is_empty() {
+            let result = ServiceStopRecord {
+                schema: SERVICE_METADATA_SCHEMA,
+                instance_id: lease.metadata.instance_id.clone(),
+                build: lease.metadata.build.clone(),
+                failures: service.worker_failures.clone(),
+            };
+            write_stop_record(&service_result_path(home_dir, &result.instance_id), &result)?;
+            drop(listener);
+            if fs::metadata(&path).is_ok_and(|m| m.ino() == bound_inode) {
+                fs::remove_file(&path)?;
+            }
+            drop(service);
+            drop(lease);
+            return Ok(());
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
 }
@@ -1354,6 +1796,116 @@ pub enum ServiceStartOutcome {
     Reused(HealthResponse),
 }
 
+/// Drain the current shared owner and wait until every owned worker settles.
+pub fn stop_service(home: &Path) -> Result<ServiceStopRecord> {
+    let health = match send_health_request(&socket_path(home)) {
+        Ok(health) => health,
+        Err(error) if !socket_path(home).exists() => {
+            if let Some(request) = read_stop_record(&service_stop_path(home))? {
+                if lock_identity(home)?.as_str() != request.instance_id && service_lease_live(home)?
+                {
+                    bail!(
+                        "a replacement scheduler service is starting; retry stop after its health becomes available"
+                    );
+                }
+                return stop_service_instance(home, &request.instance_id);
+            }
+            return Err(error).context("shared scheduler is not running");
+        }
+        Err(error) => return Err(error).context("inspect shared scheduler before drain"),
+    };
+    let verified = inspect_service_with_state(home, &health.build, true)?
+        .context("shared scheduler is not running")?;
+    stop_service_instance(
+        home,
+        verified
+            .instance_id
+            .as_deref()
+            .context("missing service instance")?,
+    )
+}
+
+/// Replay a drain for exactly one service instance, including after its exit.
+pub fn stop_service_instance(home: &Path, instance_id: &str) -> Result<ServiceStopRecord> {
+    if instance_id.len() != 32 || !instance_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("invalid scheduler service instance identity");
+    }
+    if let Some(result) = read_stop_record(&service_result_path(home, instance_id))? {
+        if result.instance_id == instance_id {
+            while !stop_result_released(home, instance_id)? {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            return settled_stop_result(result);
+        }
+    }
+    let health =
+        send_health_request(&socket_path(home)).context("inspect shared scheduler before drain")?;
+    let observed = inspect_service_with_state(home, &health.build, true)?
+        .context("shared scheduler is not running")?;
+    if observed.instance_id.as_deref() != Some(instance_id) {
+        bail!("service instance changed; stale drain request for {instance_id} rejected");
+    }
+    let record = ServiceStopRecord {
+        schema: SERVICE_METADATA_SCHEMA,
+        instance_id: instance_id.to_owned(),
+        build: observed.build,
+        failures: Vec::new(),
+    };
+    write_stop_record(&service_instance_stop_path(home, instance_id), &record)?;
+    write_stop_record(&service_stop_path(home), &record)?;
+    // Revalidate after publication. A replacement never accepts the old id.
+    if let Ok(current) = send_health_request(&socket_path(home)) {
+        if current.instance_id.as_deref() != Some(instance_id) {
+            bail!("service instance changed while requesting drain");
+        }
+        let _ = exchange(
+            &socket_path(home),
+            &SocketRequest::Drain {
+                generation: PROTOCOL_GENERATION,
+                instance_id: instance_id.to_owned(),
+            },
+        );
+    }
+    loop {
+        if let Some(result) = read_stop_record(&service_result_path(home, instance_id))? {
+            if result.instance_id == instance_id && stop_result_released(home, instance_id)? {
+                return settled_stop_result(result);
+            }
+        }
+        if let Ok(current) = send_health_request(&socket_path(home)) {
+            if current.instance_id.as_deref() != Some(instance_id) {
+                bail!(
+                    "service instance changed while draining; {} is now running",
+                    current.instance_id.unwrap_or_default()
+                );
+            }
+        } else if !service_lease_live(home)? {
+            bail!(
+                "scheduler service {instance_id} exited without a settled drain result; inspect its work before replacement"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn settled_stop_result(result: ServiceStopRecord) -> Result<ServiceStopRecord> {
+    if !result.failures.is_empty() {
+        bail!(
+            "scheduler service {} drained with worker failures: {}",
+            result.instance_id,
+            result.failures.join("; ")
+        );
+    }
+    Ok(result)
+}
+
+fn stop_result_released(home: &Path, instance_id: &str) -> Result<bool> {
+    if lock_identity(home).ok().as_deref() != Some(instance_id) {
+        return Ok(true);
+    }
+    Ok(!service_lease_live(home)?)
+}
+
 /// Set up the service for a project: assign a checkout identity, register it
 /// in the user registry, stage the current executable, record the desired
 /// build, and install through the service manager. Returns the staged build
@@ -1381,12 +1933,14 @@ pub fn start_or_reuse_service(
     manager: &dyn ServiceManager,
 ) -> Result<ServiceStartOutcome> {
     let sock = socket_path(home_dir);
-    if let Ok(health) = send_health_request(&sock) {
+    if let Some(health) = inspect_service(home_dir, build)? {
         return Ok(ServiceStartOutcome::Reused(health));
     }
     manager.start()?;
-    let health = wait_for_health(&sock, std::time::Duration::from_secs(5))?;
-    record_observed_build(home_dir, build)?;
+    wait_for_health(&sock, std::time::Duration::from_secs(5))?;
+    let health =
+        inspect_service(home_dir, build)?.context("new service disappeared after health")?;
+    record_observed_build(home_dir, &health.build)?;
     Ok(ServiceStartOutcome::Started(health))
 }
 
