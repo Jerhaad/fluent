@@ -40,14 +40,14 @@ unbounded concurrency safe.
 
 ## Shared service lifecycle
 
-Run `python3 tests/formal/scheduler/check.py --suite=lifecycle --jar=target/fluent-tools/tla2tools-1.7.4.jar` on the candidate host. `ServiceLifecycle.tla` bounds ownership to two service instances, two builds, two projects, one worker and one queued dispatch per project, and one crash. The proposed configuration checks one owner, matching build reuse, guarded admission after drain, instance-bound stop, and no stopped result with a live worker. A legacy configuration disables protocol compatibility and drain capability and checks that no drain is acknowledged. Three negative controls separately remove the build, instance, and admission guards. The checker retains each TLC log under `target/formal/scheduler/`.
+Run `python3 tests/formal/scheduler/check.py --suite=lifecycle --jar=target/fluent-tools/tla2tools-1.7.4.jar` on the candidate host. `ServiceLifecycle.tla` bounds ownership to two fresh service instances, two builds, two projects, one worker and one queued dispatch per project, and one crash. It retains each instance's stop operation, result, publication and interruption after replacement. The proposed configuration checks one owner, matching build reuse, guarded admission after drain, instance-bound stop, exact replay, retained published results, and no stopped result with a live worker. A legacy configuration disables protocol compatibility and drain capability and checks that no drain is acknowledged. Five negative controls independently remove the build, instance, admission, replay and result-retention guards. The checker retains each TLC log under `target/formal/scheduler/`.
 
 | Model action | Production boundary |
 | --- | --- |
 | `Start`, `Reuse` | `try_service_lease`, `inspect_service`, `validate_service_reuse` |
 | `Submit`, `Claim` | `SchedulerService::serve_connection`, `SchedulerService::poll_once` |
-| `RequestStop`, `Acknowledge` | `stop_service_instance`, `SchedulerService::read_drain_request`, `accept_drain` |
-| `Settle`, `Finish` | `reap_finished`, `run_service_with_runner` completion/result publication |
-| `Crash` | Lease release and later election in `try_service_lease` |
+| `RequestStop`, `Acknowledge`, `Replay` | `stop_service_instance`, `SchedulerService::read_drain_request`, `accept_drain`, `wait_for_stop_result` |
+| `Settle`, `Publish`, `Cleanup` | `reap_finished`, `write_stop_record`, then socket and lease release in `run_service_with_runner` |
+| `Crash` | Process exit before or after result publication; lease release and later election in `try_service_lease` |
 
-The progress property assumes weak fairness for worker settlement and drain completion; a crash satisfies its escape condition instead of proving natural completion. The model treats worker settlement as one atomic action and omits filesystem write errors, malformed socket frames, hung workers, and unbounded histories. The Rust socket host checks cover the transport and publication order. This is a bounded protocol check, not a general refinement proof.
+The progress property tracks each accepted drain by instance. It assumes weak fairness for worker settlement and result publication; an interruption only closes the affected instance's obligation. A replacement's drain must still finish. The model treats worker settlement as one atomic action and omits filesystem write errors, malformed socket frames, hung workers, and unbounded histories. The Rust socket host checks cover transport, a child crash after acknowledgement, and a child crash between result publication and cleanup. This is a bounded protocol check, not a general refinement proof.

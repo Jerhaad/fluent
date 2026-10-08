@@ -626,6 +626,145 @@ fn scheduler_host_upgrade_drain_restart_and_replay() {
 
 #[test]
 #[ignore]
+#[cfg(all(unix, feature = "test-support"))]
+fn scheduler_host_upgrade_replays_published_result_after_child_crash() {
+    let home = TempDir::new().unwrap();
+    let marker = home.path().join("result-published");
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "__scheduler_service_process_fixture",
+        ])
+        .env("FLUENT_SCHEDULER_TEST_HOME", home.path())
+        .env("FLUENT_SCHEDULER_TEST_PAUSE_AFTER_RESULT", &marker)
+        .env_remove("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT")
+        .spawn()
+        .unwrap();
+    let socket = scheduler_service::socket_path(home.path());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let instance = loop {
+        if let Ok(health) = scheduler_service::send_health_request(&socket) {
+            break health.instance_id.unwrap();
+        }
+        assert!(Instant::now() < deadline, "child service did not start");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let home_path = home.path().to_owned();
+    let old_instance = instance.clone();
+    let stopping = std::thread::spawn(move || {
+        scheduler_service::stop_service_instance(&home_path, &old_instance)
+    });
+    while !marker.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "child did not publish stop result"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(child.try_wait().unwrap().is_none());
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let first = stopping.join().unwrap().unwrap();
+    assert_eq!(first.instance_id, instance);
+    let replacement = start_upgrade_service(home.path(), fake_build());
+    let current = scheduler_service::send_health_request(&socket)
+        .unwrap()
+        .instance_id
+        .unwrap();
+    assert_ne!(current, instance);
+    assert_eq!(
+        scheduler_service::stop_service_instance(home.path(), &instance)
+            .unwrap()
+            .instance_id,
+        instance
+    );
+    assert_eq!(
+        scheduler_service::send_health_request(&socket)
+            .unwrap()
+            .instance_id
+            .as_deref(),
+        Some(current.as_str())
+    );
+    scheduler_service::stop_service(home.path()).unwrap();
+    replacement.join().unwrap().unwrap();
+}
+
+#[test]
+#[ignore]
+#[cfg(all(unix, feature = "test-support"))]
+fn scheduler_host_upgrade_rejects_old_drain_after_ack_crash() {
+    let root = TempDir::new().unwrap();
+    let home = root.path().join("home");
+    let project = root.path().join("project");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&project).unwrap();
+    let identity = scheduler_service::assign_checkout_identity(&project).unwrap();
+    scheduler_service::register_checkout(&home, &project, &identity).unwrap();
+    create_execution_ready_work(&project, "wi-drain-crash");
+    fluent::queue::add(&project, "wi-drain-crash", Some(0)).unwrap();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "__scheduler_service_process_fixture",
+        ])
+        .env("FLUENT_SCHEDULER_TEST_HOME", &home)
+        .env("FLUENT_SCHEDULER_TEST_CRASH_PREFIX", "1")
+        .env("FLUENT_SCHEDULER_TEST_FORCE_SOCKET", "1")
+        .env_remove("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT")
+        .spawn()
+        .unwrap();
+    let socket = scheduler_service::socket_path(&home);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let instance = loop {
+        let running = fluent::queue::show(&project, "wi-drain-crash")
+            .is_ok_and(|dispatch| dispatch.status == fluent::queue::DispatchStatus::Running);
+        if running {
+            if let Ok(health) = scheduler_service::send_health_request(&socket) {
+                break health.instance_id.unwrap();
+            }
+        }
+        assert!(Instant::now() < deadline, "child did not claim work");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let home_path = home.clone();
+    let old_instance = instance.clone();
+    let stopping = std::thread::spawn(move || {
+        scheduler_service::stop_service_instance(&home_path, &old_instance)
+    });
+    loop {
+        if scheduler_service::send_health_request(&socket)
+            .is_ok_and(|health| health.state == Some(scheduler_service::ServiceState::Draining))
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "child did not acknowledge drain");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(stopping.join().unwrap().is_err());
+    let replacement = start_upgrade_service(home.as_path(), fake_build());
+    let current = scheduler_service::send_health_request(&socket)
+        .unwrap()
+        .instance_id
+        .unwrap();
+    assert_ne!(current, instance);
+    assert!(scheduler_service::stop_service_instance(&home, &instance).is_err());
+    assert_eq!(
+        scheduler_service::send_health_request(&socket)
+            .unwrap()
+            .instance_id
+            .as_deref(),
+        Some(current.as_str())
+    );
+    scheduler_service::stop_service(&home).unwrap();
+    replacement.join().unwrap().unwrap();
+}
+
+#[test]
+#[ignore]
 #[cfg(feature = "test-support")]
 fn scheduler_host_upgrade_public_cli() {
     let home = TempDir::new().unwrap();
@@ -2730,11 +2869,24 @@ fn scheduler_workers_reap_failure_without_losing_healthy_worker() {
 fn __scheduler_service_process_fixture() {
     let home = std::env::var_os("FLUENT_SCHEDULER_TEST_HOME").expect("fixture home");
     if std::env::var_os("FLUENT_SCHEDULER_TEST_CRASH_PREFIX").is_some() {
-        scheduler_service::run_service_with_test_runner(
+        let run = if std::env::var_os("FLUENT_SCHEDULER_TEST_FORCE_SOCKET").is_some() {
+            scheduler_service::run_service_with_socket_test_runner
+        } else {
+            scheduler_service::run_service_with_test_runner
+        };
+        run(
             std::path::Path::new(&home),
             fake_build(),
             1,
             Arc::new(CrashPrefixRunner),
+        )
+        .unwrap();
+    } else if std::env::var_os("FLUENT_SCHEDULER_TEST_PAUSE_AFTER_RESULT").is_some() {
+        scheduler_service::run_service_with_socket_test_runner(
+            std::path::Path::new(&home),
+            fake_build(),
+            1,
+            Arc::new(NeedsUserRunner::default()),
         )
         .unwrap();
     } else if std::env::var_os("FLUENT_SCHEDULER_TEST_WORKER_ERROR").is_some() {

@@ -1746,6 +1746,13 @@ fn run_service_with_runner(
                 failures: service.worker_failures.clone(),
             };
             write_stop_record(&service_result_path(home_dir, &result.instance_id), &result)?;
+            #[cfg(feature = "test-support")]
+            if let Some(marker) = std::env::var_os("FLUENT_SCHEDULER_TEST_PAUSE_AFTER_RESULT") {
+                fs::write(marker, b"published")?;
+                loop {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
             drop(listener);
             if fs::metadata(&path).is_ok_and(|m| m.ino() == bound_inode) {
                 fs::remove_file(&path)?;

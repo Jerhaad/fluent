@@ -26,6 +26,8 @@ LIFECYCLE_CASES = (
     ("ServiceLifecycle", "lifecycle-negative-build.cfg", "Invariant NoMismatchedReuse is violated"),
     ("ServiceLifecycle", "lifecycle-negative-instance.cfg", "Invariant NoStaleStop is violated"),
     ("ServiceLifecycle", "lifecycle-negative-admission.cfg", "Invariant NoAdmissionAfterDrain is violated"),
+    ("ServiceLifecycle", "lifecycle-negative-replay.cfg", "Invariant ReplayStable is violated"),
+    ("ServiceLifecycle", "lifecycle-negative-retention.cfg", "Invariant RetainedResult is violated"),
 )
 
 
