@@ -4490,8 +4490,10 @@ reported with its project and available dispatch identity while the service
 continues to later checkouts. Registry errors still stop the poll because the
 service cannot establish its project set. Automatic recovery retries on a later
 configured poll; it does not create a new pause or infer an Attempt outcome
-from a worker error. Reaping joins only finished workers, and shutdown joins
-every remaining worker before reporting collected failures.
+from a worker error. Reaping joins only finished workers and reports their
+failures. On a shutdown signal, the service joins remaining workers and returns
+their collected failures to its caller. If another exit path drops the service,
+the destructor joins remaining workers and logs their failures.
 The host sandbox preflight is a service-wide capability gate: its typed failure
 stops the service before baseline preparation, queue claims, or provider launch.
 

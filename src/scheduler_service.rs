@@ -1182,6 +1182,11 @@ impl SchedulerService {
     }
 
     #[cfg(feature = "test-support")]
+    pub fn worker_count_for_test(&self) -> usize {
+        self.workers.len()
+    }
+
+    #[cfg(feature = "test-support")]
     fn owns_coordinator(&self) -> bool {
         !self.coordinators.is_empty()
     }
@@ -1205,7 +1210,9 @@ fn settle_worker(worker: ServiceWorker) -> Result<()> {
 
 impl Drop for SchedulerService {
     fn drop(&mut self) {
-        let _ = self.join_workers();
+        if let Err(error) = self.join_workers() {
+            eprintln!("[scheduler] shutdown workers: {error:#}");
+        }
         for project in self.prepared_projects.drain() {
             let _ = crate::scheduler::finish_service_execution(&project);
         }
@@ -1281,7 +1288,7 @@ fn run_service_with_runner(
     let mut next_poll = Instant::now();
     loop {
         if SERVICE_SHUTDOWN.load(Ordering::Acquire) {
-            return Ok(());
+            return service.join_workers().context("shutdown scheduler workers");
         }
         match listener.accept() {
             Ok((mut stream, _)) => {
@@ -1315,7 +1322,7 @@ fn run_transportless_service(
     let mut owned_coordinator = false;
     loop {
         if SERVICE_SHUTDOWN.load(Ordering::Acquire) {
-            return Ok(());
+            return service.join_workers().context("shutdown scheduler workers");
         }
         service.tick(Instant::now(), &mut next_poll, poll_interval)?;
         if owned_coordinator && !service.owns_coordinator() {

@@ -4,7 +4,7 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 // ─────────────────────────────────────────────────
@@ -1914,9 +1914,20 @@ fn scheduler_workers_preserve_others_after_failure() {
         assert!(!timeout.timed_out() && *failed);
         drop(failed);
         let release = runner.clone();
-        let joiner = std::thread::spawn(move || service.join_workers());
+        let (joined_tx, joined_rx) = std::sync::mpsc::channel();
+        let joiner = std::thread::spawn(move || {
+            let result = service.join_workers();
+            joined_tx.send(()).unwrap();
+            result
+        });
+        let waited_for_healthy = joined_rx.recv_timeout(Duration::from_millis(200)).is_err();
         release.blocked.release_one();
-        let error = joiner.join().unwrap().unwrap_err().to_string();
+        let joined = joiner.join().unwrap();
+        assert!(
+            waited_for_healthy,
+            "join discarded the blocked healthy worker"
+        );
+        let error = joined.unwrap_err().to_string();
         assert!(error.contains("wi-fail"));
         assert!(error.contains("worker"));
         assert!(error.contains(&project.path().display().to_string()));
@@ -1936,6 +1947,68 @@ fn scheduler_workers_preserve_others_after_failure() {
             .unwrap()
         );
     }
+}
+
+#[test]
+fn scheduler_workers_reap_failure_without_losing_healthy_worker() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    fs::create_dir_all(project.path().join(".fluent")).unwrap();
+    fs::write(
+        project.path().join(".fluent/config.yaml"),
+        "scheduler:\n  local-concurrency: 2\n",
+    )
+    .unwrap();
+    for (id, priority) in [("wi-fail", 2), ("wi-healthy", 1)] {
+        create_execution_ready_work(project.path(), id);
+        fluent::queue::add(project.path(), id, Some(priority)).unwrap();
+    }
+    let runner = Arc::new(MixedWorkerRunner {
+        blocked: BlockingRunner::default(),
+        failure_started: Arc::new((Mutex::new(false), Condvar::new())),
+        panic_worker: false,
+    });
+    let mut service = registered_service(home.path(), project.path(), runner.clone());
+    service.poll_once().unwrap();
+    runner.blocked.wait_for_started(1);
+    let (lock, changed) = &*runner.failure_started;
+    let (failed, timeout) = changed
+        .wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(2), |failed| {
+            !*failed
+        })
+        .unwrap();
+    assert!(!timeout.timed_out() && *failed);
+    drop(failed);
+
+    let interval = Duration::from_secs(60);
+    let mut next_poll = Instant::now() + interval;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while service.worker_count_for_test() == 2 && Instant::now() < deadline {
+        service
+            .tick_for_test(Instant::now(), &mut next_poll, interval)
+            .unwrap();
+        std::thread::yield_now();
+    }
+    assert_eq!(service.worker_count_for_test(), 1);
+    let (joined_tx, joined_rx) = std::sync::mpsc::channel();
+    let joiner = std::thread::spawn(move || {
+        let result = service.join_workers();
+        joined_tx.send(()).unwrap();
+        result
+    });
+    let waited_for_healthy = joined_rx.recv_timeout(Duration::from_millis(200)).is_err();
+    runner.blocked.release_one();
+    joiner.join().unwrap().unwrap();
+    assert!(
+        waited_for_healthy,
+        "reaping discarded the blocked healthy worker"
+    );
+    assert_eq!(
+        fluent::queue::show(project.path(), "wi-healthy")
+            .unwrap()
+            .status,
+        fluent::queue::DispatchStatus::NeedsUser
+    );
 }
 
 #[test]
