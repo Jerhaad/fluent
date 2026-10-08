@@ -635,19 +635,28 @@ fn scheduler_host_upgrade_managed_start_checks_observed_build() {
     scheduler_service::stop_service(home.path()).unwrap();
     manager.join();
 
-    let wrong_home = TempDir::new().unwrap();
-    let wrong = SocketServiceManager::new(wrong_home.path(), fake_build());
-    let error = scheduler_service::start_or_reuse_service(wrong_home.path(), &different, &wrong)
-        .err()
-        .unwrap();
-    assert!(error.to_string().contains("stop --all"));
-    assert_eq!(
-        scheduler_service::read_observed_build(wrong_home.path()).unwrap(),
-        None
-    );
-    assert_eq!(wrong.starts.load(Ordering::SeqCst), 1);
-    scheduler_service::stop_service(wrong_home.path()).unwrap();
-    wrong.join();
+    for requested in [
+        different,
+        BuildIdentity {
+            version: fake_build().version,
+            hash: "new-hash".into(),
+        },
+    ] {
+        let wrong_home = TempDir::new().unwrap();
+        let wrong = SocketServiceManager::new(wrong_home.path(), fake_build());
+        let error =
+            scheduler_service::start_or_reuse_service(wrong_home.path(), &requested, &wrong)
+                .err()
+                .unwrap();
+        assert!(error.to_string().contains("stop --all"));
+        assert_eq!(
+            scheduler_service::read_observed_build(wrong_home.path()).unwrap(),
+            None
+        );
+        assert_eq!(wrong.starts.load(Ordering::SeqCst), 1);
+        scheduler_service::stop_service(wrong_home.path()).unwrap();
+        wrong.join();
+    }
 }
 
 #[test]
