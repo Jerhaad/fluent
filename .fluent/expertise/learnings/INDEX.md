@@ -132,6 +132,7 @@
 - [sandbox-denials-track-template-grants](sandbox-denials-track-template-grants.md) — Handoff-only sandbox confinement depends on stripping exact shared-temp grant strings from the rendered profile
 - [sandbox-preflight-uses-admitted-private-home](sandbox-preflight-uses-admitted-private-home.md) — Run strict Codex readiness from its admitted private home and test its ancestor grants independently of workspace grants
 - [sandbox-tests-assert-invariant-in-both-host-branches](sandbox-tests-assert-invariant-in-both-host-branches.md) — A confinement test asserts its security invariant unconditionally, then branches on sandbox availability only to add the stronger observation each host permits — never skips when the sandbox is unavailable
+- [scheduler-accepted-sockets-use-bounded-framing](scheduler-accepted-sockets-use-bounded-framing.md) — Put accepted scheduler Unix streams in blocking mode with timeouts before reading framed requests
 - [scheduler-formal-checks-use-defect-controls](scheduler-formal-checks-use-defect-controls.md) — Run the pinned scheduler TLC suite with passing protocols and expected defect controls, then test the real service boundary
 - [scheduler-resume-requires-explicit-dispatch-intent](scheduler-resume-requires-explicit-dispatch-intent.md) — Scheduler recovery requires explicit resume intent bound to the exact Attempt and cancellation observed at admission
 - [scheduler-service-contains-project-failures](scheduler-service-contains-project-failures.md) — Recover each registered checkout before claiming work, contain project failures to that poll, and keep failed stop checks out of admission
@@ -140,6 +141,7 @@
 - [scoped-writers-separate-tools-from-mutable-state](scoped-writers-separate-tools-from-mutable-state.md) — Give scoped Writer retries exact validated inputs and read-only tools while keeping mutable state private
 - [semantic-validation-tests-reach-target-branch](semantic-validation-tests-reach-target-branch.md) — Semantic rejection tests must use structurally valid persisted input and assert the target validation error so deserialization cannot satisfy them accidentally
 - [serialized-reviewer-cache-admission](serialized-reviewer-cache-admission.md) — Candidate-keyed reviewer-cache admission is a project-wide serialized transaction that reclaims unreferenced caches, accounts, checks capacity, and then copies; failures start the reviewer cold
+- [shared-service-ownership-spans-drain](shared-service-ownership-spans-drain.md) — Verify the shared scheduler lease and instance through reuse, drain publication, replay, and ownership release
 - [shell-fakes-inject-malformed-cli-output](shell-fakes-inject-malformed-cli-output.md) — Shell CLI fakes must inject malformed and incomplete JSON responses to cover jq parse failure paths
 - [shell-phase-failure-all-exit-paths](shell-phase-failure-all-exit-paths.md) — Every exit path in a shell multi-phase workflow must route through fail_phase, not bare set -e
 - [shell-printed-commands-quote-paths](shell-printed-commands-quote-paths.md) — Shell paths interpolated into user-facing commands must be escaped with printf %q
