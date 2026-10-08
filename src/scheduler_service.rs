@@ -1085,6 +1085,35 @@ fn frame_read(stream: &mut UnixStream) -> io::Result<Vec<u8>> {
     Ok(payload)
 }
 
+fn configure_accepted_stream(stream: &UnixStream) -> io::Result<()> {
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))
+}
+
+#[cfg(test)]
+mod accepted_stream_tests {
+    use super::*;
+
+    #[test]
+    fn fragmented_frame_waits_for_payload() {
+        let (mut accepted, mut client) = UnixStream::pair().unwrap();
+        accepted.set_nonblocking(true).unwrap();
+        configure_accepted_stream(&accepted).unwrap();
+        let payload = b"fragmented request";
+        client
+            .write_all(&(payload.len() as u32).to_le_bytes())
+            .unwrap();
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            client.write_all(payload).unwrap();
+        });
+        let received = frame_read(&mut accepted);
+        sender.join().unwrap();
+        assert_eq!(received.unwrap(), payload);
+    }
+}
+
 /// Read a raw protocol frame from a Unix stream.
 ///
 /// Exposed only under the `test-support` feature so integration tests can
@@ -1804,8 +1833,7 @@ fn run_service_with_runner(
         service.read_drain_request()?;
         match listener.accept() {
             Ok((mut stream, _)) => {
-                stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-                stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+                configure_accepted_stream(&stream)?;
                 let _ = service.serve_connection(&mut stream);
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}

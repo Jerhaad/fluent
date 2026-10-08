@@ -1342,6 +1342,47 @@ fn scheduler_host_upgrade_public_cli() {
 #[test]
 #[ignore]
 #[cfg(feature = "test-support")]
+fn scheduler_host_upgrade_accepts_fragmented_frame() {
+    let home = TempDir::new().unwrap();
+    let service = start_upgrade_service(home.path(), fake_build());
+    let socket = scheduler_service::socket_path(home.path());
+    let mut stream = UnixStream::connect(&socket).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "kind": "health",
+        "generation": scheduler_service::PROTOCOL_GENERATION,
+    }))
+    .unwrap();
+    stream
+        .write_all(&(payload.len() as u32).to_le_bytes())
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    let split = payload.len() / 2;
+    stream.write_all(&payload[..split]).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    stream.write_all(&payload[split..]).unwrap();
+    let response = (|| -> std::io::Result<serde_json::Value> {
+        let mut length = [0; 4];
+        stream.read_exact(&mut length)?;
+        let mut response = vec![0; u32::from_le_bytes(length) as usize];
+        stream.read_exact(&mut response)?;
+        Ok(serde_json::from_slice(&response)?)
+    })();
+    scheduler_service::stop_service(home.path()).unwrap();
+    service.join().unwrap().unwrap();
+    let response = response.unwrap();
+    assert_eq!(response["kind"], "health_ok");
+    assert_eq!(
+        response["build"],
+        serde_json::to_value(fake_build()).unwrap()
+    );
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "test-support")]
 fn scheduler_host_upgrade_preserves_bad_health_socket() {
     use std::os::unix::net::UnixListener;
     for timeout in [false, true] {
