@@ -5867,7 +5867,8 @@ work_queue_remove_unknown_errors)
 WHEN a shared service answers health with a compatible protocol, a verifiable
 current lease and metadata, and the requested version and executable SHA-256,
 THE SYSTEM SHALL reuse that service through both direct and managed startup.
-Test: tests/scheduler_service.rs (scheduler_host_upgrade_upgrade_reuses_matching_service,
+Test: tests/scheduler_service.rs (scheduler_upgrade_reuses_matching_service,
+scheduler_host_upgrade_upgrade_reuses_matching_service,
 scheduler_host_upgrade_managed_start_checks_observed_build)
 
 IF either build field differs, THE SYSTEM SHALL reject reuse, report both
@@ -5884,21 +5885,28 @@ scheduler_host_upgrade_preserves_bad_health_socket,
 scheduler_host_upgrade_simultaneous_starts_preserve_owner)
 
 WHEN the identified service accepts `fluent scheduler stop --all`, THE SYSTEM
-SHALL stop claims across all registered projects and reject new socket
-submissions without persisting requests or dispatches.
-Test: tests/scheduler_service.rs (scheduler_host_upgrade_drains_two_projects_through_socket)
+SHALL stop making new dispatch claims across all registered projects.
+Test: tests/scheduler_service.rs (scheduler_drain_stops_claiming_all_projects,
+scheduler_host_upgrade_drains_two_projects_through_socket)
+
+WHILE the shared service is draining, THE SYSTEM SHALL reject new execution
+submissions without persisting their requests or dispatches.
+Test: tests/scheduler_service.rs (scheduler_drain_rejects_new_submissions,
+scheduler_host_upgrade_drains_two_projects_through_socket)
 
 WHEN every worker owned by the draining service has settled, THE SYSTEM SHALL
 reconcile their results before publishing an instance-specific stop result and
 releasing ownership.
 Test: tests/scheduler_service.rs (scheduler_host_upgrade_drains_two_projects_through_socket,
-scheduler_host_upgrade_preserves_settled_worker_after_child_crash)
+scheduler_host_upgrade_preserves_settled_worker_after_child_crash,
+scheduler_drain_waits_for_all_owned_workers)
 Test: src/scheduler_service.rs (stop_result_tests::rejects_published_result_when_lease_identity_is_unreadable)
 
 WHEN a stop request repeats for the same instance, THE SYSTEM SHALL return its
 retained result after ownership release.
 Test: tests/scheduler_service.rs (scheduler_host_upgrade_drain_restart_and_replay,
-scheduler_host_upgrade_replays_published_result_after_child_crash)
+scheduler_host_upgrade_replays_published_result_after_child_crash,
+scheduler_drain_replays_same_instance)
 
 IF a stop request names an earlier instance, THEN THE SYSTEM SHALL leave its
 replacement running.

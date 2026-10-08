@@ -331,6 +331,37 @@ fn scheduler_drain_replays_same_instance() {
     let replay = framed_exchange(&mut service, request);
     assert_eq!(first, replay);
     assert_eq!(first["state"], "draining");
+
+    // A completed result remains tied to the original instance after the
+    // service releases ownership and a replacement takes the lease.
+    let instance = "0123456789abcdef0123456789abcdef";
+    let replacement = "ffffffffffffffffffffffffffffffff";
+    let root = scheduler_service::service_state_root(home.path());
+    fs::create_dir_all(root.join("stop-results")).unwrap();
+    fs::write(root.join("service.lock"), replacement).unwrap();
+    let record = serde_json::json!({"schema":1, "instance_id":instance,
+        "build":fake_build(), "failures":[]});
+    fs::write(
+        root.join("stop-request.json"),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        root.join("stop-results").join(format!("{instance}.json")),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+    let first_result = scheduler_service::stop_service_instance(home.path(), instance).unwrap();
+    let replayed_result = scheduler_service::stop_service_instance(home.path(), instance).unwrap();
+    assert_eq!(
+        serde_json::to_value(&first_result).unwrap(),
+        serde_json::to_value(&replayed_result).unwrap()
+    );
+    assert_eq!(first_result.instance_id, instance);
+    assert_eq!(
+        fs::read_to_string(root.join("service.lock")).unwrap(),
+        replacement
+    );
 }
 
 #[test]
@@ -405,6 +436,13 @@ fn scheduler_drain_waits_for_all_owned_workers() {
         std::thread::yield_now();
     }
     assert_eq!(service.worker_count_for_test(), 1);
+    let health = framed_exchange(
+        &mut service,
+        serde_json::json!({
+            "kind":"health", "generation": scheduler_service::PROTOCOL_GENERATION
+        }),
+    );
+    assert_eq!(health["state"], "draining");
     runner.release_one();
     service.join_workers().unwrap();
     assert_eq!(service.worker_count_for_test(), 0);
