@@ -5867,8 +5867,7 @@ work_queue_remove_unknown_errors)
 WHEN a shared service answers health with a compatible protocol, a verifiable
 current lease and metadata, and the requested version and executable SHA-256,
 THE SYSTEM SHALL reuse that service through both direct and managed startup.
-Test: tests/scheduler_service.rs (scheduler_upgrade_reuses_matching_service,
-scheduler_host_upgrade_upgrade_reuses_matching_service,
+Test: tests/scheduler_service.rs (scheduler_host_upgrade_upgrade_reuses_matching_service,
 scheduler_host_upgrade_managed_start_checks_observed_build)
 
 IF either build field differs, THE SYSTEM SHALL reject reuse, report both
@@ -5898,8 +5897,7 @@ WHEN every worker owned by the draining service has settled, THE SYSTEM SHALL
 reconcile their results before publishing an instance-specific stop result and
 releasing ownership.
 Test: tests/scheduler_service.rs (scheduler_host_upgrade_drains_two_projects_through_socket,
-scheduler_host_upgrade_preserves_settled_worker_after_child_crash,
-scheduler_drain_waits_for_all_owned_workers)
+scheduler_host_upgrade_preserves_settled_worker_after_child_crash)
 Test: src/scheduler_service.rs (stop_result_tests::rejects_published_result_when_lease_identity_is_unreadable)
 
 WHEN a stop request repeats for the same instance, THE SYSTEM SHALL return its
