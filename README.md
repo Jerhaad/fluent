@@ -171,13 +171,21 @@ If a production Tester Task needs a tracked change to `.fluent/tester.yaml` or `
 An environmental repair that does not change the candidate can retry the same Tester directly. A SwiftPM nested-sandbox diagnostic has its separate one-Task `--no-sandbox` approval. Fluent never edits project test configuration or scripts itself.
 
 Use `fluent scheduler status` to see which Fluent build owns the current
-project's queue. After installing a different build, run `fluent scheduler stop`
-to stop new claims and wait for running Work to finish, then start the installed
-build with `fluent scheduler run`. Fluent rejects silent reuse across different
-executable hashes and never uses the displayed process id to stop a coordinator.
-A coordinator started by an older Fluent release has no instance metadata; stop
-that process from the terminal or process supervisor that launched it before
-starting the new build. Fluent fails closed instead of guessing a process id.
+project's queue. `fluent scheduler stop` stops claims only for that project.
+To replace the shared service build across registered projects, run
+`fluent scheduler stop --all` and wait for it to finish, then explicitly run
+`fluent scheduler run` using the intended build. The global stop leaves queued
+Work in place and waits for active service-owned Attempts in every project.
+It does not cancel Attempts, start a replacement, or signal the displayed PID.
+If an Attempt does not finish, use its existing explicit cancellation or
+recovery path and retry the stop for the same service instance.
+
+An older shared service may answer health without the instance identity and
+drain capability. The new client cannot stop that process safely. Stop it from
+its original terminal or supervisor, wait for its active work to settle, then
+run the new build. Fluent reports this manual cutover requirement and leaves
+the old socket untouched. A malformed or timed-out health reply also leaves
+the socket untouched for inspection.
 
 ### Release-test containment
 

@@ -10,7 +10,7 @@ import tempfile
 from pathlib import Path
 
 JAR_SHA256 = "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
-CASES = (
+RECOVERY_CASES = (
     ("QueueHandoff", "queue-current.cfg", "Temporal properties were violated"),
     ("QueueHandoff", "queue-proposed.cfg", None),
     ("QueueHandoff", "queue-mutant-no-lease-check.cfg", "Invariant OwnerTokenCurrent is violated"),
@@ -20,6 +20,12 @@ CASES = (
     ("ServiceIsolation", "isolation-current.cfg", "Temporal properties were violated"),
     ("ServiceIsolation", "isolation-proposed.cfg", None),
 )
+LIFECYCLE_CASES = (
+    ("ServiceLifecycle", "lifecycle-proposed.cfg", None),
+    ("ServiceLifecycle", "lifecycle-negative-build.cfg", "Invariant NoMismatchedReuse is violated"),
+    ("ServiceLifecycle", "lifecycle-negative-instance.cfg", "Invariant NoStaleStop is violated"),
+    ("ServiceLifecycle", "lifecycle-negative-admission.cfg", "Invariant NoAdmissionAfterDrain is violated"),
+)
 
 
 def is_java_21_version(output: str) -> bool:
@@ -28,7 +34,7 @@ def is_java_21_version(output: str) -> bool:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--suite", choices=["recovery"], required=True)
+    parser.add_argument("--suite", choices=["recovery", "lifecycle"], required=True)
     parser.add_argument("--jar", type=Path, required=True)
     args = parser.parse_args()
     jar = args.jar.resolve()
@@ -48,7 +54,8 @@ def main() -> int:
     logs = Path("target/formal/scheduler").resolve()
     logs.mkdir(parents=True, exist_ok=True)
     failed = False
-    for module, config, expected_invariant in CASES:
+    cases = RECOVERY_CASES if args.suite == "recovery" else LIFECYCLE_CASES
+    for module, config, expected_invariant in cases:
         with tempfile.TemporaryDirectory(prefix="tlc-", dir=logs) as metadir:
             command = ["java", "-XX:+UseParallelGC", "-Xmx256m", "-cp", str(jar),
                        "tlc2.TLC", "-workers", "1", "-fp", "0", "-seed", "1",

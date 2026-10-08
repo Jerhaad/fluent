@@ -37,3 +37,17 @@ run them. The Rust service tests check the production entry path, worker
 ownership, and dispatch fencing that the abstract models cannot establish.
 The bounded models do not prove arbitrary filesystem errors, power loss, or
 unbounded concurrency safe.
+
+## Shared service lifecycle
+
+Run `python3 tests/formal/scheduler/check.py --suite=lifecycle --jar=target/fluent-tools/tla2tools-1.7.4.jar` on the candidate host. `ServiceLifecycle.tla` bounds ownership to two service instances, two builds, two projects, one worker and one queued dispatch per project, and one crash. The proposed configuration checks one owner, matching build reuse, guarded admission after drain, instance-bound stop, and no stopped result with a live worker. Three negative controls separately remove the build, instance, and admission guards. The checker retains each TLC log under `target/formal/scheduler/`.
+
+| Model action | Production boundary |
+| --- | --- |
+| `Start`, `Reuse` | `try_service_lease`, `inspect_service`, `validate_service_reuse` |
+| `Submit`, `Claim` | `SchedulerService::serve_connection`, `SchedulerService::poll_once` |
+| `RequestStop`, `Acknowledge` | `stop_service_instance`, `SchedulerService::read_drain_request`, `accept_drain` |
+| `Settle`, `Finish` | `reap_finished`, `run_service_with_runner` completion/result publication |
+| `Crash` | Lease release and later election in `try_service_lease` |
+
+The progress property assumes weak fairness for worker settlement and drain completion; a crash satisfies its escape condition instead of proving natural completion. The model treats worker settlement as one atomic action and omits filesystem write errors, malformed socket frames, hung workers, and unbounded histories. The Rust socket host checks cover the transport and publication order. This is a bounded protocol check, not a general refinement proof.
