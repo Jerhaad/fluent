@@ -1912,25 +1912,82 @@ pub fn stop_service_instance(home: &Path, instance_id: &str) -> Result<ServiceSt
 }
 
 fn wait_for_stop_result(home: &Path, instance_id: &str) -> Result<ServiceStopRecord> {
+    wait_for_stop_result_with_interleave(home, instance_id, || Ok(()))
+}
+
+fn wait_for_stop_result_with_interleave(
+    home: &Path,
+    instance_id: &str,
+    mut after_result_read: impl FnMut() -> Result<()>,
+) -> Result<ServiceStopRecord> {
     loop {
-        if let Some(result) = read_stop_record(&service_result_path(home, instance_id))? {
-            if result.instance_id == instance_id && stop_result_released(home, instance_id)? {
-                return settled_stop_result(result);
-            }
+        if let Some(result) = released_stop_result(home, instance_id)? {
+            return settled_stop_result(result);
         }
-        if let Ok(current) = send_health_request(&socket_path(home)) {
+        after_result_read()?;
+        let exit_error = if let Ok(current) = send_health_request(&socket_path(home)) {
             if current.instance_id.as_deref() != Some(instance_id) {
-                bail!(
+                Some(format!(
                     "service instance changed while draining; {} is now running",
                     current.instance_id.unwrap_or_default()
-                );
+                ))
+            } else {
+                None
             }
         } else if !service_lease_live(home)? || lock_identity(home)?.as_str() != instance_id {
-            bail!(
+            Some(format!(
                 "scheduler service {instance_id} exited without a settled drain result; inspect its work before replacement"
-            );
+            ))
+        } else {
+            None
+        };
+        if let Some(error) = exit_error {
+            // The owner can publish its result and release its lease between
+            // the first result read and the liveness check.
+            if let Some(result) = released_stop_result(home, instance_id)? {
+                return settled_stop_result(result);
+            }
+            bail!("{error}");
         }
         std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(test)]
+mod stop_result_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_result_published_before_owner_exit_check() {
+        let home = tempfile::tempdir().unwrap();
+        let instance_id = "0123456789abcdef0123456789abcdef";
+        fs::create_dir_all(service_state_root(home.path())).unwrap();
+        fs::write(service_lock_path(home.path()), instance_id).unwrap();
+        let result = ServiceStopRecord {
+            schema: SERVICE_METADATA_SCHEMA,
+            instance_id: instance_id.to_owned(),
+            build: BuildIdentity {
+                version: "test".to_owned(),
+                hash: "test".to_owned(),
+            },
+            failures: Vec::new(),
+        };
+        let observed = wait_for_stop_result_with_interleave(home.path(), instance_id, || {
+            write_stop_record(&service_result_path(home.path(), instance_id), &result)
+        })
+        .unwrap();
+        assert_eq!(observed.instance_id, instance_id);
+    }
+}
+
+fn released_stop_result(home: &Path, instance_id: &str) -> Result<Option<ServiceStopRecord>> {
+    let Some(result) = read_stop_record(&service_result_path(home, instance_id))? else {
+        return Ok(None);
+    };
+    if result.instance_id == instance_id && stop_result_released(home, instance_id)? {
+        Ok(Some(result))
+    } else {
+        Ok(None)
     }
 }
 
