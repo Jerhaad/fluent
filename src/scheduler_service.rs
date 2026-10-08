@@ -786,9 +786,75 @@ pub struct ExecutionStatus {
 
 /// Send a health request over the Unix socket and return the response.
 pub fn send_health_request(sock_path: &Path) -> Result<HealthResponse> {
-    let mut stream = UnixStream::connect(sock_path)
-        .with_context(|| format!("connect to {}", sock_path.display()))?;
-    health_on_stream(&mut stream)
+    retry_health(|| {
+        let mut stream = UnixStream::connect(sock_path)
+            .with_context(|| format!("connect to {}", sock_path.display()))?;
+        health_on_stream(&mut stream)
+    })
+}
+
+fn retry_health(
+    mut attempt_health: impl FnMut() -> Result<HealthResponse>,
+) -> Result<HealthResponse> {
+    // A peer can close one exchange while the service stays live. Reconnect
+    // briefly, but never retry a malformed or unverifiable health response.
+    for attempt in 0..3 {
+        match attempt_health() {
+            Ok(health) => return Ok(health),
+            Err(error)
+                if attempt < 2
+                    && error.downcast_ref::<io::Error>().is_some_and(|error| {
+                        matches!(
+                            error.kind(),
+                            io::ErrorKind::BrokenPipe
+                                | io::ErrorKind::ConnectionReset
+                                | io::ErrorKind::UnexpectedEof
+                        )
+                    }) =>
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("the final health attempt returns its response or error")
+}
+
+#[cfg(test)]
+mod health_retry_tests {
+    use super::*;
+
+    #[test]
+    fn retries_closed_health_connection_without_accepting_unverified_reply() {
+        let mut calls = 0;
+        let health = retry_health(|| {
+            calls += 1;
+            if calls == 1 {
+                return Err(io::Error::from(io::ErrorKind::BrokenPipe).into());
+            }
+            Ok(HealthResponse {
+                generation: PROTOCOL_GENERATION,
+                build: BuildIdentity {
+                    version: "test".into(),
+                    hash: "hash".into(),
+                },
+                instance_id: Some("0123456789abcdef0123456789abcdef".into()),
+                state: Some(ServiceState::Running),
+            })
+        })
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(health.build.version, "test");
+        let mut invalid_calls = 0;
+        assert!(
+            retry_health(|| {
+                invalid_calls += 1;
+                bail!("unverified health response")
+            })
+            .is_err()
+        );
+        assert_eq!(invalid_calls, 1);
+    }
 }
 
 fn health_on_stream(stream: &mut UnixStream) -> Result<HealthResponse> {

@@ -53,6 +53,9 @@ fn start_upgrade_service_with_runner(
         if scheduler_service::send_health_request(&scheduler_service::socket_path(&home)).is_ok() {
             return handle;
         }
+        if handle.is_finished() {
+            panic!("shared service exited before health: {:#?}", handle.join());
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
     panic!("shared service did not answer health");
