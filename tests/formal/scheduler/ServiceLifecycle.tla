@@ -26,14 +26,14 @@ Start(i) == /\ i \in Instances /\ lease = 0
 Reuse(i) == /\ i \in Instances /\ lease = owner /\ owner # 0
             /\ state = "running" /\ ProtocolCompatible /\ DrainCapable
             /\ (CheckBuild => i = build)
-            /\ badReuse' = badReuse \/ (i # build)
+            /\ badReuse' = (badReuse \/ (i # build))
             /\ UNCHANGED <<owner, lease, state, build, workers, queued,
                            request, ack, result, crashed, badAdmission, staleStop>>
 
 Submit(p) == /\ p \in Projects /\ owner # 0 /\ queued[p] = 0
              /\ (GuardAdmission => state = "running")
              /\ queued' = [queued EXCEPT ![p] = 1]
-             /\ badAdmission' = badAdmission \/ (state = "draining")
+             /\ badAdmission' = (badAdmission \/ (state = "draining"))
              /\ UNCHANGED <<owner, lease, state, build, workers, request,
                             ack, result, crashed, badReuse, staleStop>>
 
@@ -41,7 +41,7 @@ Claim(p) == /\ p \in Projects /\ owner # 0 /\ queued[p] = 1 /\ workers[p] = 0
             /\ (GuardAdmission => state = "running")
             /\ queued' = [queued EXCEPT ![p] = 0]
             /\ workers' = [workers EXCEPT ![p] = 1]
-            /\ badAdmission' = badAdmission \/ (state = "draining")
+            /\ badAdmission' = (badAdmission \/ (state = "draining"))
             /\ UNCHANGED <<owner, lease, state, build, request, ack,
                            result, crashed, badReuse, staleStop>>
 
@@ -54,7 +54,7 @@ Acknowledge == /\ request # 0 /\ owner # 0 /\ state = "running"
                /\ ProtocolCompatible /\ DrainCapable
                /\ (BindInstance => request = owner)
                /\ state' = "draining" /\ ack' = TRUE
-               /\ staleStop' = staleStop \/ (request # owner)
+               /\ staleStop' = (staleStop \/ (request # owner))
                /\ UNCHANGED <<owner, lease, build, workers, queued, request,
                               result, crashed, badReuse, badAdmission>>
 
