@@ -5732,23 +5732,26 @@ tester_sandbox_recovery_reruns_same_tester_without_writer)
 
 WHEN `fluent queue resume <work-item-id> --attempt <attempt-id>` names a
 completed, review-passed Attempt whose Learner failed with a relaunchable
-disposition, and every Task is complete, exactly one pending unreviewed Merge
-Candidate still identifies the clean candidate HEAD, and no Learner run is
-live, THE SYSTEM SHALL append a resume dispatch bound to that Attempt.
-Test: src/queue.rs (resume_queues_and_claims_only_the_retryable_failed_learner)
+disposition, and every Task is Complete or valid Superseded terminal history,
+exactly one pending unreviewed Merge Candidate still identifies the clean
+candidate HEAD, and no Learner run is live, THE SYSTEM SHALL append a resume
+dispatch bound to that Attempt.
+Test: tests/binary.rs (learner_terminal_history_queue_resume_accepts_superseded)
 
 ### B2m
 
 WHEN the scheduler runs the resume dispatch from B2l, THE SYSTEM SHALL retry
 only the Learner and preserve the Writer, Tester, reviewer, and Merge Candidate
 records.
-Test: tests/binary.rs (scheduler_resume_retries_only_a_failed_learner)
+Test: tests/binary.rs (learner_terminal_history_scheduler_retries_only_learner)
 
 ### B2n
 
-IF the Learner failure is not relaunchable, a Task is incomplete, a Learner run
-is live, or the candidate is missing, ambiguous, reviewed, landed, moved, or
-dirty, THEN THE SYSTEM SHALL reject the resume without changing the queue.
+IF the Learner failure is not relaunchable, Task history is incomplete or
+invalid, a Learner run is live, or the candidate is missing, ambiguous,
+reviewed, landed, moved, or dirty, THEN THE SYSTEM SHALL reject the resume
+without changing the queue.
+Test: tests/binary.rs (learner_terminal_history_preserves_rejection_guards)
 Test: src/queue.rs (resume_rejects_a_dirty_learner_retry_candidate_without_queue_mutation,
 resume_rejects_a_non_relaunchable_learner_without_queue_mutation,
 resume_rejects_a_live_learner_without_queue_mutation,
@@ -5761,6 +5764,7 @@ resume_rejects_a_missing_or_ambiguous_learner_candidate)
 
 IF a candidate no longer satisfies B2l when the scheduler claims its admitted
 resume, THEN THE SYSTEM SHALL reject the claim and leave the dispatch queued.
+Test: tests/binary.rs (learner_terminal_history_claim_revalidates_current_tasks)
 Test: src/queue.rs (claim_rejects_a_learner_candidate_dirtied_after_resume)
 
 ### B2p
@@ -9420,6 +9424,7 @@ otherwise complete code-producing Attempt whose learning record is failed with
 a relaunchable disposition,
 THE SYSTEM SHALL retry only the Learner and its candidate or handoff
 bookkeeping without rerunning the Writer, Tester, or reviewers.
+Test: tests/binary.rs (learner_terminal_history_foreground_retries_only_learner)
 Test: tests/binary.rs (attempt_run_retries_only_failed_learner)
 
 ### B11b

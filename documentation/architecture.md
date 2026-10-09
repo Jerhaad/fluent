@@ -4360,14 +4360,22 @@ closed. Queue history and superseded Attempts remain available for audit.
 A relaunchable failed pre-land Learner is also an explicit scheduler recovery
 frontier even though its review-passed Attempt is complete and its prior
 dispatch is `blocked`, not `needs-user`. Queue admission and claim share a
-read-only `lifecycle_recovery` inspection. It requires every Task to remain
-complete, exactly one pending and unreviewed Merge Candidate, a clean candidate
-workspace at the recorded commit, and no live Learner lease. The resume keeps
-the prior blocked dispatch as history and launches the same Attempt. The
-ordinary Attempt loop then performs its own reservation-time checks and retries
+read-only `lifecycle_recovery` inspection. It requires every Task to be Complete
+or Superseded, exactly one pending and unreviewed Merge Candidate, a clean
+candidate workspace at the recorded commit, and no live Learner lease. The Work
+model validates retained Superseded history; active or incomplete Tasks block
+the retry. The resume keeps the prior blocked dispatch as history and launches
+the same Attempt. The ordinary Attempt loop then performs its own checks and retries
 only the Learner; it does not repeat the Writer, Tester, or reviewers. A changed,
 dirty, reviewed, landed, or ambiguous candidate fails closed, as does a
 candidate with a live Learner run.
+
+The terminal-history incident is covered by the
+`learner_terminal_history_queue_`, `learner_terminal_history_claim_`,
+`learner_terminal_history_foreground_`, `learner_terminal_history_scheduler_`,
+and `learner_terminal_history_preserves_` tests in `tests/binary.rs`. They check
+admission, claim-time drift, both retry routes, and rejection without replacing
+the stored Task or candidate evidence.
 
 Legacy dispatches omit the new fields and deserialize as ordinary run intent.
 
