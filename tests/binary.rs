@@ -6315,6 +6315,149 @@ PY
     assert!(next.contains("evidence attach"), "{next}");
 }
 
+#[test]
+fn writer_completion_recovery_committed_matrix_rejects_stale_source() {
+    for defect in [
+        "matrix",
+        "transcript",
+        "contract",
+        "assignment",
+        "candidate",
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let (fixture, _) = committed_matrix_recovery_fixture(&tmp);
+        let store = WorkModelStore::new(&fixture.project);
+        fluent_cmd()
+            .current_dir(&fixture.project)
+            .args([
+                "attempt",
+                "repair-writer-completion",
+                &fixture.work,
+                "attempt-1",
+                "--resolution",
+                &fixture.resolution,
+            ])
+            .assert()
+            .success();
+        let item = store.read_work_item(&fixture.work).unwrap();
+        let source_area = fixture.project.join(
+            &item.attempts[0].tasks[0]
+                .artifact_area
+                .as_ref()
+                .unwrap()
+                .path,
+        );
+        match defect {
+            "matrix" => fs::write(
+                source_area.join("writer-completion.json"),
+                b"changed malformed bytes",
+            )
+            .unwrap(),
+            "transcript" => fs::write(
+                source_area.join("transcript.jsonl"),
+                b"changed transcript\n",
+            )
+            .unwrap(),
+            "contract" => store
+                .mutate_work_item(&fixture.work, |item| {
+                    item.attempts[0]
+                        .writer_completion_contract
+                        .as_mut()
+                        .unwrap()
+                        .requirements[0]
+                        .requirement
+                        .push_str(" changed");
+                    Ok(())
+                })
+                .unwrap(),
+            "assignment" => store
+                .mutate_work_item(&fixture.work, |item| {
+                    let source = &mut item.attempts[0].tasks[0];
+                    let reference = source.workspace_access.writes[0].clone();
+                    source.workspace_access.reads.push(reference);
+                    Ok(())
+                })
+                .unwrap(),
+            "candidate" => commit_file(
+                &fixture.workspace,
+                "drift.txt",
+                "changed\n",
+                "Change recovered candidate",
+            ),
+            _ => unreachable!(),
+        }
+        let before = snapshot_tree(&fixture.project.join(".fluent/work"));
+        fluent_cmd()
+            .current_dir(&fixture.project)
+            .args([
+                "attempt",
+                "repair-writer-completion",
+                &fixture.work,
+                "attempt-1",
+                "--resolution",
+                &fixture.resolution,
+            ])
+            .assert()
+            .failure();
+        assert_eq!(
+            snapshot_tree(&fixture.project.join(".fluent/work")),
+            before,
+            "{defect}"
+        );
+    }
+}
+
+#[test]
+fn writer_completion_recovery_committed_matrix_rejects_cancellation() {
+    let tmp = TempDir::new().unwrap();
+    let (fixture, _) = committed_matrix_recovery_fixture(&tmp);
+    committed_matrix_repair_command(&fixture).assert().success();
+    fluent_cmd()
+        .current_dir(&fixture.project)
+        .args(["attempt", "cancel", &fixture.work, "attempt-1"])
+        .assert()
+        .success();
+    let before = snapshot_tree(&fixture.project.join(".fluent/work"));
+    committed_matrix_repair_command(&fixture).assert().failure();
+    assert_eq!(snapshot_tree(&fixture.project.join(".fluent/work")), before);
+}
+
+#[test]
+fn writer_completion_recovery_committed_matrix_rejects_live_owner() {
+    let tmp = TempDir::new().unwrap();
+    let (fixture, _) = committed_matrix_recovery_fixture(&tmp);
+    let lock_path =
+        fluent::lease::task_lock_path(&fixture.project, &fixture.work, "attempt-1-write-1");
+    let store = WorkModelStore::new(&fixture.project);
+    let lease = fluent::lease::acquire_blocking(&lock_path).unwrap();
+    let before = store.read_work_item(&fixture.work).unwrap();
+    committed_matrix_repair_command(&fixture).assert().failure();
+    assert_eq!(store.read_work_item(&fixture.work).unwrap(), before);
+    assert!(!fixture.audit.exists());
+    drop(lease);
+    committed_matrix_repair_command(&fixture).assert().success();
+    let lease = fluent::lease::acquire_blocking(&lock_path).unwrap();
+    let authorized = store.read_work_item(&fixture.work).unwrap();
+    let audit = fs::read(&fixture.audit).unwrap();
+    committed_matrix_repair_command(&fixture).assert().failure();
+    assert_eq!(store.read_work_item(&fixture.work).unwrap(), authorized);
+    assert_eq!(fs::read(&fixture.audit).unwrap(), audit);
+    drop(lease);
+}
+
+fn committed_matrix_repair_command(fixture: &WriterRecoveryFixture) -> LoggedCommand {
+    let mut command = fluent_cmd();
+    command.current_dir(&fixture.project).args([
+        "attempt",
+        "repair-writer-completion",
+        &fixture.work,
+        "attempt-1",
+        "--resolution",
+        &fixture.resolution,
+    ]);
+    command
+}
+
 fn capture_recovered_writer(fixture: &WriterRecoveryFixture, tmp: &TempDir) -> String {
     let bin = tmp.path().join("capture-provider");
     let capture = fixture.area.join("received-prompt.txt");
