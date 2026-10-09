@@ -22,9 +22,9 @@ CONTROLS = {
 }
 
 
-def run_case(source, output_dir, jar, config, expected):
+def run_case(source, output_dir, jar, java, config, expected):
     with tempfile.TemporaryDirectory(prefix="tlc-", dir=output_dir) as metadir:
-        command = ["java", "-XX:+UseParallelGC", "-Xmx512m", "-cp", str(jar),
+        command = [java, "-XX:+UseParallelGC", "-Xmx512m", "-cp", str(jar),
                    "tlc2.TLC", "-deadlock", "-workers", "1", "-fp", "0",
                    "-seed", "1", "-metadir", metadir, "-config", config,
                    "Workflow.tla"]
@@ -43,6 +43,21 @@ def run_case(source, output_dir, jar, config, expected):
     return {"case": config, "pass": ok, "expected": expected, "log": f"{config}.log"}
 
 
+def java_21(root):
+    candidates = ["java", *map(str, sorted((root / "target/fluent-tools/jdk21").glob(
+        "*/Contents/Home/bin/java")))]
+    for executable in candidates:
+        try:
+            version = subprocess.run([executable, "-version"], capture_output=True,
+                                     text=True, check=True)
+        except (OSError, subprocess.CalledProcessError):
+            continue
+        if re.search(r'(?:version "21(?:\.|"))|(?:openjdk 21(?:\.|\s|$))',
+                     version.stdout + version.stderr):
+            return executable
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--suite", required=True)
@@ -53,16 +68,11 @@ def main():
     jar = args.jar.resolve()
     if not jar.is_file() or hashlib.sha256(jar.read_bytes()).hexdigest() != JAR_SHA256:
         parser.error("pinned TLC 1.7.4 JAR is missing or has the wrong SHA-256")
-    try:
-        version = subprocess.run(["java", "-version"], capture_output=True,
-                                 text=True, check=True)
-    except (OSError, subprocess.CalledProcessError) as error:
-        parser.error(f"Java 21 is required: {error}")
-    if not re.search(r'(?:version "21(?:\.|"))|(?:openjdk 21(?:\.|\s|$))',
-                     version.stdout + version.stderr):
-        parser.error("Java 21 is required")
     source = Path(__file__).resolve().parent
     root = source.parents[2]
+    java = java_21(root)
+    if java is None:
+        parser.error("Java 21 is required")
     output = root / "target/formal/workflow/foundation"
     output.mkdir(parents=True, exist_ok=True)
     results = []
@@ -70,7 +80,7 @@ def main():
                              ("repeated-recovery.cfg", None),
                              *[(f"negative-{name}.cfg", violation)
                                for name, violation in CONTROLS.items()]]:
-        results.append(run_case(source, output, jar, config, expected))
+        results.append(run_case(source, output, jar, java, config, expected))
         print(("PASS" if results[-1]["pass"] else "FAIL") + " " + config)
     command = ["cargo", "nextest", "run", "--offline", "--features", "test-support",
                "--test", "workflow_assurance", "--no-tests", "fail",

@@ -13,7 +13,7 @@ The host foundation check uses a fresh run of the first command and then checks 
 python3 tests/formal/workflow/check.py --suite=foundation --jar=target/fluent-tools/tla2tools-1.7.4.jar
 ```
 
-The checker requires Java 21 and the official TLC 1.7.4 JAR with SHA-256 `936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88`. It downloads nothing. A missing suite, tool, complete TLC search, fixture, or required trace fails. It writes one log per model configuration, the fresh fixture log, projection log, negative trace log, and `result.json` under `target/formal/workflow/foundation/`. The Rust tests are discovered by the existing `cargo nextest` command in `.fluent/tester.yaml`; the final Tester runs that declared suite after review.
+The checker requires Java 21 and the official TLC 1.7.4 JAR with SHA-256 `936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88`. It accepts `java` on `PATH` or a Java 21 installation extracted under `target/fluent-tools/jdk21/`. It downloads nothing. A missing suite, tool, complete TLC search, fixture, or required trace fails. It writes one log per model configuration, the fresh fixture log, projection log, negative trace log, and `result.json` under `target/formal/workflow/foundation/`. The Rust tests are discovered by the existing `cargo nextest` command in `.fluent/tester.yaml`; the final Tester runs that declared suite after review.
 
 ## Model and bounds
 
