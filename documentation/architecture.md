@@ -1130,8 +1130,9 @@ worker, even if its own execution record has not yet been marked `canceled`.
 The process tree holds an inherited `execution-owner.lock`. The parent first
 stores a unique launch generation in `execution.json` with state `launching`
 and zero leader and group fields. Before it enters the requested program, the
-child publishes `execution-receipt` with that generation, its PID, and its
-process group (which equals its PID). The parent then promotes the record to
+child publishes `execution-receipt` with that generation and its PID after
+checking that its process group equals its PID. Recovery derives the group from
+that validated PID. The parent then promotes the record to
 `running` with the same identity. If the parent dies before promotion, recovery
 matches the receipt to the generation and requires the inherited identity lock
 to remain held; it can then cancel the child and its descendants. A held lock

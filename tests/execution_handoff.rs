@@ -130,7 +130,17 @@ fn launch_handoff_cancel_serializes_with_payload_start() {
     let (tx, rx) = std::sync::mpsc::channel();
     let project = dir.path().to_path_buf();
     let canceler = std::thread::spawn(move || {
+        let mut start_at_stop = false;
+        let mut payload_at_stop = false;
         let result = WorkModelStore::new(&project).mutate_work_item("work-1", |item| {
+            // The start marker must already exist when the stop obtains the
+            // model lock. Then hold that lock until the requested program's
+            // first action is visible, before committing the stop.
+            start_at_stop = project.join("start-boundary").exists();
+            if start_at_stop {
+                wait_for(&project.join("payload"));
+            }
+            payload_at_stop = project.join("payload").exists();
             let attempt = &mut item.attempts[0];
             attempt.cancellation = Some(AttemptCancellation {
                 requested_at: fluent::work_model::now_iso8601(),
@@ -141,13 +151,12 @@ fn launch_handoff_cancel_serializes_with_payload_start() {
             attempt.pause_kind = Some(PauseKind::Interrupted);
             Ok(())
         });
-        let start_at_stop = project.join("start-boundary").exists();
-        tx.send((result, start_at_stop)).unwrap();
+        tx.send((result, start_at_stop, payload_at_stop)).unwrap();
     });
     assert!(rx.recv_timeout(Duration::from_millis(150)).is_err());
     assert!(!dir.path().join("payload").exists());
     std::fs::write(&barrier, b"go").unwrap();
-    let (result, start_at_stop) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let (result, start_at_stop, payload_at_stop) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
     result.unwrap();
     // The child writes the start event as its last pre-exec action while it
     // still owns the model lock. A committed stop must therefore see it.
@@ -155,6 +164,10 @@ fn launch_handoff_cancel_serializes_with_payload_start() {
     assert!(
         start_at_stop,
         "the launch start boundary occurred after the durable stop"
+    );
+    assert!(
+        payload_at_stop,
+        "the requested program's first action occurred after the durable stop"
     );
     assert!(execution::execution_is_live(&path).unwrap());
     canceler.join().unwrap();

@@ -1,4 +1,4 @@
-# Test child-owned launch receipts
+# How to test child-owned launch receipts
 
 ## Context
 
@@ -20,6 +20,8 @@ neither cancellation nor a replacement launch may infer a group from them.
 
 `tests/execution_handoff.rs::launch_handoff_cancel_serializes_with_payload_start`
 holds a test-only pre-exec barrier after receipt publication. It kills the
-launch parent, observes the Work model lock blocking a stop mutation, releases
-the child, then requires cancellation to settle before the delayed payload can
-write its marker.
+launch parent, observes the Work model lock blocking a stop mutation, and
+releases the child. When the stop mutation obtains the model lock, it checks
+that the child crossed its pre-exec boundary. It then waits under that lock for
+the requested program's first-action marker before committing the stop. The
+test verifies the payload ran and cancellation settled.
