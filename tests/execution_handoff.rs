@@ -108,7 +108,8 @@ fn launch_handoff_cancel_serializes_with_payload_start() {
     )
     .unwrap();
     let barrier = dir.path().join("allow-exec");
-    let script = format!("sleep 2; touch '{}'", dir.path().join("payload").display());
+    // Make the first requested action observable without delaying it.
+    let script = format!("touch '{}'; sleep 30", dir.path().join("payload").display());
     let mut owner = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "launch_handoff_owner_helper", "--nocapture"])
         .env("FLUENT_TEST_LAUNCH_DIR", dir.path())
@@ -138,15 +139,26 @@ fn launch_handoff_cancel_serializes_with_payload_start() {
             attempt.pause_kind = Some(PauseKind::Interrupted);
             Ok(())
         });
-        tx.send(result).unwrap();
+        let payload_at_stop = project.join("payload").exists();
+        tx.send((result, payload_at_stop)).unwrap();
     });
     assert!(rx.recv_timeout(Duration::from_millis(150)).is_err());
     assert!(!dir.path().join("payload").exists());
     std::fs::write(&barrier, b"go").unwrap();
-    rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+    let (result, payload_at_stop) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    result.unwrap();
+    // The mutation was blocked while the child sat before exec. Once it can
+    // commit, the inherited model lock has closed at exec. The first payload
+    // action is immediate; keep the child alive to detect a late start.
+    wait_for(&dir.path().join("payload"));
+    if !payload_at_stop {
+        assert!(
+            execution::execution_is_live(&path).unwrap(),
+            "the payload started after the stop without its launch identity"
+        );
+    }
     canceler.join().unwrap();
     assert_eq!(execution::cancel(&path).unwrap(), CancelOutcome::Canceled);
-    assert!(!dir.path().join("payload").exists());
 }
 
 fn crashed_parent(dir: &Path) {

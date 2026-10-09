@@ -256,11 +256,6 @@ Test: src/work_attempt_loop.rs (cancel_local_attempt_stops_owned_group_and_repla
 Test: src/execution.rs (stale_record_never_signals_reused_identity)
 Test: tests/execution_handoff.rs (launch_handoff_rejects_unbound_identity, launch_handoff_preserves_owned_descendants, launch_handoff_settled_record_preserves_owned_descendant)
 
-WHEN a current Fluent reader sees a legacy execution record, THE SYSTEM SHALL
-retain its established ownership and stop rules. WHEN an older reader sees a
-new version 2 launch record, THE SYSTEM SHALL reject it before mutation.
-Test: tests/execution_handoff.rs (launch_handoff_legacy_records_fail_closed, launch_handoff_old_reader_rejects_new_protocol)
-
 ### B3
 
 WHEN an operator resumes an `interrupted` Attempt, THE SYSTEM SHALL replan each
@@ -274,6 +269,19 @@ exited coder leader, THE SYSTEM SHALL classify the group as already gone while
 still delivering `SIGKILL` when a live same-user descendant remains.
 Test: src/coder.rs (exited_macos_group_eperm_means_no_signalable_members)
 Test: src/coder.rs (natural_exit_sweeps_group_before_reaping)
+
+### B5
+
+WHEN a current Fluent reader sees a supported legacy execution record, THE
+SYSTEM SHALL retain its established ownership and stop rules and report a live
+legacy identity without guessing its process group.
+Test: tests/execution_handoff.rs (launch_handoff_legacy_records_fail_closed)
+
+### B6
+
+WHEN an older supported Fluent binary sees a version 2 launch record, THE
+SYSTEM SHALL reject that record before mutating execution or Attempt state.
+Test: tests/execution_handoff.rs (launch_handoff_old_reader_rejects_new_protocol)
 
 ## Enclosing agent sandbox handoff
 
