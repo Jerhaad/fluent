@@ -120,6 +120,11 @@ fi
         },
     );
     handoff.source_merge_candidate_id = Some("attempt-1-merge-candidate".into());
+    handoff.follow_ups.push(fluent::follow_up::FollowUpDraftV1 {
+        id: "verify-follow-up".into(),
+        summary: "Retain recovered landing follow-up".into(),
+        ..Default::default()
+    });
     let handoff_bytes = serde_json::to_vec(&handoff).unwrap();
     fs::write(&handoff_path, &handoff_bytes).unwrap();
     let attempt = &mut item.attempts[0];
@@ -237,6 +242,21 @@ fn interrupt(fx: &LandingFixture, point: &str) {
     assert!(result.is_err(), "injection must interrupt landing");
 }
 
+fn observation_snapshot(root: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut entries: Vec<_> = fs::read_dir(root.join(".fluent/observations"))
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            (
+                entry.file_name().to_string_lossy().into_owned(),
+                fs::read(entry.path()).unwrap(),
+            )
+        })
+        .collect();
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    entries
+}
+
 #[test]
 fn landing_recovery_persists_intent_before_git_effect() {
     let fx = fixture();
@@ -253,10 +273,79 @@ fn landing_recovery_persists_intent_before_git_effect() {
     assert_eq!(intent.target_before, before);
     assert_eq!(intent.target_branch, "main");
     assert_eq!(intent.learner_mode, LearnerMode::NoExpertise);
+    assert_eq!(
+        intent.operation_id,
+        format!("landing:work-1:attempt-1-merge-candidate:{}", fx.candidate)
+    );
+    assert!(!intent.check_artifacts.is_empty());
+    let mut evidence = Sha256::new();
+    for artifact in intent
+        .check_artifacts
+        .iter()
+        .chain(&intent.review_artifacts)
+    {
+        assert!(!artifact.producer_id.is_empty());
+        assert!(!artifact.path.is_empty());
+        let bytes = fs::read(fx.root.join(&artifact.path)).unwrap();
+        assert!(!bytes.is_empty());
+        evidence.update(artifact.producer_id.as_bytes());
+        evidence.update([0]);
+        evidence.update(artifact.path.as_bytes());
+        evidence.update([0]);
+        evidence.update(bytes);
+        evidence.update([0]);
+    }
+    assert_eq!(intent.evidence_digest, format!("{:x}", evidence.finalize()));
+    assert!(!intent.accepted_model_digest.is_empty());
+    assert!(!intent.authorization_digest.is_empty());
     let status = fluent::work_status::summarize_work_item(&item, Some(&fx.root));
     assert_eq!(status.action, "landing-pending");
     assert!(status.merge.starts_with("publication-pending"));
     assert_eq!(head(&fx.root), before, "status cannot replay landing");
+}
+
+#[test]
+fn landing_recovery_resumes_unapplied_intent() {
+    for mode in [LearnerMode::NoExpertise, LearnerMode::Capture] {
+        let fx = fixture_mode(mode);
+        interrupt(&fx, "BEFORE");
+        let before = fx.store.read_work_item("work-1").unwrap();
+        let intent = before.merge_candidates[0]
+            .merge_state
+            .landing_intent
+            .clone();
+        let calls =
+            (mode == LearnerMode::Capture).then(|| fs::read(fx.bin.join("claude.calls")).unwrap());
+        assert_eq!(land(&fx).unwrap(), fx.candidate);
+        let after = fx.store.read_work_item("work-1").unwrap();
+        assert_eq!(after.merge_candidates[0].merge_state.landing_intent, intent);
+        assert_eq!(
+            after.attempts[0].tasks.len(),
+            before.attempts[0].tasks.len()
+        );
+        if let Some(calls) = calls {
+            assert_eq!(fs::read(fx.bin.join("claude.calls")).unwrap(), calls);
+        }
+    }
+
+    let fx = fixture();
+    interrupt(&fx, "BEFORE");
+    let before = head(&fx.root);
+    let intent = fx.store.read_work_item("work-1").unwrap().merge_candidates[0]
+        .merge_state
+        .landing_intent
+        .clone();
+    fs::write(fx.root.join("file.txt"), "dirty target\n").unwrap();
+    assert!(land(&fx).is_err());
+    assert_eq!(head(&fx.root), before);
+    assert_eq!(
+        fx.store.read_work_item("work-1").unwrap().merge_candidates[0]
+            .merge_state
+            .landing_intent,
+        intent
+    );
+    git_run(&fx.root, &["restore", "file.txt"]);
+    assert_eq!(land(&fx).unwrap(), fx.candidate);
 }
 
 #[test]
@@ -489,6 +578,25 @@ fn landing_recovery_replays_partial_work_publication() {
 fn landing_recovery_preserves_both_learner_modes() {
     for mode in [LearnerMode::NoExpertise, LearnerMode::Capture] {
         let fx = fixture_mode(mode);
+        if mode == LearnerMode::Capture {
+            let hooks = fx.root.join(".fluent/hooks");
+            fs::create_dir_all(&hooks).unwrap();
+            for (name, body) in [
+                ("check-pre-merge", "#!/bin/sh\ngrep -q admitted file.txt\n"),
+                (
+                    "fix-pre-merge",
+                    "#!/bin/sh\nprintf 'admitted\\n' >> file.txt\n",
+                ),
+            ] {
+                let path = hooks.join(name);
+                fs::write(&path, body).unwrap();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+                }
+            }
+        }
         interrupt(&fx, "AFTER");
         let before = fx.store.read_work_item("work-1").unwrap();
         let intent = before.merge_candidates[0]
@@ -497,10 +605,27 @@ fn landing_recovery_preserves_both_learner_modes() {
             .clone()
             .unwrap();
         assert_eq!(intent.learner_mode, mode);
-        assert_eq!(intent.verified_commit, fx.candidate);
-        assert_eq!(land(&fx).unwrap(), fx.candidate);
+        let expected = intent.verified_commit.clone();
+        if mode == LearnerMode::Capture {
+            assert_ne!(expected, fx.candidate, "hook must create a final tip");
+        } else {
+            assert_eq!(expected, fx.candidate);
+        }
+        assert_eq!(head(&fx.root), expected);
+        assert_eq!(land(&fx).unwrap(), expected);
         let after = fx.store.read_work_item("work-1").unwrap();
-        assert_eq!(after.merge_candidates[0].candidate_commit, fx.candidate);
+        assert_eq!(after.merge_candidates[0].candidate_commit, expected);
+        assert_eq!(
+            after.merge_candidates[0]
+                .merge_state
+                .merged_commit
+                .as_deref(),
+            Some(expected.as_str())
+        );
+        assert_eq!(
+            after.attempts[0].tasks[0].output.as_ref().unwrap().commit,
+            expected
+        );
         assert_eq!(
             after.merge_candidates[0].merge_state.landing_intent,
             Some(intent)
@@ -515,6 +640,11 @@ fn landing_recovery_preserves_both_learner_modes() {
             after.attempts[0].tasks.len(),
             before.attempts[0].tasks.len()
         );
+        let observations = observation_snapshot(&fx.root);
+        assert_eq!(observations.len(), 1);
+        let observation = String::from_utf8(observations[0].1.clone()).unwrap();
+        assert!(observation.contains("follow-up-id: verify-follow-up"));
+        assert!(observation.contains(&format!("merged-commit: {expected}")));
         assert!(
             !fx.root
                 .parent()
@@ -522,7 +652,8 @@ fn landing_recovery_preserves_both_learner_modes() {
                 .join("work-6-work-1-attempt-1")
                 .exists()
         );
-        assert_eq!(land(&fx).unwrap(), fx.candidate);
+        assert_eq!(land(&fx).unwrap(), expected);
+        assert_eq!(observation_snapshot(&fx.root), observations);
     }
 }
 

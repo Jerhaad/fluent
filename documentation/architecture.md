@@ -2017,6 +2017,24 @@ original final Tester artifact when reused. Retries preserve earlier evidence.
 The completed Attempt's review, Tester, and Learning records remain intact;
 landing only adds its existing Rebase Task and updates candidate provenance.
 
+Before either landing route changes the target, Fluent stores `LandingPending`
+with a `LandingIntent` in the Work journal. The intent binds the Work Item,
+Attempt, Merge Candidate, operation ID, Learner mode, repository and branch,
+target worktree, target tip before landing, verified candidate tip, accepted
+check and review artifacts, and authorization. Capture records its final tip
+after any admitted `fix-pre-merge` change and provenance update;
+`no-expertise` records the frozen reviewed Writer SHA. The target fast-forward
+then uses that exact intent. A retry with an unchanged target revalidates the
+intent, cancellation, evidence, worktree cleanliness, and target tip before
+applying the same effect. A retry after Git advanced recognizes the intent's
+verified commit in target history, including when later commits followed it,
+and publishes the original merged result through the Work journal. It does
+not repeat rebase, hooks, or Tester work. An already-applied legacy candidate
+without intent cannot gain landing authority from Git ancestry alone. Older
+writers reject the new durable state and record version. Use
+`fluent merge-candidate land <work-item-id> <merge-candidate-id>` to complete
+publication; status and show only inspect it.
+
 After recording the merged state, Fluent removes the managed candidate worktree — unless the
 Attempt's Learner run failed and is still retryable, in which case it
 retains the workspace so a post-land handoff-only Learner retry has a
@@ -2031,7 +2049,7 @@ It may finish pending baseline preparation and follow-up recovery.
 Merge artifacts live under
 `.fluent/work/artifacts/<work-item-id>/<attempt-id>/<candidate-id>/merge/`,
 and the stored Merge Candidate records whether execution is pending,
-executing, failed, needs-user, or merged.
+executing, landing-pending, failed, needs-user, or merged.
 
 Once a Merge Candidate reaches merge status `merged`, merge execution
 materializes the Attempt's successful learner handoff into the local

@@ -392,9 +392,41 @@ pub fn merge_candidate(config: WorkMergeConfig<'_>) -> Result<WorkMergeOutcome> 
         bail!("{error}");
     }
 
-    if candidate.merge_state.status != MergeCandidateMergeStatus::Merged
-        && let Some(intent) = recognized_landing_intent(&config, &item, &candidate)?
+    let mut recognized = if candidate.merge_state.status != MergeCandidateMergeStatus::Merged {
+        recognized_landing_intent(&config, &item, &candidate)?
+    } else {
+        None
+    };
+    if candidate.merge_state.status == MergeCandidateMergeStatus::LandingPending
+        && recognized.is_none()
     {
+        let intent = candidate
+            .merge_state
+            .landing_intent
+            .as_ref()
+            .expect("validated landing-pending candidate has an intent");
+        let source = resolve_workspace_path(config.project_root, &candidate.source_workspace.path);
+        let target = resolve_workspace_path(config.project_root, &candidate.target_workspace.path);
+        ensure_same_git_repository(config.project_root, &source)?;
+        ensure_registered_worktree(config.project_root, &source)?;
+        ensure_clean_worktree(&source)?;
+        anyhow::ensure!(
+            head_commit(&source)? == intent.verified_commit,
+            "candidate HEAD changed before authorized landing effect"
+        );
+        let effect_lock =
+            crate::land_lock::acquire(&crate::land_lock::effect_lock_path(config.project_root))?;
+        assert_landing_effect_ready(&config, &candidate.id, &intent.target_before)?;
+        git::fast_forward_checked(
+            &target,
+            &candidate.target_branch,
+            &intent.target_before,
+            &intent.verified_commit,
+        )?;
+        drop(effect_lock);
+        recognized = Some(intent.clone());
+    }
+    if let Some(intent) = recognized {
         record_candidate_merged(
             config.store,
             config.work_item_id,
