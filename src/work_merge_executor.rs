@@ -105,6 +105,13 @@ fn accepted_landing_model_digest(item: &WorkItem, candidate: &MergeCandidate) ->
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
+fn landing_authorization_digest(item: &WorkItem) -> Result<String> {
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&item.authorization)?)
+    ))
+}
+
 fn persist_landing_intent(
     config: &WorkMergeConfig<'_>,
     candidate: &MergeCandidate,
@@ -120,12 +127,14 @@ fn persist_landing_intent(
         .into_owned();
     let evidence_digest = landing_evidence_digest(config.project_root, &checks, &reviews)?;
     let current_item = config.store.read_work_item(config.work_item_id)?;
+    current_item.ensure_execution_ready()?;
     let current_candidate = current_item
         .merge_candidates
         .iter()
         .find(|entry| entry.id == candidate.id)
         .ok_or_else(|| anyhow::anyhow!("landing candidate disappeared"))?;
     let accepted_model_digest = accepted_landing_model_digest(&current_item, current_candidate)?;
+    let authorization_digest = landing_authorization_digest(&current_item)?;
     let intent = LandingIntent {
         schema_version: 1,
         operation_id: format!(
@@ -143,6 +152,7 @@ fn persist_landing_intent(
         verified_commit: verified_commit.to_string(),
         evidence_digest,
         accepted_model_digest,
+        authorization_digest,
         check_artifacts: checks,
         review_artifacts: reviews,
     };
@@ -156,12 +166,15 @@ fn persist_landing_intent(
                 attempt_id: candidate.attempt_id.clone(),
             })?;
         attempt.ensure_not_canceled()?;
+        item.ensure_execution_ready()?;
         let actual_digest = item
             .merge_candidates
             .iter()
             .find(|entry| entry.id == candidate.id)
             .and_then(|entry| accepted_landing_model_digest(item, entry).ok());
         if item.learner_mode != intent.learner_mode
+            || landing_authorization_digest(item).ok().as_deref()
+                != Some(intent.authorization_digest.as_str())
             || actual_digest.as_deref() != Some(intent.accepted_model_digest.as_str())
         {
             return Err(WorkModelError::InvalidRecoveryOperation {
@@ -254,6 +267,11 @@ fn recognized_landing_intent(
     anyhow::ensure!(
         tip == intent.target_before,
         "target moved before the authorized landing effect"
+    );
+    item.ensure_execution_ready()?;
+    anyhow::ensure!(
+        intent.authorization_digest == landing_authorization_digest(item)?,
+        "landing authorization changed before Git effect"
     );
     Ok(None)
 }
@@ -517,6 +535,8 @@ pub fn merge_candidate(config: WorkMergeConfig<'_>) -> Result<WorkMergeOutcome> 
             return Ok(outcome);
         }
     }
+
+    item.ensure_execution_ready()?;
 
     // A fresh, unmerged no-expertise candidate whose Learning succeeded lands its
     // frozen reviewed SHA exactly: an identity-preserving preflight runs BEFORE any

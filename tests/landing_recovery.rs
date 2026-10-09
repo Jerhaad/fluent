@@ -333,6 +333,19 @@ fn landing_recovery_rejects_unbound_or_changed_intent() {
     assert!(land(&fx).is_err());
     assert_eq!(head(&fx.root), fx.candidate);
 
+    let fx = fixture();
+    let before = head(&fx.root);
+    interrupt(&fx, "BEFORE");
+    let root = fx.root.join(".fluent/work/items/work-1.json");
+    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&root).unwrap()).unwrap();
+    value["authorization"] = serde_json::json!({"state": "proposed"});
+    fs::write(&root, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    assert!(
+        land(&fx).is_err(),
+        "revoked authority must block the unapplied effect"
+    );
+    assert_eq!(head(&fx.root), before);
+
     let fx = fixture_mode(LearnerMode::Capture);
     let before = head(&fx.root);
     interrupt(&fx, "BEFORE");

@@ -8936,6 +8936,7 @@ pub struct LandingIntent {
     pub verified_commit: String,
     pub evidence_digest: String,
     pub accepted_model_digest: String,
+    pub authorization_digest: String,
     pub check_artifacts: Vec<ArtifactRef>,
     pub review_artifacts: Vec<ArtifactRef>,
 }
