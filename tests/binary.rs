@@ -6408,6 +6408,35 @@ fn writer_completion_recovery_committed_matrix_rejects_stale_source() {
 }
 
 #[test]
+fn writer_completion_recovery_committed_matrix_replays_identity() {
+    let tmp = TempDir::new().unwrap();
+    let (fixture, malformed) = committed_matrix_recovery_fixture(&tmp);
+    committed_matrix_repair_command(&fixture).assert().success();
+    let store = WorkModelStore::new(&fixture.project);
+    let first = store.read_work_item(&fixture.work).unwrap();
+    let audit = fs::read(&fixture.audit).unwrap();
+    let source = fixture
+        .project
+        .join(
+            &first.attempts[0].tasks[0]
+                .artifact_area
+                .as_ref()
+                .unwrap()
+                .path,
+        )
+        .join("writer-completion.json");
+    committed_matrix_repair_command(&fixture).assert().success();
+    let second = store.read_work_item(&fixture.work).unwrap();
+    assert_eq!(first.attempts[0].tasks, second.attempts[0].tasks);
+    assert_eq!(
+        first.attempts[0].recovery_operations,
+        second.attempts[0].recovery_operations
+    );
+    assert_eq!(fs::read(&fixture.audit).unwrap(), audit);
+    assert_eq!(fs::read(source).unwrap(), malformed);
+}
+
+#[test]
 fn writer_completion_recovery_committed_matrix_rejects_cancellation() {
     let tmp = TempDir::new().unwrap();
     let (fixture, _) = committed_matrix_recovery_fixture(&tmp);
