@@ -1143,6 +1143,20 @@ fn derive_other_attempt_recovery_next_action(
             ));
         }
     }
+    if attempt.status == AttemptStatus::Complete
+        && attempt.review_state == Some(AttemptReviewState::Passed)
+        && attempt
+            .learning
+            .as_ref()
+            .is_some_and(|learning| learning.is_failed() && learning.is_relaunchable())
+    {
+        crate::lifecycle_recovery::inspect_learner_terminal_history(attempt, &attempt.work_item_id)
+            .ok()?;
+        return Some(format!(
+            "fluent queue resume {} --attempt {}",
+            attempt.work_item_id, attempt.id
+        ));
+    }
     attempt.ensure_resume_ready().ok().map(|()| {
         format!(
             "fluent queue resume {} --attempt {}",

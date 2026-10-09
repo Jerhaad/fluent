@@ -1480,6 +1480,39 @@ mod tests {
     }
 
     #[test]
+    fn learner_history_recognizes_superseded_writer_from_completion_recovery() {
+        let fixture = fixture(true);
+        repair(
+            &fixture.project,
+            &fixture.store,
+            "work-1",
+            "attempt-1",
+            "Retry the exact Writer",
+        )
+        .unwrap();
+        let item = fixture.store.read_work_item("work-1").unwrap();
+        let mut attempt = item.attempts[0].clone();
+        assert!(
+            attempt
+                .tasks
+                .iter()
+                .any(|task| task.status == TaskStatus::Superseded)
+        );
+        let candidate = attempt.tasks[0].output.clone();
+        for task in &mut attempt.tasks {
+            if task.status != TaskStatus::Superseded {
+                task.status = TaskStatus::Complete;
+                task.output
+                    .get_or_insert_with(|| candidate.clone().unwrap());
+            }
+        }
+        attempt.status = AttemptStatus::Complete;
+        attempt.pause_kind = None;
+        attempt.review_state = Some(AttemptReviewState::Passed);
+        crate::lifecycle_recovery::inspect_learner_terminal_history(&attempt, "work-1").unwrap();
+    }
+
+    #[test]
     fn ordinary_candidate_drift_is_rejected_without_audit() {
         let fixture = fixture(true);
         fs::write(fixture.workspace.join("drift.txt"), "drift\n").unwrap();

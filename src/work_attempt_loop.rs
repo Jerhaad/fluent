@@ -1673,6 +1673,16 @@ fn run_attempt_inner(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunR
                         config.attempt_id
                     );
                 }
+                if item.attempts[attempt_index]
+                    .learning
+                    .as_ref()
+                    .is_some_and(|learning| learning.is_failed())
+                {
+                    crate::lifecycle_recovery::inspect_learner_terminal_history(
+                        &item.attempts[attempt_index],
+                        &item.id,
+                    )?;
+                }
                 let candidate = item
                     .merge_candidates
                     .iter()
