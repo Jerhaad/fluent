@@ -26,6 +26,17 @@ ContextId(w) == <<"context", w, 1>>
 ReviewScope(w) == <<"scope", w, CandidateId(w)>>
 EvidenceId(w, g) == <<"evidence", w, g, CandidateId(w),
                        RequirementId(w), ContextId(w), ReviewScope(w)>>
+StaleCandidateEvidenceId(w, g) == <<"evidence", w, g, <<"candidate", "old">>,
+                                     RequirementId(w), ContextId(w), ReviewScope(w)>>
+WrongRequirementEvidenceId(w, g) == <<"evidence", w, g, CandidateId(w),
+                                       <<"requirement", "other">>, ContextId(w),
+                                       ReviewScope(w)>>
+WrongContextEvidenceId(w, g) == <<"evidence", w, g, CandidateId(w),
+                                   RequirementId(w), <<"context", "old">>,
+                                   ReviewScope(w)>>
+WrongScopeEvidenceId(w, g) == <<"evidence", w, g, CandidateId(w),
+                                 RequirementId(w), ContextId(w),
+                                 <<"scope", "other">>>>
 Unowned == <<"service", 0>>
 
 VARIABLE s
@@ -73,13 +84,25 @@ Review(w) == /\ s[w].phase = "written" /\ ~s[w].failed
              /\ s' = [s EXCEPT ![w].phase = "reviewed",
                                    ![w].rawEvidence = {EvidenceId(w, s[w].generation)},
                                    ![w].credit = IF CheckEvidence
-                                       THEN {EvidenceId(w, s[w].generation)} ELSE {}]
+                                       THEN {EvidenceId(w, s[w].generation)}
+                                       ELSE {StaleCandidateEvidenceId(w, s[w].generation)}]
 StaleEvidence(w) == /\ s[w].phase = "written" /\ ~s[w].failed
                    /\ s' = [s EXCEPT ![w].phase = "reviewed",
                                         ![w].rawEvidence = {EvidenceId(w, 0)}]
 UnrelatedEvidence(w) == /\ s[w].phase = "written" /\ ~s[w].failed
                        /\ s' = [s EXCEPT ![w].phase = "reviewed",
                                             ![w].rawEvidence = {<<"evidence", "other">>}]
+MisboundEvidence(w, kind) ==
+    /\ s[w].phase = "written" /\ ~s[w].failed
+    /\ kind \in {"candidate", "requirement", "context", "scope"}
+    /\ s' = [s EXCEPT ![w].phase = "reviewed",
+                         ![w].rawEvidence = {CASE kind = "candidate"
+                            -> StaleCandidateEvidenceId(w, s[w].generation)
+                          [] kind = "requirement"
+                            -> WrongRequirementEvidenceId(w, s[w].generation)
+                          [] kind = "context"
+                            -> WrongContextEvidenceId(w, s[w].generation)
+                          [] OTHER -> WrongScopeEvidenceId(w, s[w].generation)}]
 TargetedReview(w) == /\ s[w].phase = "reviewed" /\ s[w].credit = {}
                      /\ CheckEvidence /\ ~s[w].failed /\ ~s[w].canceled
                      /\ s' = [s EXCEPT ![w].rawEvidence = {EvidenceId(w, s[w].generation)},
@@ -186,6 +209,8 @@ Next == \E w \in Works:
     Intake(w) \/ AttemptCreate(w) \/ Authorize(w) \/ Dispatch(w)
     \/ Deliver(w) \/ Writer(w)
     \/ Review(w) \/ StaleEvidence(w) \/ UnrelatedEvidence(w)
+    \/ (\E kind \in {"candidate", "requirement", "context", "scope"}:
+           MisboundEvidence(w, kind))
     \/ TargetedReview(w) \/ Tester(w) \/ LearnCapture(w)
     \/ LearnNoExpertise(w) \/ Ready(w) \/ LandingVerify(w)
     \/ ReviewOnlyStart(w) \/ ReviewOnlyReady(w)
