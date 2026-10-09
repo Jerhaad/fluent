@@ -763,9 +763,29 @@ fn landing_recovery_old_reader_rejects_new_intent() {
         identity["binary_sha256"],
         format!("{:x}", Sha256::digest(fs::read(&old_bin).unwrap()))
     );
+    let archive = old_bin
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("source.tar");
     assert_eq!(
-        identity["binary_sha256"],
-        "909fd3f12d6ff6ed1cc26b31c55c320022ab8725cc54fbaf5dac8f306ae18cd3"
+        identity["source_archive_sha256"],
+        format!("{:x}", Sha256::digest(fs::read(archive).unwrap()))
+    );
+    let source = old_bin
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("source/src/work_model.rs");
+    assert_eq!(
+        identity["work_model_sha256"],
+        format!("{:x}", Sha256::digest(fs::read(source).unwrap()))
     );
     let fx = fixture();
     interrupt(&fx, "BEFORE");
