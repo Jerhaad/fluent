@@ -570,6 +570,39 @@ fn output_free_context_command(fixture: &CombinedRecoveryFixture) -> LoggedComma
 }
 
 #[test]
+fn assignment_context_recovery_refuses_present_launch_receipt() {
+    for receipt in ["partial", "2 stale-generation 2147483647\n"] {
+        let tmp = TempDir::new().unwrap();
+        let fixture = output_free_context_fixture(&tmp);
+        let area = fixture.carried.project.join(format!(
+            ".fluent/work/artifacts/{}/attempt-1/attempt-1-write-5",
+            fixture.carried.work
+        ));
+        let record_path = area.join("execution.json");
+        let mut record = read_json_path(&record_path);
+        record["schema_version"] = 2.into();
+        record["launch_generation"] = "current-generation".into();
+        write_json_path(&record_path, &record);
+        fs::write(area.join("execution-receipt"), receipt).unwrap();
+
+        let before = snapshot_tree(&fixture.carried.project.join(".fluent/work"));
+        let source = snapshot_tree(&fixture.carried.workspace);
+        output_free_context_command(&fixture)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(
+                "setup cannot be proven unlaunched",
+            ));
+        assert_eq!(
+            snapshot_tree(&fixture.carried.project.join(".fluent/work")),
+            before
+        );
+        assert_eq!(snapshot_tree(&fixture.carried.workspace), source);
+        assert!(!area.join("received-prompt.txt").exists());
+    }
+}
+
+#[test]
 fn assignment_context_recovery_output_free_reports_next_action() {
     let tmp = TempDir::new().unwrap();
     let fixture = output_free_context_fixture(&tmp);
@@ -57217,6 +57250,56 @@ fn usage_limit_writer_recovery_resumes_proven_unlaunched_reservation() {
             .status,
         TaskStatus::Complete
     );
+}
+
+#[test]
+fn usage_limit_writer_recovery_refuses_present_launch_receipt() {
+    for receipt in ["partial", "2 stale-generation 2147483647\n"] {
+        let fixture = usage_limit_fixture();
+        fixture.approve();
+        usage_limit_retry_command(&fixture)
+            .env("FLUENT_TEST_USAGE_LIMIT_INTERRUPT", "start-journal")
+            .assert()
+            .code(86);
+        let item = WorkModelStore::new(&fixture.project)
+            .read_work_item(&fixture.work)
+            .unwrap();
+        let area = fixture.project.join(
+            &item.attempts[0]
+                .tasks
+                .last()
+                .unwrap()
+                .artifact_area
+                .as_ref()
+                .unwrap()
+                .path,
+        );
+        let record_path = area.join("execution.json");
+        let mut record = read_json_path(&record_path);
+        record["schema_version"] = 2.into();
+        record["launch_generation"] = "current-generation".into();
+        write_json_path(&record_path, &record);
+        fs::write(area.join("execution-receipt"), receipt).unwrap();
+
+        let before = WorkModelStore::new(&fixture.project)
+            .read_work_item_snapshot(&fixture.work)
+            .unwrap();
+        let source = snapshot_tree(&fixture.workspace);
+        usage_limit_retry_command(&fixture)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(
+                "setup cannot be proven unlaunched",
+            ));
+        assert_eq!(
+            WorkModelStore::new(&fixture.project)
+                .read_work_item_snapshot(&fixture.work)
+                .unwrap(),
+            before
+        );
+        assert_eq!(snapshot_tree(&fixture.workspace), source);
+        assert!(!fixture.workspace.join("resumed-source.txt").exists());
+    }
 }
 
 #[test]
