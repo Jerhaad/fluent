@@ -102,10 +102,33 @@ fn workflow_foundation_public_trace() {
 #[test]
 fn workflow_foundation_projection_rejects_bad_observations() {
     let (tmp, trace) = capture();
-    let mut cases = Vec::new();
-    let mut incomplete = trace.clone(); incomplete["collection-complete"] = json!(false); cases.push(incomplete);
-    let mut identity = trace.clone(); identity["events"][2]["raw-facts"]["work"]["id"] = json!("other"); cases.push(identity);
-    let mut ordering = trace.clone(); ordering["events"][3]["causal-predecessors"] = json!([]); cases.push(ordering);
-    let mut invented = trace.clone(); invented["events"][3]["raw-facts"]["work"]["attempts"][0]["status"] = json!("complete"); cases.push(invented);
-    for bad in cases { assert!(!project(&bad, tmp.path()).status.success()); }
+    let original_canceled = fs::read(tmp.path().join("canceled.json")).unwrap();
+    let reject = |bad: &Value, expected: &str| {
+        let result = project(bad, tmp.path());
+        assert!(!result.status.success());
+        assert!(String::from_utf8_lossy(&result.stderr).contains(expected),
+            "{}", String::from_utf8_lossy(&result.stderr));
+    };
+    let mut incomplete = trace.clone();
+    incomplete["collection-complete"] = json!(false);
+    reject(&incomplete, "collection incomplete");
+    let mut malformed = trace.clone();
+    malformed["events"][1]["boundary"] = json!("unknown");
+    reject(&malformed, "event identity or boundary differs");
+    let mut ordering = trace.clone();
+    ordering["events"][3]["causal-predecessors"] = json!([]);
+    reject(&ordering, "missing or ambiguous causal predecessor");
+    let mut identity = trace.clone();
+    identity["events"][2]["raw-facts"]["work"]["id"] = json!("other");
+    let canceled_bytes = serde_json::to_vec(&identity["events"][2]["raw-facts"]["work"]).unwrap();
+    fs::write(tmp.path().join("canceled.json"), &canceled_bytes).unwrap();
+    identity["artifacts"][2]["sha256"] = json!(digest(&canceled_bytes));
+    reject(&identity, "work identity changed");
+    fs::write(tmp.path().join("canceled.json"), &original_canceled).unwrap();
+    let mut invented = trace.clone();
+    invented["events"][3]["raw-facts"]["work"]["attempts"][0]["status"] = json!("complete");
+    let refused_bytes = serde_json::to_vec(&invented["events"][3]["raw-facts"]["work"]).unwrap();
+    fs::write(tmp.path().join("refused.json"), &refused_bytes).unwrap();
+    invented["artifacts"][3]["sha256"] = json!(digest(&refused_bytes));
+    reject(&invented, "run advanced canceled state");
 }
