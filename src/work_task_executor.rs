@@ -7570,11 +7570,16 @@ pub(crate) fn materialize_writer_completion_before_writer(
     let Some(path) = managed_writer_completion_matrix_path(project_root, task)? else {
         anyhow::bail!("Writer Task {task_id:?} has no artifact area for its completion matrix");
     };
+    let recovery_source =
+        crate::writer_completion_recovery::validated_writer_context(project_root, item, task)?
+            .map(|context| context.source_task_id);
     let prior = attempt.tasks[..task_index]
         .iter()
         .rev()
         .find(|candidate| {
-            candidate.kind == TaskKind::Write && candidate.status != TaskStatus::Superseded
+            candidate.kind == TaskKind::Write
+                && candidate.status != TaskStatus::Superseded
+                && recovery_source.as_deref() != Some(candidate.id.as_str())
         })
         .map(|candidate| {
             crate::recovery_contracts::authoritative_writer_completion_matrix(

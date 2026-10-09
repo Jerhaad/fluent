@@ -4,7 +4,7 @@ mod log;
 use fluent::git;
 use fluent::review;
 use fluent::work_model::{
-    ArtifactRef, AttemptReviewState, CompletionResponsibility, TaskOutput, TaskStatus,
+    ArtifactRef, AttemptReviewState, CompletionResponsibility, TaskKind, TaskOutput, TaskStatus,
     WRITER_COMPLETION_CONTRACT_VERSION, WRITER_CORRECTION_ASSIGNMENT_SCHEMA_VERSION,
     WorkModelStore, WriterCompletionFinding, WriterCompletionMatrix, WriterCompletionRequirement,
     WriterCompletionRequirementKind, WriterCompletionState, WriterCorrectionAssignment,
@@ -6134,6 +6134,185 @@ fn writer_recovery_fixture_with_authority(tmp: &TempDir, authorize: bool) -> Wri
         audit,
         area,
     }
+}
+
+fn committed_matrix_recovery_fixture(tmp: &TempDir) -> (WriterRecoveryFixture, Vec<u8>) {
+    let fixture = writer_recovery_fixture_with_authority(tmp, false);
+    let store = WorkModelStore::new(&fixture.project);
+    store
+        .mutate_work_item(&fixture.work, |item| {
+            let attempt = &mut item.attempts[0];
+            attempt.tasks.pop();
+            attempt
+                .writer_completion_contract
+                .as_mut()
+                .unwrap()
+                .requirements[0]
+                .verification_refs =
+                vec!["Untestable: fixture candidate has no product behavior".into()];
+            attempt
+                .writer_completion_contract
+                .as_mut()
+                .unwrap()
+                .requirements
+                .push(WriterCompletionRequirement {
+                    responsibility: Some(CompletionResponsibility::Host),
+                    id: "plan:host-check".into(),
+                    kind: WriterCompletionRequirementKind::Plan,
+                    source: "plan.md#host-check".into(),
+                    requirement: "Verify the recovered candidate on the host".into(),
+                    verification_refs: vec![],
+                    command: Some(fluent::work_model::PlanCommand {
+                        applicability: Default::default(),
+                        command: "true".into(),
+                        working_directory: ".".into(),
+                        environment: Default::default(),
+                        source_row: "plan:host-check".into(),
+                    }),
+                });
+            Ok(())
+        })
+        .unwrap();
+    fs::remove_dir_all(&fixture.area).unwrap();
+    let item = store.read_work_item(&fixture.work).unwrap();
+    let area = fixture.project.join(
+        &item.attempts[0].tasks[0]
+            .artifact_area
+            .as_ref()
+            .unwrap()
+            .path,
+    );
+    let malformed = br#"{"schema-version":2,"task-id":"attempt-1-write-1","rows":[{"verification":[{"command":"true","result":"pass; extra text"}]}]}"#.to_vec();
+    fs::write(area.join("writer-completion.json"), &malformed).unwrap();
+    (fixture, malformed)
+}
+
+#[test]
+fn writer_completion_recovery_committed_matrix_public_continuation() {
+    let tmp = TempDir::new().unwrap();
+    let (fixture, malformed) = committed_matrix_recovery_fixture(&tmp);
+    let store = WorkModelStore::new(&fixture.project);
+    let source_task = store.read_work_item(&fixture.work).unwrap().attempts[0].tasks[0].clone();
+    let source_area = fixture
+        .project
+        .join(&source_task.artifact_area.as_ref().unwrap().path);
+    let action = read_work_show_json(&fixture.project, &fixture.work)["next-action"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(action.contains("repair-writer-completion"), "{action}");
+    fluent_cmd()
+        .current_dir(&fixture.project)
+        .args([
+            "attempt",
+            "repair-writer-completion",
+            &fixture.work,
+            "attempt-1",
+            "--resolution",
+            &fixture.resolution,
+        ])
+        .assert()
+        .success();
+    let authorized = store.read_work_item(&fixture.work).unwrap();
+    let attempt = &authorized.attempts[0];
+    assert_eq!(attempt.tasks[0], source_task);
+    assert_eq!(
+        attempt.tasks[0].output.as_ref().unwrap().commit,
+        fixture.candidate
+    );
+    assert_eq!(attempt.tasks[1].status, TaskStatus::Planned);
+    assert_eq!(
+        fs::read(source_area.join("writer-completion.json")).unwrap(),
+        malformed
+    );
+    let correction = &attempt.tasks[1];
+    let correction_area = fixture
+        .project
+        .join(&correction.artifact_area.as_ref().unwrap().path);
+    let bin = tmp.path().join("committed-matrix-provider");
+    write_mock_claude(
+        &bin,
+        r#"#!/bin/bash
+set -eu
+if [ "${FLUENT_WORKFLOW_REQUIRE_HOST:-}" = 1 ]; then
+  if printf 'tamper\n' > "$RECOVERY_SOURCE_MATRIX" 2>/dev/null; then
+    exit 91
+  fi
+  printf 'denied\n' > "$RECOVERY_AREA/confinement-observed"
+fi
+python3 - <<'PY'
+import json, os
+from pathlib import Path
+area = Path(os.environ['RECOVERY_AREA'])
+matrix = area / 'writer-completion.json'
+value = json.loads(matrix.read_text())
+for row in value['rows']:
+    if row.get('responsibility', 'writer') == 'writer':
+        row['state'] = 'complete'
+        row['implementation-evidence'] = ['candidate.txt: retained source candidate']
+        row['verification'] = [{'command': 'true', 'result': 'pass'}]
+matrix.write_text(json.dumps(value))
+(area / 'no-change.json').write_text(json.dumps({'schema_version': 1,
+    'declaration_path': os.environ['RECOVERY_AREA_REL'] + '/no-change.json',
+    'reason': 'The source candidate already contains the implementation.',
+    'verification': [{'command': 'true', 'result': 'pass'}]}))
+PY
+"#,
+    );
+    let require_host = std::env::var("FLUENT_WORKFLOW_REQUIRE_HOST").as_deref() == Ok("1");
+    let mut resume = fluent_cmd();
+    resume
+        .current_dir(&fixture.project)
+        .args(["attempt", "run", &fixture.work, "attempt-1"]);
+    if !require_host {
+        resume.arg("--no-sandbox");
+    }
+    resume
+        .env("PATH", mock_path(&bin))
+        .env("RECOVERY_AREA", &correction_area)
+        .env(
+            "RECOVERY_AREA_REL",
+            &correction.artifact_area.as_ref().unwrap().path,
+        )
+        .env(
+            "RECOVERY_SOURCE_MATRIX",
+            source_area.join("writer-completion.json"),
+        )
+        .assert()
+        .success();
+    if require_host {
+        assert_eq!(
+            fs::read(correction_area.join("confinement-observed")).unwrap(),
+            b"denied\n"
+        );
+    }
+    let after = store.read_work_item(&fixture.work).unwrap();
+    assert_eq!(after.attempts[0].tasks[0].status, TaskStatus::Complete);
+    assert_eq!(after.attempts[0].tasks[1].status, TaskStatus::Complete);
+    assert_eq!(
+        fs::read(source_area.join("writer-completion.json")).unwrap(),
+        malformed
+    );
+    assert!(
+        after.attempts[0]
+            .tasks
+            .iter()
+            .all(|task| task.kind != TaskKind::Tester)
+    );
+    fluent_cmd()
+        .current_dir(&fixture.project)
+        .args(["attempt", "run", &fixture.work, "attempt-1", "--no-sandbox"])
+        .env("PATH", mock_path(&bin))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "requires host action plan:host-check",
+        ));
+    let next = read_work_show_json(&fixture.project, &fixture.work)["next-action"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(next.contains("evidence attach"), "{next}");
 }
 
 fn capture_recovered_writer(fixture: &WriterRecoveryFixture, tmp: &TempDir) -> String {

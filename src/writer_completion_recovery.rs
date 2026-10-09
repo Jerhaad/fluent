@@ -71,6 +71,12 @@ struct EligibleRecovery {
     superseded_task_ids: Vec<String>,
     existing_no_change: bool,
     schedule_corrective_writer: bool,
+    malformed_source_matrix: bool,
+    source_matrix_sha256: Option<String>,
+    requirement_contract_sha256: Option<String>,
+    source_assignment_sha256: Option<String>,
+    source_transcript_sha256: Option<String>,
+    source_output_sha256: Option<String>,
 }
 
 /// Return the command that recovers this exact Writer-completion pause, when
@@ -111,7 +117,7 @@ pub fn repair(
         .find(|attempt| attempt.id == attempt_id)
         .ok_or_else(|| anyhow::anyhow!("Attempt {attempt_id:?} not found"))?;
 
-    if let Some(existing) = existing_recovery(project_root, attempt, &resolution)? {
+    if let Some(existing) = existing_recovery(project_root, &item, attempt, &resolution)? {
         if let Some(reconciled) = reconcile_existing_recovery(
             project_root,
             store,
@@ -154,6 +160,11 @@ pub fn repair(
         resolution: resolution.clone(),
         resolution_sha256: content_digest(resolution.as_bytes()),
         created_at,
+        source_matrix_sha256: eligible.source_matrix_sha256.clone(),
+        requirement_contract_sha256: eligible.requirement_contract_sha256.clone(),
+        source_assignment_sha256: eligible.source_assignment_sha256.clone(),
+        source_transcript_sha256: eligible.source_transcript_sha256.clone(),
+        source_output_sha256: eligible.source_output_sha256.clone(),
     };
     let authority_bytes =
         serde_json::to_vec(&authority).context("serialize Writer-completion recovery identity")?;
@@ -162,7 +173,11 @@ pub fn repair(
         work_item_id,
         attempt_id,
         Some(eligible.candidate_commit.clone()),
-        Some(eligible.task_id.clone()),
+        Some(if eligible.malformed_source_matrix {
+            eligible.source_writer_task_id.clone()
+        } else {
+            eligible.task_id.clone()
+        }),
         None,
         Some(eligible.workspace_path.clone()),
         Some(resolution.clone()),
@@ -189,7 +204,12 @@ pub fn repair(
         item.attempts
             .iter()
             .find(|attempt| attempt.id == attempt_id)
-            .and_then(|attempt| attempt.tasks.iter().find(|task| task.id == task_id))
+            .and_then(|attempt| {
+                attempt
+                    .tasks
+                    .iter()
+                    .find(|task| task.id == expected_eligible.source_writer_task_id)
+            })
             .map(|task| task.input_artifacts.clone())
             .unwrap_or_default()
     } else {
@@ -230,7 +250,7 @@ pub fn repair(
                 });
             }
             if expected_eligible.schedule_corrective_writer {
-                {
+                if !expected_eligible.malformed_source_matrix {
                     let attempt = fresh
                         .attempts
                         .iter_mut()
@@ -253,6 +273,20 @@ pub fn repair(
                 if !inputs.contains(&audit_ref) {
                     inputs.push(audit_ref.clone());
                 }
+                if expected_eligible.malformed_source_matrix {
+                    let source = &expected_eligible.source_writer_task_id;
+                    let matrix = ArtifactRef {
+                        producer_id: source.clone(),
+                        path: work_artifact_path(
+                            work_item_id,
+                            attempt_id,
+                            &format!("{source}/{}", crate::recovery_contracts::WRITER_COMPLETION_MATRIX_FILE),
+                        ),
+                    };
+                    if !inputs.contains(&matrix) {
+                        inputs.push(matrix);
+                    }
+                }
                 let next_task_id = fresh
                     .add_next_write_round(attempt_id, inputs)
                     .map_err(|error| WorkModelError::AttemptResumeIneligible {
@@ -261,6 +295,12 @@ pub fn repair(
                             "could not schedule the corrective Writer for the pending completion finding: {error}"
                         ),
                     })?;
+                if expected_eligible.malformed_source_matrix && next_task_id != task_id {
+                    return Err(WorkModelError::AttemptResumeIneligible {
+                        attempt_id: attempt_id.to_string(),
+                        reason: "corrective Writer identity changed before authorization".to_string(),
+                    });
+                }
                 let successor = fresh
                     .attempts
                     .iter_mut()
@@ -993,9 +1033,11 @@ fn schedule_pending_finding_writer(
 
 fn existing_recovery(
     project_root: &Path,
+    item: &crate::work_model::WorkItem,
     attempt: &Attempt,
     resolution: &str,
 ) -> Result<Option<WriterCompletionRecovery>> {
+    attempt.ensure_not_canceled()?;
     let Some(reference) = attempt
         .artifacts
         .iter()
@@ -1007,6 +1049,7 @@ fn existing_recovery(
     else {
         return Ok(None);
     };
+    ensure_settled_ownership(project_root, attempt)?;
     let authority: RecoveryAuthority = serde_json::from_slice(
         &fs::read(project_root.join(&reference.path)).with_context(|| {
             format!(
@@ -1040,6 +1083,62 @@ fn existing_recovery(
         .ok_or_else(|| {
             anyhow::anyhow!("recovery Writer {:?} no longer exists", authority.task_id)
         })?;
+    let source = attempt
+        .tasks
+        .iter()
+        .find(|task| task.id == authority.source_writer_task_id)
+        .ok_or_else(|| anyhow::anyhow!("recovery source Writer is missing"))?;
+    crate::recovery_contracts::writer_completion::validate_committed_source_evidence(
+        project_root,
+        attempt,
+        source,
+        &authority,
+    )?;
+    let source_output = source
+        .output
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("recovery source output is missing"))?;
+    let workspace = resolve_managed_sibling_workspace_path(
+        project_root,
+        &source_output.workspace_path,
+        "Writer-completion recovery candidate workspace",
+    )?;
+    let head = git::run_stdout(
+        &workspace,
+        &["rev-parse", "HEAD"],
+        "check recovered candidate HEAD",
+    )?;
+    let status = git::run_stdout(
+        &workspace,
+        &["status", "--porcelain", "--untracked-files=all", "--", "."],
+        "check recovered candidate cleanliness",
+    )?;
+    if head != authority.candidate_commit || !status.is_empty() {
+        bail!("Writer-completion recovery candidate changed or is dirty");
+    }
+    let operation = crate::work_model::RecoveryOperationRequest::new(
+        PRODUCER,
+        &item.id,
+        &attempt.id,
+        Some(authority.candidate_commit.clone()),
+        Some(if authority.source_matrix_sha256.is_some() {
+            authority.source_writer_task_id.clone()
+        } else {
+            authority.task_id.clone()
+        }),
+        None,
+        Some(source_output.workspace_path.clone()),
+        Some(authority.resolution.clone()),
+        Some(format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(&authority)?)
+        )),
+    );
+    anyhow::ensure!(
+        item.validate_recovery_operation(project_root, &operation)?
+            .is_some(),
+        "Writer-completion recovery operation is no longer current"
+    );
     if !task.input_artifacts.contains(&reference) {
         bail!(
             "recovery Writer {:?} no longer carries its authority",
@@ -1056,13 +1155,7 @@ fn existing_recovery(
     }))
 }
 
-fn inspect_eligible(project_root: &Path, attempt: &Attempt) -> Result<EligibleRecovery> {
-    if attempt.status != AttemptStatus::NeedsUser
-        || attempt.pause_kind != Some(PauseKind::WriterCompletion)
-    {
-        bail!("Attempt is not paused for Writer-completion recovery");
-    }
-    attempt.ensure_resume_ready()?;
+fn ensure_settled_ownership(project_root: &Path, attempt: &Attempt) -> Result<()> {
     if attempt
         .tasks
         .iter()
@@ -1070,6 +1163,35 @@ fn inspect_eligible(project_root: &Path, attempt: &Attempt) -> Result<EligibleRe
     {
         bail!("Attempt has a running Task");
     }
+    for task in &attempt.tasks {
+        crate::usage_limit_contracts::unlocked(
+            &crate::lease::task_lock_path(project_root, &attempt.work_item_id, &task.id),
+            false,
+        )?;
+        if let Some(area) = &task.artifact_area {
+            let path = project_root.join(&area.path);
+            crate::usage_limit_contracts::unlocked(&path.join("execution-owner.lock"), false)?;
+            if crate::execution::execution_is_live(&path.join("execution.json"))? {
+                bail!("Writer-completion recovery requires settled execution ownership");
+            }
+        }
+    }
+    crate::usage_limit_contracts::unlocked(
+        &crate::lease::learner_lock_path(project_root, &attempt.work_item_id, &attempt.id),
+        false,
+    )?;
+    Ok(())
+}
+
+fn inspect_eligible(project_root: &Path, attempt: &Attempt) -> Result<EligibleRecovery> {
+    if attempt.status != AttemptStatus::NeedsUser
+        || attempt.pause_kind != Some(PauseKind::WriterCompletion)
+    {
+        bail!("Attempt is not paused for Writer-completion recovery");
+    }
+    attempt.ensure_resume_ready()?;
+    attempt.ensure_not_canceled()?;
+    ensure_settled_ownership(project_root, attempt)?;
     let (source_index, source_writer) = attempt
         .tasks
         .iter()
@@ -1096,46 +1218,85 @@ fn inspect_eligible(project_root: &Path, attempt: &Attempt) -> Result<EligibleRe
     if pending_writers.len() > 1 {
         bail!("Attempt has more than one paused Writer-completion Task");
     }
-    let (task_id, existing_no_change) = if let Some(task) = pending_writers.first() {
-        let area = task
-            .artifact_area
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("paused Writer has no artifact area"))?;
-        let area_path = project_root.join(&area.path);
-        if !area_path.is_dir() {
-            bail!("paused Writer artifact area is missing");
-        }
-        if !area_path
-            .join(crate::recovery_contracts::WRITER_COMPLETION_MATRIX_FILE)
-            .is_file()
-        {
-            bail!("paused Writer has no completion matrix to review");
-        }
-        (task.id.clone(), false)
-    } else if source_output.no_change.is_some() {
-        let area = source_writer
-            .artifact_area
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("completed no-change Writer has no artifact area"))?;
-        if !project_root
-            .join(&area.path)
-            .join(crate::recovery_contracts::WRITER_COMPLETION_MATRIX_FILE)
-            .is_file()
-        {
-            bail!("completed no-change Writer has no completion matrix to review");
-        }
-        (source_writer.id.clone(), true)
-    } else {
-        bail!("Writer-completion pause has no paused Writer or valid no-change Writer");
-    };
-    let schedule_corrective_writer = existing_no_change
-        && attempt
-            .tasks
-            .iter()
-            .find(|task| task.id == task_id)
-            .is_some_and(|task| {
-                writer_matrix_has_pending_finding(project_root, task).unwrap_or(false)
-            });
+    let (task_id, existing_no_change, malformed_source_matrix) =
+        if let Some(task) = pending_writers.first() {
+            let area = task
+                .artifact_area
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("paused Writer has no artifact area"))?;
+            let area_path = project_root.join(&area.path);
+            if !area_path.is_dir() {
+                bail!("paused Writer artifact area is missing");
+            }
+            if !area_path
+                .join(crate::recovery_contracts::WRITER_COMPLETION_MATRIX_FILE)
+                .is_file()
+            {
+                bail!("paused Writer has no completion matrix to review");
+            }
+            (task.id.clone(), false, false)
+        } else if source_output.no_change.is_some() {
+            let area = source_writer.artifact_area.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("completed no-change Writer has no artifact area")
+            })?;
+            if !project_root
+                .join(&area.path)
+                .join(crate::recovery_contracts::WRITER_COMPLETION_MATRIX_FILE)
+                .is_file()
+            {
+                bail!("completed no-change Writer has no completion matrix to review");
+            }
+            (source_writer.id.clone(), true, false)
+        } else {
+            attempt.writer_completion_contract.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("committed Writer has no immutable completion contract")
+            })?;
+            let area = source_writer
+                .artifact_area
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("committed Writer has no artifact area"))?;
+            let matrix_path = project_root
+                .join(&area.path)
+                .join(crate::recovery_contracts::WRITER_COMPLETION_MATRIX_FILE);
+            anyhow::ensure!(
+                fs::metadata(&matrix_path)?.len()
+                    <= crate::work_model::WRITER_COMPLETION_MATRIX_MAX_BYTES as u64,
+                "committed Writer completion matrix exceeds the size limit"
+            );
+            let bytes = fs::read(&matrix_path).with_context(|| {
+                format!(
+                    "read committed Writer completion matrix {}",
+                    matrix_path.display()
+                )
+            })?;
+            if serde_json::from_slice::<crate::work_model::WriterCompletionMatrix>(&bytes).is_ok() {
+                bail!("Writer-completion pause has no paused Writer or valid no-change Writer");
+            }
+            let next_task_id = format!(
+                "{}-write-{}",
+                attempt.id,
+                attempt
+                    .tasks
+                    .iter()
+                    .filter(|task| task.kind == TaskKind::Write)
+                    .count()
+                    + 1
+            );
+            anyhow::ensure!(
+                !attempt.tasks.iter().any(|task| task.id == next_task_id),
+                "corrective Writer identity is already reserved"
+            );
+            (next_task_id, false, true)
+        };
+    let schedule_corrective_writer = malformed_source_matrix
+        || existing_no_change
+            && attempt
+                .tasks
+                .iter()
+                .find(|task| task.id == task_id)
+                .is_some_and(|task| {
+                    writer_matrix_has_pending_finding(project_root, task).unwrap_or(false)
+                });
     let workspace = resolve_managed_sibling_workspace_path(
         project_root,
         &source_output.workspace_path,
@@ -1170,6 +1331,46 @@ fn inspect_eligible(project_root: &Path, attempt: &Attempt) -> Result<EligibleRe
         })
         .map(|task| task.id.clone())
         .collect::<Vec<_>>();
+    let source_matrix_sha256 = if malformed_source_matrix {
+        let area = source_writer.artifact_area.as_ref().unwrap();
+        let bytes = fs::read(
+            project_root
+                .join(&area.path)
+                .join(crate::recovery_contracts::WRITER_COMPLETION_MATRIX_FILE),
+        )?;
+        Some(content_digest(&bytes))
+    } else {
+        None
+    };
+    let requirement_contract_sha256 = if malformed_source_matrix {
+        Some(content_digest(&serde_json::to_vec(
+            attempt.writer_completion_contract.as_ref().unwrap(),
+        )?))
+    } else {
+        None
+    };
+    let source_assignment_sha256 = if malformed_source_matrix {
+        Some(content_digest(&serde_json::to_vec(&(
+            &source_writer.workspace_access,
+            &source_writer.writer_correction_assignment,
+        ))?))
+    } else {
+        None
+    };
+    let source_transcript_sha256 = if malformed_source_matrix {
+        let area = source_writer.artifact_area.as_ref().unwrap();
+        Some(content_digest(
+            &fs::read(project_root.join(&area.path).join("transcript.jsonl"))
+                .context("read committed Writer transcript")?,
+        ))
+    } else {
+        None
+    };
+    let source_output_sha256 = if malformed_source_matrix {
+        Some(content_digest(&serde_json::to_vec(source_output)?))
+    } else {
+        None
+    };
     Ok(EligibleRecovery {
         task_id,
         source_writer_task_id: source_writer.id.clone(),
@@ -1179,6 +1380,12 @@ fn inspect_eligible(project_root: &Path, attempt: &Attempt) -> Result<EligibleRe
         superseded_task_ids,
         existing_no_change,
         schedule_corrective_writer,
+        malformed_source_matrix,
+        source_matrix_sha256,
+        requirement_contract_sha256,
+        source_assignment_sha256,
+        source_transcript_sha256,
+        source_output_sha256,
     })
 }
 

@@ -1305,6 +1305,12 @@ fn derive_other_attempt_recovery_next_action(
         ));
     }
     if attempt.status == AttemptStatus::NeedsUser
+        && attempt.pause_kind == Some(PauseKind::WriterCompletion)
+    {
+        return project_root
+            .and_then(|root| crate::writer_completion_recovery::recovery_action(root, attempt));
+    }
+    if attempt.status == AttemptStatus::NeedsUser
         && attempt.review_state == Some(AttemptReviewState::Failed)
         && matches!(
             attempt.pause_kind,

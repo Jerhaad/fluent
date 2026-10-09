@@ -6067,6 +6067,7 @@ pub(crate) fn authoritative_writer_completion_matrix(
     attempt: &work_model::Attempt,
     writer: &Task,
 ) -> Result<Option<work_model::WriterCompletionMatrix>> {
+    writer_completion::validate_task_recovery_source(project_root, attempt, writer)?;
     let recovered = recovered_completion_matrices(project_root, attempt)?;
     let mut matrix =
         if let Some((_, matrix)) = recovered

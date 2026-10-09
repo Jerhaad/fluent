@@ -81,6 +81,7 @@ pub(crate) fn validate_terminal_superseded_history(
             .context("Writer-completion recovery replacement Writer is missing")?;
         let source = &attempt.tasks[source_index];
         let replacement = &attempt.tasks[replacement_index];
+        validate_committed_source_evidence(project_root, attempt, source, &authority)?;
         let output = source
             .output
             .as_ref()
@@ -101,7 +102,11 @@ pub(crate) fn validate_terminal_superseded_history(
             work_item_id,
             &attempt.id,
             Some(authority.candidate_commit.clone()),
-            Some(authority.task_id.clone()),
+            Some(if authority.source_matrix_sha256.is_some() {
+                authority.source_writer_task_id.clone()
+            } else {
+                authority.task_id.clone()
+            }),
             None,
             Some(output.workspace_path.clone()),
             Some(authority.resolution.clone()),
@@ -236,6 +241,7 @@ pub(crate) fn validated_writer_context(
             .iter()
             .find(|source| source.id == authority.source_writer_task_id)
             .context("Writer-completion recovery source Writer is missing")?;
+        validate_committed_source_evidence(project_root, attempt, source, &authority)?;
         let output = source
             .output
             .as_ref()
@@ -260,7 +266,11 @@ pub(crate) fn validated_writer_context(
             &item.id,
             &attempt.id,
             Some(authority.candidate_commit.clone()),
-            Some(authority.task_id.clone()),
+            Some(if authority.source_matrix_sha256.is_some() {
+                authority.source_writer_task_id.clone()
+            } else {
+                authority.task_id.clone()
+            }),
             None,
             Some(output.workspace_path.clone()),
             Some(authority.resolution.clone()),
@@ -312,6 +322,161 @@ pub(crate) struct RecoveryAuthority {
     pub(crate) resolution: String,
     pub(crate) resolution_sha256: String,
     pub(crate) created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) source_matrix_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) requirement_contract_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) source_assignment_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) source_transcript_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) source_output_sha256: Option<String>,
+}
+
+pub(crate) fn validate_committed_source_evidence(
+    project_root: &Path,
+    attempt: &Attempt,
+    source: &crate::work_model::Task,
+    authority: &RecoveryAuthority,
+) -> Result<()> {
+    if let Some(expected) = &authority.source_matrix_sha256 {
+        let area = source
+            .artifact_area
+            .as_ref()
+            .context("recovery source has no artifact area")?;
+        let path = project_root
+            .join(&area.path)
+            .join(crate::recovery_contracts::WRITER_COMPLETION_MATRIX_FILE);
+        anyhow::ensure!(
+            fs::metadata(&path)?.len()
+                <= crate::work_model::WRITER_COMPLETION_MATRIX_MAX_BYTES as u64,
+            "recovery source matrix exceeds the size limit"
+        );
+        let bytes = fs::read(&path)
+            .with_context(|| format!("read recovery source matrix {}", path.display()))?;
+        anyhow::ensure!(
+            content_digest(&bytes) == *expected,
+            "recovery source matrix changed"
+        );
+        let contract = attempt
+            .writer_completion_contract
+            .as_ref()
+            .context("recovery completion contract is missing")?;
+        anyhow::ensure!(
+            authority.requirement_contract_sha256.as_deref()
+                == Some(content_digest(&serde_json::to_vec(contract)?).as_str()),
+            "recovery completion contract changed"
+        );
+        anyhow::ensure!(
+            authority.source_assignment_sha256.as_deref()
+                == Some(
+                    content_digest(&serde_json::to_vec(&(
+                        &source.workspace_access,
+                        &source.writer_correction_assignment,
+                    ))?)
+                    .as_str()
+                ),
+            "recovery source assignment changed"
+        );
+        let output = source
+            .output
+            .as_ref()
+            .context("recovery source output is missing")?;
+        anyhow::ensure!(
+            authority.source_output_sha256.as_deref()
+                == Some(content_digest(&serde_json::to_vec(output)?).as_str()),
+            "recovery source output changed"
+        );
+        anyhow::ensure!(
+            authority.source_transcript_sha256.as_deref()
+                == Some(
+                    content_digest(&fs::read(
+                        project_root.join(&area.path).join("transcript.jsonl")
+                    )?)
+                    .as_str()
+                ),
+            "recovery source transcript changed"
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_task_recovery_source(
+    project_root: &Path,
+    attempt: &Attempt,
+    task: &crate::work_model::Task,
+) -> Result<()> {
+    for reference in task
+        .input_artifacts
+        .iter()
+        .filter(|reference| reference.producer_id == PRODUCER)
+    {
+        anyhow::ensure!(
+            attempt.artifacts.contains(reference),
+            "Writer-completion recovery authority is not attached to the Attempt"
+        );
+        let bytes = fs::read(crate::recovery_contracts::resolve_input_artifact_path(
+            project_root,
+            &reference.path,
+        )?)?;
+        let authority: RecoveryAuthority =
+            serde_json::from_slice(&bytes).context("parse Writer-completion recovery authority")?;
+        anyhow::ensure!(
+            bytes == serde_json::to_vec_pretty(&authority)?
+                && authority.schema_version == SCHEMA_VERSION
+                && authority.work_item_id == attempt.work_item_id
+                && authority.attempt_id == attempt.id
+                && authority.task_id == task.id
+                && authority.resolution_sha256 == content_digest(authority.resolution.as_bytes())
+                && reference.path
+                    == work_artifact_path(
+                        &attempt.work_item_id,
+                        &attempt.id,
+                        &format!(
+                            "writer-completion-recoveries/{}/recovery.json",
+                            authority.task_id
+                        ),
+                    ),
+            "Writer-completion recovery authority changed"
+        );
+        let source = attempt
+            .tasks
+            .iter()
+            .find(|source| source.id == authority.source_writer_task_id)
+            .context("Writer-completion recovery source Writer is missing")?;
+        let output = source
+            .output
+            .as_ref()
+            .context("Writer-completion recovery source output is missing")?;
+        let request = RecoveryOperationRequest::new(
+            PRODUCER,
+            &attempt.work_item_id,
+            &attempt.id,
+            Some(authority.candidate_commit.clone()),
+            Some(if authority.source_matrix_sha256.is_some() {
+                authority.source_writer_task_id.clone()
+            } else {
+                authority.task_id.clone()
+            }),
+            None,
+            Some(output.workspace_path.clone()),
+            Some(authority.resolution.clone()),
+            Some(format!(
+                "sha256:{:x}",
+                Sha256::digest(serde_json::to_vec(&authority)?)
+            )),
+        );
+        anyhow::ensure!(
+            attempt
+                .recovery_operations
+                .iter()
+                .any(|record| record.matches_request(&request)),
+            "Writer-completion recovery operation changed"
+        );
+        validate_committed_source_evidence(project_root, attempt, source, &authority)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn normalize_resolution(resolution: &str) -> Result<String> {
@@ -333,6 +498,6 @@ pub(crate) fn recovery_instructions(resolution: &str, audit_artifact: &str) -> S
 
 pub(crate) fn corrective_writer_instructions(resolution: &str, audit_artifact: &str) -> String {
     format!(
-        "{INSTRUCTIONS_MARKER}. A prior no-change Writer left a review finding pending in its completion matrix. Address that finding with the smallest safe source or metadata correction, preserve the candidate's existing history, and write a complete matrix for this new corrective Writer. Operator authorization: {resolution}. Authority: {audit_artifact}"
+        "{INSTRUCTIONS_MARKER}. The completed source Writer has completion evidence that needs correction. Read the source matrix and immutable requirement contract, preserve the source Task and candidate history, and write a complete fresh matrix for this corrective Writer. If no source change is needed, use the verified no-change result. Operator authorization: {resolution}. Authority: {audit_artifact}"
     )
 }
