@@ -6259,6 +6259,11 @@ matrix.write_text(json.dumps(value))
 PY
 "#,
     );
+    write_mock_executable(
+        &bin,
+        "sandbox-exec",
+        "#!/bin/bash\nexec /usr/bin/sandbox-exec \"$@\"\n",
+    );
     let require_host = std::env::var("FLUENT_WORKFLOW_REQUIRE_HOST").as_deref() == Ok("1");
     let mut resume = fluent_cmd();
     resume
