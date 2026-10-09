@@ -71,6 +71,7 @@
 - [legacy-evidence-compatibility-stays-isolated](legacy-evidence-compatibility-stays-isolated.md) — Recover historical evidence through a separate exact compatibility classifier that cannot weaken current execution rules
 - [legacy-plan-commands-use-complete-approved-row](legacy-plan-commands-use-complete-approved-row.md) — Recover missing host commands from the complete approved Plan row while preserving stored command metadata and rejecting ambiguity
 - [legacy-recovery-rechecks-active-blockers](legacy-recovery-rechecks-active-blockers.md) — Historical hook output can authorize retired findings only; recheck active blockers across the complete candidate range
+- [local-execution-identity-requires-receipt](local-execution-identity-requires-receipt.md) — Resolve versioned local execution ownership from a generation-bound child receipt and inherited lock, not record state alone
 - [lock-ordering-across-subsystems](lock-ordering-across-subsystems.md) — Release the queue lock before mutating the Work model; the codebase has a lock hierarchy that must not be inverted
 - [log-append-across-retries](log-append-across-retries.md) — Retried operation logs must append with timestamps rather than truncate so prior failures are preserved
 - [macos-flock-child-process-test-pattern](macos-flock-child-process-test-pattern.md) — macOS flock tests must spawn child processes via current_exe, not threads; a sentinel test function guards the child entry point
