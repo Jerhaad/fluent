@@ -27,6 +27,7 @@
 - [checkout-selection-revalidates-identity](checkout-selection-revalidates-identity.md) — Revalidate a discovered checkout's canonical Git identity and current authority before every setup, commit, and publication effect
 - [commit-body-bullet-point-convention](commit-body-bullet-point-convention.md) — Commit bodies should use "- prefix" bullets for multiple changes when practical
 - [commit-subject-line-fifty-char-limit](commit-subject-line-fifty-char-limit.md) — Commit subject lines should stay within 50 characters when practical
+- [committed-writer-matrix-recovery-authority](committed-writer-matrix-recovery-authority.md) — Distinguish committed-matrix recovery authority from older Writer-completion audits by its source matrix digest and operation Task binding
 - [compose-typed-failure-precedence](compose-typed-failure-precedence.md) — A finalizer facing a coder/pump primary plus a cleanup/confinement secondary composes them by fixed precedence — resumable primary pauses, pure integrity failure is hard Failed — keeping the primary downcastable
 - [composed-recovery-instructions-bind-each-preparation](composed-recovery-instructions-bind-each-preparation.md) — Validate composed Writer instructions by reversing exact audited retry preparations while preserving the full instructions delivered to the worker
 - [config-fails-open-only-for-diagnostics](config-fails-open-only-for-diagnostics.md) — Layered config fails closed by default; only diagnostic-only knobs may fail open, and that must be justified in the docstring
@@ -66,9 +67,9 @@
 - [inject-side-effects-for-testability](inject-side-effects-for-testability.md) — Side-effect functions like notify() must be injected via &dyn Fn parameters so tests can capture and assert
 - [json-manifest-paths-via-jq-arg](json-manifest-paths-via-jq-arg.md) — External values written into JSON manifests must use jq --arg, not string interpolation
 - [keep-architecture-doc-in-sync](keep-architecture-doc-in-sync.md) — Keep the architecture file map, subsystem prose, and shell documentation checks aligned with the implementation
+- [landed-status-separates-history-from-recovery](landed-status-separates-history-from-recovery.md) — Show merged Work from retained evidence history while keeping current recovery and verification for unmerged candidates
 - [landing-effect-lock-protects-cancellation](landing-effect-lock-protects-cancellation.md) — Serialize Attempt cancellation with landing intent publication and the target Git effect under a project-wide effect lock
 - [landing-recovery-tests-check-publication](landing-recovery-tests-check-publication.md) — Landing recovery tests must compare the retained intent with the published merge and its downstream effects
-- [landed-status-separates-history-from-recovery](landed-status-separates-history-from-recovery.md) — Show merged Work from retained evidence history while keeping current recovery and verification for unmerged candidates
 - [lease-acquire-types-contention-vs-infrastructure](lease-acquire-types-contention-vs-infrastructure.md) — Lock/lease acquisition must return a typed result — only a non-blocking flock WouldBlock is a live peer (fail open); every other lock-path IO error propagates as a real failure
 - [legacy-evidence-compatibility-stays-isolated](legacy-evidence-compatibility-stays-isolated.md) — Recover historical evidence through a separate exact compatibility classifier that cannot weaken current execution rules
 - [legacy-plan-commands-use-complete-approved-row](legacy-plan-commands-use-complete-approved-row.md) — Recover missing host commands from the complete approved Plan row while preserving stored command metadata and rejecting ambiguity
