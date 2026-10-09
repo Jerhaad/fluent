@@ -40,12 +40,14 @@ Dispatch(w) == /\ w \notin ReviewOnly /\ s[w].phase = "authorized"
                /\ ~s[w].failed /\ ~s[w].canceled
                /\ s' = [s EXCEPT ![w].phase = "dispatched"]
 Deliver(w) == /\ s[w].phase = "dispatched" /\ ~s[w].failed
+              /\ ~s[w].canceled
               /\ s' = [s EXCEPT ![w].phase = "delivered",
                                     ![w].delivered = DeliverInputs]
 Writer(w) == /\ s[w].phase = "delivered" /\ ~s[w].failed
              /\ ~s[w].canceled
              /\ s' = [s EXCEPT ![w].phase = "written"]
 Review(w) == /\ s[w].phase = "written" /\ ~s[w].failed
+             /\ ~s[w].canceled
              /\ s' = [s EXCEPT ![w].phase = "reviewed",
                                    ![w].rawEvidence = TRUE,
                                    ![w].credit = CheckEvidence]
@@ -53,19 +55,25 @@ TargetedReview(w) == /\ s[w].phase = "reviewed" /\ ~s[w].credit
                      /\ CheckEvidence /\ ~s[w].failed
                      /\ s' = [s EXCEPT ![w].credit = TRUE]
 Tester(w) == /\ s[w].phase = "reviewed" /\ ~s[w].failed
+             /\ ~s[w].canceled
              /\ s' = [s EXCEPT ![w].phase = "tested"]
 LearnCapture(w) == /\ s[w].phase = "tested" /\ ~s[w].failed
+                   /\ ~s[w].canceled
                    /\ s' = [s EXCEPT ![w].phase = "learned"]
 LearnNoExpertise(w) == LearnCapture(w)
 Ready(w) == /\ s[w].phase = "learned" /\ ~s[w].failed
+            /\ ~s[w].canceled
             /\ s' = [s EXCEPT ![w].phase = "ready"]
 LandingVerify(w) == /\ s[w].phase = "ready" /\ ~s[w].failed
+                    /\ ~s[w].canceled
                     /\ s' = [s EXCEPT ![w].phase = "verified"]
 ReviewOnlyStart(w) == /\ w \in ReviewOnly
                       /\ s[w].phase = "authorized" /\ ~s[w].failed
+                      /\ ~s[w].canceled
                       /\ s' = [s EXCEPT ![w].phase = "written",
                                             ![w].delivered = TRUE]
 Intent(w) == /\ s[w].phase = "verified" /\ ~s[w].failed
+             /\ ~s[w].canceled
              /\ s' = [s EXCEPT ![w].phase = "intent",
                                    ![w].pending = TRUE]
 GitEffect(w) == /\ s[w].phase = "intent" /\ ~s[w].failed
