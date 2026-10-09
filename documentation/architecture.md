@@ -296,9 +296,11 @@ continuation, or post-review corrective work.
 When a completed Writer committed a candidate but left an unreadable completion
 matrix, status offers `fluent attempt repair-writer-completion <work-item-id>
 <attempt-id> --resolution "<decision>"` while the candidate is clean and Task
-owners are settled. The command records the source matrix bytes, requirement
-contract, assignment, candidate, and explicit decision, then schedules one
-corrective Writer in the same Attempt. The completed source Task and its artifacts
+owners are settled. The command binds the source matrix bytes by SHA-256 digest
+in its audit; the original matrix remains a retained source Task artifact. It
+records the requirement contract, assignment, candidate, and explicit decision,
+then schedules one corrective Writer in the same Attempt. The completed source
+Task and its artifacts
 remain history. Run `fluent queue resume <work-item-id> --attempt <attempt-id>`
 separately to execute the correction. The new Writer receives the failed matrix
 as an input and starts a fresh matrix from the immutable contract; it may submit

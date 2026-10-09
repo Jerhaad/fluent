@@ -673,13 +673,20 @@ resolution, then explicitly resume the same Attempt:
 ```sh
 fluent attempt repair-writer-completion <work-item> <attempt> --resolution "<approved correction>"
 fluent attempt run <work-item> <attempt>
-# For scheduler-owned Work, resume through the queue instead:
+```
+
+For scheduler-owned Work, use the queue to resume after authorization:
+
+```sh
+fluent attempt repair-writer-completion <work-item> <attempt> --resolution "<approved correction>"
 fluent queue resume <work-item> --attempt <attempt>
 ```
 
-Authorization records the source matrix bytes, contract, assignment, candidate,
-and decision. It schedules a bound corrective Writer without rerunning or
-changing the completed source Task; approval alone does not execute the Writer.
+Authorization binds the source matrix bytes by SHA-256 digest; the original
+matrix remains a retained source Task artifact. The audit also records the
+contract, assignment, candidate, and decision. It schedules a bound corrective
+Writer without rerunning or changing the completed source Task; approval alone
+does not execute the Writer.
 The correction starts with a fresh matrix from the immutable contract and may
 submit a verified no-change result if the candidate already satisfies the
 requirements. Repeated eligible approval and resume reuse the recorded
@@ -703,7 +710,12 @@ retry of that exact Task, then explicitly resume:
 ```sh
 fluent attempt repair-writer-completion <work-item> <attempt> --resolution "<retry decision>"
 fluent attempt run <work-item> <attempt>
-# Queue dispatch is an alternative to foreground resume:
+```
+
+For scheduler-owned Work, use the queue to resume after authorization:
+
+```sh
+fluent attempt repair-writer-completion <work-item> <attempt> --resolution "<retry decision>"
 fluent queue resume <work-item> --attempt <attempt>
 ```
 
