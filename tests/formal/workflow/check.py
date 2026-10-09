@@ -20,12 +20,26 @@ CONTROLS = {
     "guardcleanup": "Invariant CleanupSafe is violated",
     "guardversion": "Invariant VersionSafe is violated",
 }
+PROFILE_ACTIONS = {
+    "foundation.cfg": ("ChooseForeground", "Enqueue", "Dispatch", "Writer",
+                       "Review", "TargetedReview", "RecheckSameCandidate",
+                       "CarryForward", "CorrectCandidate", "Tester",
+                       "LearnCapture", "LearnNoExpertise", "Ready",
+                       "LandingVerify", "GitEffect", "PublishResult"),
+    "repeated-recovery.cfg": ("Crash", "Recover", "FailWrite", "RecoverIO",
+                              "ReplaceGeneration", "GrantResumeAuthority"),
+    "review-only.cfg": ("ReviewOnlyStart", "ReviewOnlyReview", "ReviewOnlyReady",
+                        "ReviewOnlyFailure", "Cancel", "GrantResumeAuthority",
+                        "Observe", "VersionTransition"),
+    "service-competition.cfg": ("ChooseForeground", "Enqueue", "Dispatch",
+                                "Writer", "Crash", "Recover", "ReplaceGeneration"),
+}
 
 
 def run_case(source, output_dir, jar, java, config, expected):
     with tempfile.TemporaryDirectory(prefix="tlc-", dir=output_dir) as metadir:
         command = [java, "-XX:+UseParallelGC", "-Xmx512m", "-cp", str(jar),
-                   "tlc2.TLC", "-deadlock", "-workers", "1", "-fp", "0",
+                   "tlc2.TLC", "-deadlock", "-coverage", "1", "-workers", "1", "-fp", "0",
                    "-seed", "1", "-metadir", metadir, "-config", config,
                    "Workflow.tla"]
         try:
@@ -36,11 +50,18 @@ def run_case(source, output_dir, jar, java, config, expected):
             result = None
             log = f"TLC timed out: {error}\n"
     (output_dir / f"{config}.log").write_text("$ " + " ".join(command) + "\n" + log)
+    missing_actions = []
     if expected:
         ok = result is not None and result.returncode != 0 and expected in log
     else:
         ok = result is not None and result.returncode == 0 and "Model checking completed" in log
-    return {"case": config, "pass": ok, "expected": expected, "log": f"{config}.log"}
+        for action in PROFILE_ACTIONS.get(config, ()):
+            counts = re.findall(rf"<{action} line [^>]+>: (\d+):(\d+)", log)
+            if not any(int(generated) > 0 for _, generated in counts):
+                missing_actions.append(action)
+        ok = ok and not missing_actions
+    return {"case": config, "pass": ok, "expected": expected,
+            "missing-actions": missing_actions, "log": f"{config}.log"}
 
 
 def run_trace_case(source, output, jar, java, name, states, expect_pass):
@@ -110,6 +131,8 @@ def main():
     results = []
     for config, expected in [("foundation.cfg", None),
                              ("repeated-recovery.cfg", None),
+                             ("review-only.cfg", None),
+                             ("service-competition.cfg", None),
                              *[(f"negative-{name}.cfg", violation)
                                for name, violation in CONTROLS.items()]]:
         results.append(run_case(source, output, jar, java, config, expected))
