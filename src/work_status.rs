@@ -2354,8 +2354,8 @@ mod tests {
     }
 
     #[test]
-    fn resumable_needs_user_status_names_exact_queue_resume_command() {
-        let mut item = WorkItem::planned("work-1", "Resume through scheduler");
+    fn writer_completion_status_waits_for_recovery_evidence() {
+        let mut item = WorkItem::planned("work-1", "Await Writer completion evidence");
         item.add_initial_attempt("attempt-1").unwrap();
         let attempt = &mut item.attempts[0];
         attempt.status = AttemptStatus::NeedsUser;
@@ -2365,10 +2365,7 @@ mod tests {
         let row = summarize_work_item(&item, None);
 
         assert_eq!(row.action, "needs-user");
-        assert_eq!(
-            row.next_action.as_deref(),
-            Some("fluent queue resume work-1 --attempt attempt-1")
-        );
+        assert_eq!(row.next_action, None);
     }
 
     #[test]
@@ -2377,7 +2374,7 @@ mod tests {
         item.add_initial_attempt("attempt-1").unwrap();
         let attempt = &mut item.attempts[0];
         attempt.status = AttemptStatus::NeedsUser;
-        attempt.pause_kind = Some(PauseKind::WriterCompletion);
+        attempt.pause_kind = Some(PauseKind::Auth);
         attempt.tasks[0].status = TaskStatus::NeedsUser;
         let command = "fluent queue resume work-pause-status --attempt attempt-1";
         attempt.pause_record = Some(crate::work_model::PauseRecord::generated(

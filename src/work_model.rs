@@ -21036,14 +21036,14 @@ random banner prose that must be ignored
         let mut item = WorkItem::planned("work-pause-record", "Pause record");
         item.add_initial_attempt("attempt-1").unwrap();
         item.attempts[0].tasks[0].status = TaskStatus::NeedsUser;
-        suspend_attempt(&mut item.attempts[0], PauseKind::WriterCompletion);
+        suspend_attempt(&mut item.attempts[0], PauseKind::Auth);
 
         store.create_work_item(&item).unwrap();
         let loaded = store.read_work_item("work-pause-record").unwrap();
         let record = loaded.attempts[0].pause_record.as_ref().unwrap();
 
         assert_eq!(record.schema_version, PAUSE_RECORD_SCHEMA_VERSION);
-        assert_eq!(record.pause_kind, PauseKind::WriterCompletion);
+        assert_eq!(record.pause_kind, PauseKind::Auth);
         assert!(record.next_operation.is_some());
         assert!(record.no_safe_operation_reason.is_none());
         assert_eq!(
@@ -21051,6 +21051,29 @@ random banner prose that must be ignored
             "fluent queue resume work-pause-record --attempt attempt-1"
         );
         loaded.attempts[0].validate("work-pause-record").unwrap();
+    }
+
+    #[test]
+    fn writer_completion_without_recovery_evidence_has_no_safe_operation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let mut item = WorkItem::planned("work-writer-pause", "Writer pause");
+        item.add_initial_attempt("attempt-1").unwrap();
+        item.attempts[0].tasks[0].status = TaskStatus::NeedsUser;
+        suspend_attempt(&mut item.attempts[0], PauseKind::WriterCompletion);
+
+        store.create_work_item(&item).unwrap();
+        let loaded = store.read_work_item("work-writer-pause").unwrap();
+        let record = loaded.attempts[0].pause_record.as_ref().unwrap();
+
+        assert!(record.next_operation.is_none());
+        assert!(
+            record
+                .no_safe_operation_reason
+                .as_deref()
+                .is_some_and(|reason| { reason.contains("writer-completion") })
+        );
+        loaded.attempts[0].validate("work-writer-pause").unwrap();
     }
 
     #[test]
