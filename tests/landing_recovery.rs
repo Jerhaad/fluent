@@ -123,15 +123,6 @@ fi
     let handoff_bytes = serde_json::to_vec(&handoff).unwrap();
     fs::write(&handoff_path, &handoff_bytes).unwrap();
     let attempt = &mut item.attempts[0];
-    attempt.status = AttemptStatus::Complete;
-    attempt.review_state = Some(AttemptReviewState::Passed);
-    attempt.learning = Some(AttemptLearning::succeeded(
-        1,
-        fluent::follow_up::ArtifactRef {
-            path: ".fluent/work/artifacts/work-1/attempt-1/learner/handoff.json".into(),
-            digest: fluent::follow_up::content_digest(&handoff_bytes),
-        },
-    ));
     let write = &mut attempt.tasks[0];
     write.status = TaskStatus::Complete;
     write.output = Some(TaskOutput {
@@ -143,6 +134,43 @@ fi
         no_change: None,
         learner_canonicalization: None,
     });
+    let tester_id = item.add_final_tester_task("attempt-1").unwrap();
+    item.attempts[0].status = AttemptStatus::Complete;
+    item.attempts[0].review_state = Some(AttemptReviewState::Passed);
+    item.attempts[0].learning = Some(AttemptLearning::succeeded(
+        1,
+        fluent::follow_up::ArtifactRef {
+            path: ".fluent/work/artifacts/work-1/attempt-1/learner/handoff.json".into(),
+            digest: fluent::follow_up::content_digest(&handoff_bytes),
+        },
+    ));
+    let tester = item.attempts[0]
+        .tasks
+        .iter_mut()
+        .find(|task| task.id == tester_id)
+        .unwrap();
+    tester.status = TaskStatus::Complete;
+    let results = root.join(format!(
+        ".fluent/work/artifacts/work-1/attempt-1/{tester_id}/tester-results.json"
+    ));
+    fs::create_dir_all(results.parent().unwrap()).unwrap();
+    fs::write(
+        &results,
+        serde_json::to_vec(&fluent::tester::TesterResults {
+            candidate_commit: Some(candidate.clone()),
+            commands: Vec::new(),
+            tests: Vec::new(),
+            summary: fluent::tester::Summary {
+                total: 0,
+                pass: 0,
+                fail: 0,
+                skipped: 0,
+            },
+            error: None,
+        })
+        .unwrap(),
+    )
+    .unwrap();
     item.create_or_get_merge_candidate("attempt-1").unwrap();
     store.create_work_item(&item).unwrap();
     LandingFixture {
@@ -346,22 +374,24 @@ fn landing_recovery_rejects_unbound_or_changed_intent() {
     );
     assert_eq!(head(&fx.root), before);
 
-    let fx = fixture_mode(LearnerMode::Capture);
-    let before = head(&fx.root);
-    interrupt(&fx, "BEFORE");
-    let item = fx.store.read_work_item("work-1").unwrap();
-    let artifact = &item.merge_candidates[0]
-        .merge_state
-        .landing_intent
-        .as_ref()
-        .unwrap()
-        .check_artifacts[0];
-    let path = fx.root.join(&artifact.path);
-    let mut bytes = fs::read(&path).unwrap();
-    bytes.extend_from_slice(b"\nchanged evidence\n");
-    fs::write(&path, bytes).unwrap();
-    assert!(land(&fx).is_err());
-    assert_eq!(head(&fx.root), before);
+    for mode in [LearnerMode::NoExpertise, LearnerMode::Capture] {
+        let fx = fixture_mode(mode);
+        let before = head(&fx.root);
+        interrupt(&fx, "BEFORE");
+        let item = fx.store.read_work_item("work-1").unwrap();
+        let artifact = &item.merge_candidates[0]
+            .merge_state
+            .landing_intent
+            .as_ref()
+            .unwrap()
+            .check_artifacts[0];
+        let path = fx.root.join(&artifact.path);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.extend_from_slice(b"\nchanged evidence\n");
+        fs::write(&path, bytes).unwrap();
+        assert!(land(&fx).is_err());
+        assert_eq!(head(&fx.root), before);
+    }
 }
 
 #[test]

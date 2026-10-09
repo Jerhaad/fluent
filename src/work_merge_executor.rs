@@ -1412,7 +1412,7 @@ fn execute_frozen_no_expertise_land(
     reviewed_sha: &str,
     target_head_before: &str,
 ) -> Result<WorkMergeOutcome> {
-    let check_artifacts = match run_frozen_pre_merge_check(
+    let mut check_artifacts = match run_frozen_pre_merge_check(
         config,
         candidate,
         source_workspace,
@@ -1433,6 +1433,13 @@ fn execute_frozen_no_expertise_land(
             return Err(error);
         }
     };
+    let item = config.store.read_work_item(config.work_item_id)?;
+    if let Some(dir) = latest_final_tester_artifact_dir(config.project_root, &item, candidate)? {
+        check_artifacts.push(ArtifactRef {
+            producer_id: "accepted-final-tester".into(),
+            path: path_for_model(config.project_root, &dir.join("tester-results.json")),
+        });
+    }
 
     // Reacquire the live preconditions before mutating the target: the check ran in
     // an isolated worktree, but the live candidate and target must still hold before
