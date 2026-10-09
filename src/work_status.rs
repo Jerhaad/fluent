@@ -97,6 +97,17 @@ fn landed_evidence_history(
         let path = format!("{}/tester-results.json", area.path);
         let (_, bytes) = crate::verification_assessment::bound_recovery_artifact(root, &path)?;
         let results: crate::tester::TesterResults = serde_json::from_slice(&bytes)?;
+        let manifest_path = format!("{}/canonical-run.json", area.path);
+        let (_, manifest_bytes) =
+            crate::verification_assessment::bound_recovery_artifact(root, &manifest_path)?;
+        let manifest: crate::tester::CanonicalRunManifest =
+            serde_json::from_slice(&manifest_bytes)?;
+        anyhow::ensure!(
+            manifest.schema_version == 1
+                && manifest.full_run
+                && manifest.commands.len() == results.commands.len(),
+            "retained Tester manifest does not describe a complete run"
+        );
         anyhow::ensure!(
             results.candidate_commit.as_deref() == Some(candidate.candidate_commit.as_str()),
             "Tester result does not match the recorded candidate"
@@ -110,6 +121,26 @@ fn landed_evidence_history(
                     .all(|command| command.exit_code == 0),
             "retained Tester result does not record a passing run"
         );
+        for (index, command) in results.commands.iter().enumerate() {
+            anyhow::ensure!(
+                command.command == manifest.commands[index].command
+                    && command.test_harness == manifest.commands[index].test_harness,
+                "retained Tester command differs from its manifest"
+            );
+            for (actual, expected) in [
+                (&command.stdout_log, format!("commands/{index}-stdout.log")),
+                (&command.stderr_log, format!("commands/{index}-stderr.log")),
+            ] {
+                anyhow::ensure!(
+                    actual == &expected,
+                    "retained Tester log path differs from its command"
+                );
+                crate::verification_assessment::bound_recovery_artifact(
+                    root,
+                    &format!("{}/{}", area.path, expected),
+                )?;
+            }
+        }
         Ok(path)
     })();
     match result {

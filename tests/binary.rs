@@ -63790,6 +63790,7 @@ fn landed_status_reports_unavailable_historical_evidence() {
     let path = shown["evidence-history"]["tester-results"]
         .as_str()
         .unwrap();
+    let original = fs::read(project.join(path)).unwrap();
     fs::remove_file(project.join(path)).unwrap();
     let status = fluent::work_status::load_work_status(&project).unwrap();
     let row = &status.rows[0];
@@ -63802,6 +63803,17 @@ fn landed_status_reports_unavailable_historical_evidence() {
     );
     assert!(row.next_action.is_none());
     assert!(read_work_show_json(&project, "work-1")["evidence-history"]["diagnostic"].is_string());
+    let mut changed: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    changed["candidate_commit"] = serde_json::json!("different-candidate");
+    fs::write(project.join(path), serde_json::to_vec(&changed).unwrap()).unwrap();
+    let changed = read_work_show_json(&project, "work-1");
+    assert!(
+        changed["evidence-history"]["diagnostic"]
+            .as_str()
+            .unwrap()
+            .contains("does not match")
+    );
+    assert!(changed.get("next-action").is_none());
 }
 
 #[test]
@@ -63840,5 +63852,27 @@ fn landed_status_observation_preserves_recorded_bytes() {
     let _ = fluent::work_status::format_work_dashboard_lines(&status);
     let _ = read_work_show_json(&project, "work-1");
     assert_eq!(fs::read(&evidence).unwrap(), before[0]);
+    assert_eq!(fs::read(&work).unwrap(), before[1]);
+}
+
+#[test]
+#[serial]
+fn landed_status_observation_preserves_recorded_bytes_with_pending_publication() {
+    let tmp = TempDir::new().unwrap();
+    let project = landed_status_fixture(&tmp);
+    let store = WorkModelStore::new(&project);
+    let mut target = store.read_work_item("work-1").unwrap();
+    target.title = "Unpublished update".into();
+    unsafe { std::env::set_var("FLUENT_TEST_WORK_MODEL_INTERRUPT", "before-child-publication") };
+    let result = store.write_work_item(&target);
+    unsafe { std::env::remove_var("FLUENT_TEST_WORK_MODEL_INTERRUPT") };
+    assert!(result.is_err());
+    let journal = project.join(".fluent/work/transactions/work-1.json");
+    let work = project.join(".fluent/work/items/work-1.json");
+    let before = [fs::read(&journal).unwrap(), fs::read(&work).unwrap()];
+    let status = fluent::work_status::load_work_status(&project).unwrap();
+    let _ = fluent::work_status::format_work_dashboard_lines(&status);
+    let _ = read_work_show_json(&project, "work-1");
+    assert_eq!(fs::read(&journal).unwrap(), before[0]);
     assert_eq!(fs::read(&work).unwrap(), before[1]);
 }
