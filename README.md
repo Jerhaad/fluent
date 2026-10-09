@@ -341,6 +341,13 @@ Once every Reviewer and the final Tester pass, the Learner examines the accepted
 
 A ready Merge Candidate contains the reviewed change and any Expertise captured by the Learner, but it has not changed the target branch. Ask Fluent to show you the candidate so you can inspect it and decide whether to land it. By default, Fluent waits for your decision. Projects that want automatic landing can opt into a separate auto-merge process.
 
+If landing stops after Git advances but before Fluent records the result, run the
+same `fluent merge-candidate land` command again. Fluent uses its retained
+landing intent to confirm the exact commit and target, then finishes publishing
+the result without moving later target commits. A landing from an older Fluent
+version that advanced Git without retaining intent needs explicit recovery;
+Fluent does not infer authorization from Git ancestry alone.
+
 To land the candidate, Fluent first checks that both the candidate and target worktrees are clean. It rebases the candidate onto the current target branch, asking an agent to resolve straightforward conflicts and returning unresolved ones to you. It then runs the project’s optional `check-pre-merge` hook. If the check fails and a `fix-pre-merge` hook exists, Fluent runs it, commits any correction it makes, and checks again. Fluent moves the target branch only after these steps pass, using a fast-forward merge.
 
 ## How Fluent keeps improving your code

@@ -38,6 +38,38 @@ ownership, and dispatch fencing that the abstract models cannot establish.
 The bounded models do not prove arbitrary filesystem errors, power loss, or
 unbounded concurrency safe.
 
+## Landing publication
+
+`LandingPublication.tla` models a verified candidate, the retained landing
+intent, the Git fast-forward, result publication, a later target commit, a
+reported write failure, cancellation, retry, and cleanup as separate actions.
+Run `python3 tests/formal/scheduler/check.py --suite=landing
+--jar=target/fluent-tools/tla2tools-1.7.4.jar` on the authorized host. The
+repaired case checks bound effects, one effect, preservation of independent
+state, cancellation, and eventual result publication under weak fairness for
+the result write and I/O recovery. Three controls remove intent binding, early
+reconciliation, and replay protection; each has a named expected violation.
+
+| Model action | Production boundary |
+| --- | --- |
+| `PublishIntent` | `persist_landing_intent` writes the verified effect before either fast-forward |
+| `GitEffect` | `execute_frozen_no_expertise_land` and `finalize_merge` use checked `git merge --ff-only` |
+| `Advance` | Git commits made on the target after the interrupted landing |
+| `PublishResult` | `record_candidate_merged` publishes the merged result through `WorkModelStore` |
+| `Retry` | `merge_candidate` calls `recognized_landing_intent` before fresh landing work |
+| `IndependentWrite` | A later independent Work or cancellation record |
+| `Cleanup` | `process_landed_follow_ups` and managed workspace cleanup |
+| `Cancel` | Durable Attempt cancellation before the Git effect |
+| `FailWrite`, `RecoverIO` | Reported storage failure and a later successful retry |
+
+The model bounds two candidate identities, the Writer and retry actors, one
+owner crash, one landing operation, and one later target advancement. It
+abstracts Git ancestry and artifact digests into the intent binding. Rust
+integration tests exercise those concrete checks and split-record publication.
+The model does not prove arbitrary Git operations, power-loss durability, or
+every Rust transition. Legacy Executing records with no retained intent remain
+blocked when their candidate is already in target history.
+
 ## Child launch identity
 
 `ChildLaunchIdentity.tla` is a new model of the implemented receipt protocol,

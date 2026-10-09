@@ -35,6 +35,12 @@ LAUNCH_CASES = (
     ("ChildLaunchIdentity", "launch-negative-no-stop.cfg", "Invariant StopBeforeExecution is violated"),
     ("ChildLaunchIdentity", "launch-negative-no-generation.cfg", "Invariant NoWrongSignal is violated"),
 )
+LANDING_CASES = (
+    ("LandingPublication", "landing-repaired.cfg", None),
+    ("LandingPublication", "landing-negative-no-intent.cfg", "Invariant NoUnboundEffect is violated"),
+    ("LandingPublication", "landing-negative-late-reconcile.cfg", "Invariant OneEffect is violated"),
+    ("LandingPublication", "landing-negative-no-replay-guard.cfg", "Invariant RetainIndependent is violated"),
+)
 
 
 def is_java_21_version(output: str) -> bool:
@@ -43,7 +49,7 @@ def is_java_21_version(output: str) -> bool:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--suite", choices=["recovery", "lifecycle", "launch"], required=True)
+    parser.add_argument("--suite", choices=["recovery", "lifecycle", "launch", "landing"], required=True)
     parser.add_argument("--jar", type=Path, required=True)
     args = parser.parse_args()
     jar = args.jar.resolve()
@@ -63,7 +69,8 @@ def main() -> int:
     logs = Path("target/formal/scheduler").resolve()
     logs.mkdir(parents=True, exist_ok=True)
     failed = False
-    cases = {"recovery": RECOVERY_CASES, "lifecycle": LIFECYCLE_CASES, "launch": LAUNCH_CASES}[args.suite]
+    cases = {"recovery": RECOVERY_CASES, "lifecycle": LIFECYCLE_CASES,
+             "launch": LAUNCH_CASES, "landing": LANDING_CASES}[args.suite]
     for module, config, expected_invariant in cases:
         with tempfile.TemporaryDirectory(prefix="tlc-", dir=logs) as metadir:
             command = ["java", "-XX:+UseParallelGC", "-Xmx256m", "-cp", str(jar),

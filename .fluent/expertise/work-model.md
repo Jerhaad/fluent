@@ -16,6 +16,7 @@ attempts, tasks, and merge candidates persist as separate records.
 
 - [extend-work-item-backward-compatibly](work-model/patterns/extend-work-item-backward-compatibly.md) — read when adding a field to WorkItem or another split-stored model type
 - [serialize-aggregate-work-writes](work-model/patterns/serialize-aggregate-work-writes.md) — read when adding code that rewrites a WorkItem and its split child records
+- [fence-new-child-authority](work-model/patterns/fence-new-child-authority.md) — read when a new optional split-child field authorizes an effect older writers must reject
 
 ## Resume transitions
 
