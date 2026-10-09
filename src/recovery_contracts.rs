@@ -3012,7 +3012,7 @@ pub(crate) fn output_free_assignment_source<'a>(
         &assignment_input_bytes(root, &format!("{}/execution.json", area.path))?,
     )?;
     anyhow::ensure!(
-        record.schema_version == 1
+        matches!(record.schema_version, 1 | 2)
             && (record.state == crate::execution::ExecutionState::Launching
                 || (record.state == crate::execution::ExecutionState::Canceled
                     && attempt.cancellation_requested()
@@ -3024,7 +3024,12 @@ pub(crate) fn output_free_assignment_source<'a>(
             && record.leader_pid == 0
             && record.process_group_id == 0
             && (record.settled_at.is_none() || attempt.cancellation_requested())
-            && record.heartbeat_at == record.started_at,
+            && record.heartbeat_at == record.started_at
+            && (record.schema_version == 1
+                || (record.launch_generation.is_some()
+                    && crate::execution::receipt_absent(
+                        &root.join(&area.path).join("execution.json")
+                    )?)),
         "setup cannot be proven unlaunched"
     );
     let start = DateTime::parse_from_rfc3339(

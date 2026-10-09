@@ -327,7 +327,8 @@ pub(crate) fn settled(
     let record: crate::execution::ExecutionRecord =
         serde_json::from_slice(&bind_file(root, &record_path, &mut BTreeMap::new())?)?;
     ensure!(
-        record.schema_version == 1
+        matches!(record.schema_version, 1 | 2)
+            && (record.schema_version == 1 || record.launch_generation.is_some())
             && record.state == crate::execution::ExecutionState::Settled
             && record.settled_at.is_some(),
         "failed execution has not verifiably settled"
@@ -1129,11 +1130,16 @@ pub(crate) fn unlaunched(
         &mut BTreeMap::new(),
     )?)?;
     ensure!(
-        record.schema_version == 1
+        matches!(record.schema_version, 1 | 2)
             && record.state == crate::execution::ExecutionState::Launching
             && record.leader_pid == 0
             && record.process_group_id == 0
-            && record.settled_at.is_none(),
+            && record.settled_at.is_none()
+            && (record.schema_version == 1
+                || (record.launch_generation.is_some()
+                    && crate::execution::receipt_absent(
+                        &root.join(&area).join("execution.json")
+                    )?)),
         "setup cannot be proven unlaunched"
     );
     let owner = record

@@ -3415,7 +3415,7 @@ fn carried_finding_evidence_compatibility_refuses_public_transaction() {
         let fixture = carried_finding_fixture(&tmp);
         let journal = interrupt_carried_finding_attachment(&fixture);
         let transaction = read_json_path(&journal);
-        assert_eq!(transaction["schema_version"], 10);
+        assert_eq!(transaction["schema_version"], 11);
         let root = fixture.project.join(".fluent/work");
         let path = root.join(format!("items/{}.json", fixture.work));
         let original = read_json_path(&path);
@@ -7765,7 +7765,7 @@ fn assignment_context_recovery_rejects_unmatched_pending_publication() {
             .join(".fluent/work/transactions/work-1.json");
         let journal_bytes = fs::read(&journal_path).unwrap();
         let mut journal = read_json_path(&journal_path);
-        assert_eq!(journal["schema_version"], 10);
+        assert_eq!(journal["schema_version"], 11);
         journal["assignment_context_base"]["attempts"][0]["status"] = "planned".into();
         write_json_path(&journal_path, &journal);
         let changed = snapshot_tree(&fixture.project_root);
@@ -9485,6 +9485,7 @@ fn fluent_release_tester_historical_reader_setup_fails_closed() {
     // has already printed a path, and must preserve its diagnostic and status.
     let helpers = [
         ("ownership", "FLUENT_OWNERSHIP_OLD_BIN"),
+        ("launch-handoff", "FLUENT_LAUNCH_HANDOFF_OLD_BIN"),
         ("verification", "FLUENT_VERIFICATION_OLD_BIN"),
         ("usage-limit", "FLUENT_USAGE_LIMIT_OLD_BIN"),
         (
@@ -9526,6 +9527,8 @@ fn fluent_release_tester_historical_reader_setup_fails_closed() {
     ];
     for (failed_helper, setup_status, prints_path) in [
         ("", 0, true),
+        ("launch-handoff", 37, false),
+        ("launch-handoff", 37, true),
         ("ownership", 37, false),
         ("ownership", 37, true),
         ("verification", 37, false),
@@ -9590,7 +9593,7 @@ fn fluent_release_tester_historical_reader_setup_fails_closed() {
             r#"#!/bin/sh
 set -eu
 printf '%s\n' "$*" >> "$FLUENT_TEST_CARGO_CALLS"
-printf '%s\n' "${FLUENT_OWNERSHIP_OLD_BIN-unset}" "${FLUENT_VERIFICATION_OLD_BIN-unset}" "${FLUENT_USAGE_LIMIT_OLD_BIN-unset}" "${FLUENT_WRITER_ASSIGNMENT_MAIN_OLD_BIN-unset}" "${FLUENT_WRITER_ASSIGNMENT_PAUSED_OLD_BIN-unset}" "${FLUENT_CARRIED_FINDING_OLD_BIN-unset}" "${FLUENT_COMBINED_BASE_OLD_BIN-unset}" "${FLUENT_COMBINED_ASSIGNMENT_OLD_BIN-unset}" "${FLUENT_COMBINED_EVIDENCE_OLD_BIN-unset}" "${FLUENT_OUTPUT_FREE_CONTEXT_OLD_BIN-unset}" "${FLUENT_ROUND_CAP_APPROACH_STABLE_OLD_BIN-unset}" "${FLUENT_ROUND_CAP_APPROACH_ASSIGNMENT_OLD_BIN-unset}" "${FLUENT_INSTALLATION_MAIN_OLD_BIN-unset}" "${FLUENT_INSTALLATION_OUTPUT_FREE_OLD_BIN-unset}" "${FLUENT_INSTALLATION_ACCEPTED_PROOF_OLD_BIN-unset}" >> "$FLUENT_TEST_READER_PATHS"
+printf '%s\n' "${FLUENT_OWNERSHIP_OLD_BIN-unset}" "${FLUENT_LAUNCH_HANDOFF_OLD_BIN-unset}" "${FLUENT_VERIFICATION_OLD_BIN-unset}" "${FLUENT_USAGE_LIMIT_OLD_BIN-unset}" "${FLUENT_WRITER_ASSIGNMENT_MAIN_OLD_BIN-unset}" "${FLUENT_WRITER_ASSIGNMENT_PAUSED_OLD_BIN-unset}" "${FLUENT_CARRIED_FINDING_OLD_BIN-unset}" "${FLUENT_COMBINED_BASE_OLD_BIN-unset}" "${FLUENT_COMBINED_ASSIGNMENT_OLD_BIN-unset}" "${FLUENT_COMBINED_EVIDENCE_OLD_BIN-unset}" "${FLUENT_OUTPUT_FREE_CONTEXT_OLD_BIN-unset}" "${FLUENT_ROUND_CAP_APPROACH_STABLE_OLD_BIN-unset}" "${FLUENT_ROUND_CAP_APPROACH_ASSIGNMENT_OLD_BIN-unset}" "${FLUENT_INSTALLATION_MAIN_OLD_BIN-unset}" "${FLUENT_INSTALLATION_OUTPUT_FREE_OLD_BIN-unset}" "${FLUENT_INSTALLATION_ACCEPTED_PROOF_OLD_BIN-unset}" >> "$FLUENT_TEST_READER_PATHS"
 case "$1" in
     build) mkdir -p target/debug; touch target/debug/fluent ;;
     nextest) exit 0 ;;
@@ -9605,6 +9608,7 @@ esac
             .args(["-c", command])
             .current_dir(&project)
             .env_remove("FLUENT_OWNERSHIP_OLD_BIN")
+            .env_remove("FLUENT_LAUNCH_HANDOFF_OLD_BIN")
             .env_remove("FLUENT_VERIFICATION_OLD_BIN")
             .env_remove("FLUENT_ROUND_CAP_APPROACH_STABLE_OLD_BIN")
             .env_remove("FLUENT_ROUND_CAP_APPROACH_ASSIGNMENT_OLD_BIN")
@@ -55519,7 +55523,7 @@ fn writer_assignment_old_reader_reaches_inner_fences() {
             .expect_err("the fixture must leave a real pending aggregate transaction");
         let journal_path = work_root.join("transactions/work-1.json");
         let journal = read_json_path(&journal_path);
-        assert_eq!(journal["schema_version"], serde_json::json!(10));
+        assert_eq!(journal["schema_version"], serde_json::json!(11));
         assert!(old_transaction_schema < journal["schema_version"].as_u64().unwrap() as u32);
         let record_path = work_root.join("items/work-1.json");
         let mut record = read_json_path(&record_path);
@@ -55574,7 +55578,7 @@ fn writer_assignment_old_reader_refuses_published_records() {
             let work_root = project.join(".fluent/work");
             let record_path = work_root.join("items/work-1.json");
             let mut record = read_json_path(&record_path);
-            assert_eq!(record["schema_version"], serde_json::json!(10));
+            assert_eq!(record["schema_version"], serde_json::json!(11));
             if !envelope_is_current {
                 record["model_writer_version"]["schema_version"] =
                     serde_json::json!(old_envelope_schema);
@@ -57925,7 +57929,7 @@ fn usage_limit_writer_compatibility_refuses_public_pending_transaction() {
     let journal = fixture
         .project
         .join(format!(".fluent/work/transactions/{}.json", fixture.work));
-    assert_eq!(read_json_path(&journal)["schema_version"], 10);
+    assert_eq!(read_json_path(&journal)["schema_version"], 11);
     usage_limit_old_mutation_refuses(&binary, &fixture);
     fixture.approve();
     fixture.approve();

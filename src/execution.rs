@@ -56,6 +56,14 @@ fn receipt_path(path: &Path) -> PathBuf {
     path.with_file_name("execution-receipt")
 }
 
+pub(crate) fn receipt_absent(path: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(receipt_path(path)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Ok(_) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn new_generation() -> Result<String> {
     let mut bytes = [0u8; 16];
     File::open("/dev/urandom")?.read_exact(&mut bytes)?;
