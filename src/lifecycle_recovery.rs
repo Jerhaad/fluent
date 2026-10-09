@@ -615,13 +615,7 @@ pub(crate) fn inspect_learner_retry_recovery(
     {
         anyhow::bail!("Attempt {attempt_id:?} is not a completed, review-passed Learner retry");
     }
-    if attempt
-        .tasks
-        .iter()
-        .any(|task| task.status != TaskStatus::Complete)
-    {
-        anyhow::bail!("Attempt {attempt_id:?} still has an active or incomplete Task");
-    }
+    inspect_learner_terminal_history(attempt, &item.id)?;
     let learning = attempt
         .learning
         .as_ref()
@@ -680,6 +674,26 @@ pub(crate) fn inspect_learner_retry_recovery(
         anyhow::bail!("Learner retry candidate workspace is dirty");
     }
 
+    Ok(())
+}
+
+/// A completed Attempt may retain superseded Tasks from supported recovery.
+/// Validate the Work-model structure before treating that history as terminal.
+pub(crate) fn inspect_learner_terminal_history(
+    attempt: &Attempt,
+    work_item_id: &str,
+) -> Result<()> {
+    attempt.validate(work_item_id)?;
+    if attempt
+        .tasks
+        .iter()
+        .any(|task| !matches!(task.status, TaskStatus::Complete | TaskStatus::Superseded))
+    {
+        anyhow::bail!(
+            "Attempt {:?} still has an active or incomplete Task",
+            attempt.id
+        );
+    }
     Ok(())
 }
 
