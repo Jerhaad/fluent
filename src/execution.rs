@@ -3,6 +3,7 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -10,6 +11,7 @@ use std::time::{Duration, Instant};
 const EXECUTION_FILE: &str = "execution.json";
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 const TERMINATION_GRACE: Duration = Duration::from_secs(2);
+const LAUNCH_PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -33,6 +35,78 @@ pub struct ExecutionRecord {
     pub settled_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attempt_owner: Option<AttemptExecutionOwner>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_generation: Option<String>,
+}
+
+fn check_protocol(record: &ExecutionRecord) -> Result<()> {
+    anyhow::ensure!(
+        record.schema_version == 1 || record.schema_version == LAUNCH_PROTOCOL_VERSION,
+        "unsupported local execution protocol {}",
+        record.schema_version
+    );
+    anyhow::ensure!(
+        record.schema_version == 1 || record.launch_generation.is_some(),
+        "launch identity is missing its generation"
+    );
+    Ok(())
+}
+
+fn receipt_path(path: &Path) -> PathBuf {
+    path.with_file_name("execution-receipt")
+}
+
+fn new_generation() -> Result<String> {
+    let mut bytes = [0u8; 16];
+    File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn receipt_identity(path: &Path, record: &ExecutionRecord) -> Result<Option<u32>> {
+    if record.schema_version == 1 {
+        return Ok(None);
+    }
+    let bytes = match std::fs::read(receipt_path(path)) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let Some(generation) = record.launch_generation.as_deref() else {
+        return Ok(None);
+    };
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return Ok(None);
+    };
+    let Some(rest) = text.strip_prefix(&format!("2 {generation} ")) else {
+        return Ok(None);
+    };
+    let Some(pid_text) = rest.strip_suffix('\n') else {
+        return Ok(None);
+    };
+    if pid_text.len() != 10 || !pid_text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Ok(None);
+    }
+    let pid: u32 = pid_text.parse()?;
+    Ok((pid > 0).then_some(pid))
+}
+
+fn effective_identity(path: &Path, record: &ExecutionRecord) -> Result<Option<(u32, u32)>> {
+    check_protocol(record)?;
+    if record.schema_version == 1 {
+        return Ok((record.state == ExecutionState::Running
+            && record.leader_pid > 0
+            && record.process_group_id > 0)
+            .then_some((record.leader_pid, record.process_group_id)));
+    }
+    let Some(pid) = receipt_identity(path, record)? else {
+        return Ok(None);
+    };
+    if record.leader_pid != 0 && record.leader_pid != pid
+        || record.process_group_id != 0 && record.process_group_id != pid
+    {
+        return Ok(None);
+    }
+    Ok(Some((pid, pid)))
 }
 
 /// Bind every child in this execution to the Attempt's durable stop boundary.
@@ -57,6 +131,7 @@ fn mutate_record<T>(
         .with_context(|| format!("reading local execution record {}", path.display()))?;
     let mut record: ExecutionRecord = serde_json::from_slice(&bytes)
         .with_context(|| format!("parsing local execution record {}", path.display()))?;
+    check_protocol(&record)?;
     let result = mutate(&mut record)?;
     crate::atomic_write::atomic_write(path, &serde_json::to_vec_pretty(&record)?)
         .with_context(|| format!("writing local execution record {}", path.display()))?;
@@ -130,9 +205,12 @@ fn leader_matches_process_group(_leader_pid: u32, _process_group_id: u32) -> Res
 }
 
 fn recorded_identity_is_signalable(path: &Path, record: &ExecutionRecord) -> Result<bool> {
+    let Some((leader, group)) = effective_identity(path, record)? else {
+        return Ok(false);
+    };
     Ok(identity_is_held(path)?
-        && process_group_exists(record.process_group_id)?
-        && leader_matches_process_group(record.leader_pid, record.process_group_id)?)
+        && process_group_exists(group)?
+        && leader_matches_process_group(leader, group)?)
 }
 
 #[cfg(unix)]
@@ -183,6 +261,15 @@ pub struct ExecutionHeartbeat {
 /// identity even if the Fluent owner has exited.
 #[cfg(unix)]
 pub fn configure_identity_lock(command: &mut Command, transcript: &Path) -> Result<()> {
+    configure_launch_identity(command, transcript, None)
+}
+
+#[cfg(unix)]
+fn configure_launch_identity(
+    command: &mut Command,
+    transcript: &Path,
+    generation: Option<&str>,
+) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::process::CommandExt;
 
@@ -192,6 +279,25 @@ pub fn configure_identity_lock(command: &mut Command, transcript: &Path) -> Resu
     }
     let path = std::ffi::CString::new(identity_lock_path(&record_path).as_os_str().as_bytes())
         .context("execution identity path contains a NUL byte")?;
+    let receipt = std::ffi::CString::new(receipt_path(&record_path).as_os_str().as_bytes())
+        .context("execution receipt path contains a NUL byte")?;
+    let mut receipt_bytes = [0u8; 46];
+    if let Some(generation) = generation {
+        anyhow::ensure!(
+            generation.len() == 32 && generation.bytes().all(|b| b.is_ascii_hexdigit()),
+            "invalid launch generation"
+        );
+        receipt_bytes[..2].copy_from_slice(b"2 ");
+        receipt_bytes[2..34].copy_from_slice(generation.as_bytes());
+        receipt_bytes[34] = b' ';
+        receipt_bytes[45] = b'\n';
+    }
+    let publish = generation.is_some();
+    #[cfg(feature = "test-support")]
+    let child_barrier = std::env::var_os("FLUENT_TEST_LAUNCH_CHILD_BARRIER")
+        .map(|path| std::ffi::CString::new(Path::new(&path).as_os_str().as_bytes()))
+        .transpose()
+        .context("test launch barrier contains a NUL byte")?;
     unsafe {
         command.pre_exec(move || {
             let descriptor = libc::open(path.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o600);
@@ -202,6 +308,48 @@ pub fn configure_identity_lock(command: &mut Command, transcript: &Path) -> Resu
             // descendant from an earlier launch in this artifact area.
             if libc::flock(descriptor, libc::LOCK_EX | libc::LOCK_NB) < 0 {
                 return Err(std::io::Error::last_os_error());
+            }
+            if publish {
+                let pid = libc::getpid();
+                if pid <= 0 || libc::getpgrp() != pid {
+                    return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+                }
+                let mut digits = pid as u32;
+                for index in (35..45).rev() {
+                    receipt_bytes[index] = b'0' + (digits % 10) as u8;
+                    digits /= 10;
+                }
+                let fd = libc::open(
+                    receipt.as_ptr(),
+                    libc::O_CREAT | libc::O_TRUNC | libc::O_WRONLY,
+                    0o600,
+                );
+                if fd < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let mut written = 0;
+                while written < receipt_bytes.len() {
+                    let count = libc::write(
+                        fd,
+                        receipt_bytes[written..].as_ptr().cast(),
+                        receipt_bytes.len() - written,
+                    );
+                    if count <= 0 {
+                        let error = std::io::Error::last_os_error();
+                        libc::close(fd);
+                        return Err(error);
+                    }
+                    written += count as usize;
+                }
+                if libc::close(fd) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            #[cfg(feature = "test-support")]
+            if let Some(barrier) = &child_barrier {
+                while libc::access(barrier.as_ptr(), libc::F_OK) != 0 {
+                    libc::usleep(10_000);
+                }
             }
             let flags = libc::fcntl(descriptor, libc::F_GETFD);
             if flags < 0 || libc::fcntl(descriptor, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
@@ -233,9 +381,13 @@ pub(crate) fn prepare_launch(
         !identity_is_held(&path)?,
         "prior local execution still owns its identity"
     );
+    if path.exists() {
+        let old: ExecutionRecord = serde_json::from_slice(&std::fs::read(&path)?)?;
+        check_protocol(&old)?;
+    }
     let now = crate::work_model::now_iso8601();
     let record = ExecutionRecord {
-        schema_version: 1,
+        schema_version: LAUNCH_PROTOCOL_VERSION,
         state: ExecutionState::Launching,
         owner_pid: std::process::id(),
         leader_pid: 0,
@@ -244,6 +396,7 @@ pub(crate) fn prepare_launch(
         heartbeat_at: now,
         settled_at: None,
         attempt_owner,
+        launch_generation: Some(new_generation()?),
     };
     crate::atomic_write::atomic_write(&path, &serde_json::to_vec_pretty(&record)?)?;
     Ok(())
@@ -292,10 +445,13 @@ pub fn spawn(command: &mut Command, transcript: &Path) -> Result<std::process::C
     let owned = owned_transcript(transcript);
     let transcript = owned.as_path();
     command.process_group(0);
-    configure_identity_lock(command, transcript)?;
     let path = record_path_for_transcript(transcript);
     let attempt_owner = match std::fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice::<ExecutionRecord>(&bytes)?.attempt_owner,
+        Ok(bytes) => {
+            let record: ExecutionRecord = serde_json::from_slice(&bytes)?;
+            check_protocol(&record)?;
+            record.attempt_owner
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
     };
@@ -333,9 +489,11 @@ pub fn spawn(command: &mut Command, transcript: &Path) -> Result<std::process::C
         _ => None,
     };
     let _lock = crate::lease::acquire_blocking(&lock_path(&path))?;
+    let generation = new_generation()?;
     match std::fs::read(&path) {
         Ok(bytes) => {
-            let record: ExecutionRecord = serde_json::from_slice(&bytes)?;
+            let mut record: ExecutionRecord = serde_json::from_slice(&bytes)?;
+            check_protocol(&record)?;
             anyhow::ensure!(
                 record.attempt_owner == attempt_owner,
                 "execution ownership changed before launch"
@@ -344,16 +502,47 @@ pub fn spawn(command: &mut Command, transcript: &Path) -> Result<std::process::C
                 record.state != ExecutionState::Canceled,
                 "local execution was canceled before launch"
             );
+            anyhow::ensure!(
+                !identity_is_held(&path)?,
+                "prior local execution still owns its identity"
+            );
+            record.schema_version = LAUNCH_PROTOCOL_VERSION;
+            record.state = ExecutionState::Launching;
+            record.leader_pid = 0;
+            record.process_group_id = 0;
+            record.launch_generation = Some(generation.clone());
+            record.settled_at = None;
+            crate::atomic_write::atomic_write(&path, &serde_json::to_vec_pretty(&record)?)?;
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             anyhow::ensure!(
                 attempt_owner.is_none(),
                 "owned execution record disappeared before launch"
             );
+            let now = crate::work_model::now_iso8601();
+            let record = ExecutionRecord {
+                schema_version: LAUNCH_PROTOCOL_VERSION,
+                state: ExecutionState::Launching,
+                owner_pid: std::process::id(),
+                leader_pid: 0,
+                process_group_id: 0,
+                started_at: now.clone(),
+                heartbeat_at: now,
+                settled_at: None,
+                attempt_owner: None,
+                launch_generation: Some(generation.clone()),
+            };
+            crate::atomic_write::atomic_write(&path, &serde_json::to_vec_pretty(&record)?)?;
         }
         Err(error) => return Err(error.into()),
     }
+    configure_launch_identity(command, transcript, Some(&generation))?;
     let child = command.spawn()?;
+    #[cfg(feature = "test-support")]
+    if let Ok(barrier) = std::env::var("FLUENT_TEST_LAUNCH_PARENT_BARRIER") {
+        std::fs::write(&barrier, b"spawned")?;
+        std::process::abort();
+    }
     let publication = write_running_record(&path, child.id());
     // Worker execution and failed-launch settlement must not hold the model lock.
     drop(_lock);
@@ -410,23 +599,36 @@ pub(crate) fn output(command: &mut Command, transcript: &Path) -> Result<std::pr
 }
 
 fn write_running_record(path: &Path, leader_pid: u32) -> Result<()> {
-    let attempt_owner = match std::fs::read(path) {
-        Ok(bytes) => serde_json::from_slice::<ExecutionRecord>(&bytes)?.attempt_owner,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+    let mut record: ExecutionRecord = match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ExecutionRecord {
+            schema_version: 1,
+            state: ExecutionState::Launching,
+            owner_pid: std::process::id(),
+            leader_pid: 0,
+            process_group_id: 0,
+            started_at: String::new(),
+            heartbeat_at: String::new(),
+            settled_at: None,
+            attempt_owner: None,
+            launch_generation: None,
+        },
         Err(error) => return Err(error.into()),
     };
+    check_protocol(&record)?;
+    anyhow::ensure!(
+        record.schema_version == 1
+            || effective_identity(path, &record)? == Some((leader_pid, leader_pid)),
+        "child launch receipt does not match the spawned process"
+    );
     let now = crate::work_model::now_iso8601();
-    let record = ExecutionRecord {
-        schema_version: 1,
-        state: ExecutionState::Running,
-        owner_pid: std::process::id(),
-        leader_pid,
-        process_group_id: leader_pid,
-        started_at: now.clone(),
-        heartbeat_at: now,
-        settled_at: None,
-        attempt_owner,
-    };
+    record.state = ExecutionState::Running;
+    record.owner_pid = std::process::id();
+    record.leader_pid = leader_pid;
+    record.process_group_id = leader_pid;
+    record.started_at = now.clone();
+    record.heartbeat_at = now;
+    record.settled_at = None;
     crate::atomic_write::atomic_write(path, &serde_json::to_vec_pretty(&record)?)?;
     Ok(())
 }
@@ -440,6 +642,7 @@ impl ExecutionHeartbeat {
         let _lock = crate::lease::acquire_blocking(&lock_path(&path))?;
         if path.exists() {
             let record: ExecutionRecord = serde_json::from_slice(&std::fs::read(&path)?)?;
+            check_protocol(&record)?;
             anyhow::ensure!(
                 record.state != ExecutionState::Canceled,
                 "local execution was canceled after launch"
@@ -485,7 +688,11 @@ pub fn execution_is_live(path: &Path) -> Result<bool> {
     };
     let record: ExecutionRecord = serde_json::from_slice(&bytes)
         .with_context(|| format!("parsing local execution record {}", path.display()))?;
-    if record.state != ExecutionState::Running {
+    check_protocol(&record)?;
+    if !matches!(
+        record.state,
+        ExecutionState::Running | ExecutionState::Launching
+    ) {
         return Ok(false);
     }
     // The inherited lock alone proves that part of the original launch still
@@ -507,6 +714,7 @@ pub fn cancel(path: &Path) -> Result<CancelOutcome> {
         .with_context(|| format!("reading local execution record {}", path.display()))?;
     let mut record: ExecutionRecord = serde_json::from_slice(&bytes)
         .with_context(|| format!("parsing local execution record {}", path.display()))?;
+    check_protocol(&record)?;
     if record.state == ExecutionState::Canceled {
         return Ok(CancelOutcome::AlreadyStopped);
     }
@@ -527,14 +735,13 @@ pub fn cancel(path: &Path) -> Result<CancelOutcome> {
         );
     }
 
-    signal_process_group(record.process_group_id, libc::SIGTERM)?;
+    let (_, group) = effective_identity(path, &record)?
+        .ok_or_else(|| anyhow::anyhow!("local execution identity is unbound"))?;
+    signal_process_group(group, libc::SIGTERM)?;
     if !wait_for_identity_release(path, TERMINATION_GRACE)? {
-        signal_process_group(record.process_group_id, libc::SIGKILL)?;
+        signal_process_group(group, libc::SIGKILL)?;
         if !wait_for_identity_release(path, TERMINATION_GRACE)? {
-            bail!(
-                "local coder process group {} did not stop",
-                record.process_group_id
-            );
+            bail!("local coder process group {} did not stop", group);
         }
     }
     record.state = ExecutionState::Canceled;
@@ -735,6 +942,7 @@ mod tests {
             heartbeat_at: "heartbeat".into(),
             settled_at: None,
             attempt_owner: None,
+            launch_generation: None,
         };
         let bytes = serde_json::to_vec_pretty(&record).unwrap();
         assert!(
@@ -784,6 +992,7 @@ mod tests {
             heartbeat_at: "heartbeat".into(),
             settled_at: None,
             attempt_owner: None,
+            launch_generation: None,
         };
         std::fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
         std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o444)).unwrap();

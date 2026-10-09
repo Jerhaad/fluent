@@ -1578,6 +1578,7 @@ fn snapshot_does_not_migrate_legacy_artifacts() {
         heartbeat_at: "2026-09-06T00:00:00Z".into(),
         settled_at: None,
         attempt_owner: None,
+        launch_generation: None,
     };
     fs::write(
         area.join("execution.json"),

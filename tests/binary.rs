@@ -3829,6 +3829,7 @@ fn carried_finding_evidence_attachment_rejects_invalid_bindings() {
                     heartbeat_at: now_iso8601(),
                     settled_at: None,
                     attempt_owner: None,
+                    launch_generation: None,
                 };
                 fs::write(
                     area.join("execution.json"),
@@ -4700,6 +4701,7 @@ fn interrupted_writer_fixture_with_context(
             work_item_id: writer.work.clone(),
             attempt_id: "attempt-1".into(),
         }),
+        launch_generation: None,
     };
     fs::write(
         writer.area.join("execution.json"),
@@ -8901,6 +8903,7 @@ fn hold_live_execution_owner(
             work_item_id: fixture.work.clone(),
             attempt_id: "attempt-1".into(),
         }),
+        launch_generation: None,
     };
     fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
     (owner, record_path)
@@ -59180,6 +59183,7 @@ fn usage_limit_fixture_with_history(tmp: TempDir, completion_recovery: bool) -> 
                 work_item_id: work.clone(),
                 attempt_id: "attempt-1".into(),
             }),
+            launch_generation: None,
         })
         .unwrap(),
     )
