@@ -1552,7 +1552,7 @@ mod tests {
 
     #[cfg(feature = "test-support")]
     #[test]
-    fn attempt_scoped_tester_cache_runs_through_rendered_sandbox() {
+    fn launch_handoff_route_nested_commands_run_through_rendered_sandbox() {
         let workspace = TempDir::new().unwrap();
         let artifact_dir = TempDir::new().unwrap();
         make_workspace(workspace.path());
@@ -1571,7 +1571,10 @@ mod tests {
         crate::writer_cache::prepare_writer_dependency_cache(&cache, None).unwrap();
         write_tester_yaml(
             workspace.path(),
-            "commands:\n  - command: 'test -d \"$CARGO_HOME\" && touch \"$CARGO_HOME/rendered-sandbox-marker\"'\n    test_harness: shell-harness\n",
+            &format!(
+                "commands:\n  - command: 'test -d \"$CARGO_HOME\" && touch \"$CARGO_HOME/rendered-sandbox-marker\" && cp \"{0}/execution-receipt\" \"{0}/first-receipt\"'\n    test_harness: shell-harness\n  - command: 'cp \"{0}/execution-receipt\" \"{0}/second-receipt\"'\n    test_harness: shell-harness\n",
+                artifact_dir.path().display()
+            ),
         );
         write_extractor(workspace.path(), "#!/bin/sh\necho '[]'\n");
         let plan = plan(workspace.path()).unwrap();
@@ -1624,6 +1627,18 @@ mod tests {
 
         assert_eq!(outcome, TesterOutcome::Passed);
         assert!(cache.cargo_home().join("rendered-sandbox-marker").is_file());
+        let first = fs::read_to_string(artifact_dir.path().join("first-receipt")).unwrap();
+        let second = fs::read_to_string(artifact_dir.path().join("second-receipt")).unwrap();
+        assert_ne!(
+            first, second,
+            "nested Tester commands need fresh generations"
+        );
+        let record: crate::execution::ExecutionRecord =
+            serde_json::from_slice(&fs::read(artifact_dir.path().join("execution.json")).unwrap())
+                .unwrap();
+        assert_eq!(record.schema_version, 2);
+        assert!(second.starts_with("2 "));
+        assert!(record.launch_generation.is_some());
         let cache_write = format!(
             "(allow file-write* (subpath \"{}\"))",
             cache.root().display()
@@ -1643,7 +1658,7 @@ mod tests {
         }
         let invocations = fs::read_to_string(invocation_log).unwrap();
         let invocation_paths = invocations.lines().collect::<Vec<_>>();
-        assert_eq!(invocation_paths.len(), 2);
+        assert_eq!(invocation_paths.len(), 3);
         assert!(invocation_paths.iter().all(|path| *path == profile_path));
     }
 

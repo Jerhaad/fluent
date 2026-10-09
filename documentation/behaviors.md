@@ -89,9 +89,12 @@ Test: src/work_task_executor.rs (attempt_stop_blocks_reserved_peer_while_another
 
 WHEN cancellation races with setup or launch,
 THE SYSTEM SHALL expose a cancellable execution identity before any Task appears
-executing and SHALL make the launcher recheck the durable stop boundary before
-starting the child process.
+executing, make the launcher recheck the durable stop boundary, and retain that
+boundary until the child enters its requested program. The child SHALL publish
+a generation-bound PID and process-group receipt before that entry, so recovery
+can validate and stop it even if the parent dies before publishing `running`.
 Test: src/work_task_executor.rs (task_execution_identity_precedes_executing_state_and_honors_stop)
+Test: tests/execution_handoff.rs (launch_handoff_publishes_identity_before_payload, launch_handoff_recovers_child_after_owner_crash, launch_handoff_cancel_serializes_with_payload_start)
 Test: src/execution.rs (cancel_settled_execution_blocks_later_children_until_reservation)
 Test: src/work_attempt_loop.rs (canceled_attempt_startup_requires_resume_authorization, cancellation_resume_authority_rejects_a_later_stop)
 Test: src/queue.rs (resume_records_exact_cancellation_authority)
@@ -242,6 +245,7 @@ Test: tests/work_model_external.rs (current_reader_round_trips_fenced_record)
 WHEN Fluent launches a local coder Task, THE SYSTEM SHALL persist its owner,
 process-group identity, lifecycle state, and heartbeat beside the Task transcript.
 Test: src/coder.rs (successful_capture_returns_coder_exit_and_persists_bytes)
+Test: tests/execution_handoff.rs (launch_handoff_publishes_identity_before_payload)
 
 ### B2
 
@@ -250,6 +254,12 @@ only the process group whose inherited identity lock matches the persisted
 record, confirm it has stopped, and pause the same Attempt as `interrupted`.
 Test: src/work_attempt_loop.rs (cancel_local_attempt_stops_owned_group_and_replans_once)
 Test: src/execution.rs (stale_record_never_signals_reused_identity)
+Test: tests/execution_handoff.rs (launch_handoff_rejects_unbound_identity, launch_handoff_preserves_owned_descendants, launch_handoff_settled_record_preserves_owned_descendant)
+
+WHEN a current Fluent reader sees a legacy execution record, THE SYSTEM SHALL
+retain its established ownership and stop rules. WHEN an older reader sees a
+new version 2 launch record, THE SYSTEM SHALL reject it before mutation.
+Test: tests/execution_handoff.rs (launch_handoff_legacy_records_fail_closed, launch_handoff_old_reader_rejects_new_protocol)
 
 ### B3
 

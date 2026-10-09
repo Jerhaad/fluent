@@ -689,15 +689,9 @@ pub fn execution_is_live(path: &Path) -> Result<bool> {
     let record: ExecutionRecord = serde_json::from_slice(&bytes)
         .with_context(|| format!("parsing local execution record {}", path.display()))?;
     check_protocol(&record)?;
-    if !matches!(
-        record.state,
-        ExecutionState::Running | ExecutionState::Launching
-    ) {
-        return Ok(false);
-    }
-    // The inherited lock alone proves that part of the original launch still
-    // exists. A damaged group field must keep recovery blocked rather than make
-    // the Task look reclaimable.
+    // The inherited lock proves that part of the original launch still exists,
+    // even when a parent settled the record after its leader exited. A damaged
+    // group field must keep recovery blocked rather than make the Task reclaimable.
     identity_is_held(path)
 }
 

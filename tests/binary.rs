@@ -36,6 +36,16 @@ fn fluent_cmd() -> LoggedCommand {
     cmd
 }
 
+#[cfg(unix)]
+fn assert_launch_receipt(area: &Path) {
+    let record: fluent::execution::ExecutionRecord =
+        serde_json::from_slice(&fs::read(area.join("execution.json")).unwrap()).unwrap();
+    assert_eq!(record.schema_version, 2);
+    let generation = record.launch_generation.unwrap();
+    let receipt = fs::read_to_string(area.join("execution-receipt")).unwrap();
+    assert!(receipt.starts_with(&format!("2 {generation} ")));
+}
+
 struct CarriedFindingFixture {
     project: PathBuf,
     workspace: PathBuf,
@@ -26465,6 +26475,79 @@ exit 7
     assert!(task.get("output").is_none());
 }
 
+#[cfg(unix)]
+#[test]
+fn launch_handoff_route_task_recovers_after_parent_publication_loss() {
+    let tmp = TempDir::new().unwrap();
+    let main_dir = setup_git_project(&tmp);
+    let bin_dir = tmp.path().join("bin-launch-task");
+    write_mock_claude(&bin_dir, "#!/bin/bash\nsleep 30\n");
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args([
+            "work-item",
+            "create",
+            "work-1",
+            "--title",
+            "Recover task launch",
+        ])
+        .assert()
+        .success();
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["attempt", "create", "work-1", "attempt-1"])
+        .assert()
+        .success();
+    let item = WorkModelStore::new(&main_dir)
+        .read_work_item("work-1")
+        .unwrap();
+    let area = main_dir.join(
+        &item.attempts[0].tasks[0]
+            .artifact_area
+            .as_ref()
+            .unwrap()
+            .path,
+    );
+    let barrier = tmp.path().join("allow-child-exec");
+    let mut owner = fluent_cmd()
+        .current_dir(&main_dir)
+        .args([
+            "task",
+            "run",
+            "work-1",
+            "attempt-1",
+            "attempt-1-write-1",
+            "--no-sandbox",
+        ])
+        .env("PATH", mock_path(&bin_dir))
+        .env("FLUENT_TEST_LAUNCH_CHILD_BARRIER", &barrier)
+        .spawn()
+        .unwrap();
+    let receipt = area.join("execution-receipt");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !receipt.is_file() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        receipt.is_file(),
+        "task route did not publish a child receipt"
+    );
+    owner.kill().unwrap();
+    owner.wait().unwrap();
+    assert_launch_receipt(&area);
+    let record = area.join("execution.json");
+    assert!(
+        fluent::execution::execution_is_live(&record).unwrap(),
+        "Task child lost ownership after parent crash: {}",
+        fs::read_to_string(&record).unwrap()
+    );
+    fs::write(&barrier, b"go").unwrap();
+    assert_eq!(
+        fluent::execution::cancel(&record).unwrap(),
+        fluent::execution::CancelOutcome::Canceled
+    );
+}
+
 #[test]
 fn work_task_run_write_auth_rejection_pauses_attempt_after_one_retry() {
     let tmp = TempDir::new().unwrap();
@@ -46134,8 +46217,9 @@ jq -cn \
     assert_codex_worker_home_was_cleaned(&source_home, &invocation_log);
 }
 
+#[cfg(unix)]
 #[test]
-fn autonomous_codex_learner_uses_and_removes_worker_home() {
+fn launch_handoff_route_learner_uses_and_removes_worker_home() {
     let tmp = TempDir::new().unwrap();
     let main_dir = setup_git_project(&tmp);
     let bin_dir = tmp.path().join("bin-codex-worker-home-learner");
@@ -46167,6 +46251,23 @@ printf '%s\n' '{"learning_summary":"learned","follow_ups":[]}' > "$DRAFT""##,
         .env("FLUENT_TEST_CODEX_INVOCATIONS", &invocation_log)
         .assert()
         .success();
+
+    let runs = main_dir.join(".fluent/work/artifacts/work-1/attempt-1/learner/runs");
+    let run = fs::read_dir(&runs)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.join("execution-receipt").is_file())
+        .unwrap_or_else(|| {
+            panic!(
+                "Learner worker run with execution identity under {}: {:?}",
+                runs.display(),
+                fs::read_dir(&runs)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .collect::<Vec<_>>()
+            )
+        });
+    assert_launch_receipt(&run);
 
     assert_codex_worker_home_was_cleaned(&source_home, &invocation_log);
 }

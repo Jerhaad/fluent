@@ -53,6 +53,30 @@ fn launch_handoff_preserves_owned_descendants() {
 }
 
 #[test]
+fn launch_handoff_settled_record_preserves_owned_descendant() {
+    let dir = tempfile::tempdir().unwrap();
+    let transcript = dir.path().join("transcript.jsonl");
+    let mut command = Command::new("/bin/sh");
+    command
+        .arg("-c")
+        .arg("sleep 30 &")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut leader = execution::spawn(&mut command, &transcript).unwrap();
+    let mut heartbeat = execution::ExecutionHeartbeat::start(&transcript, leader.id()).unwrap();
+    leader.wait().unwrap();
+    let path = dir.path().join("execution.json");
+    heartbeat.settle().unwrap();
+    let record: ExecutionRecord = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(record.state, ExecutionState::Settled);
+    assert!(execution::execution_is_live(&path).unwrap());
+    let mut second = Command::new("/usr/bin/true");
+    assert!(execution::spawn(&mut second, &transcript).is_err());
+    assert_eq!(execution::cancel(&path).unwrap(), CancelOutcome::Canceled);
+    assert!(!execution::execution_is_live(&path).unwrap());
+}
+
+#[test]
 fn launch_handoff_cancel_serializes_with_payload_start() {
     use fluent::work_model::{
         AttemptCancellation, AttemptStatus, PauseKind, WorkItem, WorkModelStore,

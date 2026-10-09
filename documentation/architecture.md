@@ -1127,8 +1127,26 @@ Attempt stop, and holds both through child creation and identity publication.
 It releases both before waiting for the worker or settling a failed launch.
 Thus a reserved peer cannot start while cancellation is still settling another
 worker, even if its own execution record has not yet been marked `canceled`.
-The process tree holds an inherited `execution-owner.lock`; `execution.json`
-records the owner, leader, process group, heartbeat, and terminal state. Nested
+The process tree holds an inherited `execution-owner.lock`. The parent first
+stores a unique launch generation in `execution.json` with state `launching`
+and zero leader and group fields. Before it enters the requested program, the
+child publishes `execution-receipt` with that generation, its PID, and its
+process group (which equals its PID). The parent then promotes the record to
+`running` with the same identity. If the parent dies before promotion, recovery
+matches the receipt to the generation and requires the inherited identity lock
+to remain held; it can then cancel the child and its descendants. A held lock
+keeps even a `settled` record live until ownership is released. A missing,
+partial, or mismatched receipt cannot authorize signaling or a replacement
+launch. The child retains the Work model lock through entry into the requested
+program, so a durable stop cannot pass the final launch boundary after parent
+death. Legacy version 1 records remain readable with their established
+ownership rules. Version 2 records require the generation and receipt, and
+older binaries reject their schema before mutation. The receipt and stop
+boundaries are covered by `tests/execution_handoff.rs` tests
+`launch_handoff_publishes_identity_before_payload`,
+`launch_handoff_recovers_child_after_owner_crash`,
+`launch_handoff_settled_record_preserves_owned_descendant`, and
+`launch_handoff_cancel_serializes_with_payload_start`. Nested
 Tester commands belong to their Task, and Learner executions register their
 identities before entering `in-progress`. `run_task` installs a scoped,
 thread-local `TaskOwner` so synchronous nested commands use the Task's transcript

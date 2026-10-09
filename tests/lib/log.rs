@@ -13,6 +13,13 @@ pub struct LoggedCommand {
 }
 
 impl LoggedCommand {
+    pub fn spawn(&mut self) -> Result<std::process::Child, std::io::Error> {
+        self.inner
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+    }
+
     pub fn cargo_bin(name: &str) -> Self {
         let program = if name == "fluent" {
             std::env::var_os("FLUENT_BIN_OVERRIDE")
