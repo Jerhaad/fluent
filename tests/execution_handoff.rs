@@ -14,6 +14,45 @@ fn wait_for(path: &Path) {
     assert!(path.exists(), "{} was not produced", path.display());
 }
 
+fn wait_for_receipt_pid(path: &Path) -> u32 {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if let Ok(receipt) = std::fs::read_to_string(path) {
+            let fields: Vec<_> = receipt.split_whitespace().collect();
+            if fields.len() == 3 && receipt.ends_with('\n') {
+                return fields[2].parse().unwrap();
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!(
+        "{} did not contain a complete child receipt",
+        path.display()
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn executable_path(pid: u32) -> std::io::Result<std::path::PathBuf> {
+    let mut buffer = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    let length = unsafe {
+        libc::proc_pidpath(
+            pid as libc::c_int,
+            buffer.as_mut_ptr().cast(),
+            buffer.len() as u32,
+        )
+    };
+    if length <= 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    use std::os::unix::ffi::OsStrExt;
+    Ok(std::ffi::OsStr::from_bytes(&buffer[..length as usize]).into())
+}
+
+#[cfg(target_os = "linux")]
+fn executable_path(pid: u32) -> std::io::Result<std::path::PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/exe"))
+}
+
 #[test]
 fn launch_handoff_owner_helper() {
     let Ok(dir) = std::env::var("FLUENT_TEST_LAUNCH_DIR") else {
@@ -122,7 +161,7 @@ fn launch_handoff_cancel_serializes_with_payload_start() {
         .spawn()
         .unwrap();
     let receipt = dir.path().join("execution-receipt");
-    wait_for(&receipt);
+    let child_pid = wait_for_receipt_pid(&receipt);
     let path = dir.path().join("execution.json");
     assert!(execution::execution_is_live(&path).unwrap());
     owner.kill().unwrap();
@@ -131,16 +170,12 @@ fn launch_handoff_cancel_serializes_with_payload_start() {
     let project = dir.path().to_path_buf();
     let canceler = std::thread::spawn(move || {
         let mut start_at_stop = false;
-        let mut payload_at_stop = false;
+        let mut executable_at_stop = None;
         let result = WorkModelStore::new(&project).mutate_work_item("work-1", |item| {
-            // The start marker must already exist when the stop obtains the
-            // model lock. Then hold that lock until the requested program's
-            // first action is visible, before committing the stop.
+            // Observe the requested executable while holding the model lock.
+            // A pre-exec marker alone cannot prove that exec preceded this stop.
             start_at_stop = project.join("start-boundary").exists();
-            if start_at_stop {
-                wait_for(&project.join("payload"));
-            }
-            payload_at_stop = project.join("payload").exists();
+            executable_at_stop = Some(executable_path(child_pid).unwrap());
             let attempt = &mut item.attempts[0];
             attempt.cancellation = Some(AttemptCancellation {
                 requested_at: fluent::work_model::now_iso8601(),
@@ -151,24 +186,25 @@ fn launch_handoff_cancel_serializes_with_payload_start() {
             attempt.pause_kind = Some(PauseKind::Interrupted);
             Ok(())
         });
-        tx.send((result, start_at_stop, payload_at_stop)).unwrap();
+        tx.send((result, start_at_stop, executable_at_stop))
+            .unwrap();
     });
     assert!(rx.recv_timeout(Duration::from_millis(150)).is_err());
     assert!(!dir.path().join("payload").exists());
     std::fs::write(&barrier, b"go").unwrap();
-    let (result, start_at_stop, payload_at_stop) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let (result, start_at_stop, executable_at_stop) =
+        rx.recv_timeout(Duration::from_secs(5)).unwrap();
     result.unwrap();
-    // The child writes the start event as its last pre-exec action while it
-    // still owns the model lock. A committed stop must therefore see it.
-    wait_for(&dir.path().join("payload"));
     assert!(
         start_at_stop,
         "the launch start boundary occurred after the durable stop"
     );
-    assert!(
-        payload_at_stop,
-        "the requested program's first action occurred after the durable stop"
+    assert_eq!(
+        executable_at_stop.unwrap().canonicalize().unwrap(),
+        std::fs::canonicalize("/bin/sh").unwrap(),
+        "the requested program had not started when the durable stop committed"
     );
+    wait_for(&dir.path().join("payload"));
     assert!(execution::execution_is_live(&path).unwrap());
     canceler.join().unwrap();
     assert_eq!(execution::cancel(&path).unwrap(), CancelOutcome::Canceled);

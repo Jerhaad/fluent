@@ -22,6 +22,8 @@ neither cancellation nor a replacement launch may infer a group from them.
 holds a test-only pre-exec barrier after receipt publication. It kills the
 launch parent, observes the Work model lock blocking a stop mutation, and
 releases the child. When the stop mutation obtains the model lock, it checks
-that the child crossed its pre-exec boundary. It then waits under that lock for
-the requested program's first-action marker before committing the stop. The
-test verifies the payload ran and cancellation settled.
+both the child's final pre-exec marker and the operating system's executable
+path for the child PID. The stop commits without waiting for a payload action.
+The test then verifies the payload ran and cancellation settled. Inspecting the
+executable at lock acquisition detects a stop that overtakes exec even if a
+later payload action succeeds.
