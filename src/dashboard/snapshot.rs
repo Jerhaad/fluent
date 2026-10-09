@@ -126,6 +126,7 @@ mod tests {
         WorkItemStatus {
             recovery_blocker: None,
             verification: None,
+            evidence_history: None,
             id: action.into(),
             title: action.into(),
             attempt: "-".into(),

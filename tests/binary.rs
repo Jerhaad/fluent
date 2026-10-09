@@ -63720,3 +63720,125 @@ fn prepare_unbound_round_cap_sidecar(
     assert_eq!(fs::read(&audit_path).unwrap(), audit_bytes);
     (audit_path, audit_bytes)
 }
+
+fn landed_status_fixture(tmp: &TempDir) -> PathBuf {
+    let project = setup_git_project(tmp);
+    let bin = tmp.path().join("landed-status-bin");
+    write_mock_claude(
+        &bin,
+        &learner_land_mock_script(r#"{"learning_summary":"retained","follow_ups":[]}"#),
+    );
+    create_and_run_learner_attempt(&project, &bin);
+    land_work_1(&project, &bin, true);
+    let item = work_item_value(&project, "work-1");
+    let source = item["merge_candidates"][0]["source_workspace"]["path"]
+        .as_str()
+        .unwrap();
+    assert!(
+        !project.join(source).exists(),
+        "landing retires the source checkout"
+    );
+    project
+}
+
+#[test]
+fn landed_status_preserves_result_after_source_retirement() {
+    let tmp = TempDir::new().unwrap();
+    let project = landed_status_fixture(&tmp);
+    let status = fluent::work_status::load_work_status(&project).unwrap();
+    assert_eq!(status.rows[0].action, "merged");
+    assert!(
+        status.rows[0]
+            .evidence_history
+            .as_ref()
+            .unwrap()
+            .diagnostic
+            .is_none()
+    );
+    let shown = read_work_show_json(&project, "work-1");
+    assert!(shown["evidence-history"]["tester-results"].is_string());
+    assert_eq!(
+        shown["evidence-history"]["merged-commit"],
+        git_head(&project)
+    );
+}
+
+#[test]
+fn landed_status_does_not_reopen_historical_requirements() {
+    let tmp = TempDir::new().unwrap();
+    let project = landed_status_fixture(&tmp);
+    let status = fluent::work_status::load_work_status(&project).unwrap();
+    let row = &status.rows[0];
+    assert!(row.verification.is_none());
+    assert!(row.next_action.is_none());
+    assert!(row.recovery_blocker.is_none());
+    let shown = read_work_show_json(&project, "work-1");
+    assert!(shown.get("evidence-recovery").is_none());
+    assert!(shown.get("next-action").is_none());
+    assert!(
+        fluent::work_status::format_work_dashboard_lines(&status)
+            .iter()
+            .any(|line| line.contains("[merged]"))
+    );
+}
+
+#[test]
+fn landed_status_reports_unavailable_historical_evidence() {
+    let tmp = TempDir::new().unwrap();
+    let project = landed_status_fixture(&tmp);
+    let shown = read_work_show_json(&project, "work-1");
+    let path = shown["evidence-history"]["tester-results"]
+        .as_str()
+        .unwrap();
+    fs::remove_file(project.join(path)).unwrap();
+    let status = fluent::work_status::load_work_status(&project).unwrap();
+    let row = &status.rows[0];
+    assert_eq!(row.action, "merged");
+    assert!(
+        row.recovery_blocker
+            .as_deref()
+            .unwrap()
+            .contains("Landed evidence history")
+    );
+    assert!(row.next_action.is_none());
+    assert!(read_work_show_json(&project, "work-1")["evidence-history"]["diagnostic"].is_string());
+}
+
+#[test]
+fn landed_status_keeps_unmerged_checks_strict() {
+    let tmp = TempDir::new().unwrap();
+    let project = setup_git_project(&tmp);
+    let bin = tmp.path().join("unmerged-status-bin");
+    write_mock_claude(
+        &bin,
+        &learner_land_mock_script(r#"{"learning_summary":"retained","follow_ups":[]}"#),
+    );
+    create_and_run_learner_attempt(&project, &bin);
+    let status = fluent::work_status::load_work_status(&project).unwrap();
+    assert!(status.rows[0].evidence_history.is_none());
+    assert!(status.rows[0].verification.is_some());
+    assert!(
+        read_work_show_json(&project, "work-1")
+            .get("evidence-history")
+            .is_none()
+    );
+}
+
+#[test]
+fn landed_status_observation_preserves_recorded_bytes() {
+    let tmp = TempDir::new().unwrap();
+    let project = landed_status_fixture(&tmp);
+    let shown = read_work_show_json(&project, "work-1");
+    let evidence = project.join(
+        shown["evidence-history"]["tester-results"]
+            .as_str()
+            .unwrap(),
+    );
+    let work = project.join(".fluent/work/items/work-1.json");
+    let before = [fs::read(&evidence).unwrap(), fs::read(&work).unwrap()];
+    let status = fluent::work_status::load_work_status(&project).unwrap();
+    let _ = fluent::work_status::format_work_dashboard_lines(&status);
+    let _ = read_work_show_json(&project, "work-1");
+    assert_eq!(fs::read(&evidence).unwrap(), before[0]);
+    assert_eq!(fs::read(&work).unwrap(), before[1]);
+}

@@ -87,6 +87,7 @@ fn row(id: &str, action: &str) -> WorkItemStatus {
     WorkItemStatus {
         recovery_blocker: None,
         verification: None,
+        evidence_history: None,
         id: id.into(),
         title: format!("{id} title"),
         attempt: "attempt [running]".into(),

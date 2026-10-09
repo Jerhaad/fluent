@@ -34,9 +34,91 @@ pub struct WorkItemStatus {
     pub next_action: Option<String>,
     pub recovery_blocker: Option<String>,
     pub verification: Option<crate::verification_assessment::VerificationAssessment>,
+    pub evidence_history: Option<LandedEvidenceHistory>,
     pub metrics: WorkMetrics,
     pub compatibility_warnings: Vec<String>,
     pub release: Option<ReleaseStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct LandedEvidenceHistory {
+    pub merged_commit: String,
+    pub tester_results: Option<String>,
+    pub diagnostic: Option<String>,
+}
+
+fn landed_evidence_history(
+    root: Option<&Path>,
+    attempt: &Attempt,
+    candidate: &MergeCandidate,
+) -> LandedEvidenceHistory {
+    let mut history = LandedEvidenceHistory {
+        merged_commit: candidate
+            .merge_state
+            .merged_commit
+            .clone()
+            .unwrap_or_default(),
+        tester_results: None,
+        diagnostic: None,
+    };
+    let result = (|| -> anyhow::Result<String> {
+        anyhow::ensure!(
+            !history.merged_commit.is_empty(),
+            "merged commit is missing"
+        );
+        let root = root.ok_or_else(|| anyhow::anyhow!("project root is unavailable"))?;
+        let tester = attempt
+            .tasks
+            .iter()
+            .rev()
+            .find(|task| {
+                task.kind == TaskKind::Tester
+                    && task.status == TaskStatus::Complete
+                    && !task.is_failed_command_recheck()
+                    && task.review_context.as_ref().is_some_and(|context| {
+                        context.candidate_commit == candidate.candidate_commit
+                    })
+            })
+            .ok_or_else(|| anyhow::anyhow!("completed candidate-bound Tester is missing"))?;
+        let area = tester
+            .artifact_area
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Tester artifact area is missing"))?;
+        anyhow::ensure!(
+            area.path
+                == crate::work_model::work_artifact_path(
+                    &attempt.work_item_id,
+                    &attempt.id,
+                    &tester.id
+                ),
+            "Tester artifact area differs from its recorded identity"
+        );
+        let path = format!("{}/tester-results.json", area.path);
+        let (_, bytes) = crate::verification_assessment::bound_recovery_artifact(root, &path)?;
+        let results: crate::tester::TesterResults = serde_json::from_slice(&bytes)?;
+        anyhow::ensure!(
+            results.candidate_commit.as_deref() == Some(candidate.candidate_commit.as_str()),
+            "Tester result does not match the recorded candidate"
+        );
+        anyhow::ensure!(
+            results.error.is_none()
+                && results.summary.fail == 0
+                && results
+                    .commands
+                    .iter()
+                    .all(|command| command.exit_code == 0),
+            "retained Tester result does not record a passing run"
+        );
+        Ok(path)
+    })();
+    match result {
+        Ok(path) => history.tester_results = Some(path),
+        Err(error) => {
+            history.diagnostic = Some(format!("Landed evidence history is unavailable: {error:#}"))
+        }
+    }
+    history
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
@@ -136,15 +218,29 @@ pub fn summarize_work_item(item: &WorkItem, project_root: Option<&Path>) -> Work
             .find(|candidate| candidate.attempt_id == attempt.id)
     });
 
-    let recovery = attempt_recovery_guidance(attempt, project_root);
-    let verification = attempt.and_then(|attempt| {
-        project_root.and_then(|root| {
-            crate::verification_assessment::assess_current_verification(root, attempt).ok()
-        })
-    });
+    let evidence_history = attempt
+        .zip(merge_candidate)
+        .filter(|(_, candidate)| candidate.merge_state.status == MergeCandidateMergeStatus::Merged)
+        .map(|(attempt, candidate)| landed_evidence_history(project_root, attempt, candidate));
+    let recovery = if evidence_history.is_some() {
+        AttemptRecoveryGuidance::default()
+    } else {
+        attempt_recovery_guidance(attempt, project_root)
+    };
+    let verification = attempt
+        .filter(|_| evidence_history.is_none())
+        .and_then(|attempt| {
+            project_root.and_then(|root| {
+                crate::verification_assessment::assess_current_verification(root, attempt).ok()
+            })
+        });
     WorkItemStatus {
         verification,
-        recovery_blocker: recovery.blocker,
+        recovery_blocker: evidence_history
+            .as_ref()
+            .and_then(|history| history.diagnostic.clone())
+            .or(recovery.blocker),
+        evidence_history,
         id: item.id.clone(),
         title: item.title.clone(),
         attempt: attempt
@@ -401,7 +497,25 @@ pub fn work_item_show_value(
         output["compatibility-warnings"] = serde_json::to_value(warnings)?;
     }
     let attempt = display_attempt(item, Some(project_root));
-    let recovery = attempt_recovery_guidance(attempt, Some(project_root));
+    let candidate = attempt.and_then(|attempt| {
+        item.merge_candidates.iter().rev().find(|candidate| {
+            candidate.attempt_id == attempt.id
+                && candidate.merge_state.status == MergeCandidateMergeStatus::Merged
+        })
+    });
+    let recovery = if candidate.is_some() {
+        AttemptRecoveryGuidance::default()
+    } else {
+        attempt_recovery_guidance(attempt, Some(project_root))
+    };
+    if let (Some(attempt), Some(candidate)) = (attempt, candidate) {
+        output["evidence-history"] = serde_json::to_value(landed_evidence_history(
+            Some(project_root),
+            attempt,
+            candidate,
+        ))?;
+        return Ok(output);
+    }
     if let Some(next_action) = recovery.next_action {
         output["next-action"] = serde_json::to_value(next_action)?;
     }
@@ -587,6 +701,11 @@ pub fn format_work_status(status: &WorkStatus) -> String {
                     ));
                 }
             }
+            if let Some(history) = &row.evidence_history {
+                if let Some(path) = &history.tester_results {
+                    output.push_str(&format!("  evidence-history: Tester result {path}\n"));
+                }
+            }
             if let Some(reason) = &row.recovery_blocker {
                 output.push_str(&format!("  evidence: {reason}\n"));
             }
@@ -658,6 +777,11 @@ pub fn format_work_dashboard_lines(status: &WorkStatus) -> Vec<String> {
                     },
                     requirement.owner
                 ));
+            }
+        }
+        if let Some(history) = &row.evidence_history {
+            if let Some(path) = &history.tester_results {
+                lines.push(format!("  Evidence history: Tester result {path}"));
             }
         }
         if let Some(reason) = &row.recovery_blocker {
@@ -1861,6 +1985,7 @@ mod tests {
             rows: vec![WorkItemStatus {
                 recovery_blocker: None,
                 verification: None,
+                evidence_history: None,
                 id: "work-1".to_string(),
                 title: "Build status view".to_string(),
                 attempt: "attempt-1 [planned]".to_string(),
@@ -1892,6 +2017,7 @@ mod tests {
             rows: vec![WorkItemStatus {
                 recovery_blocker: None,
                 verification: None,
+                evidence_history: None,
                 id: "work-1".to_string(),
                 title: "Build status view".to_string(),
                 attempt: "attempt-1 [planned]".to_string(),
