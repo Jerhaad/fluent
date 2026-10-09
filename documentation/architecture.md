@@ -293,6 +293,21 @@ each host-derived Writer outcome, candidate commit, progress and matrix completi
 counts, provider session identity, and whether the run was initial, pre-review
 continuation, or post-review corrective work.
 
+When a completed Writer committed a candidate but left an unreadable completion
+matrix, status offers `fluent attempt repair-writer-completion <work-item-id>
+<attempt-id> --resolution "<decision>"` while the candidate is clean and Task
+owners are settled. The command records the source matrix bytes, requirement
+contract, assignment, candidate, and explicit decision, then schedules one
+corrective Writer in the same Attempt. The completed source Task and its artifacts
+remain history. Run `fluent queue resume <work-item-id> --attempt <attempt-id>`
+separately to execute the correction. The new Writer receives the failed matrix
+as an input and starts a fresh matrix from the immutable contract; it may submit
+a verified no-change result when the source candidate already satisfies the
+requirements. Host evidence, targeted Tests Review, ordinary review, final
+Tester, and Learner remain separate gates. Repeated authorization reuses the
+recorded Task and operation; changed source evidence, contract, assignment,
+candidate, or ownership rejects stale authority.
+
 `ordinary_review_tasks` in `recovery_contracts::review_coverage` establishes
 ordinary coverage from completed Review Tasks, their candidate contexts, and
 their saved verdicts. Attempt advancement and completed Approach-recovery resume

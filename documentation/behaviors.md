@@ -7297,6 +7297,22 @@ records, or its binding evidence is changed or contradictory, THEN THE SYSTEM
 SHALL pause at `needs-user` with a specific diagnosis before downstream work.
 Test: tests/binary.rs (corrective_writer_assignment_rejects_invalid_authority)
 
+## Public workflow continuation
+
+### B1
+
+IF an in-scope failure leaves Work unfinished, THEN THE SYSTEM SHALL provide a
+supported public route to continue that Work from its retained state once
+required access, evidence, and authorization are supplied.
+Test: tests/binary.rs (writer_completion_recovery_committed_matrix_public_continuation)
+
+For a completed Writer with a committed candidate and malformed completion
+matrix, the public repair command records explicit authorization and schedules
+one corrective Writer. A separate resume executes it. The source Task, matrix,
+transcript, and candidate history remain intact; changed bindings and live
+owners reject stale recovery. Host checks, review, final Tester, and Learner
+retain their existing gates.
+
 ### B20
 
 WHEN every Writer-owned obligation and applicable finding is satisfied, the
