@@ -76,6 +76,9 @@ def main() -> int:
             command = ["java", "-XX:+UseParallelGC", "-Xmx256m", "-cp", str(jar),
                        "tlc2.TLC", "-workers", "1", "-fp", "0", "-seed", "1",
                        "-metadir", metadir, "-config", config, module + ".tla"]
+            if args.suite == "landing":
+                # Cancellation can legitimately leave no enabled landing action.
+                command.insert(command.index("-metadir"), "-deadlock")
             try:
                 result = subprocess.run(command, cwd=source, capture_output=True, text=True, timeout=180)
                 output = result.stdout + result.stderr

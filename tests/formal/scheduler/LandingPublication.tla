@@ -28,7 +28,7 @@ GitEffect == /\ target = "base" /\ ~stopped
              /\ target' = IF intent \in Candidates THEN intent
                            ELSE CHOOSE candidate \in Candidates: TRUE
              /\ effects' = effects + 1
-             /\ badUnbound' = badUnbound \/ (intent \notin Candidates)
+             /\ badUnbound' = (badUnbound \/ (intent \notin Candidates))
              /\ UNCHANGED <<owner, crashes, failures, intent, result, provenance, cleaned,
                            stopped, ioFailed, independent, badReplay>>
 
@@ -56,7 +56,7 @@ Retry == /\ owner = "retry" /\ intent \in Candidates
          /\ target \in {intent, "later"} /\ result = intent
          /\ effects' = IF EarlyReconcile THEN effects ELSE effects + 1
          /\ independent' = IF ReplayProtection THEN independent ELSE FALSE
-         /\ badReplay' = badReplay \/ (independent /\ ~ReplayProtection)
+         /\ badReplay' = (badReplay \/ (independent /\ ~ReplayProtection))
          /\ UNCHANGED <<owner, crashes, failures, intent, target, result, provenance,
                        cleaned, stopped, ioFailed, badUnbound>>
 

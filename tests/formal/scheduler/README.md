@@ -49,6 +49,8 @@ repaired case checks bound effects, one effect, preservation of independent
 state, cancellation, and eventual result publication under weak fairness for
 the result write and I/O recovery. Three controls remove intent binding, early
 reconciliation, and replay protection; each has a named expected violation.
+The landing check permits terminal states after cancellation; its safety
+invariants still check every reached state.
 
 | Model action | Production boundary |
 | --- | --- |
