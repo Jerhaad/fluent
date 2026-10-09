@@ -6413,6 +6413,59 @@ fn writer_completion_recovery_committed_matrix_rejects_stale_source() {
 }
 
 #[test]
+fn writer_completion_recovery_committed_matrix_rejects_stale_source_at_start() {
+    let tmp = TempDir::new().unwrap();
+    let (fixture, _) = committed_matrix_recovery_fixture(&tmp);
+    committed_matrix_repair_command(&fixture).assert().success();
+    let store = WorkModelStore::new(&fixture.project);
+    let approved = store.read_work_item(&fixture.work).unwrap();
+    let source = &approved.attempts[0].tasks[0];
+    let source_area = fixture
+        .project
+        .join(&source.artifact_area.as_ref().unwrap().path);
+    let source_matrix = source_area.join("writer-completion.json");
+    fs::write(&source_matrix, b"changed malformed bytes").unwrap();
+    let retained_matrix = fs::read(&source_matrix).unwrap();
+    let source_transcript = fs::read(source_area.join("transcript.jsonl")).unwrap();
+    let authority = fs::read(&fixture.audit).unwrap();
+
+    let bin = tmp.path().join("stale-source-provider");
+    let launched = tmp.path().join("provider-launched");
+    write_mock_claude(
+        &bin,
+        "#!/bin/bash\nset -eu\nprintf 'launched\\n' > \"$RECOVERY_PROVIDER_LAUNCHED\"\nexit 73\n",
+    );
+    fluent_cmd()
+        .current_dir(&fixture.project)
+        .args(["attempt", "run", &fixture.work, "attempt-1", "--no-sandbox"])
+        .env("PATH", mock_path(&bin))
+        .env("RECOVERY_PROVIDER_LAUNCHED", &launched)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("recovery source matrix changed"));
+
+    assert!(
+        !launched.exists(),
+        "stale authority must stop provider launch"
+    );
+    assert_eq!(store.read_work_item(&fixture.work).unwrap(), approved);
+    assert_eq!(fs::read(source_matrix).unwrap(), retained_matrix);
+    assert_eq!(
+        fs::read(source_area.join("transcript.jsonl")).unwrap(),
+        source_transcript
+    );
+    assert_eq!(fs::read(&fixture.audit).unwrap(), authority);
+    assert_eq!(approved.attempts[0].tasks[0].status, TaskStatus::Complete);
+    assert_eq!(approved.attempts[0].tasks[1].status, TaskStatus::Planned);
+    assert!(
+        approved.attempts[0]
+            .tasks
+            .iter()
+            .all(|task| task.kind == TaskKind::Write)
+    );
+}
+
+#[test]
 fn writer_completion_recovery_committed_matrix_replays_identity() {
     let tmp = TempDir::new().unwrap();
     let (fixture, malformed) = committed_matrix_recovery_fixture(&tmp);
