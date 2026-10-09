@@ -2,8 +2,9 @@ use fluent::content::ContentResolver;
 use fluent::git;
 use fluent::work_merge_executor::{WorkMergeConfig, merge_candidate};
 use fluent::work_model::{
-    AttemptCancellation, AttemptLearning, AttemptReviewState, AttemptStatus, LearnerMode,
-    PauseKind, TaskOutput, TaskStatus, WorkItem, WorkModelStore,
+    AttemptCancellation, AttemptLearning, AttemptReviewState, AttemptStatus, LandingIntent,
+    LearnerMode, MergeCandidateMergeState, PauseKind, TaskOutput, TaskStatus, WorkItem,
+    WorkModelStore,
 };
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -257,6 +258,31 @@ fn observation_snapshot(root: &Path) -> Vec<(String, Vec<u8>)> {
     entries
 }
 
+fn evidence_snapshot(root: &Path, intent: &LandingIntent) -> Vec<(String, Vec<u8>)> {
+    intent
+        .check_artifacts
+        .iter()
+        .chain(&intent.review_artifacts)
+        .map(|artifact| {
+            (
+                artifact.path.clone(),
+                fs::read(root.join(&artifact.path)).unwrap(),
+            )
+        })
+        .collect()
+}
+
+fn assert_published_evidence(
+    root: &Path,
+    intent: &LandingIntent,
+    merge_state: &MergeCandidateMergeState,
+    expected_bytes: &[(String, Vec<u8>)],
+) {
+    assert_eq!(merge_state.check_artifacts, intent.check_artifacts);
+    assert_eq!(merge_state.review_artifacts, intent.review_artifacts);
+    assert_eq!(evidence_snapshot(root, intent), expected_bytes);
+}
+
 #[test]
 fn landing_recovery_persists_intent_before_git_effect() {
     let fx = fixture();
@@ -384,11 +410,30 @@ fn landing_recovery_replay_preserves_operation_and_evidence() {
     let intent = before.merge_candidates[0]
         .merge_state
         .landing_intent
-        .clone();
+        .clone()
+        .unwrap();
+    let evidence = evidence_snapshot(&fx.root, &intent);
     land(&fx).unwrap();
     let after = fx.store.read_work_item("work-1").unwrap();
-    assert_eq!(after.merge_candidates[0].merge_state.landing_intent, intent);
+    assert_eq!(
+        after.merge_candidates[0].merge_state.landing_intent,
+        Some(intent.clone())
+    );
+    assert_published_evidence(
+        &fx.root,
+        &intent,
+        &after.merge_candidates[0].merge_state,
+        &evidence,
+    );
     assert_eq!(after.attempts.len(), before.attempts.len());
+    land(&fx).unwrap();
+    let repeated = fx.store.read_work_item("work-1").unwrap();
+    assert_published_evidence(
+        &fx.root,
+        &intent,
+        &repeated.merge_candidates[0].merge_state,
+        &evidence,
+    );
 
     let fx = fixture_mode(LearnerMode::Capture);
     interrupt(&fx, "AFTER");
@@ -397,12 +442,31 @@ fn landing_recovery_replay_preserves_operation_and_evidence() {
     let intent = before.merge_candidates[0]
         .merge_state
         .landing_intent
-        .clone();
+        .clone()
+        .unwrap();
+    let evidence = evidence_snapshot(&fx.root, &intent);
     land(&fx).unwrap();
     assert_eq!(fs::read(fx.bin.join("claude.calls")).unwrap(), calls);
     let after = fx.store.read_work_item("work-1").unwrap();
-    assert_eq!(after.merge_candidates[0].merge_state.landing_intent, intent);
+    assert_eq!(
+        after.merge_candidates[0].merge_state.landing_intent,
+        Some(intent.clone())
+    );
+    assert_published_evidence(
+        &fx.root,
+        &intent,
+        &after.merge_candidates[0].merge_state,
+        &evidence,
+    );
     assert_eq!(after.attempts.len(), before.attempts.len());
+    land(&fx).unwrap();
+    let repeated = fx.store.read_work_item("work-1").unwrap();
+    assert_published_evidence(
+        &fx.root,
+        &intent,
+        &repeated.merge_candidates[0].merge_state,
+        &evidence,
+    );
 }
 
 #[test]
@@ -604,6 +668,7 @@ fn landing_recovery_preserves_both_learner_modes() {
             .landing_intent
             .clone()
             .unwrap();
+        let evidence = evidence_snapshot(&fx.root, &intent);
         assert_eq!(intent.learner_mode, mode);
         let expected = intent.verified_commit.clone();
         if mode == LearnerMode::Capture {
@@ -628,7 +693,13 @@ fn landing_recovery_preserves_both_learner_modes() {
         );
         assert_eq!(
             after.merge_candidates[0].merge_state.landing_intent,
-            Some(intent)
+            Some(intent.clone())
+        );
+        assert_published_evidence(
+            &fx.root,
+            &intent,
+            &after.merge_candidates[0].merge_state,
+            &evidence,
         );
         assert!(
             after.merge_candidates[0]
@@ -654,6 +725,13 @@ fn landing_recovery_preserves_both_learner_modes() {
         );
         assert_eq!(land(&fx).unwrap(), expected);
         assert_eq!(observation_snapshot(&fx.root), observations);
+        let repeated = fx.store.read_work_item("work-1").unwrap();
+        assert_published_evidence(
+            &fx.root,
+            &intent,
+            &repeated.merge_candidates[0].merge_state,
+            &evidence,
+        );
     }
 }
 
