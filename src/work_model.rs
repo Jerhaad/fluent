@@ -31,7 +31,7 @@ pub const WORK_MODEL_WRITER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// before this marker omit the field and are read as version 0. They remain
 /// readable, but the explicit `work-item upgrade` command rewrites them using
 /// this version after checking every record.
-pub const WORK_MODEL_RECORD_SCHEMA_VERSION: u32 = 11;
+pub const WORK_MODEL_RECORD_SCHEMA_VERSION: u32 = 12;
 pub const WORK_MODEL_UPGRADE_SCHEMA_VERSION: u32 = 1;
 pub const MIN_ADDITIONAL_WRITE_ROUNDS: usize = 1;
 pub const MAX_ADDITIONAL_WRITE_ROUNDS: usize = 3;
@@ -2091,7 +2091,11 @@ impl WorkItem {
         }
         if let Some(candidate) = self.merge_candidates.iter().find(|candidate| {
             candidate.merge_review_state == MergeReviewState::Reviewing
-                || candidate.merge_state.status == MergeCandidateMergeStatus::Executing
+                || matches!(
+                    candidate.merge_state.status,
+                    MergeCandidateMergeStatus::Executing
+                        | MergeCandidateMergeStatus::LandingPending
+                )
         }) {
             return Err(WorkModelError::WorkItemAbandonmentBlocked {
                 work_item_id: self.id.clone(),
@@ -8722,6 +8726,27 @@ pub struct MergeCandidate {
 impl MergeCandidate {
     pub fn validate(&self, work_item: &WorkItem) -> Result<(), WorkModelError> {
         validate_id("merge candidate", &self.id)?;
+        if (self.merge_state.status == MergeCandidateMergeStatus::LandingPending)
+            != self.merge_state.landing_intent.is_some()
+            && self.merge_state.status != MergeCandidateMergeStatus::Merged
+        {
+            return Err(WorkModelError::InvalidRecoveryOperation {
+                attempt_id: self.attempt_id.clone(),
+                reason: "landing status and retained intent disagree".into(),
+            });
+        }
+        if let Some(intent) = self.merge_state.landing_intent.as_ref()
+            && (intent.schema_version != 1
+                || intent.work_item_id != work_item.id
+                || intent.attempt_id != self.attempt_id
+                || intent.merge_candidate_id != self.id
+                || intent.verified_commit != self.candidate_commit)
+        {
+            return Err(WorkModelError::InvalidRecoveryOperation {
+                attempt_id: self.attempt_id.clone(),
+                reason: "landing intent is not bound to this candidate".into(),
+            });
+        }
         let Some(attempt) = work_item
             .attempts
             .iter()
@@ -8801,7 +8826,16 @@ impl MergeCandidate {
         // to block execution and advancement. Failed merges remain exempt.
         let host_sandbox_paused = attempt.status == AttemptStatus::NeedsUser
             && attempt.pause_kind == Some(PauseKind::HostSandbox);
-        let status_ok = attempt.status == AttemptStatus::Complete || host_sandbox_paused;
+        let interrupted_landing = attempt.status == AttemptStatus::NeedsUser
+            && attempt.pause_kind == Some(PauseKind::Interrupted)
+            && attempt.cancellation_requested()
+            && matches!(
+                self.merge_state.status,
+                MergeCandidateMergeStatus::LandingPending | MergeCandidateMergeStatus::Merged
+            )
+            && self.merge_state.landing_intent.is_some();
+        let status_ok =
+            attempt.status == AttemptStatus::Complete || host_sandbox_paused || interrupted_landing;
         let reviews_passed = attempt.review_state == Some(AttemptReviewState::Passed);
         if self.merge_state.status != MergeCandidateMergeStatus::Failed
             && !(status_ok && reviews_passed)
@@ -8820,7 +8854,9 @@ impl MergeCandidate {
         if self.merge_state.status != MergeCandidateMergeStatus::Failed
             && let Some(ready_at) = self.ready_at.as_ref()
         {
-            attempt.learning_advancement_readiness()?;
+            if !interrupted_landing {
+                attempt.learning_advancement_readiness()?;
+            }
             if attempt.completed_at.as_ref() != Some(ready_at) {
                 return Err(WorkModelError::MergeCandidateReadinessTimestampMismatch {
                     candidate_id: self.id.clone(),
@@ -8879,6 +8915,29 @@ pub struct MergeCandidateMergeState {
     /// the first incomplete stage so a retry can resume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub follow_up_failure: Option<FollowUpProcessingFailure>,
+    /// Authority for one verified target change, retained through result publication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landing_intent: Option<LandingIntent>,
+}
+
+/// The exact landing authorized before Git changes the target branch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LandingIntent {
+    pub schema_version: u32,
+    pub operation_id: String,
+    pub work_item_id: String,
+    pub attempt_id: String,
+    pub merge_candidate_id: String,
+    pub learner_mode: LearnerMode,
+    pub repository: String,
+    pub target_branch: String,
+    pub target_workspace: String,
+    pub target_before: String,
+    pub verified_commit: String,
+    pub evidence_digest: String,
+    pub accepted_model_digest: String,
+    pub check_artifacts: Vec<ArtifactRef>,
+    pub review_artifacts: Vec<ArtifactRef>,
 }
 
 impl Default for MergeCandidateMergeState {
@@ -8891,6 +8950,7 @@ impl Default for MergeCandidateMergeState {
             review_artifacts: Vec::new(),
             auto_merge_skipped: None,
             follow_up_failure: None,
+            landing_intent: None,
         }
     }
 }
@@ -8915,6 +8975,8 @@ pub enum MergeCandidateMergeStatus {
     #[default]
     Pending,
     Executing,
+    /// A verified external effect has durable authority and may need replay.
+    LandingPending,
     Failed,
     NeedsUser,
     Merged,
@@ -9987,7 +10049,7 @@ pub struct WorkModelSnapshot {
 const WORK_MODEL_WRITER_ENVELOPE_FORMAT: &str = "fluent-work-item-writer";
 // Fence both installation source lineages: neither predecessor preserves the
 // union of revision audits, assignments, and separately authorized retries.
-const WORK_MODEL_WRITER_ENVELOPE_SCHEMA_VERSION: u32 = 9;
+const WORK_MODEL_WRITER_ENVELOPE_SCHEMA_VERSION: u32 = 10;
 
 fn is_supported_writer_envelope_schema(version: u32) -> bool {
     matches!(version, 1..=WORK_MODEL_WRITER_ENVELOPE_SCHEMA_VERSION)
@@ -10115,7 +10177,7 @@ struct StoredRecordVersions {
 impl WorkItemTransaction {
     // Source journals lack either managed revision files or retry authority.
     // Preserve their modeled formats, but publish the combined format separately.
-    const SCHEMA_VERSION: u32 = 11;
+    const SCHEMA_VERSION: u32 = 12;
 
     fn is_supported_schema(version: u32) -> bool {
         matches!(version, 1..=Self::SCHEMA_VERSION)
@@ -12243,6 +12305,8 @@ impl WorkModelStore {
             let attempt_path = self.work_attempt_path(&work_item.id, &attempt.id)?;
             let record = AttemptRecord::from_attempt(attempt, order);
             write_json_file(&attempt_path, &record)?;
+            #[cfg(feature = "test-support")]
+            self.test_interrupt_landing_child(work_item, "after-attempt-record")?;
             if attempt
                 .recovery_operations
                 .last()
@@ -12272,6 +12336,8 @@ impl WorkModelStore {
                 let task_path = self.work_task_path(&work_item.id, &attempt.id, &task.id)?;
                 let record = TaskRecord::from_task(task, order);
                 write_json_file(&task_path, &record)?;
+                #[cfg(feature = "test-support")]
+                self.test_interrupt_landing_child(work_item, "after-task-record")?;
                 if attempt.recovery_operations.last().is_some_and(|r| {
                     r.operation_kind == "assignment-context-recovery"
                         && r.task_id.as_deref() == Some(task.id.as_str())
@@ -12290,6 +12356,30 @@ impl WorkModelStore {
         }
         prune_json_files(&attempts_dir, &attempt_files)?;
         prune_child_dirs(&tasks_item_dir, &attempt_dirs)?;
+        Ok(())
+    }
+
+    #[cfg(feature = "test-support")]
+    fn test_interrupt_landing_child(
+        &self,
+        work_item: &WorkItem,
+        stage: &str,
+    ) -> Result<(), WorkModelStorageError> {
+        let key = format!("{stage}:{}", work_item.id);
+        if std::env::var("FLUENT_TEST_WORK_MODEL_INTERRUPT")
+            .ok()
+            .as_deref()
+            == Some(&key)
+            && work_item.merge_candidates.iter().any(|candidate| {
+                candidate.merge_state.status == MergeCandidateMergeStatus::Merged
+                    && candidate.merge_state.landing_intent.is_some()
+            })
+        {
+            return Err(WorkModelStorageError::WriteFile {
+                path: self.work_transaction_path(&work_item.id)?,
+                source: io::Error::other("injected landing child publication interruption"),
+            });
+        }
         Ok(())
     }
 
@@ -16819,6 +16909,7 @@ random banner prose that must be ignored
                 }],
                 auto_merge_skipped: None,
                 follow_up_failure: None,
+                landing_intent: None,
             },
             created_at: None,
             ready_at: None,
@@ -17748,6 +17839,7 @@ random banner prose that must be ignored
                 review_artifacts: Vec::new(),
                 auto_merge_skipped: None,
                 follow_up_failure: None,
+                landing_intent: None,
             },
             created_at: None,
             ready_at: None,
@@ -17807,6 +17899,7 @@ random banner prose that must be ignored
                 review_artifacts: Vec::new(),
                 auto_merge_skipped: None,
                 follow_up_failure: None,
+                landing_intent: None,
             },
             created_at: None,
             ready_at: None,
@@ -20198,6 +20291,7 @@ random banner prose that must be ignored
             review_artifacts: Vec::new(),
             auto_merge_skipped: Some(true),
             follow_up_failure: None,
+            landing_intent: None,
         };
         let json = serde_json::to_string(&state).unwrap();
         let parsed: MergeCandidateMergeState = serde_json::from_str(&json).unwrap();

@@ -376,6 +376,7 @@ mod tests {
                 review_artifacts: vec![],
                 auto_merge_skipped,
                 follow_up_failure: None,
+                landing_intent: None,
             },
             created_at: None,
             ready_at: None,

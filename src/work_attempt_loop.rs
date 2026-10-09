@@ -973,7 +973,9 @@ pub fn extend_round_cap(
             candidate.attempt_id == attempt_id
                 && matches!(
                     candidate.merge_state.status,
-                    MergeCandidateMergeStatus::Executing | MergeCandidateMergeStatus::Pending
+                    MergeCandidateMergeStatus::Executing
+                        | MergeCandidateMergeStatus::LandingPending
+                        | MergeCandidateMergeStatus::Pending
                 )
         }) {
             return Err(round_cap_ineligible("a landing owns this Attempt"));
@@ -5814,6 +5816,8 @@ pub fn cancel_local_attempt(
     work_item_id: &str,
     attempt_id: &str,
 ) -> Result<usize> {
+    let _effect_lock = crate::land_lock::acquire(&crate::land_lock::effect_lock_path(project_root))
+        .map_err(|error| anyhow::anyhow!("failed to acquire landing effect lock: {error}"))?;
     let attempt = mutate_attempt_work_item(store, work_item_id, |item| {
         item.ensure_not_abandoned()?;
         let has_pending_candidate = item.merge_candidates.iter().any(|candidate| {
@@ -5849,6 +5853,7 @@ pub fn cancel_local_attempt(
         }
         Ok(attempt.clone())
     })?;
+    drop(_effect_lock);
     if attempt.cancellation.as_ref().unwrap().settled_at.is_some() {
         return Ok(0);
     }

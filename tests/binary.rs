@@ -17014,6 +17014,7 @@ fn simulate_legacy_land(main_dir: &Path) {
         review_artifacts: Vec::new(),
         auto_merge_skipped: None,
         follow_up_failure: None,
+        landing_intent: None,
     };
     set_merge_candidate_terminal(candidate, MergeCandidateMergeStatus::Merged);
     store

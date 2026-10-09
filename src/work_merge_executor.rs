@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -8,7 +9,7 @@ use crate::content::ContentResolver;
 use crate::git;
 use crate::hooks::{self, HookContext, HookOutcome};
 use crate::work_model::{
-    ArtifactRef, DurableTransitionMetadata, DurableTransitionOrigin, MergeCandidate,
+    ArtifactRef, DurableTransitionMetadata, DurableTransitionOrigin, LandingIntent, MergeCandidate,
     MergeCandidateMergeState, MergeCandidateMergeStatus, MergeReviewState, Task, TaskKind,
     TaskStatus, WORK_ARTIFACTS_DIR, WorkItem, WorkModelError, WorkModelStorageError,
     WorkModelStore, WorkspaceAccess, resolve_expected_candidate_workspace_path, work_artifact_path,
@@ -45,6 +46,248 @@ fn mutate_landing_work_item<T>(
     reducer: impl FnOnce(&mut WorkItem) -> Result<T, WorkModelError>,
 ) -> Result<T, WorkModelStorageError> {
     store.mutate_work_item_with_transition(id, &landing_transition(), reducer)
+}
+
+fn landing_repository_identity(workspace: &Path) -> Result<String> {
+    let common = git::run_stdout(
+        workspace,
+        &["rev-parse", "--git-common-dir"],
+        "resolve repository identity",
+    )?;
+    let path = Path::new(&common);
+    Ok(fs::canonicalize(if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        workspace.join(path)
+    })?
+    .to_string_lossy()
+    .into_owned())
+}
+
+fn landing_evidence_digest(
+    project_root: &Path,
+    checks: &[ArtifactRef],
+    reviews: &[ArtifactRef],
+) -> Result<String> {
+    let mut hash = Sha256::new();
+    for artifact in checks.iter().chain(reviews) {
+        hash.update(artifact.producer_id.as_bytes());
+        hash.update([0]);
+        hash.update(artifact.path.as_bytes());
+        hash.update([0]);
+        let path = Path::new(&artifact.path);
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            project_root.join(path)
+        };
+        hash.update(
+            fs::read(&path)
+                .with_context(|| format!("read accepted landing evidence {}", path.display()))?,
+        );
+        hash.update([0]);
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+fn accepted_landing_model_digest(item: &WorkItem, candidate: &MergeCandidate) -> Result<String> {
+    let attempt = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == candidate.attempt_id)
+        .ok_or_else(|| anyhow::anyhow!("landing Attempt is missing"))?;
+    let bytes = serde_json::to_vec(&(
+        &attempt.tasks,
+        &attempt.review_state,
+        &attempt.learning,
+        &candidate.merge_review_state,
+    ))?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn persist_landing_intent(
+    config: &WorkMergeConfig<'_>,
+    candidate: &MergeCandidate,
+    target_workspace: &Path,
+    target_before: &str,
+    verified_commit: &str,
+    checks: Vec<ArtifactRef>,
+    reviews: Vec<ArtifactRef>,
+) -> Result<LandingIntent> {
+    let repository = landing_repository_identity(target_workspace)?;
+    let target_workspace_identity = fs::canonicalize(target_workspace)?
+        .to_string_lossy()
+        .into_owned();
+    let evidence_digest = landing_evidence_digest(config.project_root, &checks, &reviews)?;
+    let current_item = config.store.read_work_item(config.work_item_id)?;
+    let current_candidate = current_item
+        .merge_candidates
+        .iter()
+        .find(|entry| entry.id == candidate.id)
+        .ok_or_else(|| anyhow::anyhow!("landing candidate disappeared"))?;
+    let accepted_model_digest = accepted_landing_model_digest(&current_item, current_candidate)?;
+    let intent = LandingIntent {
+        schema_version: 1,
+        operation_id: format!(
+            "landing:{}:{}:{}",
+            config.work_item_id, candidate.id, verified_commit
+        ),
+        work_item_id: config.work_item_id.to_string(),
+        attempt_id: candidate.attempt_id.clone(),
+        merge_candidate_id: candidate.id.clone(),
+        learner_mode: current_item.learner_mode,
+        repository,
+        target_branch: candidate.target_branch.clone(),
+        target_workspace: target_workspace_identity,
+        target_before: target_before.to_string(),
+        verified_commit: verified_commit.to_string(),
+        evidence_digest,
+        accepted_model_digest,
+        check_artifacts: checks,
+        review_artifacts: reviews,
+    };
+    mutate_landing_work_item(config.store, config.work_item_id, |item| {
+        let attempt = item
+            .attempts
+            .iter()
+            .find(|attempt| attempt.id == candidate.attempt_id)
+            .ok_or_else(|| WorkModelError::MergeCandidateAttemptNotFound {
+                candidate_id: candidate.id.clone(),
+                attempt_id: candidate.attempt_id.clone(),
+            })?;
+        attempt.ensure_not_canceled()?;
+        let actual_digest = item
+            .merge_candidates
+            .iter()
+            .find(|entry| entry.id == candidate.id)
+            .and_then(|entry| accepted_landing_model_digest(item, entry).ok());
+        if item.learner_mode != intent.learner_mode
+            || actual_digest.as_deref() != Some(intent.accepted_model_digest.as_str())
+        {
+            return Err(WorkModelError::InvalidRecoveryOperation {
+                attempt_id: candidate.attempt_id.clone(),
+                reason: "accepted landing evidence changed before intent publication".into(),
+            });
+        }
+        let current = item
+            .merge_candidates
+            .iter_mut()
+            .find(|current| current.id == candidate.id)
+            .ok_or_else(|| WorkModelError::MergeCandidateNotFound {
+                candidate_id: candidate.id.clone(),
+            })?;
+        if current.merge_state.status != MergeCandidateMergeStatus::Executing
+            || current.candidate_commit != verified_commit
+            || current.target_branch != intent.target_branch
+            || current
+                .merge_state
+                .landing_intent
+                .as_ref()
+                .is_some_and(|prior| prior != &intent)
+        {
+            return Err(WorkModelError::InvalidRecoveryOperation {
+                attempt_id: candidate.attempt_id.clone(),
+                reason: "landing intent conflicts with candidate state".into(),
+            });
+        }
+        current.merge_state.landing_intent = Some(intent.clone());
+        current.merge_state.status = MergeCandidateMergeStatus::LandingPending;
+        Ok(())
+    })?;
+    Ok(intent)
+}
+
+fn recognized_landing_intent(
+    config: &WorkMergeConfig<'_>,
+    item: &WorkItem,
+    candidate: &MergeCandidate,
+) -> Result<Option<LandingIntent>> {
+    let Some(intent) = candidate.merge_state.landing_intent.as_ref() else {
+        return Ok(None);
+    };
+    let target = resolve_workspace_path(config.project_root, &candidate.target_workspace.path);
+    anyhow::ensure!(
+        intent.schema_version == 1
+            && intent.work_item_id == item.id
+            && intent.attempt_id == candidate.attempt_id
+            && intent.merge_candidate_id == candidate.id
+            && intent.operation_id
+                == format!(
+                    "landing:{}:{}:{}",
+                    item.id, candidate.id, intent.verified_commit
+                )
+            && intent.learner_mode == item.learner_mode
+            && intent.target_branch == candidate.target_branch
+            && intent.target_workspace == fs::canonicalize(&target)?.to_string_lossy()
+            && intent.repository == landing_repository_identity(&target)?
+            && intent.verified_commit == candidate.candidate_commit
+            && intent.accepted_model_digest == accepted_landing_model_digest(item, candidate)?
+            && intent.evidence_digest
+                == landing_evidence_digest(
+                    config.project_root,
+                    &intent.check_artifacts,
+                    &intent.review_artifacts
+                )?,
+        "landing intent no longer matches its authorized candidate, target, or evidence"
+    );
+    let tip = resolve_target_head(&target, &candidate.target_branch)?;
+    let verified_base = git::run_raw(
+        &target,
+        &[
+            "merge-base",
+            "--is-ancestor",
+            &intent.target_before,
+            &intent.verified_commit,
+        ],
+    )?;
+    anyhow::ensure!(
+        verified_base.status.success(),
+        "landing intent base is not an ancestor of its verified commit"
+    );
+    let ancestry = git::run_raw(
+        &target,
+        &["merge-base", "--is-ancestor", &intent.verified_commit, &tip],
+    )?;
+    if ancestry.status.success() {
+        return Ok(Some(intent.clone()));
+    }
+    anyhow::ensure!(
+        tip == intent.target_before,
+        "target moved before the authorized landing effect"
+    );
+    Ok(None)
+}
+
+fn assert_landing_effect_ready(
+    config: &WorkMergeConfig<'_>,
+    candidate_id: &str,
+    target_before: &str,
+) -> Result<()> {
+    let item = config.store.read_work_item(config.work_item_id)?;
+    let candidate = item
+        .merge_candidates
+        .iter()
+        .find(|candidate| candidate.id == candidate_id)
+        .ok_or_else(|| anyhow::anyhow!("landing candidate disappeared"))?;
+    let attempt = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == candidate.attempt_id)
+        .ok_or_else(|| anyhow::anyhow!("landing Attempt disappeared"))?;
+    attempt.ensure_not_canceled()?;
+    anyhow::ensure!(
+        candidate.merge_state.status == MergeCandidateMergeStatus::LandingPending
+            && candidate.merge_state.landing_intent.is_some()
+            && recognized_landing_intent(config, &item, candidate)?.is_none(),
+        "landing effect authority changed before Git update"
+    );
+    let target = resolve_workspace_path(config.project_root, &candidate.target_workspace.path);
+    anyhow::ensure!(
+        resolve_target_head(&target, &candidate.target_branch)? == target_before,
+        "target moved before the authorized Git effect"
+    );
+    ensure_clean_worktree(&target)?;
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -129,6 +372,47 @@ pub fn merge_candidate(config: WorkMergeConfig<'_>) -> Result<WorkMergeOutcome> 
             )?;
         }
         bail!("{error}");
+    }
+
+    if candidate.merge_state.status != MergeCandidateMergeStatus::Merged
+        && let Some(intent) = recognized_landing_intent(&config, &item, &candidate)?
+    {
+        record_candidate_merged(
+            config.store,
+            config.work_item_id,
+            &candidate.id,
+            &intent.verified_commit,
+            intent.check_artifacts.clone(),
+            intent.review_artifacts.clone(),
+        )?;
+        let outcome = WorkMergeOutcome {
+            merge_candidate_id: candidate.id.clone(),
+            merged_commit: intent.verified_commit,
+        };
+        if let Err(error) = process_landed_follow_ups(&config, &outcome) {
+            eprintln!("  Warning: failed to update follow-up-processing recovery state: {error}");
+        }
+        prepare_landed_baseline_or_warn(&config, &candidate, &outcome);
+        return Ok(outcome);
+    }
+    if candidate.merge_state.status == MergeCandidateMergeStatus::Executing
+        && candidate.merge_state.landing_intent.is_none()
+    {
+        let target = resolve_workspace_path(config.project_root, &candidate.target_workspace.path);
+        let target_tip = resolve_target_head(&target, &candidate.target_branch)?;
+        let already_present = git::run_raw(
+            &target,
+            &[
+                "merge-base",
+                "--is-ancestor",
+                &candidate.candidate_commit,
+                &target_tip,
+            ],
+        )?;
+        anyhow::ensure!(
+            !already_present.status.success(),
+            "candidate commit is already in target history without a landing intent; explicit recovery is required"
+        );
     }
 
     // Resolve an interactive land only after the executor has validated the
@@ -1169,18 +1453,36 @@ fn execute_frozen_no_expertise_land(
         return Err(error);
     }
 
+    let effect_lock =
+        crate::land_lock::acquire(&crate::land_lock::effect_lock_path(config.project_root))?;
+    persist_landing_intent(
+        config,
+        candidate,
+        target_workspace,
+        target_head_before,
+        reviewed_sha,
+        check_artifacts.clone(),
+        Vec::new(),
+    )?;
+    #[cfg(feature = "test-support")]
+    if std::env::var_os("FLUENT_TEST_INTERRUPT_BEFORE_LANDING_GIT").is_some() {
+        bail!("injected interruption before landing Git effect");
+    }
+    assert_landing_effect_ready(config, &candidate.id, target_head_before)?;
     // Fast-forward the target to exactly the reviewed SHA. No rebase, no provenance
     // regeneration, no autofix commit — the approved commit lands verbatim.
-    git::run(
+    git::fast_forward_checked(
         target_workspace,
-        &["checkout", &candidate.target_branch],
-        "checkout target branch",
+        &candidate.target_branch,
+        target_head_before,
+        reviewed_sha,
     )?;
-    git::run(
-        target_workspace,
-        &["merge", "--ff-only", reviewed_sha],
-        "fast-forward target branch to frozen reviewed SHA",
-    )?;
+    drop(effect_lock);
+
+    #[cfg(feature = "test-support")]
+    if std::env::var_os("FLUENT_TEST_INTERRUPT_AFTER_LANDING_GIT").is_some() {
+        bail!("injected interruption after landing Git effect");
+    }
 
     record_candidate_merged(
         config.store,
@@ -1949,24 +2251,9 @@ fn finalize_merge(
         );
     }
 
-    git::run(
-        target_workspace,
-        &["checkout", &candidate.target_branch],
-        "checkout target branch",
-    )?;
-    git::run(
-        target_workspace,
-        &["merge", "--ff-only", &merged_commit],
-        "fast-forward target branch",
-    )?;
-
-    // The landed commit is the final tip, which includes any fix-pre-merge autofix
-    // commit made after the rebase. The first provenance regeneration ran against
-    // the pre-autofix rebase tip, so settle the Write provenance and candidate
-    // pointer onto the actually-landed commit here: every land pointer — the latest
-    // completed Write output, candidate_commit, merged_commit, the returned outcome,
-    // and target HEAD — then names one regenerated SHA (B4al). When no autofix ran
-    // the merged tip equals the rebase tip and this is a no-op.
+    // The final tip includes any fix-pre-merge autofix commit made after the
+    // rebase. Settle Write provenance and the candidate pointer onto that tip
+    // before authorizing Git. A retry can publish the same exact pointers.
     regenerate_provenance(
         config.store,
         config.work_item_id,
@@ -1976,6 +2263,35 @@ fn finalize_merge(
         target_head_before,
         &merged_commit,
     )?;
+    let effect_lock =
+        crate::land_lock::acquire(&crate::land_lock::effect_lock_path(config.project_root))?;
+    persist_landing_intent(
+        config,
+        candidate,
+        target_workspace,
+        target_head_before,
+        &merged_commit,
+        check_artifacts.clone(),
+        review_artifacts.clone(),
+    )?;
+    #[cfg(feature = "test-support")]
+    if std::env::var_os("FLUENT_TEST_INTERRUPT_BEFORE_LANDING_GIT").is_some() {
+        bail!("injected interruption before landing Git effect");
+    }
+    assert_landing_effect_ready(config, &candidate.id, target_head_before)?;
+
+    git::fast_forward_checked(
+        target_workspace,
+        &candidate.target_branch,
+        target_head_before,
+        &merged_commit,
+    )?;
+    drop(effect_lock);
+
+    #[cfg(feature = "test-support")]
+    if std::env::var_os("FLUENT_TEST_INTERRUPT_AFTER_LANDING_GIT").is_some() {
+        bail!("injected interruption after landing Git effect");
+    }
 
     record_candidate_merged(
         config.store,
@@ -2324,6 +2640,7 @@ fn set_candidate_executing(
             review_artifacts: Vec::new(),
             auto_merge_skipped: None,
             follow_up_failure: None,
+            landing_intent: None,
         };
         crate::work_model::mark_merge_candidate_started(candidate);
         Ok(())
@@ -2345,6 +2662,9 @@ fn record_candidate_failure(
         {
             return;
         }
+        if candidate.merge_state.landing_intent.is_some() {
+            return;
+        }
         if !review_artifacts.is_empty()
             || candidate.merge_review_state == MergeReviewState::Reviewing
         {
@@ -2358,6 +2678,7 @@ fn record_candidate_failure(
             review_artifacts,
             auto_merge_skipped: None,
             follow_up_failure: None,
+            landing_intent: None,
         };
         crate::work_model::set_merge_candidate_terminal(
             candidate,
@@ -2388,6 +2709,7 @@ fn record_candidate_merged(
         })?;
     {
         let candidate = &mut item.merge_candidates[candidate_index];
+        let intent = candidate.merge_state.landing_intent.clone();
         candidate.merge_review_state = MergeReviewState::Passed;
         candidate.merge_state = MergeCandidateMergeState {
             status: MergeCandidateMergeStatus::Merged,
@@ -2397,6 +2719,7 @@ fn record_candidate_merged(
             review_artifacts,
             auto_merge_skipped: None,
             follow_up_failure: None,
+            landing_intent: intent,
         };
         crate::work_model::set_merge_candidate_terminal(
             candidate,
@@ -3195,6 +3518,7 @@ fn settle_candidate_terminal(
         review_artifacts: Vec::new(),
         auto_merge_skipped: None,
         follow_up_failure: None,
+        landing_intent: None,
     };
     crate::work_model::set_merge_candidate_terminal(candidate, terminal);
 }
@@ -3852,6 +4176,7 @@ mod tests {
             review_artifacts: Vec::new(),
             auto_merge_skipped: None,
             follow_up_failure: None,
+            landing_intent: None,
         };
         crate::work_model::set_merge_candidate_terminal(
             candidate,

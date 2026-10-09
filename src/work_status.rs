@@ -1025,7 +1025,11 @@ fn local_task_is_live(project_root: &Path, item: &WorkItem, task: &Task) -> bool
 }
 
 fn format_merge_state(candidate: &MergeCandidate) -> String {
-    let status = merge_status_label(&candidate.merge_state.status);
+    let status = if candidate.merge_state.status == MergeCandidateMergeStatus::LandingPending {
+        "publication-pending"
+    } else {
+        merge_status_label(&candidate.merge_state.status)
+    };
     let review = merge_review_label(&candidate.merge_review_state);
     format!("{status} review:{review}")
 }
@@ -1105,6 +1109,7 @@ fn action_label_with_liveness(
     if let Some(candidate) = merge_candidate {
         return match candidate.merge_state.status {
             MergeCandidateMergeStatus::NeedsUser => "needs-user",
+            MergeCandidateMergeStatus::LandingPending => "landing-pending",
             MergeCandidateMergeStatus::Executing => "merging",
             MergeCandidateMergeStatus::Failed => "merge-failed",
             MergeCandidateMergeStatus::Merged => "merged",
@@ -1496,6 +1501,7 @@ fn merge_status_label(status: &MergeCandidateMergeStatus) -> &'static str {
     match status {
         MergeCandidateMergeStatus::Pending => "pending",
         MergeCandidateMergeStatus::Executing => "executing",
+        MergeCandidateMergeStatus::LandingPending => "publication-pending",
         MergeCandidateMergeStatus::Failed => "failed",
         MergeCandidateMergeStatus::NeedsUser => "needs-user",
         MergeCandidateMergeStatus::Merged => "merged",
@@ -2170,6 +2176,7 @@ mod tests {
             review_artifacts: Vec::new(),
             auto_merge_skipped: None,
             follow_up_failure: None,
+            landing_intent: None,
         };
 
         let row = summarize_work_item(&item, None);

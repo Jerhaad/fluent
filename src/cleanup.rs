@@ -186,9 +186,12 @@ fn has_executing_merge_candidate(store: &WorkModelStore, work_item_id: &str) -> 
     let Ok(item) = store.read_work_item(work_item_id) else {
         return false;
     };
-    item.merge_candidates
-        .iter()
-        .any(|candidate| candidate.merge_state.status == MergeCandidateMergeStatus::Executing)
+    item.merge_candidates.iter().any(|candidate| {
+        matches!(
+            candidate.merge_state.status,
+            MergeCandidateMergeStatus::Executing | MergeCandidateMergeStatus::LandingPending
+        )
+    })
 }
 
 fn cleanup_source_root(search_root: &Path) -> Result<PathBuf> {
@@ -268,7 +271,10 @@ fn work_item_has_no_active_execution(work_item: &WorkItem) -> bool {
             .all(|task| task.status != TaskStatus::Executing)
     }) && work_item.merge_candidates.iter().all(|candidate| {
         candidate.merge_review_state != MergeReviewState::Reviewing
-            && candidate.merge_state.status != MergeCandidateMergeStatus::Executing
+            && !matches!(
+                candidate.merge_state.status,
+                MergeCandidateMergeStatus::Executing | MergeCandidateMergeStatus::LandingPending
+            )
     })
 }
 

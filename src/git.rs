@@ -90,6 +90,26 @@ pub fn run(cwd: &Path, args: &[&str], action: &str) -> Result<()> {
     )
 }
 
+/// Fast-forward a target branch only while it still names the verified base.
+pub fn fast_forward_checked(cwd: &Path, branch: &str, base: &str, commit: &str) -> Result<()> {
+    let current = run_stdout(cwd, &["rev-parse", branch], "resolve target branch")?;
+    anyhow::ensure!(
+        current == base,
+        "target branch {branch} moved from {base} to {current}"
+    );
+    run(cwd, &["checkout", branch], "checkout target branch")?;
+    let checked_out = run_stdout(cwd, &["rev-parse", "HEAD"], "resolve checked-out target")?;
+    anyhow::ensure!(
+        checked_out == base,
+        "target checkout moved from {base} to {checked_out}"
+    );
+    run(
+        cwd,
+        &["merge", "--ff-only", commit],
+        "fast-forward target branch",
+    )
+}
+
 /// Run `git <args>` in `cwd`, return trimmed stdout on success.
 pub fn run_stdout(cwd: &Path, args: &[&str], action: &str) -> Result<String> {
     let output = run_with_lock_retry(|| build_command(cwd, args))?;
