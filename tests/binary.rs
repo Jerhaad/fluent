@@ -32380,6 +32380,26 @@ fn learner_terminal_history_preserves_rejection_guards() {
         assert_eq!(snapshot_tree(&project.join(".fluent/work")), before);
     }
     fs::write(&path, &original).unwrap();
+    let mut incomplete: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    incomplete["status"] = "planned".into();
+    write_json_path(&path, &incomplete);
+    let bin = tmp.path().join("bin-rejected-learner-history");
+    let marker = tmp.path().join("unauthorized-provider-launch");
+    write_mock_claude(
+        &bin,
+        "#!/bin/bash\n: > \"$LEARNER_HISTORY_LAUNCH_MARKER\"\nexit 1\n",
+    );
+    let before = snapshot_tree(&project.join(".fluent/work"));
+    fluent_cmd()
+        .current_dir(&project)
+        .env("PATH", mock_path(&bin))
+        .env("LEARNER_HISTORY_LAUNCH_MARKER", &marker)
+        .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
+        .assert()
+        .failure();
+    assert!(!marker.exists());
+    assert_eq!(snapshot_tree(&project.join(".fluent/work")), before);
+    fs::write(&path, &original).unwrap();
     let mut invalid: serde_json::Value = serde_json::from_slice(&original).unwrap();
     invalid["output"] =
         read_work_show_json(&project, "work-1")["attempts"][0]["tasks"][1]["output"].clone();
