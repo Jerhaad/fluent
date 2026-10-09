@@ -66,6 +66,8 @@
 - [inject-side-effects-for-testability](inject-side-effects-for-testability.md) — Side-effect functions like notify() must be injected via &dyn Fn parameters so tests can capture and assert
 - [json-manifest-paths-via-jq-arg](json-manifest-paths-via-jq-arg.md) — External values written into JSON manifests must use jq --arg, not string interpolation
 - [keep-architecture-doc-in-sync](keep-architecture-doc-in-sync.md) — Keep the architecture file map, subsystem prose, and shell documentation checks aligned with the implementation
+- [landing-effect-lock-protects-cancellation](landing-effect-lock-protects-cancellation.md) — Serialize Attempt cancellation with landing intent publication and the target Git effect under a project-wide effect lock
+- [landing-recovery-tests-check-publication](landing-recovery-tests-check-publication.md) — Landing recovery tests must compare the retained intent with the published merge and its downstream effects
 - [landed-status-separates-history-from-recovery](landed-status-separates-history-from-recovery.md) — Show merged Work from retained evidence history while keeping current recovery and verification for unmerged candidates
 - [lease-acquire-types-contention-vs-infrastructure](lease-acquire-types-contention-vs-infrastructure.md) — Lock/lease acquisition must return a typed result — only a non-blocking flock WouldBlock is a live peer (fail open); every other lock-path IO error propagates as a real failure
 - [legacy-evidence-compatibility-stays-isolated](legacy-evidence-compatibility-stays-isolated.md) — Recover historical evidence through a separate exact compatibility classifier that cannot weaken current execution rules
