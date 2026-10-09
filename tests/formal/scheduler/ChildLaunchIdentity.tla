@@ -38,8 +38,8 @@ Execute == /\ phase \in {"created", "receipted", "published"} /\ held
            /\ (RequireReceipt => receipt = generation)
            /\ (CheckStop => ~stopped)
            /\ phase' = "executing" /\ executions' = executions + 1
-           /\ badExecution' = badExecution \/ (receipt # generation)
-           /\ badStop' = badStop \/ stopped
+           /\ badExecution' = (badExecution \/ (receipt # generation))
+           /\ badStop' = (badStop \/ stopped)
            /\ UNCHANGED <<generation, held, receipt, parentAlive, stopped, badSignal>>
 
 Crash == /\ parentAlive /\ phase \in {"created", "receipted", "published", "executing"}
@@ -59,7 +59,7 @@ Recover == /\ held /\ ~parentAlive /\ receipt = generation
 
 Signal == /\ held /\ stopped /\ receipt # 0
           /\ (CheckGeneration => receipt = generation)
-          /\ badSignal' = badSignal \/ (receipt # generation)
+          /\ badSignal' = (badSignal \/ (receipt # generation))
           /\ held' = FALSE /\ phase' = "settled"
           /\ UNCHANGED <<generation, receipt, parentAlive, stopped,
                         badExecution, badStop, executions>>
@@ -69,8 +69,11 @@ Settle == /\ held /\ phase = "executing"
           /\ UNCHANGED <<generation, receipt, parentAlive, stopped,
                         badExecution, badStop, badSignal, executions>>
 
+Finish == /\ phase = "settled" /\ generation = 2 /\ ~held
+          /\ UNCHANGED vars
+
 Next == Reserve \/ Create \/ ChildReceipt \/ ParentPublish \/ Execute
-        \/ Crash \/ RequestStop \/ Recover \/ Signal \/ Settle
+        \/ Crash \/ RequestStop \/ Recover \/ Signal \/ Settle \/ Finish
 Spec == Init /\ [][Next]_vars
 FairSpec == Spec /\ WF_vars(Recover) /\ WF_vars(Settle)
 
