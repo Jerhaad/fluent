@@ -1894,6 +1894,15 @@ the approved Plan.
 `fluent work-item list` and `fluent work-item show <id>` expose the same durable
 Work Item model for inspection. These commands use `.fluent/work/items/`
 through the Rust storage model and validate stored objects.
+Once a validated Merge Candidate records `Merged` and its merged commit,
+`work_status` presents retained Tester evidence as history. It reads the
+candidate-bound Tester result from its managed artifact path without opening
+the disposable source checkout. A missing or inconsistent result produces an
+evidence-history diagnostic; it does not reopen a Writer row or offer an
+Attempt resume command. Unmerged candidates, including Complete Attempts that
+have not landed, continue through current recovery and verification checks.
+Status, Work Item inspection, and dashboard assemble snapshots without
+replaying pending Work transactions or changing retained evidence.
 `fluent status` and `fluent dashboard` use Work Items as the default
 operator surface. They read Work Items through `work_status.rs`, which
 reduces stored Work Items to operator-facing rows. That boundary chooses

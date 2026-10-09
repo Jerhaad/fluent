@@ -3747,6 +3747,40 @@ Test: tests/behaviors/operations/test-fargate-entrypoint-codex.sh (codex missing
 
 ## Status reporting
 
+### B6
+
+WHEN status, Work Item inspection, or dashboard observes a merged candidate
+after its source checkout is retired, THE SYSTEM SHALL show its recorded landed
+result and retained Tester evidence.
+Test: tests/binary.rs (landed_status_preserves_result_after_source_retirement)
+
+### B7
+
+WHEN those views present verification for merged Work, THE SYSTEM SHALL
+identify retained Tester results as evidence history and SHALL NOT present
+historical Writer rows as current requirements.
+Test: tests/binary.rs (landed_status_does_not_reopen_historical_requirements)
+
+### B8
+
+IF retained landed Tester evidence is missing or inconsistent, THEN THE SYSTEM
+SHALL report an evidence-history diagnostic without offering a pre-land resume
+command.
+Test: tests/binary.rs (landed_status_reports_unavailable_historical_evidence)
+
+### B9
+
+WHEN an unmerged candidate is inspected, including a Complete Attempt still
+awaiting landing, THE SYSTEM SHALL retain current recovery and verification
+checks.
+Test: tests/binary.rs (landed_status_keeps_unmerged_checks_strict)
+
+### B10
+
+WHEN these observation routes inspect Work, THE SYSTEM SHALL preserve stored
+records and retained evidence bytes.
+Test: tests/binary.rs (landed_status_observation_preserves_recorded_bytes, landed_status_observation_preserves_recorded_bytes_with_pending_publication)
+
 ### B1
 
 WHEN `fluent status` is invoked and stored Work Items exist,
