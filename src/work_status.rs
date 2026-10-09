@@ -121,6 +121,28 @@ fn landed_evidence_history(
                     .all(|command| command.exit_code == 0),
             "retained Tester result does not record a passing run"
         );
+        anyhow::ensure!(
+            results.summary.total == results.tests.len()
+                && results.summary.pass
+                    == results
+                        .tests
+                        .iter()
+                        .filter(|test| test.status == "pass")
+                        .count()
+                && results.summary.fail
+                    == results
+                        .tests
+                        .iter()
+                        .filter(|test| test.status == "fail")
+                        .count()
+                && results.summary.skipped
+                    == results
+                        .tests
+                        .iter()
+                        .filter(|test| matches!(test.status.as_str(), "skipped" | "not_run"))
+                        .count(),
+            "retained Tester summary disagrees with its test results"
+        );
         for (index, command) in results.commands.iter().enumerate() {
             anyhow::ensure!(
                 command.command == manifest.commands[index].command

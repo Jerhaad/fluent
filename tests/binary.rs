@@ -63814,6 +63814,20 @@ fn landed_status_reports_unavailable_historical_evidence() {
             .contains("does not match")
     );
     assert!(changed.get("next-action").is_none());
+    let mut inconsistent: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    inconsistent["summary"]["total"] = serde_json::json!(99);
+    fs::write(
+        project.join(path),
+        serde_json::to_vec(&inconsistent).unwrap(),
+    )
+    .unwrap();
+    let inconsistent = read_work_show_json(&project, "work-1");
+    assert!(
+        inconsistent["evidence-history"]["diagnostic"]
+            .as_str()
+            .unwrap()
+            .contains("summary disagrees")
+    );
 }
 
 #[test]
