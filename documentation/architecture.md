@@ -1,5 +1,7 @@
 # Architecture
 
+The [workflow foundation](../tests/formal/workflow/README.md) records the bounded whole-workflow model, first public-command trace, and the pending connections to the detailed scheduler protocols.
+
 Workflow and execution system for autonomous coding agents. Manages work
 from intent capture through execution and review across multiple sessions.
 

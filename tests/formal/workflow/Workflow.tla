@@ -25,7 +25,8 @@ RecoveryId(w, g) == <<"recovery", w, g>>
 VARIABLE s
 vars == <<s>>
 Init == s = [w \in Works |->
-    [phase |-> "new", delivered |-> FALSE, credit |-> FALSE,
+    [phase |-> "new", required |-> TRUE, delivered |-> FALSE,
+     rawEvidence |-> FALSE, credit |-> FALSE,
      canceled |-> FALSE, authority |-> 0, generation |-> 1,
      failures |-> 0, failed |-> FALSE, ioFailed |-> FALSE,
      effects |-> 0, observed |-> "none", cleaned |-> FALSE,
@@ -46,6 +47,7 @@ Writer(w) == /\ s[w].phase = "delivered" /\ ~s[w].failed
              /\ s' = [s EXCEPT ![w].phase = "written"]
 Review(w) == /\ s[w].phase = "written" /\ ~s[w].failed
              /\ s' = [s EXCEPT ![w].phase = "reviewed",
+                                   ![w].rawEvidence = TRUE,
                                    ![w].credit = CheckEvidence]
 TargetedReview(w) == /\ s[w].phase = "reviewed" /\ ~s[w].credit
                      /\ CheckEvidence /\ ~s[w].failed
@@ -57,11 +59,13 @@ LearnCapture(w) == /\ s[w].phase = "tested" /\ ~s[w].failed
 LearnNoExpertise(w) == LearnCapture(w)
 Ready(w) == /\ s[w].phase = "learned" /\ ~s[w].failed
             /\ s' = [s EXCEPT ![w].phase = "ready"]
+LandingVerify(w) == /\ s[w].phase = "ready" /\ ~s[w].failed
+                    /\ s' = [s EXCEPT ![w].phase = "verified"]
 ReviewOnlyStart(w) == /\ w \in ReviewOnly
                       /\ s[w].phase = "authorized" /\ ~s[w].failed
                       /\ s' = [s EXCEPT ![w].phase = "written",
                                             ![w].delivered = TRUE]
-Intent(w) == /\ s[w].phase = "ready" /\ ~s[w].failed
+Intent(w) == /\ s[w].phase = "verified" /\ ~s[w].failed
              /\ s' = [s EXCEPT ![w].phase = "intent",
                                    ![w].pending = TRUE]
 GitEffect(w) == /\ s[w].phase = "intent" /\ ~s[w].failed
@@ -74,7 +78,9 @@ PublishResult(w) == /\ s[w].phase = "git" /\ ~s[w].ioFailed
                     /\ s' = [s EXCEPT ![w].phase = "published",
                                           ![w].published = TRUE,
                                           ![w].pending = FALSE]
-FollowUp(w) == /\ s[w].phase = "published" /\ ~s[w].failed
+FollowUpStart(w) == /\ s[w].phase = "published" /\ ~s[w].failed
+                    /\ s' = [s EXCEPT ![w].phase = "follow-up-pending"]
+FollowUp(w) == /\ s[w].phase = "follow-up-pending" /\ ~s[w].failed
                /\ s' = [s EXCEPT ![w].phase = "follow-up"]
 RetryEffect(w) == /\ s[w].phase = "git" /\ ~s[w].failed
                   /\ s' = [s EXCEPT ![w].effects = IF GuardEffect THEN @ ELSE @ + 1]
@@ -94,13 +100,16 @@ Resume(w) == /\ s[w].canceled
              /\ (s[w].authority = s[w].generation \/ ~FenceResume)
              /\ s' = [s EXCEPT ![w].canceled = FALSE,
                                    ![w].badResume = s[w].authority # s[w].generation]
-Crash(w) == /\ ~s[w].failed /\ s[w].failures < MaxFailures
+FaultBudgetAvailable(w) ==
+    /\ s[w].failures < MaxFailures
+    /\ (MaxFailures # 1 \/ \A x \in Works: s[x].failures = 0)
+Crash(w) == /\ ~s[w].failed /\ FaultBudgetAvailable(w)
             /\ s[w].phase \notin {"new", "follow-up"}
             /\ s' = [s EXCEPT ![w].failed = TRUE,
                                   ![w].failures = @ + 1]
 Recover(w) == /\ s[w].failed /\ s' = [s EXCEPT ![w].failed = FALSE]
-FailWrite(w) == /\ ~s[w].ioFailed /\ s[w].failures < MaxFailures
-                /\ s[w].phase \in {"intent", "git"}
+FailWrite(w) == /\ ~s[w].ioFailed /\ FaultBudgetAvailable(w)
+                /\ s[w].phase \in {"intent", "git", "follow-up-pending"}
                 /\ s' = [s EXCEPT ![w].ioFailed = TRUE,
                                       ![w].failures = @ + 1]
 RecoverIO(w) == /\ s[w].ioFailed /\ s' = [s EXCEPT ![w].ioFailed = FALSE]
@@ -112,8 +121,9 @@ VersionTransition(w) == /\ ~s[w].badVersion
 Next == \E w \in Works:
     Intake(w) \/ Authorize(w) \/ Dispatch(w) \/ Deliver(w) \/ Writer(w)
     \/ Review(w) \/ TargetedReview(w) \/ Tester(w) \/ LearnCapture(w)
-    \/ LearnNoExpertise(w) \/ Ready(w) \/ ReviewOnlyStart(w) \/ Intent(w)
-    \/ GitEffect(w) \/ PublishResult(w) \/ FollowUp(w) \/ RetryEffect(w)
+    \/ LearnNoExpertise(w) \/ Ready(w) \/ LandingVerify(w)
+    \/ ReviewOnlyStart(w) \/ Intent(w) \/ GitEffect(w) \/ PublishResult(w)
+    \/ FollowUpStart(w) \/ FollowUp(w) \/ RetryEffect(w)
     \/ Observe(w) \/ Cleanup(w) \/ Cancel(w) \/ ReplaceGeneration(w)
     \/ Resume(w) \/ Crash(w) \/ Recover(w) \/ FailWrite(w)
     \/ RecoverIO(w) \/ VersionTransition(w)
@@ -124,10 +134,11 @@ FairSpec == Spec /\ (\A w \in Works: WF_vars(Recover(w))
 
 InputSafe == \A w \in Works:
     s[w].phase \notin {"written", "reviewed", "tested", "learned", "ready",
-                       "intent", "git", "published", "follow-up"} \/ s[w].delivered
+                       "verified", "intent", "git", "published", "follow-up-pending",
+                       "follow-up"} \/ s[w].delivered
 EvidenceSafe == \A w \in Works:
-    s[w].phase \notin {"tested", "learned", "ready", "intent", "git",
-                       "published", "follow-up"} \/ s[w].credit
+    s[w].phase \notin {"tested", "learned", "ready", "verified", "intent", "git",
+                       "published", "follow-up-pending", "follow-up"} \/ s[w].credit
 ResumeSafe == \A w \in Works: ~s[w].badResume
 OneEffect == \A w \in Works: s[w].effects <= 1
 ObservationSafe == \A w \in Works:

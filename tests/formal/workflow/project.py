@@ -21,6 +21,18 @@ def exact_keys(value, keys, label):
     require(type(value) is dict and set(value) == set(keys), f"{label}: invalid fields")
 
 
+def unique_object(pairs):
+    value = {}
+    for key, item in pairs:
+        require(key not in value, f"duplicate JSON key: {key}")
+        value[key] = item
+    return value
+
+
+def load_json(data):
+    return json.loads(data, object_pairs_hook=unique_object)
+
+
 def attempt(work):
     require(type(work) is dict and type(work.get("attempts")) is list,
             "work snapshot lacks attempts")
@@ -78,7 +90,8 @@ def project(trace, root):
             require(facts["exit-code"] != 0 and type(facts["stderr"]) is str
                     and type(facts["stdout"]) is str, "run refusal not observed")
         name = ("intake.json", "planned.json", "canceled.json", "refused.json")[index]
-        require(facts["work"] == json.loads((root / name).read_text()),
+        require(type(facts["work"]) is dict and
+                facts["work"] == load_json((root / name).read_text()),
                 "raw snapshot differs from artifact")
         snapshots.append(facts["work"])
     work_id = snapshots[0].get("id")
@@ -86,10 +99,13 @@ def project(trace, root):
             "work identity changed")
     require(attempt(snapshots[0]) == [], "intake already has attempt")
     first = attempt(snapshots[1])
-    require(len(first) == 1 and first[0].get("id") == "attempt-1"
+    require(len(first) == 1 and type(first[0]) is dict
+            and first[0].get("id") == "attempt-1"
             and first[0].get("status") == "planned", "attempt creation did not plan once")
     canceled = attempt(snapshots[2])
-    require(len(canceled) == 1 and canceled[0].get("id") == "attempt-1"
+    require(len(canceled) == 1 and type(canceled[0]) is dict
+            and type(canceled[0].get("cancellation")) is dict
+            and canceled[0].get("id") == "attempt-1"
             and canceled[0].get("status") == "needs-user"
             and canceled[0].get("cancellation", {}).get("requested_at") is not None,
             "cancellation did not suspend current attempt")
@@ -101,7 +117,7 @@ def project(trace, root):
 def main():
     try:
         path = Path(sys.argv[1]).resolve()
-        print(json.dumps(project(json.loads(path.read_text()), path.parent), sort_keys=True))
+        print(json.dumps(project(load_json(path.read_text()), path.parent), sort_keys=True))
     except (TraceError, OSError, ValueError, IndexError) as error:
         print(f"trace violation: {error}", file=sys.stderr)
         return 1

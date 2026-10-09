@@ -75,10 +75,13 @@ def main():
     command = ["cargo", "nextest", "run", "--offline", "--features", "test-support",
                "--test", "workflow_assurance", "--no-tests", "fail",
                "workflow_foundation_public_trace"]
+    trace_path = output / "production-trace.json"
+    for name in ("production-trace.json", "intake.json", "planned.json",
+                 "canceled.json", "refused.json"):
+        (output / name).unlink(missing_ok=True)
     fixture = subprocess.run(command, cwd=root, capture_output=True, text=True)
     (output / "production-fixture.log").write_text("$ " + " ".join(command) + "\n"
                                                     + fixture.stdout + fixture.stderr)
-    trace_path = output / "production-trace.json"
     fixture_ok = fixture.returncode == 0 and trace_path.is_file()
     results.append({"case": "fresh-production-fixture", "pass": fixture_ok,
                     "log": "production-fixture.log"})
