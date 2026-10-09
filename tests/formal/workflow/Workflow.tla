@@ -28,6 +28,7 @@ Init == s = [w \in Works |->
     [phase |-> "new", required |-> TRUE, delivered |-> FALSE,
      rawEvidence |-> FALSE, credit |-> FALSE,
      canceled |-> FALSE, authority |-> 0, generation |-> 1,
+     serviceOwner |-> "none", version |-> 1,
      failures |-> 0, failed |-> FALSE, ioFailed |-> FALSE,
      effects |-> 0, observed |-> "none", cleaned |-> FALSE,
      pending |-> FALSE, published |-> FALSE, git |-> FALSE,
@@ -38,7 +39,8 @@ Authorize(w) == /\ s[w].phase = "intake" /\ ~s[w].failed
                 /\ s' = [s EXCEPT ![w].phase = "authorized"]
 Dispatch(w) == /\ w \notin ReviewOnly /\ s[w].phase = "authorized"
                /\ ~s[w].failed /\ ~s[w].canceled
-               /\ s' = [s EXCEPT ![w].phase = "dispatched"]
+               /\ s' = [s EXCEPT ![w].phase = "dispatched",
+                                     ![w].serviceOwner = ServiceId(s[w].generation)]
 Deliver(w) == /\ s[w].phase = "dispatched" /\ ~s[w].failed
               /\ ~s[w].canceled
               /\ s' = [s EXCEPT ![w].phase = "delivered",
@@ -103,7 +105,8 @@ Cancel(w) == /\ ~s[w].canceled /\ ~s[w].git
              /\ s' = [s EXCEPT ![w].canceled = TRUE,
                                    ![w].authority = s[w].generation]
 ReplaceGeneration(w) == /\ s[w].canceled /\ s[w].generation = 1
-                        /\ s' = [s EXCEPT ![w].generation = 2]
+                        /\ s' = [s EXCEPT ![w].generation = 2,
+                                              ![w].serviceOwner = ServiceId(2)]
 Resume(w) == /\ s[w].canceled
              /\ (s[w].authority = s[w].generation \/ ~FenceResume)
              /\ s' = [s EXCEPT ![w].canceled = FALSE,
@@ -114,17 +117,21 @@ FaultBudgetAvailable(w) ==
 Crash(w) == /\ ~s[w].failed /\ FaultBudgetAvailable(w)
             /\ s[w].phase \notin {"new", "follow-up"}
             /\ s' = [s EXCEPT ![w].failed = TRUE,
+                                  ![w].serviceOwner = "none",
                                   ![w].failures = @ + 1]
-Recover(w) == /\ s[w].failed /\ s' = [s EXCEPT ![w].failed = FALSE]
+Recover(w) == /\ s[w].failed
+              /\ s' = [s EXCEPT ![w].failed = FALSE,
+                                    ![w].serviceOwner = ServiceId(s[w].generation)]
 FailWrite(w) == /\ ~s[w].ioFailed /\ FaultBudgetAvailable(w)
                 /\ s[w].phase \in {"intent", "git", "follow-up-pending"}
                 /\ s' = [s EXCEPT ![w].ioFailed = TRUE,
                                       ![w].failures = @ + 1]
 RecoverIO(w) == /\ s[w].ioFailed /\ s' = [s EXCEPT ![w].ioFailed = FALSE]
-VersionTransition(w) == /\ ~s[w].badVersion
+VersionTransition(w) == /\ s[w].version = 1 /\ ~s[w].badVersion
                         /\ (s[w].phase \in {"new", "follow-up"} \/ ~GuardVersion)
                         /\ s' = [s EXCEPT ![w].badVersion =
-                                      s[w].phase \notin {"new", "follow-up"}]
+                                      s[w].phase \notin {"new", "follow-up"},
+                                      ![w].version = 2]
 
 Next == \E w \in Works:
     Intake(w) \/ Authorize(w) \/ Dispatch(w) \/ Deliver(w) \/ Writer(w)
@@ -157,6 +164,9 @@ VersionSafe == \A w \in Works: ~s[w].badVersion
 PublicationSafe == \A w \in Works:
     (s[w].published => s[w].git) /\ (s[w].git => s[w].pending \/ s[w].published)
 CancellationSafe == \A w \in Works: s[w].canceled => ~s[w].git
+OwnershipSafe == \A w \in Works:
+    w \in ReviewOnly \/ s[w].phase \in {"new", "intake", "authorized"}
+    \/ s[w].failed \/ s[w].serviceOwner = ServiceId(s[w].generation)
 
 \* Progress depends on a finite failure budget, enabled recovery, and a
 \* continuing public scheduler/operator. FairSpec states only local recovery
