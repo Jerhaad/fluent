@@ -5737,6 +5737,7 @@ exactly one pending unreviewed Merge Candidate still identifies the clean
 candidate HEAD, and no Learner run is live, THE SYSTEM SHALL append a resume
 dispatch bound to that Attempt.
 Test: tests/binary.rs (learner_terminal_history_queue_resume_accepts_superseded)
+Test: src/queue.rs (resume_queues_and_claims_only_the_retryable_failed_learner)
 
 ### B2m
 
@@ -5744,6 +5745,7 @@ WHEN the scheduler runs the resume dispatch from B2l, THE SYSTEM SHALL retry
 only the Learner and preserve the Writer, Tester, reviewer, and Merge Candidate
 records.
 Test: tests/binary.rs (learner_terminal_history_scheduler_retries_only_learner)
+Test: tests/binary.rs (scheduler_resume_retries_only_a_failed_learner)
 
 ### B2n
 
@@ -9421,7 +9423,8 @@ Test: tests/binary.rs (learner_retry_completes_existing_record_idempotently)
 
 WHEN `fluent attempt run <work-item-id> <attempt-id>` is invoked for an
 otherwise complete code-producing Attempt whose learning record is failed with
-a relaunchable disposition,
+a relaunchable disposition and whose Task history contains Complete Tasks and
+valid Superseded terminal history,
 THE SYSTEM SHALL retry only the Learner and its candidate or handoff
 bookkeeping without rerunning the Writer, Tester, or reviewers.
 Test: tests/binary.rs (learner_terminal_history_foreground_retries_only_learner)

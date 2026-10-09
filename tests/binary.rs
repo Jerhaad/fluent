@@ -32154,108 +32154,177 @@ fn scheduler_resume_retries_only_a_failed_learner() {
     assert_eq!(dispatches[1]["resume_of_dispatch_id"], "dispatch-1");
 }
 
-fn learner_terminal_history_fixture(tmp: &TempDir) -> (PathBuf, PathBuf, Vec<u8>) {
+fn learner_terminal_history_fixture(tmp: &TempDir) -> (PathBuf, String, PathBuf, Vec<u8>) {
     learner_terminal_history_fixture_with_mode(tmp, false)
 }
 
 fn learner_terminal_history_fixture_with_mode(
     tmp: &TempDir,
     no_expertise: bool,
-) -> (PathBuf, PathBuf, Vec<u8>) {
+) -> (PathBuf, String, PathBuf, Vec<u8>) {
     use fluent::work_model::*;
 
-    let project = setup_git_project(tmp);
-    let bin = tmp.path().join("bin-terminal-learner");
+    let fixture = writer_recovery_fixture_with_authority(tmp, false);
+    let store = WorkModelStore::new(&fixture.project);
+    store
+        .mutate_work_item(&fixture.work, |item| {
+            let attempt = &mut item.attempts[0];
+            // This fixture's synthetic behavior has no canonical Tester command.
+            attempt
+                .writer_completion_contract
+                .as_mut()
+                .unwrap()
+                .requirements[0]
+                .verification_refs =
+                vec!["Untestable: fixture candidate has no product behavior".into()];
+            let mut stale = attempt.tasks[1].clone();
+            stale.id = "attempt-1-write-3".into();
+            stale.status = TaskStatus::Planned;
+            stale.artifact_area = Some(TaskArtifactArea {
+                path: work_artifact_path(&fixture.work, "attempt-1", &stale.id),
+            });
+            attempt.tasks.push(stale);
+            if no_expertise {
+                item.learner_mode = LearnerMode::NoExpertise;
+            }
+            Ok(())
+        })
+        .unwrap();
+    fluent_cmd()
+        .current_dir(&fixture.project)
+        .args([
+            "attempt",
+            "repair-writer-completion",
+            &fixture.work,
+            "attempt-1",
+            "--resolution",
+            &fixture.resolution,
+        ])
+        .assert()
+        .success();
+    let recovered = store.read_work_item(&fixture.work).unwrap();
+    assert_eq!(
+        recovered.attempts[0].tasks[2].status,
+        TaskStatus::Superseded
+    );
+    store
+        .mutate_work_item(&fixture.work, |item| {
+            let attempt = &mut item.attempts[0];
+            attempt.tasks[1].status = TaskStatus::Complete;
+            attempt.tasks[1].output = attempt.tasks[0].output.clone();
+            item.add_review_tasks("attempt-1", &fluent::review::REVIEWERS)?;
+            let attempt = &mut item.attempts[0];
+            for task in attempt
+                .tasks
+                .iter_mut()
+                .filter(|task| task.kind == TaskKind::Review)
+            {
+                task.status = TaskStatus::Complete;
+            }
+            attempt.status = AttemptStatus::Complete;
+            attempt.pause_kind = None;
+            attempt.review_state = Some(AttemptReviewState::Passed);
+            item.create_or_get_merge_candidate("attempt-1")?;
+            Ok(())
+        })
+        .unwrap();
+    let ready = store.read_work_item(&fixture.work).unwrap();
+    for task in ready.attempts[0]
+        .tasks
+        .iter()
+        .filter(|task| task.kind == TaskKind::Review)
+    {
+        let path = fixture
+            .project
+            .join(&task.artifact_area.as_ref().unwrap().path)
+            .join("review.md");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "Verdict: pass\n\nRecovered candidate reviewed.\n").unwrap();
+    }
+    let history = fixture
+        .project
+        .join(
+            &ready.attempts[0].tasks[2]
+                .artifact_area
+                .as_ref()
+                .unwrap()
+                .path,
+        )
+        .join("history.txt");
+    fs::create_dir_all(history.parent().unwrap()).unwrap();
+    let bytes = b"preserve superseded Writer evidence\n".to_vec();
+    fs::write(history, &bytes).unwrap();
+    let bin = tmp.path().join("bin-recovered-learner");
     if no_expertise {
         write_mock_claude(&bin, &learner_failing_mock_script());
     } else {
         write_scheduler_claude(&bin, &learner_failing_mock_script());
     }
-    let mut create = fluent_cmd();
-    create.current_dir(&project).args([
-        "work-item",
-        "create",
-        "work-1",
-        "--title",
-        "Learner history",
-    ]);
-    if no_expertise {
-        create.args(["--learner-mode", "no-expertise"]);
-    }
-    create.assert().success();
     fluent_cmd()
-        .current_dir(&project)
-        .args(["queue", "add", "work-1"])
+        .current_dir(&fixture.project)
+        .env("PATH", mock_path(&bin))
+        .args(["attempt", "run", &fixture.work, "attempt-1", "--no-sandbox"])
         .assert()
         .success();
-    run_scheduler_until_dispatch_status(&project, "work-1", &bin, "blocked");
-
-    let store = WorkModelStore::new(&project);
-    store
-        .mutate_work_item("work-1", |item| {
-            let attempt = &mut item.attempts[0];
-            let mut history = attempt.tasks[0].clone();
-            history.id = "attempt-1-write-superseded-history".into();
-            history.status = TaskStatus::Superseded;
-            history.output = None;
-            history.started_at = None;
-            history.completed_at = Some(now_iso8601());
-            history.artifact_area = Some(TaskArtifactArea {
-                path: ".fluent/work/artifacts/work-1/attempt-1/attempt-1-write-superseded-history"
-                    .into(),
-            });
-            attempt.tasks.insert(0, history);
-            Ok(())
-        })
-        .unwrap();
-    let history = project.join(
-        ".fluent/work/artifacts/work-1/attempt-1/attempt-1-write-superseded-history/history.txt",
+    let failed = store.read_work_item(&fixture.work).unwrap();
+    assert!(
+        failed.attempts[0]
+            .learning
+            .as_ref()
+            .is_some_and(AttemptLearning::is_failed)
     );
-    fs::create_dir_all(history.parent().unwrap()).unwrap();
-    let bytes = b"preserve superseded Writer evidence\n".to_vec();
-    fs::write(&history, &bytes).unwrap();
-    (project, bin, bytes)
+    (fixture.project, fixture.work, bin, bytes)
+}
+
+#[test]
+fn learner_terminal_history_completion_recovery_reaches_learner() {
+    let tmp = TempDir::new().unwrap();
+    let (project, work, _, _) = learner_terminal_history_fixture(&tmp);
+    let shown = read_work_show_json(&project, &work);
+    assert_eq!(shown["attempts"][0]["tasks"][2]["status"], "superseded");
+    assert_eq!(shown["attempts"][0]["learning"]["status"], "failed");
+    assert_eq!(shown["attempts"][0]["learning"]["runs"], 1);
 }
 
 #[test]
 fn learner_terminal_history_queue_resume_accepts_superseded() {
     let tmp = TempDir::new().unwrap();
-    let (project, _, _) = learner_terminal_history_fixture(&tmp);
-    let shown = read_work_show_json(&project, "work-1");
+    let (project, work, _, _) = learner_terminal_history_fixture(&tmp);
+    let shown = read_work_show_json(&project, &work);
     assert_eq!(
         shown["next-action"],
-        "fluent queue resume work-1 --attempt attempt-1"
+        format!("fluent queue resume {work} --attempt attempt-1")
     );
     fluent_cmd()
         .current_dir(&project)
-        .args(["queue", "resume", "work-1", "--attempt", "attempt-1"])
+        .args(["queue", "resume", &work, "--attempt", "attempt-1"])
         .assert()
         .success();
-    let ledger = read_json_path(&queue_ledger_path(&project, "work-1"));
-    assert_eq!(ledger["dispatches"][1]["status"], "queued");
-    assert_eq!(ledger["dispatches"][1]["bound_attempt_id"], "attempt-1");
+    let ledger = read_json_path(&queue_ledger_path(&project, &work));
+    assert_eq!(ledger["dispatches"][0]["status"], "queued");
+    assert_eq!(ledger["dispatches"][0]["bound_attempt_id"], "attempt-1");
 }
 
 #[test]
 fn learner_terminal_history_claim_revalidates_current_tasks() {
     let tmp = TempDir::new().unwrap();
-    let (project, _, _) = learner_terminal_history_fixture(&tmp);
+    let (project, work, _, _) = learner_terminal_history_fixture(&tmp);
     fluent_cmd()
         .current_dir(&project)
-        .args(["queue", "resume", "work-1", "--attempt", "attempt-1"])
+        .args(["queue", "resume", &work, "--attempt", "attempt-1"])
         .assert()
         .success();
     let store = fluent::work_model::WorkModelStore::new(&project);
     let path = store
-        .work_task_path("work-1", "attempt-1", "attempt-1-write-superseded-history")
+        .work_task_path(&work, "attempt-1", "attempt-1-write-3")
         .unwrap();
     let mut task = read_json_path(&path);
     task["status"] = "planned".into();
     write_json_path(&path, &task);
-    let before = fs::read(queue_ledger_path(&project, "work-1")).unwrap();
-    assert!(fluent::queue::claim(&project, "work-1", "attempt-1").is_err());
+    let before = fs::read(queue_ledger_path(&project, &work)).unwrap();
+    assert!(fluent::queue::claim(&project, &work, "attempt-1").is_err());
     assert_eq!(
-        fs::read(queue_ledger_path(&project, "work-1")).unwrap(),
+        fs::read(queue_ledger_path(&project, &work)).unwrap(),
         before
     );
 }
@@ -32263,16 +32332,16 @@ fn learner_terminal_history_claim_revalidates_current_tasks() {
 #[test]
 fn learner_terminal_history_foreground_retries_only_learner() {
     let tmp = TempDir::new().unwrap();
-    let (project, bin, bytes) = learner_terminal_history_fixture(&tmp);
-    let before = read_work_show_json(&project, "work-1");
+    let (project, work, bin, bytes) = learner_terminal_history_fixture(&tmp);
+    let before = read_work_show_json(&project, &work);
     write_scheduler_claude(&bin, learner_only_success_mock_script());
     fluent_cmd()
         .current_dir(&project)
         .env("PATH", mock_path(&bin))
-        .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
+        .args(["attempt", "run", &work, "attempt-1", "--no-sandbox"])
         .assert()
         .success();
-    let after = read_work_show_json(&project, "work-1");
+    let after = read_work_show_json(&project, &work);
     assert_eq!(
         after["attempts"][0]["tasks"],
         before["attempts"][0]["tasks"]
@@ -32283,9 +32352,9 @@ fn learner_terminal_history_foreground_retries_only_learner() {
     );
     assert_eq!(after["attempts"][0]["learning"]["status"], "succeeded");
     assert_eq!(
-        fs::read(project.join(
-            ".fluent/work/artifacts/work-1/attempt-1/attempt-1-write-superseded-history/history.txt"
-        ))
+        fs::read(project.join(format!(
+            ".fluent/work/artifacts/{work}/attempt-1/attempt-1-write-3/history.txt"
+        )))
         .unwrap(),
         bytes
     );
@@ -32294,16 +32363,16 @@ fn learner_terminal_history_foreground_retries_only_learner() {
 #[test]
 fn learner_terminal_history_scheduler_retries_only_learner() {
     let tmp = TempDir::new().unwrap();
-    let (project, bin, bytes) = learner_terminal_history_fixture(&tmp);
-    let before = read_work_show_json(&project, "work-1");
+    let (project, work, bin, bytes) = learner_terminal_history_fixture(&tmp);
+    let before = read_work_show_json(&project, &work);
     write_scheduler_claude(&bin, learner_only_success_mock_script());
     fluent_cmd()
         .current_dir(&project)
-        .args(["queue", "resume", "work-1", "--attempt", "attempt-1"])
+        .args(["queue", "resume", &work, "--attempt", "attempt-1"])
         .assert()
         .success();
-    run_scheduler_until_dispatch_status(&project, "work-1", &bin, "candidate-ready");
-    let after = read_work_show_json(&project, "work-1");
+    run_scheduler_until_dispatch_status(&project, &work, &bin, "candidate-ready");
+    let after = read_work_show_json(&project, &work);
     assert_eq!(
         after["attempts"][0]["tasks"],
         before["attempts"][0]["tasks"]
@@ -32318,27 +32387,27 @@ fn learner_terminal_history_scheduler_retries_only_learner() {
     );
     assert_eq!(after["attempts"][0]["learning"]["status"], "succeeded");
     assert_eq!(
-        fs::read(project.join(
-            ".fluent/work/artifacts/work-1/attempt-1/attempt-1-write-superseded-history/history.txt"
-        ))
+        fs::read(project.join(format!(
+            ".fluent/work/artifacts/{work}/attempt-1/attempt-1-write-3/history.txt"
+        )))
         .unwrap(),
         bytes
     );
 }
 
 #[test]
-fn learner_terminal_history_no_expertise_preserves_candidate_on_retry_failure() {
+fn learner_terminal_history_no_expertise_retries_only_learner() {
     let tmp = TempDir::new().unwrap();
-    let (project, bin, bytes) = learner_terminal_history_fixture_with_mode(&tmp, true);
-    let before = read_work_show_json(&project, "work-1");
+    let (project, work, bin, bytes) = learner_terminal_history_fixture_with_mode(&tmp, true);
+    let before = read_work_show_json(&project, &work);
     write_mock_claude(&bin, learner_only_success_mock_script());
     fluent_cmd()
         .current_dir(&project)
         .env("PATH", mock_path(&bin))
-        .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
+        .args(["attempt", "run", &work, "attempt-1", "--no-sandbox"])
         .assert()
         .success();
-    let after = read_work_show_json(&project, "work-1");
+    let after = read_work_show_json(&project, &work);
     assert_eq!(
         after["attempts"][0]["tasks"],
         before["attempts"][0]["tasks"]
@@ -32347,12 +32416,20 @@ fn learner_terminal_history_no_expertise_preserves_candidate_on_retry_failure() 
         after["merge_candidates"][0]["id"],
         before["merge_candidates"][0]["id"]
     );
-    assert_eq!(after["attempts"][0]["learning"]["status"], "failed");
+    assert_eq!(after["learner_mode"], "no-expertise");
+    assert_eq!(
+        after["attempts"][0]["learning"]["status"],
+        if real_sandbox_exec_is_usable() {
+            "succeeded"
+        } else {
+            "failed"
+        }
+    );
     assert_eq!(after["attempts"][0]["learning"]["runs"], 2);
     assert_eq!(
-        fs::read(project.join(
-            ".fluent/work/artifacts/work-1/attempt-1/attempt-1-write-superseded-history/history.txt"
-        ))
+        fs::read(project.join(format!(
+            ".fluent/work/artifacts/{work}/attempt-1/attempt-1-write-3/history.txt"
+        )))
         .unwrap(),
         bytes
     );
@@ -32361,10 +32438,10 @@ fn learner_terminal_history_no_expertise_preserves_candidate_on_retry_failure() 
 #[test]
 fn learner_terminal_history_preserves_rejection_guards() {
     let tmp = TempDir::new().unwrap();
-    let (project, _, _) = learner_terminal_history_fixture(&tmp);
+    let (project, work, _, _) = learner_terminal_history_fixture(&tmp);
     let store = fluent::work_model::WorkModelStore::new(&project);
     let path = store
-        .work_task_path("work-1", "attempt-1", "attempt-1-write-superseded-history")
+        .work_task_path(&work, "attempt-1", "attempt-1-write-3")
         .unwrap();
     let original = fs::read(&path).unwrap();
     for status in ["planned", "failed", "executing"] {
@@ -32374,7 +32451,7 @@ fn learner_terminal_history_preserves_rejection_guards() {
         let before = snapshot_tree(&project.join(".fluent/work"));
         fluent_cmd()
             .current_dir(&project)
-            .args(["queue", "resume", "work-1", "--attempt", "attempt-1"])
+            .args(["queue", "resume", &work, "--attempt", "attempt-1"])
             .assert()
             .failure();
         assert_eq!(snapshot_tree(&project.join(".fluent/work")), before);
@@ -32394,7 +32471,7 @@ fn learner_terminal_history_preserves_rejection_guards() {
         .current_dir(&project)
         .env("PATH", mock_path(&bin))
         .env("LEARNER_HISTORY_LAUNCH_MARKER", &marker)
-        .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
+        .args(["attempt", "run", &work, "attempt-1", "--no-sandbox"])
         .assert()
         .failure();
     assert!(!marker.exists());
@@ -32402,16 +32479,35 @@ fn learner_terminal_history_preserves_rejection_guards() {
     fs::write(&path, &original).unwrap();
     let mut invalid: serde_json::Value = serde_json::from_slice(&original).unwrap();
     invalid["output"] =
-        read_work_show_json(&project, "work-1")["attempts"][0]["tasks"][1]["output"].clone();
+        read_work_show_json(&project, &work)["attempts"][0]["tasks"][1]["output"].clone();
     write_json_path(&path, &invalid);
     let before = snapshot_tree(&project.join(".fluent/work"));
     fluent_cmd()
         .current_dir(&project)
-        .args(["queue", "resume", "work-1", "--attempt", "attempt-1"])
+        .args(["queue", "resume", &work, "--attempt", "attempt-1"])
         .assert()
         .failure();
     assert_eq!(snapshot_tree(&project.join(".fluent/work")), before);
     fs::write(&path, original).unwrap();
+    store
+        .mutate_work_item(&work, |item| {
+            let attempt = &mut item.attempts[0];
+            let mut forged = attempt.tasks[2].clone();
+            forged.id = "attempt-1-write-forged-history".into();
+            forged.artifact_area = Some(fluent::work_model::TaskArtifactArea {
+                path: fluent::work_model::work_artifact_path(&work, "attempt-1", &forged.id),
+            });
+            attempt.tasks.insert(2, forged);
+            Ok(())
+        })
+        .unwrap();
+    let before = snapshot_tree(&project.join(".fluent/work"));
+    fluent_cmd()
+        .current_dir(&project)
+        .args(["queue", "resume", &work, "--attempt", "attempt-1"])
+        .assert()
+        .failure();
+    assert_eq!(snapshot_tree(&project.join(".fluent/work")), before);
 }
 
 #[test]

@@ -1,17 +1,143 @@
 //! Validate recorded Writer-completion authority without lifecycle mutation.
 use crate::{
     follow_up::content_digest,
-    work_model::{ArtifactRef, TaskKind, TaskStatus, work_artifact_path},
+    work_model::{
+        ArtifactRef, Attempt, RecoveryOperationRequest, TaskKind, TaskStatus, work_artifact_path,
+    },
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{fs, path::Path};
+use std::{collections::BTreeSet, fs, path::Path};
 
 pub(crate) const SCHEMA_VERSION: u32 = 1;
 pub(crate) const PRODUCER: &str = "writer-completion-recovery";
 const MAX_RESOLUTION_BYTES: usize = 4_096;
 const INSTRUCTIONS_MARKER: &str = "Fluent writer-completion recovery";
+
+/// Admit terminal Superseded Tasks only when a completed replacement still
+/// carries the exact authority and operation written by completion recovery.
+pub(crate) fn validate_terminal_superseded_history(
+    project_root: &Path,
+    attempt: &Attempt,
+    work_item_id: &str,
+) -> Result<()> {
+    let actual = attempt
+        .tasks
+        .iter()
+        .filter(|task| task.status == TaskStatus::Superseded)
+        .map(|task| task.id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut authorized = BTreeSet::new();
+    for reference in attempt
+        .artifacts
+        .iter()
+        .filter(|reference| reference.producer_id == PRODUCER)
+    {
+        let path =
+            crate::recovery_contracts::resolve_input_artifact_path(project_root, &reference.path)?;
+        let canonical = fs::canonicalize(&path)?;
+        anyhow::ensure!(
+            canonical.starts_with(fs::canonicalize(project_root)?) && canonical.is_file(),
+            "Writer-completion recovery authority must be a project file"
+        );
+        anyhow::ensure!(
+            fs::metadata(&canonical)?.len() <= 64 * 1024,
+            "Writer-completion recovery authority exceeds 65536 bytes"
+        );
+        let bytes = fs::read(&canonical)?;
+        let authority: RecoveryAuthority = serde_json::from_slice(&bytes)
+            .context("parse terminal Writer-completion recovery authority")?;
+        anyhow::ensure!(
+            bytes == serde_json::to_vec_pretty(&authority)?,
+            "Writer-completion recovery authority bytes changed"
+        );
+        anyhow::ensure!(
+            authority.schema_version == SCHEMA_VERSION
+                && authority.work_item_id == work_item_id
+                && authority.attempt_id == attempt.id
+                && authority.resolution == normalize_resolution(&authority.resolution)?
+                && authority.resolution_sha256 == content_digest(authority.resolution.as_bytes())
+                && reference.path
+                    == work_artifact_path(
+                        work_item_id,
+                        &attempt.id,
+                        &format!(
+                            "writer-completion-recoveries/{}/recovery.json",
+                            authority.task_id
+                        )
+                    ),
+            "Writer-completion recovery authority does not match this Attempt"
+        );
+        let source_index = attempt
+            .tasks
+            .iter()
+            .position(|task| task.id == authority.source_writer_task_id)
+            .context("Writer-completion recovery source Writer is missing")?;
+        let replacement_index = attempt
+            .tasks
+            .iter()
+            .position(|task| task.id == authority.task_id)
+            .context("Writer-completion recovery replacement Writer is missing")?;
+        let source = &attempt.tasks[source_index];
+        let replacement = &attempt.tasks[replacement_index];
+        let output = source
+            .output
+            .as_ref()
+            .context("Writer-completion recovery source has no output")?;
+        anyhow::ensure!(
+            source_index < replacement_index
+                && source.kind == TaskKind::Write
+                && source.status == TaskStatus::Complete
+                && output.commit == authority.candidate_commit
+                && output.base_commit == authority.protected_base_commit
+                && replacement.kind == TaskKind::Write
+                && replacement.status == TaskStatus::Complete
+                && replacement.input_artifacts.contains(reference),
+            "Writer-completion recovery source or completed replacement changed"
+        );
+        let request = RecoveryOperationRequest::new(
+            PRODUCER,
+            work_item_id,
+            &attempt.id,
+            Some(authority.candidate_commit.clone()),
+            Some(authority.task_id.clone()),
+            None,
+            Some(output.workspace_path.clone()),
+            Some(authority.resolution.clone()),
+            Some(format!(
+                "sha256:{:x}",
+                Sha256::digest(serde_json::to_vec(&authority)?)
+            )),
+        );
+        anyhow::ensure!(
+            attempt
+                .recovery_operations
+                .iter()
+                .any(|record| record.matches_request(&request)),
+            "Writer-completion recovery has no matching recorded operation"
+        );
+        for id in &authority.superseded_task_ids {
+            let index = attempt
+                .tasks
+                .iter()
+                .position(|task| task.id == *id)
+                .context("Writer-completion recovery Superseded Task is missing")?;
+            let task = &attempt.tasks[index];
+            anyhow::ensure!(
+                index > replacement_index
+                    && task.status == TaskStatus::Superseded
+                    && authorized.insert(id.clone()),
+                "Writer-completion recovery Superseded Task changed or was authorized twice"
+            );
+        }
+    }
+    anyhow::ensure!(
+        actual == authorized,
+        "Superseded Task history has no matching completed recovery authority"
+    );
+    Ok(())
+}
 
 /// Instructions and exact files admitted by the recovery owner. Callers must
 /// not turn a filename or a Task instruction into recovery authority.

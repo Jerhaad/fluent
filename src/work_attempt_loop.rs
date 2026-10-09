@@ -1679,6 +1679,7 @@ fn run_attempt_inner(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunR
                     .is_some_and(|learning| learning.is_failed())
                 {
                     crate::lifecycle_recovery::inspect_learner_terminal_history(
+                        Some(config.project_root),
                         &item.attempts[attempt_index],
                         &item.id,
                     )?;

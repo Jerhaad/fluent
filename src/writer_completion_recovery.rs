@@ -1509,7 +1509,12 @@ mod tests {
         attempt.status = AttemptStatus::Complete;
         attempt.pause_kind = None;
         attempt.review_state = Some(AttemptReviewState::Passed);
-        crate::lifecycle_recovery::inspect_learner_terminal_history(&attempt, "work-1").unwrap();
+        crate::lifecycle_recovery::inspect_learner_terminal_history(
+            Some(&fixture.project),
+            &attempt,
+            "work-1",
+        )
+        .unwrap();
     }
 
     #[test]

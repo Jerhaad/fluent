@@ -615,7 +615,7 @@ pub(crate) fn inspect_learner_retry_recovery(
     {
         anyhow::bail!("Attempt {attempt_id:?} is not a completed, review-passed Learner retry");
     }
-    inspect_learner_terminal_history(attempt, &item.id)?;
+    inspect_learner_terminal_history(Some(project_root), attempt, &item.id)?;
     let learning = attempt
         .learning
         .as_ref()
@@ -680,6 +680,7 @@ pub(crate) fn inspect_learner_retry_recovery(
 /// A completed Attempt may retain superseded Tasks from supported recovery.
 /// Validate the Work-model structure before treating that history as terminal.
 pub(crate) fn inspect_learner_terminal_history(
+    project_root: Option<&Path>,
     attempt: &Attempt,
     work_item_id: &str,
 ) -> Result<()> {
@@ -693,6 +694,20 @@ pub(crate) fn inspect_learner_terminal_history(
             "Attempt {:?} still has an active or incomplete Task",
             attempt.id
         );
+    }
+    if attempt
+        .tasks
+        .iter()
+        .any(|task| task.status == TaskStatus::Superseded)
+    {
+        let project_root = project_root.ok_or_else(|| {
+            anyhow::anyhow!("Superseded Task history requires its recovery authority")
+        })?;
+        crate::recovery_contracts::writer_completion::validate_terminal_superseded_history(
+            project_root,
+            attempt,
+            work_item_id,
+        )?;
     }
     Ok(())
 }

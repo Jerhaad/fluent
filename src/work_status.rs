@@ -1150,8 +1150,12 @@ fn derive_other_attempt_recovery_next_action(
             .as_ref()
             .is_some_and(|learning| learning.is_failed() && learning.is_relaunchable())
     {
-        crate::lifecycle_recovery::inspect_learner_terminal_history(attempt, &attempt.work_item_id)
-            .ok()?;
+        crate::lifecycle_recovery::inspect_learner_terminal_history(
+            project_root,
+            attempt,
+            &attempt.work_item_id,
+        )
+        .ok()?;
         return Some(format!(
             "fluent queue resume {} --attempt {}",
             attempt.work_item_id, attempt.id
