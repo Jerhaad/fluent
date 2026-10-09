@@ -21,43 +21,73 @@ DispatchId(w) == <<"dispatch", w>>
 ServiceId(g) == <<"service", g>>
 WorkerId(w, g) == <<"worker", w, g>>
 RecoveryId(w, g) == <<"recovery", w, g>>
+RequirementId(w) == <<"requirement", w, 1>>
+ContextId(w) == <<"context", w, 1>>
+ReviewScope(w) == <<"scope", w, CandidateId(w)>>
+EvidenceId(w, g) == <<"evidence", w, g, CandidateId(w),
+                       RequirementId(w), ContextId(w), ReviewScope(w)>>
+Unowned == <<"service", 0>>
 
 VARIABLE s
 vars == <<s>>
 Init == s = [w \in Works |->
-    [phase |-> "new", required |-> TRUE, delivered |-> FALSE,
-     rawEvidence |-> FALSE, credit |-> FALSE,
+    [phase |-> "new", route |-> IF w \in ReviewOnly THEN "review-only" ELSE "ordinary",
+     attempt |-> AttemptId(w), task |-> TaskId(w),
+     workspace |-> WorkspaceId(w), candidate |-> CandidateId(w),
+     dispatch |-> DispatchId(w), worker |-> WorkerId(w, 1),
+     recovery |-> RecoveryId(w, 1),
+     required |-> {RequirementId(w)}, delivered |-> {},
+     context |-> ContextId(w), reviewScope |-> ReviewScope(w),
+     rawEvidence |-> {}, credit |-> {},
      canceled |-> FALSE, authority |-> 0, generation |-> 1,
-     serviceOwner |-> "none", version |-> 1,
+     serviceOwner |-> Unowned, version |-> 1,
      failures |-> 0, failed |-> FALSE, ioFailed |-> FALSE,
      effects |-> 0, observed |-> "none", cleaned |-> FALSE,
      pending |-> FALSE, published |-> FALSE, git |-> FALSE,
      badResume |-> FALSE, badVersion |-> FALSE]]
 
 Intake(w) == /\ s[w].phase = "new" /\ s' = [s EXCEPT ![w].phase = "intake"]
-Authorize(w) == /\ s[w].phase = "intake" /\ ~s[w].failed
+AttemptCreate(w) == /\ s[w].phase = "intake" /\ ~s[w].canceled
+                    /\ s[w].attempt = AttemptId(w)
+                    /\ s' = [s EXCEPT ![w].phase = "planned"]
+Authorize(w) == /\ s[w].phase \in {"intake", "planned"} /\ ~s[w].failed
+                /\ ~s[w].canceled
                 /\ s' = [s EXCEPT ![w].phase = "authorized"]
 Dispatch(w) == /\ w \notin ReviewOnly /\ s[w].phase = "authorized"
                /\ ~s[w].failed /\ ~s[w].canceled
+               /\ s[w].attempt = AttemptId(w) /\ s[w].task = TaskId(w)
+               /\ s[w].workspace = WorkspaceId(w)
+               /\ s[w].dispatch = DispatchId(w)
                /\ s' = [s EXCEPT ![w].phase = "dispatched",
                                      ![w].serviceOwner = ServiceId(s[w].generation)]
 Deliver(w) == /\ s[w].phase = "dispatched" /\ ~s[w].failed
               /\ ~s[w].canceled
               /\ s' = [s EXCEPT ![w].phase = "delivered",
-                                    ![w].delivered = DeliverInputs]
+                                    ![w].delivered = IF DeliverInputs THEN s[w].required ELSE {}]
 Writer(w) == /\ s[w].phase = "delivered" /\ ~s[w].failed
              /\ ~s[w].canceled
+             /\ s[w].worker = WorkerId(w, s[w].generation)
              /\ s' = [s EXCEPT ![w].phase = "written"]
 Review(w) == /\ s[w].phase = "written" /\ ~s[w].failed
              /\ ~s[w].canceled
              /\ s' = [s EXCEPT ![w].phase = "reviewed",
-                                   ![w].rawEvidence = TRUE,
-                                   ![w].credit = CheckEvidence]
-TargetedReview(w) == /\ s[w].phase = "reviewed" /\ ~s[w].credit
-                     /\ CheckEvidence /\ ~s[w].failed
-                     /\ s' = [s EXCEPT ![w].credit = TRUE]
+                                   ![w].rawEvidence = {EvidenceId(w, s[w].generation)},
+                                   ![w].credit = IF CheckEvidence
+                                       THEN {EvidenceId(w, s[w].generation)} ELSE {}]
+StaleEvidence(w) == /\ s[w].phase = "written" /\ ~s[w].failed
+                   /\ s' = [s EXCEPT ![w].phase = "reviewed",
+                                        ![w].rawEvidence = {EvidenceId(w, 0)}]
+UnrelatedEvidence(w) == /\ s[w].phase = "written" /\ ~s[w].failed
+                       /\ s' = [s EXCEPT ![w].phase = "reviewed",
+                                            ![w].rawEvidence = {<<"evidence", "other">>}]
+TargetedReview(w) == /\ s[w].phase = "reviewed" /\ s[w].credit = {}
+                     /\ CheckEvidence /\ ~s[w].failed /\ ~s[w].canceled
+                     /\ s' = [s EXCEPT ![w].rawEvidence = {EvidenceId(w, s[w].generation)},
+                                           ![w].credit = {EvidenceId(w, s[w].generation)}]
 Tester(w) == /\ s[w].phase = "reviewed" /\ ~s[w].failed
              /\ ~s[w].canceled
+             /\ w \notin ReviewOnly
+             /\ (CheckEvidence => s[w].credit = {EvidenceId(w, s[w].generation)})
              /\ s' = [s EXCEPT ![w].phase = "tested"]
 LearnCapture(w) == /\ s[w].phase = "tested" /\ ~s[w].failed
                    /\ ~s[w].canceled
@@ -72,8 +102,13 @@ LandingVerify(w) == /\ s[w].phase = "ready" /\ ~s[w].failed
 ReviewOnlyStart(w) == /\ w \in ReviewOnly
                       /\ s[w].phase = "authorized" /\ ~s[w].failed
                       /\ ~s[w].canceled
-                      /\ s' = [s EXCEPT ![w].phase = "written",
-                                            ![w].delivered = TRUE]
+                      /\ s' = [s EXCEPT ![w].phase = "reviewed",
+                                            ![w].delivered = s[w].required,
+                                            ![w].rawEvidence = {EvidenceId(w, s[w].generation)},
+                                            ![w].credit = {EvidenceId(w, s[w].generation)}]
+ReviewOnlyReady(w) == /\ w \in ReviewOnly /\ s[w].phase = "reviewed"
+                      /\ ~s[w].failed /\ ~s[w].canceled
+                      /\ s' = [s EXCEPT ![w].phase = "ready"]
 Intent(w) == /\ s[w].phase = "verified" /\ ~s[w].failed
              /\ ~s[w].canceled
              /\ s' = [s EXCEPT ![w].phase = "intent",
@@ -95,17 +130,25 @@ FollowUp(w) == /\ s[w].phase = "follow-up-pending" /\ ~s[w].failed
 RetryEffect(w) == /\ s[w].phase = "git" /\ ~s[w].failed
                   /\ s' = [s EXCEPT ![w].effects = IF GuardEffect THEN @ ELSE @ + 1]
 Observe(w) == /\ s[w].observed = "none"
+              /\ w \notin ReviewOnly
               /\ s' = [s EXCEPT ![w].observed =
                           IF TruthfulObservation THEN s[w].phase ELSE "bad"]
 Cleanup(w) == /\ ~s[w].cleaned
               /\ (s[w].phase = "follow-up" \/ ~GuardCleanup)
               /\ s' = [s EXCEPT ![w].cleaned = TRUE]
-Cancel(w) == /\ ~s[w].canceled /\ ~s[w].git
+Cancel(w) == /\ w \notin ReviewOnly
+             /\ ~s[w].canceled /\ ~s[w].git
              /\ s[w].phase \notin {"new", "published", "follow-up"}
              /\ s' = [s EXCEPT ![w].canceled = TRUE,
                                    ![w].authority = s[w].generation]
 ReplaceGeneration(w) == /\ s[w].canceled /\ s[w].generation = 1
                         /\ s' = [s EXCEPT ![w].generation = 2,
+                                              ![w].phase = IF s[w].credit # {}
+                                                  THEN "reviewed" ELSE @,
+                                              ![w].credit = {},
+                                              ![w].pending = FALSE,
+                                              ![w].worker = WorkerId(w, 2),
+                                              ![w].recovery = RecoveryId(w, 2),
                                               ![w].serviceOwner = ServiceId(2)]
 Resume(w) == /\ s[w].canceled
              /\ (s[w].authority = s[w].generation \/ ~FenceResume)
@@ -114,30 +157,39 @@ Resume(w) == /\ s[w].canceled
 FaultBudgetAvailable(w) ==
     /\ s[w].failures < MaxFailures
     /\ (MaxFailures # 1 \/ \A x \in Works: s[x].failures = 0)
-Crash(w) == /\ ~s[w].failed /\ FaultBudgetAvailable(w)
+Crash(w) == /\ w \notin ReviewOnly
+            /\ ~s[w].failed /\ FaultBudgetAvailable(w)
             /\ s[w].phase \notin {"new", "follow-up"}
             /\ s' = [s EXCEPT ![w].failed = TRUE,
-                                  ![w].serviceOwner = "none",
+                                  ![w].serviceOwner = Unowned,
                                   ![w].failures = @ + 1]
 Recover(w) == /\ s[w].failed
+              /\ s[w].recovery = RecoveryId(w, s[w].generation)
               /\ s' = [s EXCEPT ![w].failed = FALSE,
                                     ![w].serviceOwner = ServiceId(s[w].generation)]
-FailWrite(w) == /\ ~s[w].ioFailed /\ FaultBudgetAvailable(w)
+FailWrite(w) == /\ w \notin ReviewOnly
+                /\ ~s[w].ioFailed /\ FaultBudgetAvailable(w)
                 /\ s[w].phase \in {"intent", "git", "follow-up-pending"}
                 /\ s' = [s EXCEPT ![w].ioFailed = TRUE,
                                       ![w].failures = @ + 1]
 RecoverIO(w) == /\ s[w].ioFailed /\ s' = [s EXCEPT ![w].ioFailed = FALSE]
-VersionTransition(w) == /\ s[w].version = 1 /\ ~s[w].badVersion
-                        /\ (s[w].phase \in {"new", "follow-up"} \/ ~GuardVersion)
+VersionTransition(w) == /\ w \notin ReviewOnly
+                        /\ s[w].version = 1 /\ ~s[w].badVersion
+                        /\ (s[w].phase \in {"new", "follow-up"}
+                            \/ s[w].canceled \/ ~GuardVersion)
                         /\ s' = [s EXCEPT ![w].badVersion =
-                                      s[w].phase \notin {"new", "follow-up"},
+                                      s[w].phase \notin {"new", "follow-up"}
+                                      /\ ~s[w].canceled,
                                       ![w].version = 2]
 
 Next == \E w \in Works:
-    Intake(w) \/ Authorize(w) \/ Dispatch(w) \/ Deliver(w) \/ Writer(w)
-    \/ Review(w) \/ TargetedReview(w) \/ Tester(w) \/ LearnCapture(w)
+    Intake(w) \/ AttemptCreate(w) \/ Authorize(w) \/ Dispatch(w)
+    \/ Deliver(w) \/ Writer(w)
+    \/ Review(w) \/ StaleEvidence(w) \/ UnrelatedEvidence(w)
+    \/ TargetedReview(w) \/ Tester(w) \/ LearnCapture(w)
     \/ LearnNoExpertise(w) \/ Ready(w) \/ LandingVerify(w)
-    \/ ReviewOnlyStart(w) \/ Intent(w) \/ GitEffect(w) \/ PublishResult(w)
+    \/ ReviewOnlyStart(w) \/ ReviewOnlyReady(w)
+    \/ Intent(w) \/ GitEffect(w) \/ PublishResult(w)
     \/ FollowUpStart(w) \/ FollowUp(w) \/ RetryEffect(w)
     \/ Observe(w) \/ Cleanup(w) \/ Cancel(w) \/ ReplaceGeneration(w)
     \/ Resume(w) \/ Crash(w) \/ Recover(w) \/ FailWrite(w)
@@ -150,10 +202,12 @@ FairSpec == Spec /\ (\A w \in Works: WF_vars(Recover(w))
 InputSafe == \A w \in Works:
     s[w].phase \notin {"written", "reviewed", "tested", "learned", "ready",
                        "verified", "intent", "git", "published", "follow-up-pending",
-                       "follow-up"} \/ s[w].delivered
+                       "follow-up"} \/ s[w].required \subseteq s[w].delivered
 EvidenceSafe == \A w \in Works:
     s[w].phase \notin {"tested", "learned", "ready", "verified", "intent", "git",
-                       "published", "follow-up-pending", "follow-up"} \/ s[w].credit
+                       "published", "follow-up-pending", "follow-up"}
+    \/ (s[w].credit = {EvidenceId(w, s[w].generation)}
+        /\ s[w].credit \subseteq s[w].rawEvidence)
 ResumeSafe == \A w \in Works: ~s[w].badResume
 OneEffect == \A w \in Works: s[w].effects <= 1
 ObservationSafe == \A w \in Works:
@@ -165,8 +219,15 @@ PublicationSafe == \A w \in Works:
     (s[w].published => s[w].git) /\ (s[w].git => s[w].pending \/ s[w].published)
 CancellationSafe == \A w \in Works: s[w].canceled => ~s[w].git
 OwnershipSafe == \A w \in Works:
-    w \in ReviewOnly \/ s[w].phase \in {"new", "intake", "authorized"}
+    w \in ReviewOnly \/ s[w].phase \in {"new", "intake", "planned", "authorized"}
     \/ s[w].failed \/ s[w].serviceOwner = ServiceId(s[w].generation)
+IdentitySafe == \A w \in Works:
+    /\ s[w].attempt = AttemptId(w) /\ s[w].task = TaskId(w)
+    /\ s[w].workspace = WorkspaceId(w) /\ s[w].candidate = CandidateId(w)
+    /\ s[w].dispatch = DispatchId(w)
+    /\ s[w].worker = WorkerId(w, s[w].generation)
+    /\ s[w].recovery = RecoveryId(w, s[w].generation)
+    /\ s[w].context = ContextId(w) /\ s[w].reviewScope = ReviewScope(w)
 
 \* Progress depends on a finite failure budget, enabled recovery, and a
 \* continuing public scheduler/operator. FairSpec states only local recovery

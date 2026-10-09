@@ -43,6 +43,38 @@ def run_case(source, output_dir, jar, java, config, expected):
     return {"case": config, "pass": ok, "expected": expected, "log": f"{config}.log"}
 
 
+def run_trace_case(source, output, jar, java, name, states, expect_pass):
+    config = output / f"{name}.cfg"
+    config.write_text("SPECIFICATION TraceSpec\nCONSTANTS\n"
+                      "  Works = {w1}\n  TraceWork = w1\n  ReviewOnly = {}\n  MaxFailures = 0\n"
+                      + "".join(f"  {control} = TRUE\n" for control in
+                                ("DeliverInputs", "CheckEvidence", "FenceResume",
+                                 "GuardEffect", "TruthfulObservation", "GuardCleanup",
+                                 "GuardVersion"))
+                      + "".join(f"  TraceState{i} = {json.dumps(state)}\n"
+                                for i, state in enumerate(states, 1))
+                      + "PROPERTY TraceComplete\n")
+    with tempfile.TemporaryDirectory(prefix="tlc-trace-", dir=output) as metadir:
+        command = [java, "-XX:+UseParallelGC", "-Xmx512m", "-cp", str(jar),
+                   "tlc2.TLC", "-deadlock", "-workers", "1", "-fp", "0",
+                   "-seed", "1", "-metadir", metadir, "-config", str(config),
+                   "Trace.tla"]
+        try:
+            result = subprocess.run(command, cwd=source, capture_output=True,
+                                    text=True, timeout=60)
+            log = result.stdout + result.stderr
+        except subprocess.TimeoutExpired as error:
+            result = None
+            log = f"TLC timed out: {error}\n"
+    (output / f"{name}.log").write_text("$ " + " ".join(command) + "\n" + log)
+    complete = result is not None and "Model checking completed" in log
+    ok = (result.returncode == 0 and complete) if expect_pass else (
+        result is not None and result.returncode != 0 and
+        "Temporal properties were violated" in log and
+        "traceIndex = 3" in log and bool(re.search(r"State \d+: Stuttering", log)))
+    return {"case": name, "pass": ok, "log": f"{name}.log"}
+
+
 def java_21(root):
     candidates = ["java", *map(str, sorted((root / "target/fluent-tools/jdk21").glob(
         "*/Contents/Home/bin/java")))]
@@ -108,16 +140,31 @@ def main():
         valid = bound and projection.returncode == 0
         results.append({"case": "production-projection", "pass": valid,
                         "log": "projection.log"})
+        if valid:
+            states = json.loads(projection.stdout)["states"]
+            results.append(run_trace_case(source, output, jar, java,
+                                          "production-model-path", states, True))
         corrupt = json.loads(json.dumps(trace))
-        corrupt["events"][2]["raw-facts"]["work"]["id"] = "wrong-work"
-        corrupt_path = output / "negative-trace.json"
+        corrupt["events"][3]["raw-facts"]["work"]["attempts"][0]["status"] = "complete"
+        negative_dir = output / "negative-trace"
+        negative_dir.mkdir(exist_ok=True)
+        for name in ("intake.json", "planned.json", "canceled.json"):
+            (negative_dir / name).write_bytes((output / name).read_bytes())
+        refused = json.dumps(corrupt["events"][3]["raw-facts"]["work"]).encode()
+        (negative_dir / "refused.json").write_bytes(refused)
+        corrupt["artifacts"][3]["sha256"] = hashlib.sha256(refused).hexdigest()
+        corrupt_path = negative_dir / "negative-trace.json"
         corrupt_path.write_text(json.dumps(corrupt))
-        negative = subprocess.run(["python3", str(source / "project.py"), str(corrupt_path)],
+        negative = subprocess.run(["python3", str(source / "project.py"), str(corrupt_path),
+                                   "--model-input"],
                                   capture_output=True, text=True)
         (output / "negative-trace.log").write_text(negative.stdout + negative.stderr)
-        results.append({"case": "negative-trace", "pass": negative.returncode != 0 and
-                        "raw snapshot differs from artifact" in negative.stderr,
+        results.append({"case": "negative-trace-projection", "pass": negative.returncode == 0,
                         "log": "negative-trace.log"})
+        if negative.returncode == 0:
+            results.append(run_trace_case(source, output, jar, java,
+                                          "negative-model-path",
+                                          json.loads(negative.stdout)["states"], False))
     result = {"schema-version": 1, "suite": args.suite, "cases": results,
               "pass": all(row["pass"] for row in results)}
     (output / "result.json").write_text(json.dumps(result, indent=2) + "\n")

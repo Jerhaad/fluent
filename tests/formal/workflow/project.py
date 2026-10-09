@@ -39,7 +39,7 @@ def attempt(work):
     return work["attempts"]
 
 
-def project(trace, root):
+def project(trace, root, model_input=False):
     exact_keys(trace, ("schema-version", "scenario", "fluent-commit",
                        "fluent-binary-sha256", "model-profile", "collection-complete",
                        "events", "artifacts"), "trace")
@@ -109,15 +109,21 @@ def project(trace, root):
             and canceled[0].get("status") == "needs-user"
             and canceled[0].get("cancellation", {}).get("requested_at") is not None,
             "cancellation did not suspend current attempt")
-    require(snapshots[3] == snapshots[2], "run advanced canceled state")
-    return {"states": ["intake", "planned", "canceled", "canceled"],
+    if not model_input:
+        require(snapshots[3] == snapshots[2], "run advanced canceled state")
+    final_state = "canceled" if snapshots[3] == snapshots[2] else "advanced"
+    return {"states": ["intake", "planned", "canceled", final_state],
             "work-id": work_id, "attempt-id": "attempt-1"}
 
 
 def main():
     try:
         path = Path(sys.argv[1]).resolve()
-        print(json.dumps(project(load_json(path.read_text()), path.parent), sort_keys=True))
+        require(len(sys.argv) == 2 or
+                (len(sys.argv) == 3 and sys.argv[2] == "--model-input"),
+                "invalid arguments")
+        print(json.dumps(project(load_json(path.read_text()), path.parent,
+                                 len(sys.argv) == 3), sort_keys=True))
     except (TraceError, OSError, ValueError, IndexError) as error:
         print(f"trace violation: {error}", file=sys.stderr)
         return 1
