@@ -108,12 +108,14 @@ fn launch_handoff_cancel_serializes_with_payload_start() {
     )
     .unwrap();
     let barrier = dir.path().join("allow-exec");
+    let start_marker = dir.path().join("start-boundary");
     // Make the first requested action observable without delaying it.
     let script = format!("touch '{}'; sleep 30", dir.path().join("payload").display());
     let mut owner = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "launch_handoff_owner_helper", "--nocapture"])
         .env("FLUENT_TEST_LAUNCH_DIR", dir.path())
         .env("FLUENT_TEST_LAUNCH_CHILD_BARRIER", &barrier)
+        .env("FLUENT_TEST_LAUNCH_START_MARKER", &start_marker)
         .env("FLUENT_TEST_LAUNCH_SCRIPT", script)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -139,24 +141,22 @@ fn launch_handoff_cancel_serializes_with_payload_start() {
             attempt.pause_kind = Some(PauseKind::Interrupted);
             Ok(())
         });
-        let payload_at_stop = project.join("payload").exists();
-        tx.send((result, payload_at_stop)).unwrap();
+        let start_at_stop = project.join("start-boundary").exists();
+        tx.send((result, start_at_stop)).unwrap();
     });
     assert!(rx.recv_timeout(Duration::from_millis(150)).is_err());
     assert!(!dir.path().join("payload").exists());
     std::fs::write(&barrier, b"go").unwrap();
-    let (result, payload_at_stop) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let (result, start_at_stop) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
     result.unwrap();
-    // The mutation was blocked while the child sat before exec. Once it can
-    // commit, the inherited model lock has closed at exec. The first payload
-    // action is immediate; keep the child alive to detect a late start.
+    // The child writes the start event as its last pre-exec action while it
+    // still owns the model lock. A committed stop must therefore see it.
     wait_for(&dir.path().join("payload"));
-    if !payload_at_stop {
-        assert!(
-            execution::execution_is_live(&path).unwrap(),
-            "the payload started after the stop without its launch identity"
-        );
-    }
+    assert!(
+        start_at_stop,
+        "the launch start boundary occurred after the durable stop"
+    );
+    assert!(execution::execution_is_live(&path).unwrap());
     canceler.join().unwrap();
     assert_eq!(execution::cancel(&path).unwrap(), CancelOutcome::Canceled);
 }

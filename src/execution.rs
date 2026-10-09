@@ -298,6 +298,11 @@ fn configure_launch_identity(
         .map(|path| std::ffi::CString::new(Path::new(&path).as_os_str().as_bytes()))
         .transpose()
         .context("test launch barrier contains a NUL byte")?;
+    #[cfg(feature = "test-support")]
+    let start_marker = std::env::var_os("FLUENT_TEST_LAUNCH_START_MARKER")
+        .map(|path| std::ffi::CString::new(Path::new(&path).as_os_str().as_bytes()))
+        .transpose()
+        .context("test launch start marker contains a NUL byte")?;
     unsafe {
         command.pre_exec(move || {
             let descriptor = libc::open(path.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o600);
@@ -354,6 +359,16 @@ fn configure_launch_identity(
             let flags = libc::fcntl(descriptor, libc::F_GETFD);
             if flags < 0 || libc::fcntl(descriptor, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
                 return Err(std::io::Error::last_os_error());
+            }
+            #[cfg(feature = "test-support")]
+            if let Some(marker) = &start_marker {
+                let fd = libc::open(marker.as_ptr(), libc::O_CREAT | libc::O_WRONLY, 0o600);
+                if fd < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::close(fd) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
             }
             Ok(())
         });
