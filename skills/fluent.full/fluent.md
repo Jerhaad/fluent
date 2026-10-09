@@ -230,8 +230,8 @@ The round outcome determines what happens next:
   project check that changes HEAD or the worktree — Attempt records `needs-user`
   before Tester and review. Inspect `candidate-gate.json` and repair the named
   candidate or project check before resuming.
-- A missing, malformed, contradictory, or structurally edited completion matrix —
-  Attempt records `needs-user`; restore the host-owned rows before resuming.
+- A missing, malformed, contradictory, or structurally edited completion matrix records `needs-user`. For a committed Writer's malformed matrix, follow [Recover a committed Writer with a malformed matrix](references/host-evidence-recovery.md#recover-a-committed-writer-with-a-malformed-matrix).
+  Preserve the original bytes and completed Task. Diagnose other matrix failures separately; do not edit host-owned rows to force completion.
 - A provider exhausts its retries before the model produces tokens or uses tools — Attempt records `needs-user` as `provider-unavailable`.
 
 When an uncertain review came from an external problem and the candidate does

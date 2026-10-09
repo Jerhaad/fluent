@@ -19,6 +19,8 @@ schedules a Writer on the existing Attempt.
 ## Contents
 
 - [Recover mutable Writer assignment context](#recover-mutable-writer-assignment-context)
+- [Recover a committed Writer with a malformed matrix](#recover-a-committed-writer-with-a-malformed-matrix)
+- [Recover an output-free failed Writer](#recover-an-output-free-failed-writer)
 - [Recover a usage-limit-interrupted Writer](#recover-a-usage-limit-interrupted-writer)
 - [Diagnose a reported process leak](#diagnose-a-reported-process-leak)
 - [Attach host-only evidence](#attach-host-only-evidence)
@@ -651,6 +653,42 @@ mutable input is stale, inspect status again and recover that input using its
 newly reported assignment digest. For a completed Writer, separately run `fluent attempt run
 <work-item> <attempt>` or `fluent queue resume <work-item> --attempt <attempt>`.
 The native lifecycle requires any outstanding host evidence before advancement.
+
+## Recover a committed Writer with a malformed matrix
+
+When a completed Writer committed a candidate but left a malformed completion
+matrix, inspect `fluent work-item show <work-item>` or `fluent status` for the
+Writer-completion pause and the offered recovery action. Preserve the original
+matrix bytes and completed source Task; do not rewrite host-owned rows or replace
+the matrix with invented passing evidence. This route requires the immutable
+completion contract and retained source transcript, output, assignment, and
+matrix. The candidate must still be clean at the recorded commit, all execution
+owners must be settled, and the Attempt must remain uncanceled and within its
+Writer-round limit. A missing matrix, a valid matrix, changed source evidence or
+assignment, or another pause kind is not this recovery case.
+
+After inspecting the saved evidence, authorize the correction with a concrete
+resolution, then explicitly resume the same Attempt:
+
+```sh
+fluent attempt repair-writer-completion <work-item> <attempt> --resolution "<approved correction>"
+fluent attempt run <work-item> <attempt>
+# For scheduler-owned Work, resume through the queue instead:
+fluent queue resume <work-item> --attempt <attempt>
+```
+
+Authorization records the source matrix bytes, contract, assignment, candidate,
+and decision. It schedules a bound corrective Writer without rerunning or
+changing the completed source Task; approval alone does not execute the Writer.
+The correction starts with a fresh matrix from the immutable contract and may
+submit a verified no-change result if the candidate already satisfies the
+requirements. Repeated eligible approval and resume reuse the recorded
+recovery and Task identities. A later cancellation or changed candidate,
+assignment, contract, or source evidence invalidates stale authority. Host
+evidence, targeted Tests Review, ordinary review, final Tester, and Learner
+remain required after the correction.
+
+## Recover an output-free failed Writer
 
 For an output-free failed Writer, recovery requires the original saved assignment,
 its completion-recovery authority, the same clean candidate and workspace, and a
