@@ -63850,7 +63850,11 @@ fn landed_status_observation_preserves_recorded_bytes() {
     let before = [fs::read(&evidence).unwrap(), fs::read(&work).unwrap()];
     let status = fluent::work_status::load_work_status(&project).unwrap();
     let _ = fluent::work_status::format_work_dashboard_lines(&status);
-    fluent_cmd().current_dir(&project).arg("status").assert().success();
+    fluent_cmd()
+        .current_dir(&project)
+        .arg("status")
+        .assert()
+        .success();
     let _ = read_work_show_json(&project, "work-1");
     assert_eq!(fs::read(&evidence).unwrap(), before[0]);
     assert_eq!(fs::read(&work).unwrap(), before[1]);
@@ -63878,7 +63882,11 @@ fn landed_status_observation_preserves_recorded_bytes_with_pending_publication()
     let before = [fs::read(&journal).unwrap(), fs::read(&work).unwrap()];
     let status = fluent::work_status::load_work_status(&project).unwrap();
     let _ = fluent::work_status::format_work_dashboard_lines(&status);
-    fluent_cmd().current_dir(&project).arg("status").assert().success();
+    fluent_cmd()
+        .current_dir(&project)
+        .arg("status")
+        .assert()
+        .success();
     let _ = read_work_show_json(&project, "work-1");
     assert_eq!(fs::read(&journal).unwrap(), before[0]);
     assert_eq!(fs::read(&work).unwrap(), before[1]);
