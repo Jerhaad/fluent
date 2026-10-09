@@ -29,6 +29,12 @@ LIFECYCLE_CASES = (
     ("ServiceLifecycle", "lifecycle-negative-replay.cfg", "Invariant ReplayStable is violated"),
     ("ServiceLifecycle", "lifecycle-negative-retention.cfg", "Invariant RetainedResult is violated"),
 )
+LAUNCH_CASES = (
+    ("ChildLaunchIdentity", "launch-repaired.cfg", None),
+    ("ChildLaunchIdentity", "launch-negative-no-receipt.cfg", "Invariant NoUnrecordedExecution is violated"),
+    ("ChildLaunchIdentity", "launch-negative-no-stop.cfg", "Invariant StopBeforeExecution is violated"),
+    ("ChildLaunchIdentity", "launch-negative-no-generation.cfg", "Invariant NoWrongSignal is violated"),
+)
 
 
 def is_java_21_version(output: str) -> bool:
@@ -37,7 +43,7 @@ def is_java_21_version(output: str) -> bool:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--suite", choices=["recovery", "lifecycle"], required=True)
+    parser.add_argument("--suite", choices=["recovery", "lifecycle", "launch"], required=True)
     parser.add_argument("--jar", type=Path, required=True)
     args = parser.parse_args()
     jar = args.jar.resolve()
@@ -57,7 +63,7 @@ def main() -> int:
     logs = Path("target/formal/scheduler").resolve()
     logs.mkdir(parents=True, exist_ok=True)
     failed = False
-    cases = RECOVERY_CASES if args.suite == "recovery" else LIFECYCLE_CASES
+    cases = {"recovery": RECOVERY_CASES, "lifecycle": LIFECYCLE_CASES, "launch": LAUNCH_CASES}[args.suite]
     for module, config, expected_invariant in cases:
         with tempfile.TemporaryDirectory(prefix="tlc-", dir=logs) as metadir:
             command = ["java", "-XX:+UseParallelGC", "-Xmx256m", "-cp", str(jar),

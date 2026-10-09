@@ -38,6 +38,37 @@ ownership, and dispatch fencing that the abstract models cannot establish.
 The bounded models do not prove arbitrary filesystem errors, power loss, or
 unbounded concurrency safe.
 
+## Child launch identity
+
+`ChildLaunchIdentity.tla` is a new model of the implemented receipt protocol,
+not an alteration of the historical audit sources. The `launch` checker suite
+uses the same pinned TLC tool as the recovery and lifecycle suites. Its repaired
+configuration checks that execution has a current receipt and ownership, that
+a durable stop blocks a later start, and that a signal cannot use an earlier
+generation. Three controls remove those guards independently and must report
+`NoUnrecordedExecution`, `StopBeforeExecution`, and `NoWrongSignal` violations.
+
+| Model action | Production boundary |
+| --- | --- |
+| `Reserve` | `execution::prepare_launch` and the `spawn` record update assign a fresh generation under the execution lock |
+| `Create` | `Command::spawn` forks after the stop check while the model and execution locks remain held |
+| `ChildReceipt` | `configure_launch_identity` writes the fixed receipt after acquiring the inherited identity lock and before exec |
+| `ParentPublish` | `write_running_record` promotes the matching receipt to Running |
+| `Execute` | The `pre_exec` callback returns and `Command` enters the requested program |
+| `Crash` | A lost Fluent parent drops its descriptors while the child retains its inherited locks until exec |
+| `RequestStop`, `Signal` | Attempt cancellation commits under the model lock; `execution::cancel` validates the receipt and held lock before group signaling |
+| `Recover`, `Settle` | Recovery signals the matching held group; normal supervision and identity-lock release settle the launch |
+
+The model bounds two launch generations, one child tree at a time, and a parent
+crash. Recovery progress assumes weak fairness for recovery and process
+settlement when a matching receipt stays held. It abstracts lock and file I/O
+into actions, so the real subprocess tests cover descriptor lifetime, receipt
+bytes, partial writes, and parent death. Power-loss durability, hostile file
+replacement, and permanently hung kernel calls are outside the claim. Version 1
+records remain readable; a live legacy Launching record with no PID stays
+unresolved, and a predecessor reader is fenced by Work record schema 11 before
+it can mutate a new-protocol Work Item.
+
 ## Shared service lifecycle
 
 Run `python3 tests/formal/scheduler/check.py --suite=lifecycle --jar=target/fluent-tools/tla2tools-1.7.4.jar` on the candidate host. `ServiceLifecycle.tla` bounds ownership to two fresh service instances, two builds, two projects, one worker and one queued dispatch per project, and one crash. It retains each instance's stop operation, result, publication and interruption after replacement. The proposed configuration checks one owner, matching build reuse, guarded admission after drain, instance-bound stop, exact replay, retained published results, and no stopped result with a live worker. A legacy configuration disables protocol compatibility and drain capability and checks that no drain is acknowledged. Five negative controls independently remove the build, instance, admission, replay and result-retention guards. The checker retains each TLC log under `target/formal/scheduler/`.
