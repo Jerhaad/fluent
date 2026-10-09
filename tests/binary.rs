@@ -63850,6 +63850,7 @@ fn landed_status_observation_preserves_recorded_bytes() {
     let before = [fs::read(&evidence).unwrap(), fs::read(&work).unwrap()];
     let status = fluent::work_status::load_work_status(&project).unwrap();
     let _ = fluent::work_status::format_work_dashboard_lines(&status);
+    fluent_cmd().current_dir(&project).arg("status").assert().success();
     let _ = read_work_show_json(&project, "work-1");
     assert_eq!(fs::read(&evidence).unwrap(), before[0]);
     assert_eq!(fs::read(&work).unwrap(), before[1]);
@@ -63863,7 +63864,12 @@ fn landed_status_observation_preserves_recorded_bytes_with_pending_publication()
     let store = WorkModelStore::new(&project);
     let mut target = store.read_work_item("work-1").unwrap();
     target.title = "Unpublished update".into();
-    unsafe { std::env::set_var("FLUENT_TEST_WORK_MODEL_INTERRUPT", "before-child-publication") };
+    unsafe {
+        std::env::set_var(
+            "FLUENT_TEST_WORK_MODEL_INTERRUPT",
+            "before-child-publication",
+        )
+    };
     let result = store.write_work_item(&target);
     unsafe { std::env::remove_var("FLUENT_TEST_WORK_MODEL_INTERRUPT") };
     assert!(result.is_err());
@@ -63872,6 +63878,7 @@ fn landed_status_observation_preserves_recorded_bytes_with_pending_publication()
     let before = [fs::read(&journal).unwrap(), fs::read(&work).unwrap()];
     let status = fluent::work_status::load_work_status(&project).unwrap();
     let _ = fluent::work_status::format_work_dashboard_lines(&status);
+    fluent_cmd().current_dir(&project).arg("status").assert().success();
     let _ = read_work_show_json(&project, "work-1");
     assert_eq!(fs::read(&journal).unwrap(), before[0]);
     assert_eq!(fs::read(&work).unwrap(), before[1]);

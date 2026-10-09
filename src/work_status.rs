@@ -738,7 +738,12 @@ pub fn format_work_status(status: &WorkStatus) -> String {
                 }
             }
             if let Some(reason) = &row.recovery_blocker {
-                output.push_str(&format!("  evidence: {reason}\n"));
+                let label = if row.evidence_history.is_some() {
+                    "evidence-history"
+                } else {
+                    "evidence"
+                };
+                output.push_str(&format!("  {label}: {reason}\n"));
             }
             if let Some(next_action) = row.next_action.as_deref() {
                 output.push_str(&format!("  next-action: {next_action}\n"));
@@ -816,7 +821,12 @@ pub fn format_work_dashboard_lines(status: &WorkStatus) -> Vec<String> {
             }
         }
         if let Some(reason) = &row.recovery_blocker {
-            lines.push(format!("  Evidence: {reason}"));
+            let label = if row.evidence_history.is_some() {
+                "Evidence history"
+            } else {
+                "Evidence"
+            };
+            lines.push(format!("  {label}: {reason}"));
         }
         if let Some(next_action) = row.next_action.as_deref() {
             lines.push(format!("  Next action: {next_action}"));

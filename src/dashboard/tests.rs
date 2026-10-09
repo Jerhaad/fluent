@@ -251,6 +251,30 @@ fn detail_does_not_invent_next_action() {
     assert!(text(&app, 100, 24).contains("No operator action"));
 }
 #[test]
+fn landed_detail_shows_evidence_history() {
+    let mut status = row("work", "merged");
+    status.evidence_history = Some(crate::work_status::LandedEvidenceHistory {
+        merged_commit: "landed-sha".into(),
+        tester_results: Some(".fluent/work/artifacts/work/tester-results.json".into()),
+        diagnostic: None,
+    });
+    let snapshot = snapshot::DashboardSnapshot::from_status(crate::work_status::WorkStatus {
+        rows: vec![status],
+        errors: vec![],
+    });
+    let detail = layout::detail_values(&snapshot.rows[0]);
+    assert!(
+        detail
+            .iter()
+            .any(|line| line == "Landed commit: landed-sha")
+    );
+    assert!(
+        detail
+            .iter()
+            .any(|line| line.contains("Evidence history: Tester result"))
+    );
+}
+#[test]
 fn selection_moves_across_groups_and_scrolls() {
     let mut app = app(vec![row("need", "failed"), row("run", "executing")]);
     app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);

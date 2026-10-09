@@ -523,6 +523,7 @@ mod tests {
         crate::work_status::WorkItemStatus {
             recovery_blocker: None,
             verification: None,
+            evidence_history: None,
             id: id.to_string(),
             title: "Title".to_string(),
             attempt: "-".to_string(),

@@ -60,6 +60,20 @@ pub fn detail_values(row: &DashboardRow) -> Vec<String> {
             release.criteria, release.blockers
         ));
     }
+    if let Some(history) = &status.evidence_history {
+        values.push(format!("Landed commit: {}", history.merged_commit));
+        if let Some(path) = &history.tester_results {
+            values.push(format!("Evidence history: Tester result {path}"));
+        }
+    }
+    if let Some(diagnostic) = &status.recovery_blocker {
+        let label = if status.evidence_history.is_some() {
+            "Evidence history"
+        } else {
+            "Evidence"
+        };
+        values.push(format!("{label}: {diagnostic}"));
+    }
     if let Some(latest) = &row.latest_transition {
         let transition = &latest.transition;
         values.push(format!(
