@@ -63835,33 +63835,63 @@ fn landed_status_keeps_unmerged_checks_strict() {
     let tmp = TempDir::new().unwrap();
     let project = setup_git_project(&tmp);
     let bin = tmp.path().join("unmerged-status-bin");
-    write_mock_claude(
-        &bin,
-        &learner_land_mock_script(r#"{"learning_summary":"retained","follow_ups":[]}"#),
+    write_mock_claude(&bin, &learner_failing_mock_script());
+    create_and_run_failed_learner_attempt(&project, &bin);
+    let raw = work_item_value(&project, "work-1");
+    assert_eq!(raw["attempts"][0]["status"], "complete");
+    assert_eq!(raw["attempts"][0]["learning"]["status"], "failed");
+    assert_eq!(
+        raw["merge_candidates"][0]["merge_state"]["status"],
+        "pending"
     );
-    create_and_run_learner_attempt(&project, &bin);
     let status = fluent::work_status::load_work_status(&project).unwrap();
-    assert!(status.rows[0].evidence_history.is_none());
-    assert!(status.rows[0].verification.is_some());
+    let row = &status.rows[0];
+    assert_eq!(row.action, "learner-not-ready");
+    assert!(row.evidence_history.is_none());
+    assert!(row.next_action.as_deref().unwrap().contains("queue resume"));
+    let verification = row
+        .verification
+        .as_ref()
+        .expect("unmerged verification remains active");
+    assert!(!verification.commands.is_empty());
+    let shown = read_work_show_json(&project, "work-1");
+    assert!(shown.get("evidence-history").is_none());
     assert!(
-        read_work_show_json(&project, "work-1")
-            .get("evidence-history")
-            .is_none()
+        shown["next-action"]
+            .as_str()
+            .unwrap()
+            .contains("queue resume")
     );
+    assert!(shown["verification"].is_object());
+    let tester = raw["attempts"][0]["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["kind"] == "tester" && task["status"] == "complete")
+        .unwrap();
+    let results = project
+        .join(tester["artifact_area"]["path"].as_str().unwrap())
+        .join("tester-results.json");
+    fs::remove_file(results).unwrap();
+    let incomplete = fluent::work_status::load_work_status(&project).unwrap();
+    assert_eq!(incomplete.rows[0].action, "learner-not-ready");
+    assert!(incomplete.rows[0].evidence_history.is_none());
+    assert!(incomplete.rows[0].recovery_blocker.is_some());
+    let shown = read_work_show_json(&project, "work-1");
+    assert!(shown["evidence-recovery"].is_object());
+    assert!(shown["verification-diagnostic"].is_string());
 }
 
 #[test]
 fn landed_status_observation_preserves_recorded_bytes() {
     let tmp = TempDir::new().unwrap();
     let project = landed_status_fixture(&tmp);
-    let shown = read_work_show_json(&project, "work-1");
-    let evidence = project.join(
-        shown["evidence-history"]["tester-results"]
-            .as_str()
-            .unwrap(),
+    let before = recorded_work_bytes(&project);
+    assert!(
+        before
+            .keys()
+            .any(|path| path.ends_with("tester-results.json"))
     );
-    let work = project.join(".fluent/work/items/work-1.json");
-    let before = [fs::read(&evidence).unwrap(), fs::read(&work).unwrap()];
     let status = fluent::work_status::load_work_status(&project).unwrap();
     let _ = fluent::work_status::format_work_dashboard_lines(&status);
     fluent_cmd()
@@ -63870,38 +63900,76 @@ fn landed_status_observation_preserves_recorded_bytes() {
         .assert()
         .success();
     let _ = read_work_show_json(&project, "work-1");
-    assert_eq!(fs::read(&evidence).unwrap(), before[0]);
-    assert_eq!(fs::read(&work).unwrap(), before[1]);
+    assert_eq!(recorded_work_bytes(&project), before);
 }
 
 #[test]
 #[serial]
 fn landed_status_observation_preserves_recorded_bytes_with_pending_publication() {
-    let tmp = TempDir::new().unwrap();
-    let project = landed_status_fixture(&tmp);
-    let store = WorkModelStore::new(&project);
-    let mut target = store.read_work_item("work-1").unwrap();
-    target.title = "Unpublished update".into();
-    unsafe {
-        std::env::set_var(
-            "FLUENT_TEST_WORK_MODEL_INTERRUPT",
-            "before-child-publication",
-        )
-    };
-    let result = store.write_work_item(&target);
-    unsafe { std::env::remove_var("FLUENT_TEST_WORK_MODEL_INTERRUPT") };
-    assert!(result.is_err());
-    let journal = project.join(".fluent/work/transactions/work-1.json");
-    let work = project.join(".fluent/work/items/work-1.json");
-    let before = [fs::read(&journal).unwrap(), fs::read(&work).unwrap()];
-    let status = fluent::work_status::load_work_status(&project).unwrap();
-    let _ = fluent::work_status::format_work_dashboard_lines(&status);
-    fluent_cmd()
-        .current_dir(&project)
-        .arg("status")
-        .assert()
-        .success();
-    let _ = read_work_show_json(&project, "work-1");
-    assert_eq!(fs::read(&journal).unwrap(), before[0]);
-    assert_eq!(fs::read(&work).unwrap(), before[1]);
+    for interruption in ["before-child-publication", "before-root-publication:work-1"] {
+        let tmp = TempDir::new().unwrap();
+        let project = landed_status_fixture(&tmp);
+        let store = WorkModelStore::new(&project);
+        let mut target = store.read_work_item("work-1").unwrap();
+        target.title = "Unpublished update".into();
+        target.attempts[0].tasks[0].instructions = Some("Unpublished child".into());
+        unsafe { std::env::set_var("FLUENT_TEST_WORK_MODEL_INTERRUPT", interruption) };
+        let result = store.write_work_item(&target);
+        unsafe { std::env::remove_var("FLUENT_TEST_WORK_MODEL_INTERRUPT") };
+        assert!(
+            result.is_err(),
+            "{interruption} must leave a pending transaction"
+        );
+        let journal = project.join(".fluent/work/transactions/work-1.json");
+        assert!(journal.is_file());
+        let before = recorded_work_bytes(&project);
+        assert!(
+            before
+                .keys()
+                .any(|path| path.ends_with("tester-results.json"))
+        );
+        let status = fluent::work_status::load_work_status(&project).unwrap();
+        let _ = fluent::work_status::format_work_dashboard_lines(&status);
+        fluent_cmd()
+            .current_dir(&project)
+            .arg("status")
+            .assert()
+            .success();
+        let show = fluent_cmd()
+            .current_dir(&project)
+            .args(["work-item", "show", "work-1"])
+            .output()
+            .unwrap();
+        if interruption == "before-child-publication" {
+            assert!(show.status.success());
+        } else {
+            assert!(!show.status.success());
+            assert!(
+                status
+                    .errors
+                    .iter()
+                    .any(|error| error.contains("host-owned recovery is pending"))
+            );
+        }
+        assert_eq!(recorded_work_bytes(&project), before);
+    }
+}
+
+fn recorded_work_bytes(project: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    fn collect(dir: &Path, into: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>) {
+        if !dir.exists() {
+            return;
+        }
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                collect(&path, into);
+            } else if path.is_file() {
+                into.insert(path.clone(), fs::read(path).unwrap());
+            }
+        }
+    }
+    let mut files = std::collections::BTreeMap::new();
+    collect(&project.join(".fluent/work"), &mut files);
+    files
 }

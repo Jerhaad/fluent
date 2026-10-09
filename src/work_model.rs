@@ -12138,6 +12138,18 @@ impl WorkModelStore {
 
         self.write_attempt_records(&transaction.work_item)?;
         self.write_merge_candidate_records(&transaction.work_item)?;
+        // Exercise a durable journal with published children and the old root.
+        #[cfg(feature = "test-support")]
+        if std::env::var("FLUENT_TEST_WORK_MODEL_INTERRUPT")
+            .ok()
+            .as_deref()
+            == Some(format!("before-root-publication:{}", transaction.id).as_str())
+        {
+            return Err(WorkModelStorageError::WriteFile {
+                path: self.work_transaction_path(&transaction.id)?,
+                source: io::Error::other("injected Work-model root publication interruption"),
+            });
+        }
         if !transaction.context_retry_publications.is_empty() {
             crate::recovery_contracts::context_retry::test_interrupt("children");
         }

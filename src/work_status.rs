@@ -585,6 +585,25 @@ pub fn work_item_show_value(
             }
             Ok(None) => {}
         }
+        if attempt.kind.is_review_only_like()
+            || attempt.tasks.iter().any(|task| {
+                task.kind == TaskKind::Write
+                    && task.status == TaskStatus::Complete
+                    && task.output.is_some()
+            })
+        {
+            match crate::verification_assessment::assess_current_verification(project_root, attempt)
+            {
+                Ok(verification) => {
+                    output["verification"] = serde_json::to_value(verification)?;
+                }
+                Err(error) => {
+                    output["verification-diagnostic"] = serde_json::to_value(format!(
+                        "Current verification is unavailable: {error:#}"
+                    ))?;
+                }
+            }
+        }
     }
     Ok(output)
 }

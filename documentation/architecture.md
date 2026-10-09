@@ -1901,6 +1901,8 @@ the disposable source checkout. A missing or inconsistent result produces an
 evidence-history diagnostic; it does not reopen a Writer row or offer an
 Attempt resume command. Unmerged candidates, including Complete Attempts that
 have not landed, continue through current recovery and verification checks.
+`work-item show` includes their current verification assessment, or a
+verification diagnostic when that assessment cannot read its required proof.
 Status, Work Item inspection, and dashboard assemble snapshots without
 replaying pending Work transactions or changing retained evidence.
 `fluent status` and `fluent dashboard` use Work Items as the default

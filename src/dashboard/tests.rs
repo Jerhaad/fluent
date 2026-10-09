@@ -83,6 +83,60 @@ fn dashboard_snapshot_is_nonmutating() {
     );
 }
 
+#[test]
+#[serial_test::serial]
+fn dashboard_does_not_replay_pending_root_publication() {
+    let root = tempfile::tempdir().unwrap();
+    let store = crate::work_model::WorkModelStore::new(root.path());
+    let mut item = crate::work_model::WorkItem::planned("dashboard-root", "Published");
+    item.add_initial_attempt("attempt-1").unwrap();
+    store.create_work_item(&item).unwrap();
+    let artifact = root
+        .path()
+        .join(".fluent/work/artifacts/dashboard-root/history.bin");
+    std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+    std::fs::write(&artifact, b"retained evidence").unwrap();
+    let mut target = store.read_work_item("dashboard-root").unwrap();
+    target.title = "Unpublished".into();
+    target.attempts[0].tasks[0].instructions = Some("new child".into());
+    unsafe {
+        std::env::set_var(
+            "FLUENT_TEST_WORK_MODEL_INTERRUPT",
+            "before-root-publication:dashboard-root",
+        )
+    };
+    let result = store.write_work_item(&target);
+    unsafe { std::env::remove_var("FLUENT_TEST_WORK_MODEL_INTERRUPT") };
+    assert!(result.is_err());
+    let journal = root
+        .path()
+        .join(".fluent/work/transactions/dashboard-root.json");
+    let work = root.path().join(".fluent/work/items/dashboard-root.json");
+    let child = root
+        .path()
+        .join(".fluent/work/attempts/dashboard-root/attempt-1.json");
+    let before = [&journal, &work, &child, &artifact].map(|path| std::fs::read(path).unwrap());
+    let status = crate::work_status::load_work_status(root.path()).unwrap();
+    assert!(
+        status
+            .errors
+            .iter()
+            .any(|error| error.contains("host-owned recovery is pending"))
+    );
+    assert!(store.read_work_item_snapshot("dashboard-root").is_err());
+    let snapshot = load_snapshot(root.path()).unwrap();
+    assert!(
+        snapshot
+            .errors
+            .iter()
+            .any(|error| error.contains("host-owned recovery is pending"))
+    );
+    assert!(snapshot.rows.is_empty());
+    for (path, bytes) in [&journal, &work, &child, &artifact].into_iter().zip(before) {
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
+}
+
 fn row(id: &str, action: &str) -> WorkItemStatus {
     WorkItemStatus {
         recovery_blocker: None,
