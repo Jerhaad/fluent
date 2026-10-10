@@ -2067,6 +2067,14 @@ mod tests {
         let fixture = fixture(false);
         let task_id = "attempt-1-write-2";
         let area = work_artifact_path("work-1", "attempt-1", task_id);
+        let review_path = format!("{area}/review-documentation/review.md");
+        fs::create_dir_all(fixture.project.join(&area).join("review-documentation")).unwrap();
+        fs::write(
+            fixture.project.join(&review_path),
+            "Verdict: fail\n\n- [ ] Fix the documented line-length finding.\n",
+        )
+        .unwrap();
+        fs::write(fixture.project.join(&area).join("transcript.jsonl"), "").unwrap();
         fs::write(
             fixture.project.join(&area).join("no-change.json"),
             serde_json::json!({
@@ -2078,28 +2086,14 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        fs::write(
-            fixture
-                .project
-                .join(&area)
-                .join(crate::recovery_contracts::WRITER_COMPLETION_MATRIX_FILE),
-            serde_json::json!({
-                "schema-version": 1,
-                "task-id": task_id,
-                "rows": [{
-                    "id": "finding:documentation:line-length",
-                    "kind": "finding",
-                    "source": "review.md",
-                    "requirement": "Fix the documented line-length finding.",
-                    "state": "pending"
-                }]
-            })
-            .to_string(),
-        )
-        .unwrap();
         fixture
             .store
             .mutate_work_item("work-1", |item| {
+                item.attempts[0].writer_completion_contract =
+                    Some(crate::work_model::WriterCompletionContract {
+                        version: crate::work_model::WRITER_COMPLETION_CONTRACT_VERSION,
+                        requirements: Vec::new(),
+                    });
                 item.attempts[0].tasks[1].output.as_mut().unwrap().no_change =
                     Some(crate::work_model::NoChangeOutput {
                         schema_version: 1,
@@ -2111,6 +2105,10 @@ mod tests {
                         }],
                     });
                 item.attempts[0].tasks[1].input_artifacts.push(ArtifactRef {
+                    producer_id: "review-documentation".to_string(),
+                    path: review_path,
+                });
+                item.attempts[0].tasks[1].input_artifacts.push(ArtifactRef {
                     producer_id: task_id.to_string(),
                     path: format!(
                         "{area}/{}",
@@ -2120,6 +2118,29 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+        let item = fixture.store.read_work_item("work-1").unwrap();
+        let attempt = &item.attempts[0];
+        let findings = crate::recovery_contracts::writer_completion_findings(
+            &fixture.project,
+            &attempt.tasks[1],
+        )
+        .unwrap();
+        assert_eq!(findings.len(), 1);
+        let matrix = crate::work_model::WriterCompletionMatrix::skeleton(
+            attempt.writer_completion_contract.as_ref().unwrap(),
+            task_id,
+            &findings,
+            None,
+        )
+        .unwrap();
+        fs::write(
+            fixture
+                .project
+                .join(&area)
+                .join(crate::recovery_contracts::WRITER_COMPLETION_MATRIX_FILE),
+            serde_json::to_vec(&matrix).unwrap(),
+        )
+        .unwrap();
 
         let resolution = "Authorize a corrective Writer for the pending documentation finding.";
         let first = repair(
