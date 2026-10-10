@@ -29,7 +29,7 @@ The checker also requires positive TLC action coverage for the distinct route, c
 
 ## Version-1 trace
 
-`workflow_foundation_public_trace` creates an isolated Git project and runs public `work-item create`, `work-item show`, `attempt create`, `attempt cancel`, `task run`, and another `work-item show`. It captures four raw JSON snapshots, exit codes, and command output. The attempted Task run must be refused while cancellation remains active. `project.py` validates each event against its snapshot, checks causal order and identity, and derives the state sequence `intake → planned → canceled → canceled` without using a production acceptance boolean. It refuses incomplete, malformed, ambiguous, or contradictory observations. The negative Rust test rebinds changed snapshots to valid digests before testing identity and cancellation invariants.
+`workflow_foundation_public_trace` creates an isolated Git project and runs public `work-item create`, `work-item show`, `attempt create`, `attempt cancel`, `task run`, and another `work-item show`. It captures four raw JSON snapshots, exit codes, and command output. The attempted Task run must return the public durable-cancellation diagnostic while cancellation remains active. `project.py` validates that diagnostic and each event against its snapshot, checks causal order and identity, and derives the state sequence `intake → planned → canceled → canceled` without using a production acceptance boolean. It refuses incomplete, malformed, ambiguous, or contradictory observations. The negative Rust test substitutes an unrelated failure and rebinds changed snapshots to valid digests before testing identity and cancellation invariants.
 
 The JSON envelope has exactly these fields:
 

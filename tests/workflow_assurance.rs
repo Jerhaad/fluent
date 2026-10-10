@@ -187,6 +187,10 @@ fn workflow_foundation_projection_rejects_bad_observations() {
     let mut ordering = trace.clone();
     ordering["events"][3]["causal-predecessors"] = json!([]);
     reject(&ordering, "missing or ambiguous causal predecessor");
+    let mut unrelated_failure = trace.clone();
+    unrelated_failure["events"][3]["raw-facts"]["stderr"] =
+        json!("Error: task setup failed for another reason\n");
+    reject(&unrelated_failure, "cancellation refusal not observed");
     let mut identity = trace.clone();
     identity["events"][2]["raw-facts"]["work"]["id"] = json!("other");
     let canceled_bytes = serde_json::to_vec(&identity["events"][2]["raw-facts"]["work"]).unwrap();

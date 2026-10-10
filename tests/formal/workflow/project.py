@@ -89,6 +89,9 @@ def project(trace, root, model_input=False):
         else:
             require(facts["exit-code"] != 0 and type(facts["stderr"]) is str
                     and type(facts["stdout"]) is str, "run refusal not observed")
+            require(facts["stderr"] ==
+                    "Error: Attempt has a durable cancellation request; explicitly resume after settlement\n"
+                    and facts["stdout"] == "", "cancellation refusal not observed")
         name = ("intake.json", "planned.json", "canceled.json", "refused.json")[index]
         require(type(facts["work"]) is dict and
                 facts["work"] == load_json((root / name).read_text()),
