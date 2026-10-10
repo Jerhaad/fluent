@@ -477,7 +477,11 @@ ServiceCompetitionBound == \A w \in Works:
     /\ ~s[w].cleaned /\ ~s[w].ioFailed
 FoundationBound == \A w \in Works: s[w].generation = 1
 RecoveryBound == \A w \in Works:
-    ~s[w].correction /\ ~s[w].rechecked
+    /\ ~s[w].correction /\ ~s[w].rechecked
+    /\ s[w].routeMode \in {"unset", "foreground"}
+    /\ s[w].observed = "none" /\ s[w].version = 1
+    /\ ~s[w].cleaned
+    /\ s[w].targetCommit = <<"target", w, 1>>
 AcceptedBaselineSafe == \A w \in Works:
     s[w].phase \notin {"learned", "ready", "verified", "intent", "git",
                        "published", "follow-up-pending", "follow-up",
