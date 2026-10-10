@@ -1,3 +1,4 @@
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::Path;
@@ -68,36 +69,78 @@ fn landed_evidence_history(
             "merged commit is missing"
         );
         let root = root.ok_or_else(|| anyhow::anyhow!("project root is unavailable"))?;
-        let tester = attempt
-            .tasks
+        let tester = attempt.tasks.iter().rev().find(|task| {
+            task.kind == TaskKind::Tester
+                && task.status == TaskStatus::Complete
+                && !task.is_failed_command_recheck()
+                && task
+                    .review_context
+                    .as_ref()
+                    .is_some_and(|context| context.candidate_commit == history.merged_commit)
+        });
+        let landing = candidate
+            .merge_state
+            .check_artifacts
             .iter()
             .rev()
-            .find(|task| {
-                task.kind == TaskKind::Tester
-                    && task.status == TaskStatus::Complete
-                    && !task.is_failed_command_recheck()
-                    && task.review_context.as_ref().is_some_and(|context| {
-                        context.candidate_commit == candidate.candidate_commit
-                    })
-            })
-            .ok_or_else(|| anyhow::anyhow!("completed candidate-bound Tester is missing"))?;
-        let area = tester
-            .artifact_area
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Tester artifact area is missing"))?;
-        anyhow::ensure!(
-            area.path
-                == crate::work_model::work_artifact_path(
-                    &attempt.work_item_id,
-                    &attempt.id,
-                    &tester.id
-                ),
-            "Tester artifact area differs from its recorded identity"
-        );
-        let path = format!("{}/tester-results.json", area.path);
+            .find(|artifact| artifact.producer_id == "merge-tester");
+        let (path, baseline_path) = if let Some(landing) = landing {
+            let prefix = format!(
+                "{}/{}/{}/{}/merge/verification-",
+                crate::work_model::WORK_ARTIFACTS_DIR,
+                attempt.work_item_id,
+                attempt.id,
+                candidate.id
+            );
+            let attempt_path = tester
+                .and_then(|task| task.artifact_area.as_ref())
+                .map(|area| format!("{}/tester-results.json", area.path));
+            let merge_dir = landing
+                .path
+                .strip_prefix(&prefix)
+                .and_then(|rest| rest.strip_suffix("/tester/tester-results.json"));
+            anyhow::ensure!(
+                attempt_path.as_deref() == Some(landing.path.as_str())
+                    || merge_dir.is_some_and(|part| !part.is_empty() && !part.contains('/')),
+                "merge Tester artifact differs from its recorded identity"
+            );
+            let baseline = candidate
+                .merge_state
+                .check_artifacts
+                .iter()
+                .find(|artifact| artifact.producer_id == "merge-target-baseline")
+                .ok_or_else(|| anyhow::anyhow!("merge target baseline is missing"))?;
+            if let Some(part) = merge_dir {
+                anyhow::ensure!(
+                    baseline.path == format!("{prefix}{part}/target-baseline/tester-results.json"),
+                    "merge target baseline differs from its recorded identity"
+                );
+            }
+            (landing.path.clone(), Some(baseline.path.as_str()))
+        } else {
+            let tester = tester
+                .ok_or_else(|| anyhow::anyhow!("completed merged-commit Tester is missing"))?;
+            let area = tester
+                .artifact_area
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Tester artifact area is missing"))?;
+            anyhow::ensure!(
+                area.path
+                    == crate::work_model::work_artifact_path(
+                        &attempt.work_item_id,
+                        &attempt.id,
+                        &tester.id
+                    ),
+                "Tester artifact area differs from its recorded identity"
+            );
+            (format!("{}/tester-results.json", area.path), None)
+        };
+        let area = path
+            .strip_suffix("/tester-results.json")
+            .ok_or_else(|| anyhow::anyhow!("Tester artifact path is invalid"))?;
         let (_, bytes) = crate::verification_assessment::bound_recovery_artifact(root, &path)?;
         let results: crate::tester::TesterResults = serde_json::from_slice(&bytes)?;
-        let manifest_path = format!("{}/canonical-run.json", area.path);
+        let manifest_path = format!("{area}/canonical-run.json");
         let (_, manifest_bytes) =
             crate::verification_assessment::bound_recovery_artifact(root, &manifest_path)?;
         let manifest: crate::tester::CanonicalRunManifest =
@@ -108,19 +151,70 @@ fn landed_evidence_history(
                 && manifest.commands.len() == results.commands.len(),
             "retained Tester manifest does not describe a complete run"
         );
+        for (name, digest) in [
+            (".fluent/tester.yaml", &manifest.config_digest),
+            (".fluent/extract-tester-results", &manifest.extractor_digest),
+        ] {
+            let object = crate::git::run_raw(
+                root,
+                &["show", &format!("{}:{name}", history.merged_commit)],
+            )?;
+            anyhow::ensure!(
+                object.status.success(),
+                "merged check configuration is unavailable: {name}"
+            );
+            anyhow::ensure!(
+                &format!("sha256:{:x}", Sha256::digest(&object.stdout)) == digest,
+                "retained Tester configuration differs from the merged commit: {name}"
+            );
+            if name == ".fluent/tester.yaml" {
+                let config: crate::tester::TesterConfig = serde_yaml::from_slice(&object.stdout)?;
+                anyhow::ensure!(
+                    config.commands == manifest.commands,
+                    "retained Tester manifest differs from configured commands"
+                );
+            }
+        }
         anyhow::ensure!(
-            results.candidate_commit.as_deref() == Some(candidate.candidate_commit.as_str()),
-            "Tester result does not match the recorded candidate"
+            results.candidate_commit.as_deref() == Some(history.merged_commit.as_str()),
+            "Tester result does not match the merged candidate"
         );
         anyhow::ensure!(
             results.error.is_none()
-                && results.summary.fail == 0
-                && results
-                    .commands
-                    .iter()
-                    .all(|command| command.exit_code == 0),
-            "retained Tester result does not record a passing run"
+                && results.commands.iter().all(|command| command
+                    .process_settlement
+                    .as_ref()
+                    .is_none_or(|settlement| settlement.leaks.is_empty())),
+            "retained Tester result has a harness error or process leak"
         );
+        if results.summary.fail != 0
+            || results
+                .commands
+                .iter()
+                .any(|command| command.exit_code != 0)
+        {
+            let baseline = baseline_path.ok_or_else(|| {
+                anyhow::anyhow!("retained Tester result does not record a passing run")
+            })?;
+            let (_, bytes) =
+                crate::verification_assessment::bound_recovery_artifact(root, baseline)?;
+            let baseline_results: crate::tester::TesterResults = serde_json::from_slice(&bytes)?;
+            anyhow::ensure!(
+                baseline_results.error.is_none(),
+                "retained target baseline has a harness error"
+            );
+            anyhow::ensure!(
+                crate::tester_evidence::introduced_tester_failures(
+                    &root.join(&path),
+                    Some(&root.join(baseline))
+                ) == 0
+                    && crate::tester_evidence::unexplained_failed_tester_commands(
+                        &root.join(&path),
+                        Some(&root.join(baseline))
+                    ) == 0,
+                "retained Tester result has new failures or unexplained failed commands"
+            );
+        }
         anyhow::ensure!(
             results.summary.total == results.tests.len()
                 && results.summary.pass
@@ -159,7 +253,7 @@ fn landed_evidence_history(
                 );
                 crate::verification_assessment::bound_recovery_artifact(
                     root,
-                    &format!("{}/{}", area.path, expected),
+                    &format!("{area}/{expected}"),
                 )?;
             }
         }

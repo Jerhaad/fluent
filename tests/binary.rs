@@ -65709,6 +65709,127 @@ fn landed_status_fixture(tmp: &TempDir) -> PathBuf {
 }
 
 #[test]
+fn landed_status_uses_final_landing_tester_evidence() {
+    let tmp = TempDir::new().unwrap();
+    let (project, bin, _) = setup_rebased_tester_candidate(&tmp, ":");
+    advance_tester_target(&project);
+    land_work_1(&project, &bin, true);
+    let item = read_work_show_json(&project, "work-1");
+    let attempt_tester = item["attempts"][0]["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["kind"] == "tester" && task["status"] == "complete")
+        .unwrap();
+    assert_ne!(
+        attempt_tester["review_context"]["candidate_commit"],
+        git_head(&project)
+    );
+    let landing_path = item["merge_candidates"][0]["merge_state"]["check_artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|artifact| artifact["producer_id"] == "merge-tester")
+        .unwrap()["path"]
+        .as_str()
+        .unwrap();
+    assert_eq!(item["evidence-history"]["tester-results"], landing_path);
+    assert_eq!(
+        item["evidence-history"]["merged-commit"],
+        git_head(&project)
+    );
+    assert!(item["evidence-history"]["diagnostic"].is_null());
+    let status = fluent::work_status::load_work_status(&project).unwrap();
+    assert_eq!(status.rows[0].action, "merged");
+    assert_eq!(
+        status.rows[0]
+            .evidence_history
+            .as_ref()
+            .unwrap()
+            .tester_results
+            .as_deref(),
+        Some(landing_path)
+    );
+    assert!(
+        fluent::work_status::format_work_dashboard_lines(&status)
+            .iter()
+            .any(|line| line.contains(landing_path))
+    );
+
+    // A failure already present on the target is accepted by the landing
+    // Tester and remains valid historical proof.
+    let known_tmp = TempDir::new().unwrap();
+    let (known_project, known_bin, _) = setup_rebased_tester_candidate(
+        &known_tmp,
+        "printf 'not ok known-target-failure\\n'; exit 1",
+    );
+    advance_tester_target(&known_project);
+    land_work_1(&known_project, &known_bin, true);
+    let known = read_work_show_json(&known_project, "work-1");
+    assert_eq!(
+        known["evidence-history"]["tester-results"],
+        known["merge_candidates"][0]["merge_state"]["check_artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|artifact| artifact["producer_id"] == "merge-tester")
+            .unwrap()["path"]
+    );
+    assert!(known["evidence-history"]["diagnostic"].is_null());
+}
+
+#[test]
+fn landed_status_validates_retained_landing_evidence() {
+    let tmp = TempDir::new().unwrap();
+    let (project, bin, _) = setup_rebased_tester_candidate(&tmp, ":");
+    advance_tester_target(&project);
+    land_work_1(&project, &bin, true);
+    let item = read_work_show_json(&project, "work-1");
+    let path = item["evidence-history"]["tester-results"].as_str().unwrap();
+    let original = fs::read(project.join(path)).unwrap();
+    let mut wrong: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    wrong["candidate_commit"] = serde_json::json!("wrong-commit");
+    fs::write(project.join(path), serde_json::to_vec(&wrong).unwrap()).unwrap();
+    let shown = read_work_show_json(&project, "work-1");
+    assert!(shown["evidence-history"]["tester-results"].is_null());
+    assert!(
+        shown["evidence-history"]["diagnostic"]
+            .as_str()
+            .unwrap()
+            .contains("candidate")
+    );
+    assert!(shown.get("next-action").is_none());
+    assert_eq!(
+        fluent::work_status::load_work_status(&project)
+            .unwrap()
+            .rows[0]
+            .action,
+        "merged"
+    );
+    fs::write(project.join(path), &original).unwrap();
+    let mut wrong: serde_json::Value = read_json_path(&project.join(path));
+    wrong["commands"][0]["command"] = serde_json::json!("printf forged");
+    fs::write(project.join(path), serde_json::to_vec(&wrong).unwrap()).unwrap();
+    assert!(
+        read_work_show_json(&project, "work-1")["evidence-history"]["diagnostic"]
+            .as_str()
+            .unwrap()
+            .contains("command differs")
+    );
+    fs::write(project.join(path), &original).unwrap();
+    let manifest_path = project.join(path).with_file_name("canonical-run.json");
+    let mut manifest = read_json_path(&manifest_path);
+    manifest["config_digest"] = serde_json::json!("sha256:forged");
+    fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    assert!(
+        read_work_show_json(&project, "work-1")["evidence-history"]["diagnostic"]
+            .as_str()
+            .unwrap()
+            .contains("configuration")
+    );
+}
+
+#[test]
 fn landed_status_preserves_result_after_source_retirement() {
     let tmp = TempDir::new().unwrap();
     let project = landed_status_fixture(&tmp);
