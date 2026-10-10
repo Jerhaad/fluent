@@ -126,6 +126,44 @@ fn released_upgrade_preserves_workflow_state() {
         .assert().success();
     assert_eq!(WorkModelStore::new(&project).read_work_item_snapshot("released-planned")
         .unwrap().attempts[0].tasks[0].id, before.attempts[0].tasks[0].id);
+
+    let queued_tmp = TempDir::new().unwrap();
+    let queued = released_work_fixture(&queued_tmp, &release, "released-queued");
+    let queue = released_command(&release, &queued,
+        &["queue", "add", "released-queued"]);
+    assert!(queue.status.success(), "{}", String::from_utf8_lossy(&queue.stderr));
+    let queued_before = released_command(&release, &queued,
+        &["queue", "show", "released-queued"]);
+    assert!(queued_before.status.success());
+    assert!(String::from_utf8_lossy(&queued_before.stdout).contains("queued"));
+    fluent_cmd().current_dir(&queued)
+        .args(["work-item", "upgrade", "released-queued"])
+        .assert().success();
+    let queued_after = fluent_cmd().current_dir(&queued)
+        .args(["queue", "show", "released-queued"])
+        .output().unwrap();
+    assert!(queued_after.status.success());
+    assert!(String::from_utf8_lossy(&queued_after.stdout).contains("queued"));
+
+    let paused_tmp = TempDir::new().unwrap();
+    let paused = released_work_fixture(&paused_tmp, &release, "released-paused");
+    let paused_before = released_command(&release, &paused,
+        &["attempt", "cancel", "released-paused", "attempt-1"]);
+    assert!(paused_before.status.success());
+    let saved = released_command(&release, &paused,
+        &["work-item", "show", "released-paused"]);
+    assert!(saved.status.success());
+    let paused_work: serde_json::Value = serde_json::from_slice(&saved.stdout).unwrap();
+    fluent_cmd().current_dir(&paused)
+        .args(["work-item", "upgrade", "released-paused"])
+        .assert().success();
+    let upgraded = fluent_cmd().current_dir(&paused)
+        .args(["work-item", "show", "released-paused"])
+        .output().unwrap();
+    assert!(upgraded.status.success());
+    let upgraded_work: serde_json::Value = serde_json::from_slice(&upgraded.stdout).unwrap();
+    assert_eq!(upgraded_work["attempts"][0]["id"], paused_work["attempts"][0]["id"]);
+    assert_eq!(upgraded_work["attempts"][0]["status"], paused_work["attempts"][0]["status"]);
 }
 
 #[test]
