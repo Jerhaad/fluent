@@ -65850,6 +65850,7 @@ fn record_evidence_status_trace(project: &Path, ready: &serde_json::Value, targe
             "attempt-results.json".into(),
             fs::read(project.join(attempt_path).join("tester-results.json")).unwrap(),
         ),
+        ("writer-deltas.json".into(), b"[]".to_vec()),
         ("status.txt".into(), status.stdout.clone()),
         ("shown-work.json".into(), show.stdout.clone()),
         (

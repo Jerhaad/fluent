@@ -307,7 +307,7 @@ def evidence_status_suite(source, root, output, jar, java):
     for name in ("production-trace.json", "ready-work.json", "landed-work.json",
                  "landing-results.json", "landing-manifest.json", "target-baseline.json",
                  "attempt-results.json", "status.txt", "shown-work.json",
-                 "tester-config.yaml", "extractor"):
+                 "tester-config.yaml", "extractor", "writer-deltas.json"):
         (output / name).unlink(missing_ok=True)
     fixture = subprocess.run(command, cwd=root, capture_output=True, text=True)
     (output / "production-fixture.log").write_text("$ " + " ".join(command) + "\n"
@@ -364,6 +364,8 @@ def evidence_status_suite(source, root, output, jar, java):
                     entry["sha256"] = hashlib.sha256(data).hexdigest()
             if label == "old-display":
                 changed["events"][3]["raw-facts"]["show"] = value
+            if artifact == "ready-work.json":
+                changed["events"][0]["raw-facts"]["work"] = value
             control_path = negative_dir / "trace.json"
             control_path.write_text(json.dumps(changed))
             negative = subprocess.run(["python3", str(source / "project_evidence.py"),
@@ -371,6 +373,40 @@ def evidence_status_suite(source, root, output, jar, java):
             (output / f"{label}.log").write_text(negative.stdout + negative.stderr)
             results.append({"case": label, "pass": negative.returncode != 0 and
                             diagnostic in negative.stderr, "log": f"{label}.log"})
+        for label, paths, expected_pass in (
+            ("carried-review-valid", [".fluent/expertise/learned.md"], True),
+            ("carried-review-stale", ["tests/corrected.rs"], False),
+        ):
+            control_dir = output / label
+            control_dir.mkdir(exist_ok=True)
+            carried = json.loads(json.dumps(trace))
+            for entry in trace["artifacts"]:
+                (control_dir / entry["path"]).write_bytes((output / entry["path"]).read_bytes())
+            work = json.loads((control_dir / "ready-work.json").read_text())
+            tasks = work["attempts"][0]["tasks"]
+            previous = "1" * 40
+            tasks[0]["output"]["commit"] = previous
+            for task in tasks:
+                if task["kind"] == "review" and task.get("evidence_review_context") is None:
+                    task["review_context"]["candidate_commit"] = previous
+            correction = json.loads(json.dumps(tasks[0]))
+            correction["id"] = "attempt-1-write-carried-control"
+            correction["output"]["commit"] = work["merge_candidates"][0]["candidate_commit"]
+            tasks.insert(next(i for i, task in enumerate(tasks) if task["kind"] == "tester"), correction)
+            delta = [{"from": previous, "to": correction["output"]["commit"], "paths": paths}]
+            for name, value in (("ready-work.json", work), ("writer-deltas.json", delta)):
+                data = json.dumps(value).encode()
+                (control_dir / name).write_bytes(data)
+                next(entry for entry in carried["artifacts"] if entry["path"] == name)["sha256"] = hashlib.sha256(data).hexdigest()
+            carried["events"][0]["raw-facts"]["work"] = work
+            control_path = control_dir / "trace.json"
+            control_path.write_text(json.dumps(carried))
+            checked = subprocess.run(["python3", str(source / "project_evidence.py"),
+                                      str(control_path)], capture_output=True, text=True)
+            (output / f"{label}.log").write_text(checked.stdout + checked.stderr)
+            results.append({"case": label, "pass": (checked.returncode == 0) == expected_pass and
+                            (expected_pass or "ordinary review binding differs" in checked.stderr),
+                            "log": f"{label}.log"})
         missing = json.loads(json.dumps(trace))
         missing["events"] = missing["events"][:-1]
         missing_path = output / "missing-observation.json"

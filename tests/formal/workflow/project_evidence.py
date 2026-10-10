@@ -12,7 +12,48 @@ from project import TraceError, exact_keys, load_json, require
 
 NAMES = {"ready-work.json", "landed-work.json", "landing-results.json",
          "landing-manifest.json", "target-baseline.json", "attempt-results.json",
-         "status.txt", "shown-work.json", "tester-config.yaml", "extractor"}
+         "status.txt", "shown-work.json", "tester-config.yaml", "extractor",
+         "writer-deltas.json"}
+
+
+def affected_roles(paths):
+    """Apply the ordinary review domain policy to retained Writer paths."""
+    roles = set()
+    for path in paths:
+        require(isinstance(path, str) and path and not path.startswith("/") and
+                all(part not in ("", ".", "..") for part in path.split("/")),
+                "invalid Writer delta path")
+        if path.startswith(".fluent/expertise/"):
+            changed = set()
+        elif path in ("documentation/architecture.md", "expertise/architecture.md"):
+            changed = {"documentation", "architecture"}
+        elif path in ("documentation/behaviors.md", "expertise/behaviors.md"):
+            changed = {"documentation", "behaviors", "tests"}
+        elif path.startswith("documentation/") or path in ("README.md", "LICENSE") or path.startswith("CHANGELOG"):
+            changed = {"documentation"}
+        elif path == "expertise/tests.md":
+            changed = {"documentation", "tests"}
+        elif path == "expertise/skills.md":
+            changed = {"documentation", "skills"}
+        elif path in ("expertise/documentation.md", "expertise/README.md"):
+            changed = {"documentation"}
+        elif path.startswith("expertise/"):
+            changed = {"documentation", "behaviors", "architecture", "skills", "tests"}
+        elif path.startswith("skills/"):
+            changed = {"documentation", "skills"}
+        elif path.startswith("skill-migrations/"):
+            changed = {"documentation", "skills", "tests"}
+        elif path.startswith("prompts/"):
+            changed = {"documentation", "behaviors", "skills", "tests"}
+        elif path.startswith("tests/"):
+            changed = {"tests"}
+        elif (path.startswith(("src/", "scripts/", "tools/", "infrastructure/", "sandboxes/", ".fluent/hooks/")) or
+              path in (".fluent/tester.yaml", ".fluent/extract-tester-results", "Cargo.toml", "Cargo.lock", "build.rs")):
+            changed = {"documentation", "architecture", "tests"}
+        else:
+            changed = {"documentation", "behaviors", "architecture", "skills", "tests"}
+        roles.update(changed)
+    return roles
 
 
 def digest(data):
@@ -96,6 +137,16 @@ def project(trace, root):
                         "candidate_workspace_id": ready_candidate["source_workspace"]["id"],
                         "candidate_workspace_path": ready_candidate["source_workspace"]["path"],
                         "source_branch": ready_candidate["source_branch"]}
+    deltas = load_json((root / "writer-deltas.json").read_text())
+    require(type(deltas) is list and len(deltas) == len(writes) - 1,
+            "Writer delta evidence is incomplete")
+    invalidated = {}
+    for index, delta in enumerate(deltas, 1):
+        require(delta.get("from") == writes[index - 1]["output"]["commit"] and
+                delta.get("to") == writes[index]["output"]["commit"] and
+                type(delta.get("paths")) is list,
+                "Writer delta binding differs")
+        invalidated[writes[index]["id"]] = affected_roles(delta["paths"])
     reviews = [task for task in ready_attempt["tasks"] if task["kind"] == "review" and
                task["status"] == "complete" and task.get("evidence_review_context") is None]
     credited = set()
@@ -106,14 +157,14 @@ def project(trace, root):
         context = review.get("review_context") or {}
         bound = all(context.get(key) == value for key, value in expected_context.items())
         if not bound:
-            # A later Writer can explicitly carry a completed review forward when
-            # its output still identifies the reviewed candidate.
-            carried = any(write["output"]["commit"] == ready_candidate["candidate_commit"] and
-                          any(ref["producer_id"] == review["id"] for ref in
-                              write["input_artifacts"]) and
-                          context.get("candidate_commit") in
-                          {prior["output"]["commit"] for prior in writes}
-                          for write in writes[1:])
+            # Each later Writer must leave this Review's domain unchanged.
+            review_index = ready_attempt["tasks"].index(review)
+            later = [write for write in writes[1:] if
+                     ready_attempt["tasks"].index(write) > review_index]
+            carried = (context.get("candidate_commit") in
+                       {write["output"]["commit"] for write in writes} and
+                       bool(later) and all(role not in invalidated[write["id"]]
+                                           for write in later))
             require(carried and all(context.get(key) == expected_context[key] for key in
                                     ("candidate_workspace_id", "candidate_workspace_path",
                                      "source_branch")),
