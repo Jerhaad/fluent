@@ -1942,11 +1942,17 @@ Work Item model for inspection. These commands use `.fluent/work/items/`
 through the Rust storage model and validate stored objects.
 Once a validated Merge Candidate records `Merged` and its merged commit,
 `work_status` presents retained Tester evidence as history. It reads the
-candidate-bound Tester result from its managed artifact path without opening
-the disposable source checkout. A missing or inconsistent result produces an
-evidence-history diagnostic; it does not reopen a Writer row or offer an
-Attempt resume command. Unmerged candidates, including Complete Attempts that
-have not landed, continue through current recovery and verification checks.
+final landing Tester result from the Merge Candidate's check artifacts when
+Learning or rebase changed the tested commit. When the Attempt Tester already
+names the merged commit, that managed Task artifact remains valid history.
+The resolver checks the exact merged SHA, committed Tester configuration,
+command occurrences, logs, summary, and accepted target baseline failures.
+For a retained landing intent, it also checks the artifact digest that bound
+the accepted landing evidence. These reads need no disposable source checkout.
+A missing or inconsistent result produces an evidence-history diagnostic; it
+does not reopen a Writer row or offer an Attempt resume command. Unmerged
+candidates, including Complete Attempts that have not landed, continue through
+current recovery and verification checks.
 `work-item show` includes their current verification assessment, or a
 verification diagnostic when that assessment cannot read its required proof.
 Status, Work Item inspection, and dashboard assemble snapshots without

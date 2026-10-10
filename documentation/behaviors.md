@@ -3769,8 +3769,12 @@ Test: tests/behaviors/operations/test-fargate-entrypoint-codex.sh (codex missing
 
 WHEN status, Work Item inspection, or dashboard observes a merged candidate
 after its source checkout is retired, THE SYSTEM SHALL show its recorded landed
-result and retained Tester evidence.
-Test: tests/binary.rs (landed_status_preserves_result_after_source_retirement)
+result and retained Tester evidence accepted for the exact merged commit,
+including when Learning or rebase changed the candidate after the Attempt
+Tester ran. It SHALL validate the retained landing result and target baseline
+against their recorded identity, command occurrence, manifest, and landing
+intent. An earlier commit's Tester result cannot supply final proof.
+Test: tests/binary.rs (landed_status_preserves_result_after_source_retirement, landed_status_uses_final_landing_tester_evidence, landed_status_validates_retained_landing_evidence)
 
 ### B7
 
