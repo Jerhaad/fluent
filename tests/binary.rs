@@ -20,6 +20,127 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use tempfile::TempDir;
 
+const RELEASED_050_SHA256: &str =
+    "8bb76717be942e4a0c97c297c318c0a1331e92105180edb386354dddbae12974";
+
+fn released_050_binary(tmp: &TempDir) -> PathBuf {
+    let source = Path::new("/Users/mrinal/.local/bin/fluent");
+    let bytes = fs::read(source).expect("actual v0.5.0 release executable is required");
+    assert_eq!(format!("{:x}", Sha256::digest(&bytes)), RELEASED_050_SHA256);
+    let copy = tmp.path().join("fluent-v0.5.0");
+    fs::write(&copy, bytes).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&copy, fs::Permissions::from_mode(0o755)).unwrap();
+    let version = Command::new(&copy).arg("version").output().unwrap();
+    assert!(version.status.success());
+    assert!(String::from_utf8_lossy(&version.stdout).contains("0.5.0 6875b409"));
+    copy
+}
+
+fn released_command(binary: &Path, project: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(binary)
+        .current_dir(project)
+        .env("FLUENT_NO_UPDATE_CHECK", "1")
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+fn released_work_fixture(tmp: &TempDir, binary: &Path, id: &str) -> PathBuf {
+    let project = setup_git_project(tmp);
+    for args in [
+        vec!["work-item", "create", id, "--title", "Released Work"],
+        vec!["attempt", "create", id, "attempt-1"],
+    ] {
+        let result = released_command(binary, &project, &args);
+        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    }
+    project
+}
+
+#[test]
+fn released_upgrade_preserves_workflow_state() {
+    let tmp = TempDir::new().unwrap();
+    let release = released_050_binary(&tmp);
+    let project = released_work_fixture(&tmp, &release, "released-planned");
+    let before = WorkModelStore::new(&project)
+        .read_work_item_snapshot("released-planned")
+        .unwrap();
+    fluent_cmd().current_dir(&project)
+        .args(["work-item", "show", "released-planned"])
+        .assert().success();
+    let after_read = WorkModelStore::new(&project)
+        .read_work_item_snapshot("released-planned")
+        .unwrap();
+    assert_eq!(after_read.id, before.id);
+    fluent_cmd().current_dir(&project)
+        .args(["work-item", "upgrade", "released-planned"])
+        .assert().success();
+    let after = WorkModelStore::new(&project)
+        .read_work_item_snapshot("released-planned")
+        .unwrap();
+    assert_eq!(after.id, before.id);
+    assert_eq!(after.attempts[0].id, before.attempts[0].id);
+    assert_eq!(after.attempts[0].tasks[0].id, before.attempts[0].tasks[0].id);
+    fluent_cmd().current_dir(&project)
+        .args(["attempt", "cancel", "released-planned", "attempt-1"])
+        .assert().success();
+    assert_eq!(WorkModelStore::new(&project).read_work_item_snapshot("released-planned")
+        .unwrap().attempts[0].tasks[0].id, before.attempts[0].tasks[0].id);
+}
+
+#[test]
+fn released_upgrade_recovers_interrupted_publication() {
+    let tmp = TempDir::new().unwrap();
+    let release = released_050_binary(&tmp);
+    let project = released_work_fixture(&tmp, &release, "released-pending");
+    let result = fluent_cmd().current_dir(&project)
+        .env("FLUENT_TEST_WORK_MODEL_INTERRUPT", "before-child-publication")
+        .args(["attempt", "cancel", "released-pending", "attempt-1"])
+        .output().unwrap();
+    assert!(!result.status.success());
+    assert!(project.join(".fluent/work/transactions/released-pending.json").exists());
+    fluent_cmd().current_dir(&project)
+        .args(["attempt", "cancel", "released-pending", "attempt-1"])
+        .assert().success();
+    assert!(!project.join(".fluent/work/transactions/released-pending.json").exists());
+}
+
+#[test]
+fn released_predecessor_refuses_current_authority() {
+    let tmp = TempDir::new().unwrap();
+    let release = released_050_binary(&tmp);
+    let project = released_work_fixture(&tmp, &release, "released-refusal");
+    fluent_cmd().current_dir(&project)
+        .args(["work-item", "upgrade", "released-refusal"])
+        .assert().success();
+    let root = project.join(".fluent/work");
+    let before = snapshot_tree(&root);
+    let result = released_command(&release, &project,
+        &["work-item", "abandon", "released-refusal", "--reason", "old reader"]);
+    assert!(!result.status.success(), "old release changed current authority");
+    assert_eq!(snapshot_tree(&root), before);
+}
+
+#[test]
+fn released_predecessor_refuses_pending_current_publication() {
+    let tmp = TempDir::new().unwrap();
+    let release = released_050_binary(&tmp);
+    let project = released_work_fixture(&tmp, &release, "released-pending-refusal");
+    let result = fluent_cmd().current_dir(&project)
+        .env("FLUENT_TEST_WORK_MODEL_INTERRUPT", "before-child-publication")
+        .args(["attempt", "cancel", "released-pending-refusal", "attempt-1"])
+        .output().unwrap();
+    assert!(!result.status.success());
+    let root = project.join(".fluent/work");
+    assert!(root.join("transactions/released-pending-refusal.json").exists());
+    let before = snapshot_tree(&root);
+    let result = released_command(&release, &project,
+        &["work-item", "abandon", "released-pending-refusal", "--reason", "old reader"]);
+    assert!(!result.status.success(), "old release replayed current publication");
+    assert_eq!(snapshot_tree(&root), before);
+}
+
 fn fluent_cmd() -> LoggedCommand {
     let mut cmd = LoggedCommand::cargo_bin("fluent");
     cmd.env_remove("FLUENT_TASK_KIND");
