@@ -111,6 +111,9 @@ fn released_predecessor_refuses_current_authority() {
     let tmp = TempDir::new().unwrap();
     let release = released_050_binary(&tmp);
     let project = released_work_fixture(&tmp, &release, "released-refusal");
+    let legacy_read = released_command(&release, &project,
+        &["work-item", "show", "released-refusal"]);
+    assert!(legacy_read.status.success());
     fluent_cmd().current_dir(&project)
         .args(["work-item", "upgrade", "released-refusal"])
         .assert().success();
@@ -119,6 +122,7 @@ fn released_predecessor_refuses_current_authority() {
     let result = released_command(&release, &project,
         &["work-item", "abandon", "released-refusal", "--reason", "old reader"]);
     assert!(!result.status.success(), "old release changed current authority");
+    assert!(!result.stderr.is_empty(), "refusal must explain the incompatible record");
     assert_eq!(snapshot_tree(&root), before);
 }
 
@@ -139,6 +143,10 @@ fn released_predecessor_refuses_pending_current_publication() {
         &["work-item", "abandon", "released-pending-refusal", "--reason", "old reader"]);
     assert!(!result.status.success(), "old release replayed current publication");
     assert_eq!(snapshot_tree(&root), before);
+    fluent_cmd().current_dir(&project)
+        .args(["attempt", "cancel", "released-pending-refusal", "attempt-1"])
+        .assert().success();
+    assert!(!root.join("transactions/released-pending-refusal.json").exists());
 }
 
 fn fluent_cmd() -> LoggedCommand {
