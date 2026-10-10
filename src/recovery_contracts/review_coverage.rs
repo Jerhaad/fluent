@@ -17,10 +17,34 @@ pub(crate) fn ordinary_review_tasks<'a>(
     project_root: &Path,
     attempt: &'a Attempt,
 ) -> Vec<(&'a Task, Verdict)> {
+    ordinary_review_tasks_with_target(project_root, attempt, None)
+}
+
+/// Reconstruct landing coverage after rebase rewrites the last Writer output.
+/// Ignore target-only paths added by that rebase when deciding which ordinary
+/// reviews a Writer invalidated.
+pub(crate) fn ordinary_review_tasks_for_landing<'a>(
+    project_root: &Path,
+    attempt: &'a Attempt,
+    candidate_tip: &str,
+    target_tip: &str,
+) -> Vec<(&'a Task, Verdict)> {
+    ordinary_review_tasks_with_target(project_root, attempt, Some((candidate_tip, target_tip)))
+}
+
+fn ordinary_review_tasks_with_target<'a>(
+    project_root: &Path,
+    attempt: &'a Attempt,
+    landing_tips: Option<(&str, &str)>,
+) -> Vec<(&'a Task, Verdict)> {
     let mut current: Option<&TaskOutput> = None;
     let mut reviews: Vec<(&Task, Verdict)> = Vec::new();
     let mut ambiguous_roles = HashSet::new();
-    for task in &attempt.tasks {
+    let last_writer = attempt
+        .tasks
+        .iter()
+        .rposition(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete);
+    for (index, task) in attempt.tasks.iter().enumerate() {
         if task.status != TaskStatus::Complete {
             continue;
         }
@@ -40,8 +64,21 @@ pub(crate) fn ordinary_review_tasks<'a>(
                         &prior.commit,
                         &output.commit,
                     )
+                    .map(|mut paths| {
+                        if Some(index) == last_writer {
+                            if let Some((candidate_tip, target_tip)) = landing_tips {
+                                paths.retain(|path| {
+                                    !crate::git::run_raw(
+                                        &workspace,
+                                        &["diff", "--quiet", candidate_tip, target_tip, "--", path],
+                                    )
+                                    .is_ok_and(|output| output.status.success())
+                                });
+                            }
+                        }
+                        crate::review_invalidation::affected_review_roles(&paths)
+                    })
                 })
-                .map(|paths| crate::review_invalidation::affected_review_roles(&paths))
                 .unwrap_or_else(|_| review::REVIEWERS.to_vec()),
                 _ => review::REVIEWERS.to_vec(),
             };

@@ -137,6 +137,39 @@ fn ensure_review_bindings_current(
             task.role
         );
     }
+    // Checking recorded Tasks alone misses a role removed after a later Writer
+    // invalidated its domain. Reconstruct coverage from the Writer history.
+    // Landing provenance can rewrite Review bindings to the rebased tip; use
+    // each Review's position after its Writer to recover the pre-rebase binding
+    // solely for this read-only coverage calculation.
+    let mut coverage_attempt = attempt.clone();
+    let mut writer_commit = None;
+    for task in &mut coverage_attempt.tasks {
+        if task.kind == TaskKind::Write && task.status == TaskStatus::Complete {
+            writer_commit = task.output.as_ref().map(|output| output.commit.clone());
+        } else if task.kind == TaskKind::Review {
+            if let (Some(context), Some(commit)) = (task.review_context.as_mut(), &writer_commit) {
+                context.candidate_commit.clone_from(commit);
+            }
+        }
+    }
+    let target = resolve_workspace_path(project_root, &candidate.target_workspace.path);
+    let target_tip = resolve_target_head(&target, &candidate.target_branch)?;
+    let candidate_tip = head_commit(&source)?;
+    let ordinary = crate::recovery_contracts::review_coverage::ordinary_review_tasks_for_landing(
+        project_root,
+        &coverage_attempt,
+        &candidate_tip,
+        &target_tip,
+    );
+    for role in crate::review::REVIEWERS {
+        anyhow::ensure!(
+            ordinary.iter().any(|(task, verdict)| {
+                task.role == *role && *verdict == crate::review::Verdict::Pass
+            }),
+            "ordinary {role} review binding changed before landing"
+        );
+    }
     Ok(())
 }
 
