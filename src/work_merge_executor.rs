@@ -601,6 +601,12 @@ pub fn merge_candidate(config: WorkMergeConfig<'_>) -> Result<WorkMergeOutcome> 
         config.work_item_id,
         &candidate.attempt_id,
     )?;
+    let live_tip = head_commit(&source_workspace)?;
+    anyhow::ensure!(
+        live_tip == candidate.candidate_commit,
+        "candidate HEAD {live_tip} differs from reviewed Merge Candidate {}; rerun the Attempt before landing",
+        candidate.candidate_commit
+    );
     let target_workspace =
         resolve_workspace_path(config.project_root, &candidate.target_workspace.path);
     let artifact_dir = merge_artifact_dir(

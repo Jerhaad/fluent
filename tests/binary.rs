@@ -65830,6 +65830,74 @@ fn landed_status_validates_retained_landing_evidence() {
 }
 
 #[test]
+fn workflow_evidence_satisfies_only_validly_bound_requirements() {
+    let tmp = TempDir::new().unwrap();
+    let (project, bin, _) = setup_rebased_tester_candidate(&tmp, ":");
+    let before = git_head(&project);
+    let candidate_workspace = project.join("../work-6-work-1-attempt-1");
+    git::run(
+        &candidate_workspace,
+        &["commit", "--allow-empty", "-m", "Change candidate"],
+        "change candidate after its Tester",
+    )
+    .unwrap();
+    fluent_cmd()
+        .current_dir(&project)
+        .args(["merge-candidate", "land", "work-1", "--no-sandbox"])
+        .env("PATH", mock_path(&bin))
+        .assert()
+        .failure();
+    assert_eq!(git_head(&project), before);
+    let shown = read_work_show_json(&project, "work-1");
+    assert_ne!(
+        shown["attempts"][0]["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|task| task["kind"] == "tester")
+            .unwrap()["review_context"]["candidate_commit"],
+        git_head(&candidate_workspace)
+    );
+    assert_ne!(
+        shown["merge_candidates"][0]["merge_state"]["status"],
+        "merged"
+    );
+}
+
+#[test]
+fn workflow_changed_bindings_reassess_evidence_before_advancement() {
+    let tmp = TempDir::new().unwrap();
+    let (project, bin, _) = setup_rebased_tester_candidate(&tmp, ":");
+    let target = advance_tester_target(&project);
+    land_work_1(&project, &bin, true);
+    let shown = read_work_show_json(&project, "work-1");
+    let path = shown["evidence-history"]["tester-results"]
+        .as_str()
+        .unwrap();
+    let mut results = read_json_path(&project.join(path));
+    results["candidate_commit"] = serde_json::json!(target);
+    fs::write(project.join(path), serde_json::to_vec(&results).unwrap()).unwrap();
+    let status = fluent::work_status::load_work_status(&project).unwrap();
+    assert_eq!(status.rows[0].action, "merged");
+    assert!(
+        status.rows[0]
+            .evidence_history
+            .as_ref()
+            .unwrap()
+            .tester_results
+            .is_none()
+    );
+    assert!(
+        status.rows[0]
+            .recovery_blocker
+            .as_deref()
+            .unwrap()
+            .contains("merged candidate")
+    );
+    assert!(status.rows[0].next_action.is_none());
+}
+
+#[test]
 fn landed_status_preserves_result_after_source_retirement() {
     let tmp = TempDir::new().unwrap();
     let project = landed_status_fixture(&tmp);
