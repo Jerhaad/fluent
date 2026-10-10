@@ -741,6 +741,8 @@ def release_transition_suite(source, root, output, jar, java):
                     instance_id=trace["events"][0]["raw-facts"]["health"]["instance_id"])),
                 ("service-worker-negative", lambda trace: trace["events"][1]["raw-facts"]["owned-workers"][0].update(
                     dispatch_id="unobserved-dispatch")),
+                ("service-launch-negative", lambda trace: trace["events"][1]["raw-facts"]["owned-workers"][0]["launches"][0].update(
+                    {"process-group-absent": False})),
                 ("service-stale-stop-negative", lambda trace: trace["events"][2]["raw-facts"]["stale-stop"].update(
                     {"requested-coordinator": "unobserved-coordinator"}))):
             corrupted = json.loads(service_trace.read_text())

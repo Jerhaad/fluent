@@ -383,6 +383,31 @@ fn released_service_fixture_reaps_descendant_after_leader_exit() {
     assert!(!release_group_exists(group));
 }
 
+#[test]
+fn released_service_fixture_tracks_relaunched_provider_groups() {
+    let root = TempDir::new().unwrap();
+    let project = root.path().join("project");
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&project).unwrap();
+    fs::create_dir(&workspace).unwrap();
+    let started = root.path().join("started");
+    fs::write(
+        &started,
+        format!(
+            "101\t{}\n102\t{}\n103\t{}\n104\t{}\n",
+            workspace.display(),
+            workspace.display(),
+            project.display(),
+            root.path().display()
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        observed_release_groups(&started, &project, &workspace),
+        vec![101, 102, 103]
+    );
+}
+
 fn observed_release_worker(
     project: &std::path::Path,
     work: &str,
@@ -444,6 +469,28 @@ fn observed_release_worker(
         return Some((task.id.clone(), workspace, receipt, group));
     }
     None
+}
+
+fn observed_release_groups(
+    started: &std::path::Path,
+    project: &std::path::Path,
+    workspace: &std::path::Path,
+) -> Vec<i32> {
+    let log = fs::read_to_string(started).unwrap();
+    let project = fs::canonicalize(project).unwrap();
+    let workspace = fs::canonicalize(workspace).unwrap();
+    let mut groups = Vec::new();
+    for line in log.lines() {
+        let (pid, path) = line.split_once('\t').expect("provider launch needs a path");
+        let path = fs::canonicalize(path).expect("provider launch path must exist");
+        if path == workspace || path == project {
+            let pid: i32 = pid.parse().expect("provider launch needs a PID");
+            assert!(pid > 0);
+            assert!(!groups.contains(&pid), "provider launch PID repeated");
+            groups.push(pid);
+        }
+    }
+    groups
 }
 
 fn release_project_matches(recorded: &std::path::Path, project: &std::path::Path) -> bool {
@@ -874,7 +921,7 @@ fn scheduler_released_upgrade_preserves_shared_ownership() {
         for (project, work) in [(first.path(), "first"), (second.path(), "second")] {
             if owned_before_stop
                 .iter()
-                .any(|(seen, _, _, _, _, _)| seen == project)
+                .any(|(seen, _, _, _, _, _, _)| seen == project)
             {
                 continue;
             }
@@ -885,6 +932,13 @@ fn scheduler_released_upgrade_preserves_shared_ownership() {
             if let Some((task_id, workspace, receipt, pid)) = worker
                 .filter(|_| matches!(dispatch["status"].as_str(), Some("claimed" | "running")))
             {
+                let initial: fluent::execution::ExecutionRecord =
+                    serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
+                if initial.state != fluent::execution::ExecutionState::Running
+                    || initial.process_group_id != pid as u32
+                {
+                    continue;
+                }
                 assert_eq!(dispatch["work_item_id"], work);
                 assert_eq!(dispatch["bound_attempt_id"], "attempt-1");
                 assert!(
@@ -898,6 +952,7 @@ fn scheduler_released_upgrade_preserves_shared_ownership() {
                     workspace,
                     receipt,
                     pid,
+                    initial,
                     dispatch,
                 ));
             }
@@ -981,38 +1036,74 @@ fn scheduler_released_upgrade_preserves_shared_ownership() {
     )));
     let owned_workers: Vec<_> = owned_before_stop
         .iter()
-        .map(|(project, task_id, workspace, receipt, pid, before)| {
-            let after = active_after_stop
-                .iter()
-                .find(|after| {
-                    after["work_item_id"] == before["work_item_id"]
-                        && after["dispatch_id"] == before["dispatch_id"]
-                })
-                .expect("owned dispatch must still be visible after stop");
-            assert_eq!(after["bound_attempt_id"], before["bound_attempt_id"]);
-            assert!(matches!(
-                after["status"].as_str(),
-                Some("candidate-ready" | "failed" | "needs-user" | "canceled" | "blocked")
-            ));
-            let execution: fluent::execution::ExecutionRecord =
-                serde_json::from_slice(&fs::read(receipt).unwrap()).unwrap();
-            assert!(matches!(
-                execution.state,
-                fluent::execution::ExecutionState::Settled
-                    | fluent::execution::ExecutionState::Canceled
-            ));
-            assert_eq!(execution.process_group_id, *pid as u32);
-            assert!(
-                !release_group_exists(*pid),
-                "owned provider group remains live"
-            );
-            serde_json::json!({"project":project,"pid":pid,
+        .map(
+            |(project, task_id, workspace, receipt, pid, initial, before)| {
+                let after = active_after_stop
+                    .iter()
+                    .find(|after| {
+                        after["work_item_id"] == before["work_item_id"]
+                            && after["dispatch_id"] == before["dispatch_id"]
+                    })
+                    .expect("owned dispatch must still be visible after stop");
+                assert_eq!(after["bound_attempt_id"], before["bound_attempt_id"]);
+                assert!(matches!(
+                    after["status"].as_str(),
+                    Some("candidate-ready" | "failed" | "needs-user" | "canceled" | "blocked")
+                ));
+                let execution: fluent::execution::ExecutionRecord =
+                    serde_json::from_slice(&fs::read(receipt).unwrap()).unwrap();
+                assert!(matches!(
+                    execution.state,
+                    fluent::execution::ExecutionState::Settled
+                        | fluent::execution::ExecutionState::Canceled
+                ));
+                assert_eq!(execution.attempt_owner, initial.attempt_owner);
+                let final_pid = i32::try_from(execution.process_group_id).unwrap();
+                let groups = observed_release_groups(&started, project, workspace);
+                assert!(groups.contains(pid), "initial provider launch is missing");
+                assert!(
+                    groups.contains(&final_pid),
+                    "final provider launch is missing"
+                );
+                let launches: Vec<_> = groups
+                    .iter()
+                    .map(|group| {
+                        assert!(
+                            !release_group_exists(*group),
+                            "owned provider group {group} remains live"
+                        );
+                        serde_json::json!({"pid":group,"process-group-absent":true})
+                    })
+                    .collect();
+                let item = fluent::work_model::WorkModelStore::new(project)
+                    .read_work_item_snapshot(before["work_item_id"].as_str().unwrap())
+                    .unwrap();
+                let task = item
+                    .attempts
+                    .iter()
+                    .find(|attempt| attempt.id == "attempt-1")
+                    .unwrap()
+                    .tasks
+                    .iter()
+                    .find(|task| task.id == *task_id)
+                    .unwrap();
+                assert!(matches!(
+                    task.status,
+                    fluent::work_model::TaskStatus::Complete
+                        | fluent::work_model::TaskStatus::Failed
+                        | fluent::work_model::TaskStatus::NeedsUser
+                        | fluent::work_model::TaskStatus::Superseded
+                ));
+                serde_json::json!({"project":project,"pid":pid,
             "task_id":task_id,"workspace":workspace,"receipt":receipt,
+            "initial-receipt":initial,"final-receipt":execution,
+            "launches":launches,"task-status":task.status,
             "execution-state":execution.state,"process-group-absent":true,
             "work_item_id":before["work_item_id"], "dispatch_id":before["dispatch_id"],
             "attempt_id":before["bound_attempt_id"],
             "status-before-stop":before["status"],"status-after-stop":after["status"]})
-        })
+            },
+        )
         .collect();
     release_guard.reap();
     assert!(

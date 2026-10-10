@@ -87,6 +87,16 @@ def project_service(trace):
                and type(worker["pid"]) is int and worker["pid"] > 0
                and worker["task_id"] and worker["workspace"] and worker["receipt"]
                and worker["execution-state"] in {"settled", "canceled"}
+               and worker["initial-receipt"]["state"] == "running"
+               and worker["initial-receipt"]["process_group_id"] == worker["pid"]
+               and worker["final-receipt"]["state"] == worker["execution-state"]
+               and worker["initial-receipt"]["attempt_owner"] == worker["final-receipt"]["attempt_owner"]
+               and worker["task-status"] in {"complete", "failed", "needs-user", "superseded"}
+               and len(worker["launches"]) > 0
+               and all(launch["process-group-absent"] is True for launch in worker["launches"])
+               and len({launch["pid"] for launch in worker["launches"]}) == len(worker["launches"])
+               and worker["pid"] in {launch["pid"] for launch in worker["launches"]}
+               and worker["final-receipt"]["process_group_id"] in {launch["pid"] for launch in worker["launches"]}
                and worker["process-group-absent"] is True
                and worker["status-before-stop"] in {"claimed", "running"}
                and worker["status-after-stop"] in {"candidate-ready", "failed", "needs-user", "canceled", "blocked"}
