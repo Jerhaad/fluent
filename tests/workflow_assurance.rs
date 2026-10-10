@@ -405,3 +405,92 @@ fn workflow_integrated_rejects_missing_model_tool() {
     assert!(!result.status.success());
     assert!(String::from_utf8_lossy(&result.stderr).contains("pinned TLC 1.7.4 JAR"));
 }
+
+#[test]
+fn workflow_integrated_queue_survives_other_attempt_cancellation() {
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path();
+    assert!(
+        run(project, "git", &["init", "-b", "main"])
+            .status
+            .success()
+    );
+    assert!(
+        run(
+            project,
+            "git",
+            &["config", "user.email", "test@example.com"]
+        )
+        .status
+        .success()
+    );
+    assert!(
+        run(project, "git", &["config", "user.name", "Test"])
+            .status
+            .success()
+    );
+    fs::write(project.join("README.md"), "fixture\n").unwrap();
+    assert!(run(project, "git", &["add", "README.md"]).status.success());
+    assert!(
+        run(project, "git", &["commit", "-m", "Initialize fixture"])
+            .status
+            .success()
+    );
+    assert!(fluent(project, &["init"]).status.success());
+    for work in ["foreground", "queued"] {
+        let created = fluent(project, &["work-item", "create", work, "--title", work]);
+        assert!(
+            created.status.success(),
+            "{}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+    }
+    let attempt = fluent(project, &["attempt", "create", "foreground", "attempt-1"]);
+    assert!(
+        attempt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&attempt.stderr)
+    );
+    let queued = fluent(project, &["queue", "add", "queued"]);
+    assert!(
+        queued.status.success(),
+        "{}",
+        String::from_utf8_lossy(&queued.stderr)
+    );
+    let before_queue = fluent(project, &["work-item", "show", "queued"]);
+    assert!(before_queue.status.success());
+    let cancel = fluent(project, &["attempt", "cancel", "foreground", "attempt-1"]);
+    assert!(
+        cancel.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cancel.stderr)
+    );
+    let foreground = fluent(project, &["work-item", "show", "foreground"]);
+    assert!(foreground.status.success());
+    let work: Value = serde_json::from_slice(&foreground.stdout).unwrap();
+    assert_eq!(work["attempts"][0]["status"], "needs-user");
+    assert!(work["attempts"][0]["cancellation"]["requested_at"].is_string());
+    let queue = fluent(project, &["queue", "list"]);
+    assert!(queue.status.success());
+    assert!(String::from_utf8_lossy(&queue.stdout).contains("queued"));
+    let status = fluent(project, &["status"]);
+    assert!(status.status.success());
+    let after_queue = fluent(project, &["work-item", "show", "queued"]);
+    assert!(after_queue.status.success());
+    assert_eq!(before_queue.stdout, after_queue.stdout);
+    let refused = fluent(
+        project,
+        &[
+            "task",
+            "run",
+            "foreground",
+            "attempt-1",
+            "attempt-1-write-1",
+        ],
+    );
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("cancel"));
+    let after_foreground = fluent(project, &["work-item", "show", "foreground"]);
+    assert!(after_foreground.status.success());
+    assert_eq!(foreground.stdout, after_foreground.stdout);
+}
