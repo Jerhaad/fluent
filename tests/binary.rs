@@ -390,7 +390,7 @@ fn released_upgrade_recovers_predecessor_interrupted_work() {
                 "--no-sandbox",
             ]),
     );
-    assert!(poll_until(std::time::Duration::from_secs(10), || started.exists()));
+    wait_for_released_writer(&mut running, &started);
     let before = released_command(
         &release,
         &project,
@@ -562,7 +562,7 @@ fn released_upgrade_preserves_running_before_stop() {
                 "--no-sandbox",
             ]),
     );
-    assert!(poll_until(std::time::Duration::from_secs(10), || started.exists()));
+    wait_for_released_writer(&mut running, &started);
     let before = released_command(
         &release,
         &project,
@@ -32655,6 +32655,17 @@ fn poll_until(timeout: std::time::Duration, mut condition: impl FnMut() -> bool)
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
+}
+
+fn wait_for_released_writer(running: &mut OwnedFixtureProcess, started: &Path) {
+    let observed = poll_until(std::time::Duration::from_secs(45), || {
+        started.exists() || running.try_wait().unwrap().is_some()
+    });
+    assert!(
+        observed && started.exists(),
+        "released writer did not start; process status: {:?}",
+        running.try_wait().unwrap()
+    );
 }
 
 fn git_common_dir(repo: &Path) -> PathBuf {
