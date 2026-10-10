@@ -7078,6 +7078,13 @@ PY
 "#,
     );
     let require_host = std::env::var("FLUENT_WORKFLOW_REQUIRE_HOST").as_deref() == Ok("1");
+    if require_host {
+        write_mock_executable(
+            &bin,
+            "sandbox-exec",
+            "#!/bin/bash\nexec /usr/bin/sandbox-exec \"$@\"\n",
+        );
+    }
     let mut resume = fluent_cmd();
     resume
         .current_dir(&fixture.project)
@@ -7096,8 +7103,9 @@ PY
         .unwrap();
     assert!(
         run.status.success(),
-        "{}",
-        String::from_utf8_lossy(&run.stderr)
+        "{}\nprovider stderr: {}",
+        String::from_utf8_lossy(&run.stderr),
+        fs::read_to_string(correction_area.join("provider-stderr.log")).unwrap_or_default()
     );
     let continued_shown = read_work_show_json(&fixture.project, &fixture.work);
     let continued = store.read_work_item(&fixture.work).unwrap();
