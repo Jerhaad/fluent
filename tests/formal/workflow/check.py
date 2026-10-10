@@ -613,8 +613,11 @@ def recovery_observation_suite(source, root, output, jar, java):
             states = json.loads(projection.stdout)["states"]
             config = output / "recovery-production.cfg"
             config.write_text("SPECIFICATION Spec\nCONSTANTS\n" +
-                              "".join(f"  TraceState{i} = {json.dumps(state)}\n"
-                                      for i, state in enumerate(states, 1)) +
+                              "".join(f"  Trace{i}{key} = " +
+                                      ("TRUE" if value is True else "FALSE" if value is False
+                                       else json.dumps(value)) + "\n"
+                                      for i, state in enumerate(states, 1)
+                                      for key, value in state.items()) +
                               "INVARIANT TraceSafe\nPROPERTY TraceComplete\n")
             results.append(run_case(source, output, jar, java, str(config), None,
                                     "RecoveryTrace"))
@@ -622,6 +625,10 @@ def recovery_observation_suite(source, root, output, jar, java):
             ("stale-action", lambda work: work.__setitem__("next-action", "queue resume")),
             ("missing-transition", lambda work: work["attempts"][0]["tasks"][1]
              .__setitem__("status", "planned")),
+            ("misbound-authorization", lambda work: work["attempts"][0]
+             ["recovery_operations"][0].__setitem__(
+                 "candidate-commit", work["attempts"][0]["tasks"][0]
+                 ["output"]["base_commit"])),
         ):
             negative_dir = output / name
             negative_dir.mkdir(exist_ok=True)
@@ -629,7 +636,8 @@ def recovery_observation_suite(source, root, output, jar, java):
                 (negative_dir / entry["path"]).write_bytes(
                     (output / entry["path"]).read_bytes())
             modified = json.loads(json.dumps(trace))
-            index = 0 if name == "stale-action" else 2
+            index = {"stale-action": 0, "missing-transition": 2,
+                     "misbound-authorization": 1}[name]
             artifact = modified["artifacts"][index]
             work = json.loads((negative_dir / artifact["path"]).read_text())
             edit(work)
@@ -637,6 +645,14 @@ def recovery_observation_suite(source, root, output, jar, java):
             (negative_dir / artifact["path"]).write_bytes(data)
             artifact["sha256"] = hashlib.sha256(data).hexdigest()
             modified["events"][index]["raw-facts"]["work"] = work
+            if name == "misbound-authorization":
+                later = modified["artifacts"][2]
+                later_work = json.loads((negative_dir / later["path"]).read_text())
+                edit(later_work)
+                later_data = json.dumps(later_work, sort_keys=True).encode()
+                (negative_dir / later["path"]).write_bytes(later_data)
+                later["sha256"] = hashlib.sha256(later_data).hexdigest()
+                modified["events"][2]["raw-facts"]["work"] = later_work
             negative_path = negative_dir / "production-trace.json"
             negative_path.write_text(json.dumps(modified))
             rejected = subprocess.run(["python3", str(source / "project_recovery.py"),

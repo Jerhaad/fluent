@@ -21182,14 +21182,27 @@ fn workflow_cleanup_rechecks_current_eligibility() {
     eligible.attempts[0].status = AttemptStatus::Failed;
     eligible.attempts[0].tasks[0].status = TaskStatus::Failed;
     store.create_work_item(&eligible).unwrap();
-    let lock = fluent::land_lock::acquire(&fluent::land_lock::lock_path(&project)).unwrap();
+    let reached = tmp.path().join("cleanup-selected");
+    let release = tmp.path().join("cleanup-release");
     let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("fluent"));
     command
         .current_dir(&project)
         .args(["cleanup", "--apply"])
+        .env("FLUENT_TEST_CLEANUP_SELECTED", &reached)
+        .env("FLUENT_TEST_CLEANUP_RELEASE", &release)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     let mut child = OwnedFixtureProcess::spawn(&mut command);
+    for _ in 0..500 {
+        if reached.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        reached.exists(),
+        "cleanup did not reach post-selection barrier"
+    );
     store
         .mutate_work_item("cleanup-recheck", |item| {
             item.attempts[0].status = AttemptStatus::NeedsUser;
@@ -21197,7 +21210,7 @@ fn workflow_cleanup_rechecks_current_eligibility() {
             Ok(())
         })
         .unwrap();
-    drop(lock);
+    fs::write(&release, b"continue").unwrap();
     let output = child.wait_with_output().unwrap();
     assert!(
         output.status.success(),
@@ -66749,21 +66762,31 @@ fn landed_status_keeps_unmerged_checks_strict() {
 #[test]
 fn workflow_recovery_preserves_settled_effects() {
     let tmp = TempDir::new().unwrap();
-    let project = landed_status_fixture(&tmp);
-    let before = work_item_value(&project, "work-1");
+    let project = setup_git_project(&tmp);
+    let bin = run_plain_attempt(&project, &tmp, "workflow-recovery-provider");
+    fs::write(project.join(".fluent/observations"), "block publication\n").unwrap();
+    land_work_1(&project, &bin, true);
+    assert_eq!(follow_up_failure_stage(&project), "observation");
     let head = git_head(&project);
-    let bin = tmp.path().join("landed-status-bin");
+    let merged = work_item_value(&project, "work-1");
     land_work_1(&project, &bin, true);
     assert_eq!(git_head(&project), head);
-    assert_eq!(work_item_value(&project, "work-1"), before);
-    assert_eq!(open_observation_files(&project).len(), 0);
+    assert_eq!(work_item_value(&project, "work-1"), merged);
+    fs::remove_file(project.join(".fluent/observations")).unwrap();
+    land_work_1(&project, &bin, true);
+    assert_eq!(git_head(&project), head);
+    assert_eq!(follow_up_failure_stage(&project), "");
+    assert_eq!(open_observation_files(&project).len(), 1);
 }
 
 #[test]
 fn workflow_recovery_preserves_intervening_changes() {
     let tmp = TempDir::new().unwrap();
-    let project = landed_status_fixture(&tmp);
-    let before = work_item_value(&project, "work-1");
+    let project = setup_git_project(&tmp);
+    let bin = run_plain_attempt(&project, &tmp, "workflow-recovery-provider");
+    fs::write(project.join(".fluent/observations"), "block publication\n").unwrap();
+    land_work_1(&project, &bin, true);
+    assert_eq!(follow_up_failure_stage(&project), "observation");
     commit_file(
         &project,
         "independent.txt",
@@ -66783,7 +66806,7 @@ fn workflow_recovery_preserves_intervening_changes() {
         .success();
     let independent = work_item_value(&project, "later-work");
     let later_head = git_head(&project);
-    let bin = tmp.path().join("landed-status-bin");
+    fs::remove_file(project.join(".fluent/observations")).unwrap();
     land_work_1(&project, &bin, true);
     assert_eq!(git_head(&project), later_head);
     assert_eq!(
@@ -66791,7 +66814,8 @@ fn workflow_recovery_preserves_intervening_changes() {
         b"later work\n"
     );
     assert_eq!(work_item_value(&project, "later-work"), independent);
-    assert_eq!(work_item_value(&project, "work-1"), before);
+    assert_eq!(follow_up_failure_stage(&project), "");
+    assert_eq!(open_observation_files(&project).len(), 1);
 }
 
 #[test]
@@ -66799,6 +66823,83 @@ fn workflow_recovery_requires_current_resume_authority() {
     launch_handoff_route_task_recovers_after_parent_publication_loss();
     attempt_cancel_persists_stop_before_settling_active_execution();
     evidence_recovery_receipt_cannot_clear_intervening_stop();
+    let fixture = setup_round_cap_approach_revision_fixture();
+    approve_round_cap_extension(&fixture);
+    revise_round_cap_approach(&fixture).success();
+    let bin = fixture._tmp.path().join("repeated-stop-provider");
+    let prompts = fixture._tmp.path().join("repeated-stop-prompts.log");
+    write_scheduler_claude(&bin, &round_cap_resume_provider_script(&prompts));
+    fluent_cmd()
+        .current_dir(&fixture.main_dir)
+        .args(["attempt", "cancel", "work-1", "attempt-1"])
+        .assert()
+        .success();
+    let first = fixture.store.read_work_item("work-1").unwrap();
+    let first_stop = first.attempts[0]
+        .cancellation
+        .as_ref()
+        .unwrap()
+        .requested_at
+        .clone();
+    fluent_cmd()
+        .current_dir(&fixture.main_dir)
+        .args(["queue", "resume", "work-1", "--attempt", "attempt-1"])
+        .assert()
+        .success();
+    let first_ledger = read_json_path(&queue_ledger_path(&fixture.main_dir, "work-1"));
+    let first_dispatch = first_ledger["dispatches"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap();
+    assert_eq!(
+        first_dispatch["resume_cancellation_requested_at"],
+        first_stop
+    );
+    run_scheduler_until_dispatch_status(&fixture.main_dir, "work-1", &bin, "needs-user");
+    let resumed = fixture.store.read_work_item("work-1").unwrap();
+    assert!(
+        resumed.attempts[0]
+            .cancellation
+            .as_ref()
+            .unwrap()
+            .resumed_at
+            .is_some()
+    );
+    fluent_cmd()
+        .current_dir(&fixture.main_dir)
+        .args(["attempt", "cancel", "work-1", "attempt-1"])
+        .assert()
+        .success();
+    let second = fixture.store.read_work_item("work-1").unwrap();
+    let second_stop = second.attempts[0]
+        .cancellation
+        .as_ref()
+        .unwrap()
+        .requested_at
+        .clone();
+    assert_ne!(second_stop, first_stop);
+    assert!(
+        second.attempts[0]
+            .cancellation
+            .as_ref()
+            .unwrap()
+            .resumed_at
+            .is_none()
+    );
+    fluent_cmd()
+        .current_dir(&fixture.main_dir)
+        .args(["queue", "resume", "work-1", "--attempt", "attempt-1"])
+        .assert()
+        .success();
+    let second_ledger = read_json_path(&queue_ledger_path(&fixture.main_dir, "work-1"));
+    let latest = second_ledger["dispatches"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap();
+    assert_eq!(latest["resume_cancellation_requested_at"], second_stop);
+    assert_ne!(latest["dispatch_id"], first_dispatch["dispatch_id"]);
 }
 
 #[test]

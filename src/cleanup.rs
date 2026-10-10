@@ -79,6 +79,21 @@ pub fn cleanup_work_items(
         .collect::<HashSet<_>>();
     let candidates = cleanup_work_item_candidates(&source_root, work_items);
     let registered = registered_worktrees(&source_root)?;
+    #[cfg(feature = "test-support")]
+    if let (Ok(reached), Ok(release)) = (
+        std::env::var("FLUENT_TEST_CLEANUP_SELECTED"),
+        std::env::var("FLUENT_TEST_CLEANUP_RELEASE"),
+    ) {
+        fs::write(&reached, b"selected")?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !Path::new(&release).exists() {
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "cleanup selection barrier timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
     let mut results = Vec::new();
 
     for work_item in candidates {

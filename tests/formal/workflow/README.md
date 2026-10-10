@@ -8,8 +8,11 @@ observation and cleanup negative controls, and a joint service/child settlement
 boundary. `JointSettlement.tla` keeps a child's ownership receipt across two
 service crashes. It permits publication of a completed stop only after the
 child settles; its negative configuration allows early publication and must
-violate the invariant. This closes the atomic worker-clear assumption in the
-separate `ServiceLifecycle` model at the modeled handoff. The Rust cancellation
+violate the invariant. This is a bounded abstract control: it does not connect
+`ServiceLifecycle.Crash` worker clearing to the child receipt or publication.
+The project decision is to retain that live connection as a future model
+extension rather than claim the atomic worker-clear assumption is discharged.
+The Rust cancellation
 test remains the production check for stale authority, while a live child
 crash trace remains a separate connection obligation.
 
@@ -21,8 +24,9 @@ completes one corrective Writer while preserving the original matrix and
 candidate. The next action names evidence attachment for the remaining host
 row. `project_recovery.py` derives `paused → authorized → continued` from
 the Work snapshots and commands. Rebound stale guidance and a missing Writer
-transition fail its negative controls. `RecoveryTrace.tla` checks the derived
-transition order. The trace proves this recovery case; the other public
+transition and a misbound recovery authorization fail its negative controls.
+`RecoveryTrace.tla` checks the projected Work, Task, candidate, authority, and
+publication state across the repair and run actions. The trace proves this recovery case; the other public
 failure routes remain covered by their focused Rust tests.
 
 Run the focused projector on an already captured trace with:

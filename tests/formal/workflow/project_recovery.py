@@ -104,7 +104,49 @@ def project(path):
             len(after.get("recovery_operations", [])) == 1 and
             "evidence attach" in continued.get("next-action", ""),
             "recovery did not execute the next permitted transition")
-    return {"states": ["paused", "authorized", "continued"],
+    correction = repaired["tasks"][1]
+    operation = repaired["recovery_operations"][0]
+    authority_path = (f".fluent/work/artifacts/{work_id}/attempt-1/"
+                      f"writer-completion-recoveries/{correction['id']}/recovery.json")
+    require(operation == after["recovery_operations"][0] and
+            operation["schema-version"] == 1 and
+            operation["operation-kind"] == "writer-completion-recovery" and
+            operation["result"] == "applied" and
+            operation["authorization-digest"] == "sha256:" +
+            hashlib.sha256(operation["authorization"].encode()).hexdigest() and
+            isinstance(operation["operation-id"], str) and
+            operation["operation-id"].startswith("recovery-") and
+            operation["work-item-id"] == work_id and
+            operation["attempt-id"] == "attempt-1" and
+            operation["task-id"] == source["id"] and
+            operation["candidate-commit"] == source["output"]["commit"] and
+            operation["candidate-commit"] == before["pause_record"]["candidate-commit"] and
+            operation["workspace-path"] == source["output"]["workspace_path"] and
+            correction["work_item_id"] == work_id and
+            correction["attempt_id"] == "attempt-1" and
+            correction["kind"] == "write" and
+            correction["role"] == "author" and
+            {(entry["path"], entry["producer_id"])
+             for entry in correction["input_artifacts"]} ==
+            {(authority_path, "writer-completion-recovery"),
+             (source["artifact_area"]["path"] + "/writer-completion.json", source["id"])} and
+            authority_path in correction["instructions"] and
+            operation["authorization"] in correction["instructions"],
+            "recovery authorization is not bound to source Work, Task, candidate, and authority")
+    states = []
+    for phase, work, task_status in (("paused", paused, "absent"),
+                                     ("authorized", authorized, "planned"),
+                                     ("continued", continued, "complete")):
+        attempt = work["attempts"][0]
+        states.append({"phase": phase, "work": work_id,
+                       "attempt": attempt["id"], "source": source["id"],
+                       "candidate": source["output"]["commit"],
+                       "correction": correction["id"] if len(attempt["tasks"]) > 1 else "absent",
+                       "correctionStatus": task_status,
+                       "operation": operation["operation-id"] if attempt.get("recovery_operations") else "absent",
+                       "authority": authority_path if attempt.get("recovery_operations") else "absent",
+                       "published": phase == "continued"})
+    return {"states": states,
             "work-id": work_id, "attempt-id": "attempt-1"}
 
 
