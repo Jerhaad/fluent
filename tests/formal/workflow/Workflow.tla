@@ -55,7 +55,7 @@ vars == <<s>>
 CurrentEvidence(w, g) == <<"evidence", w, g, s[w].candidate,
                             CHOOSE r \in s[w].required: TRUE,
                             s[w].context, s[w].reviewScope>>
-Init == s = [w \in Works |->
+InitialWork(w) ==
     [phase |-> "new", route |-> IF w \in ReviewOnly THEN "review-only" ELSE "ordinary",
      attempt |-> AttemptId(w), task |-> TaskId(w),
      workspace |-> WorkspaceId(w), candidate |-> IF w \in ReviewOnly
@@ -97,7 +97,8 @@ Init == s = [w \in Works |->
      landingHarnessError |-> FALSE, landingProcessLeak |-> FALSE,
      landingUnexplained |-> FALSE, landingReferencePassed |-> FALSE,
      learnerMode |-> "unset", expertise |-> 0,
-     expertiseBeforeLearning |-> 0]]
+     expertiseBeforeLearning |-> 0]
+Init == s = [w \in Works |-> InitialWork(w)]
 
 Intake(w) == /\ s[w].phase = "new" /\ s' = [s EXCEPT ![w].phase = "intake"]
 AttemptCreate(w) == /\ s[w].phase = "intake" /\ ~s[w].canceled

@@ -10666,9 +10666,14 @@ Test: tests/binary.rs (classified_writer_rejects_invalid_required_inputs_before_
 
 WHEN an approved source correction follows an earlier request for more host
 evidence, THE SYSTEM SHALL identify the source correction as the current
-assigned action in the Writer context. It SHALL retain the earlier evidence,
-classification authorization, exact candidate bindings, and remaining
-verification gates.
+assigned action in the Writer context.
+Test: tests/binary.rs (classified_writer_context_identifies_current_assignment)
+
+### B5
+
+WHEN a Writer receives an approved source correction, THE SYSTEM SHALL retain
+the earlier evidence, classification authorization, exact candidate bindings,
+and remaining verification gates.
 Test: tests/binary.rs (classified_writer_context_identifies_current_assignment)
 
 ## Interrupted candidate restoration

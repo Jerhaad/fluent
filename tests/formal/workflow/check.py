@@ -204,7 +204,7 @@ def writer_inputs_suite(source, root, output, jar, java):
                "classified_writer_receives_current_authorized_instructions"]
     trace_path = output / "production-trace.json"
     for name in ("production-trace.json", "classified-work.json", "writer-work.json",
-                 "classification.json", "provider-observation.txt"):
+                 "classification.json", "provider-invocation.txt", "provider-observation.txt"):
         (output / name).unlink(missing_ok=True)
     fixture = subprocess.run(command, cwd=root, capture_output=True, text=True)
     (output / "production-fixture.log").write_text("$ " + " ".join(command) + "\n"
@@ -228,7 +228,8 @@ def writer_inputs_suite(source, root, output, jar, java):
         omitted = json.loads(json.dumps(trace))
         negative_dir = output / "omitted-instruction"
         negative_dir.mkdir(exist_ok=True)
-        for name in ("classified-work.json", "writer-work.json", "classification.json"):
+        for name in ("classified-work.json", "writer-work.json", "classification.json",
+                     "provider-invocation.txt"):
             (negative_dir / name).write_bytes((output / name).read_bytes())
         observation = (output / "provider-observation.txt").read_text()
         authorization = json.loads((output / "classification.json").read_text())["authorization"]
@@ -247,6 +248,20 @@ def writer_inputs_suite(source, root, output, jar, java):
                         "pass": require_omission and negative.returncode != 0 and
                                 "provider did not observe current instructions" in negative.stderr,
                         "log": "omitted-instruction.log"})
+        missing = json.loads(json.dumps(trace))
+        missing["events"] = [event for event in missing["events"]
+                             if event["boundary"] != "read-required-input"]
+        missing_path = output / "missing-delivery-trace.json"
+        missing_path.write_text(json.dumps(missing))
+        missing_result = subprocess.run(
+            ["python3", str(source / "project_writer.py"), str(missing_path)],
+            capture_output=True, text=True)
+        (output / "missing-delivery.log").write_text(
+            missing_result.stdout + missing_result.stderr)
+        results.append({"case": "missing-delivery-boundary-control",
+                        "pass": missing_result.returncode != 0 and
+                                "missing writer events" in missing_result.stderr,
+                        "log": "missing-delivery.log"})
         if valid:
             states = json.loads(projection.stdout)["states"]
             config = output / "writer-production-path.cfg"

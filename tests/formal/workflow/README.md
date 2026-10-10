@@ -4,10 +4,13 @@
 
 The `writer-inputs` suite runs the exact classified Writer launch test, checks
 its captured classification, prompt, and Work snapshots with
-`project_writer.py`, and maps the observed sequence through `WriterTrace.tla`
-to the `Workflow` actions. The projector checks the instruction bytes and the
-audit's candidate and evidence bindings before it marks delivery. A digest
-consistent trace with the instruction removed must fail projection; the model's
+`project_writer.py`, and maps the observed delivery and completion boundaries
+through `WriterTrace.tla` to the `Workflow` actions. The classified Work snapshot
+and provider invocation establish the dispatch precondition; fixture setup
+before classification is outside the checked path. The projector checks the
+instruction bytes and the audit's candidate and evidence bindings before it
+marks delivery. A missing delivery event or a digest consistent trace with the
+instruction removed must fail projection; the model's
 `negative-deliverinputs.cfg` independently checks that an omitted delivery
 violates `InputSafe`. Run the suite with:
 

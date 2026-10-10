@@ -11,7 +11,7 @@ from project import TraceError, exact_keys, load_json, require
 
 
 NAMES = {"classified-work.json", "writer-work.json", "classification.json",
-         "provider-observation.txt"}
+         "provider-invocation.txt", "provider-observation.txt"}
 
 
 def project(trace, root):
@@ -37,12 +37,13 @@ def project(trace, root):
         require(hashlib.sha256((root / name).read_bytes()).hexdigest() == artifact["sha256"],
                 f"artifact digest differs: {name}")
     events = trace["events"]
-    require(type(events) is list and len(events) == 2, "missing writer events")
+    require(type(events) is list and len(events) == 4, "missing writer events")
     classified = load_json((root / "classified-work.json").read_text())
     completed = load_json((root / "writer-work.json").read_text())
     recovery = classified["attempts"][0]["evidence_recoveries"][0]
     authority = recovery["code_change_classification"]
     audit = load_json((root / "classification.json").read_text())
+    invocation = (root / "provider-invocation.txt").read_text()
     observation = (root / "provider-observation.txt").read_text()
     require(audit["operation_id"] == authority["operation_id"] and
             audit["writer_task_id"] == authority["writer_task_id"] and
@@ -63,26 +64,41 @@ def project(trace, root):
     require(any(ref["path"] == authority["audit_artifact"]["path"] and
                 ref["producer_id"] == authority["operation_id"]
                 for ref in writer["input_artifacts"]), "writer lost audit input")
-    require("Current assigned action: source correction" in observation and
+    require(observation.startswith(invocation) and
+            "Current assigned action: source correction" in invocation and
             audit["authorization"] in observation and
             authority["audit_artifact"]["path"] in observation and
             observation.endswith("\nread\n"), "provider did not observe current instructions")
-    for index, (actor, boundary, operation, work) in enumerate((
-            ("operator", "classify-source-correction", authority["operation_id"], classified),
-            ("worker", "writer-launch", authority["writer_task_id"], completed))):
+    states = []
+    for index, (actor, boundary, operation, facts) in enumerate((
+            ("operator", "classify-source-correction", authority["operation_id"],
+             {"exit-code": 0, "work": classified}),
+            ("provider", "provider-invoked", authority["writer_task_id"],
+             {"invocation": invocation}),
+            ("provider", "read-required-input", authority["writer_task_id"],
+             {"observation": observation,
+              "audit-sha256": hashlib.sha256((root / "classification.json").read_bytes()).hexdigest()}),
+            ("worker", "writer-complete", authority["writer_task_id"],
+             {"exit-code": 0, "work": completed}))):
         event = events[index]
         exact_keys(event, ("sequence", "actor", "operation-id", "generation",
                            "boundary", "causal-predecessors", "raw-facts"), "event")
         require(event["sequence"] == index + 1 and event["actor"] == actor and
                 event["operation-id"] == operation and event["generation"] is None and
                 event["boundary"] == boundary and
-                event["causal-predecessors"] == ([] if index == 0 else [1]),
+                event["causal-predecessors"] == ([] if index == 0 else [index]),
                 "writer event identity or order differs")
-        exact_keys(event["raw-facts"], ("exit-code", "work"), "raw facts")
-        require(event["raw-facts"]["exit-code"] == 0 and
-                event["raw-facts"]["work"] == work, "writer event facts differ")
-    return {"states": ["intake", "planned", "authorized", "authorized",
-                       "dispatched", "delivered", "written"],
+        exact_keys(event["raw-facts"], tuple(facts), "raw facts")
+        require(event["raw-facts"] == facts, "writer event facts differ")
+        if boundary == "read-required-input":
+            require(events[index - 1]["boundary"] == "provider-invoked",
+                    "delivery lacks observed dispatch")
+            states.append("delivered")
+        elif boundary == "writer-complete":
+            require(states == ["delivered"], "writer completed before delivery")
+            states.append("written")
+    require(states == ["delivered", "written"], "missing checked Writer boundary")
+    return {"states": states,
             "work-id": classified["id"], "attempt-id": "attempt-1"}
 
 

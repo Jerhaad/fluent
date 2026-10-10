@@ -41762,14 +41762,14 @@ fn classified_writer_receives_current_authorized_instructions() {
     classified_writer_delivery_probe(false, true);
 }
 
-fn classified_writer_delivery_probe(check_history: bool, retry_once: bool) {
+fn classified_writer_delivery_probe(check_history: bool, resume_session: bool) {
     let tmp = TempDir::new_in("target").unwrap();
     let suffix = tmp.path().file_name().unwrap().to_string_lossy();
     let work_id = format!("classified-writer-inputs-{suffix}");
     let (project, candidate, _, review, digest, _) =
         setup_paused_code_change_classification_fixture(&tmp, &work_id);
     let workspace = bind_candidate_to_managed_sibling(&project, &work_id, &candidate);
-    let instruction = "Repair the runner and its result parser: sentinel-7841.";
+    let instruction = format!("Repair the runner and its result parser: {work_id}.");
     fluent_cmd()
         .current_dir(&project)
         .args([
@@ -41785,7 +41785,7 @@ fn classified_writer_delivery_probe(check_history: bool, retry_once: bool) {
             "--evidence-digest",
             &digest,
             "--resolution",
-            instruction,
+            &instruction,
         ])
         .assert()
         .success();
@@ -41793,6 +41793,29 @@ fn classified_writer_delivery_probe(check_history: bool, retry_once: bool) {
     let classification =
         &classified["attempts"][0]["evidence_recoveries"][0]["code_change_classification"];
     let writer_id = classification["writer_task_id"].as_str().unwrap();
+    let saved_session = format!("saved-{work_id}");
+    if resume_session {
+        let store = WorkModelStore::new(&project);
+        store
+            .mutate_work_item(&work_id, |item| {
+                let previous_id = item.attempts[0].tasks[0].id.clone();
+                item.attempts[0]
+                    .writer_runs
+                    .push(fluent::work_model::WriterRun {
+                        task_id: previous_id,
+                        outcome: fluent::work_model::WriterOutcome::Complete,
+                        kind: fluent::work_model::WriterRunKind::Initial,
+                        provider: "claude".into(),
+                        session_id: Some(saved_session.clone()),
+                        continuation: 0,
+                        checked_required: 0,
+                        completed_matrix: 0,
+                        candidate_commit: candidate.clone(),
+                    });
+                Ok(())
+            })
+            .unwrap();
+    }
     let audit = project.join(classification["audit_artifact"]["path"].as_str().unwrap());
     let writer = classified["attempts"][0]["tasks"]
         .as_array()
@@ -41802,7 +41825,7 @@ fn classified_writer_delivery_probe(check_history: bool, retry_once: bool) {
         .unwrap();
     let area = project.join(writer["artifact_area"]["path"].as_str().unwrap());
     let marker = area.join("writer-read-confirmed");
-    let retry_marker = area.join("first-provider-attempt");
+    let invocation = area.join("writer-invoked");
     let require_host = std::env::var("FLUENT_WORKFLOW_REQUIRE_HOST").as_deref() == Ok("1");
     let bin = if require_host {
         area.join("provider-double")
@@ -41836,25 +41859,27 @@ fn classified_writer_delivery_probe(check_history: bool, retry_once: bool) {
 set -euo pipefail
 prompt=""
 next=0
+resume=""
 for arg in "$@"; do
-  if [ "$next" = 1 ]; then prompt="$arg"; break; fi
+  if [ "$next" = 1 ]; then prompt="$arg"; next=0; continue; fi
+  if [ "$next" = 2 ]; then resume="$arg"; next=0; continue; fi
   if [ "$arg" = "-p" ]; then next=1; fi
+  if [ "$arg" = "--resume" ]; then next=2; fi
 done
-printf 'prompt=%s\naudit=%s\n' "$prompt" "${CLASSIFICATION_AUDIT:-missing}" > "$WRITER_MARKER"
+printf 'prompt=%s\naudit=%s\nresume=%s\n' "$prompt" "${CLASSIFICATION_AUDIT:-missing}" "$resume" > "$WRITER_INVOKED"
+cp "$WRITER_INVOKED" "$WRITER_MARKER"
 printf '%s' "$prompt" | grep -F 'Current assigned action: source correction' >/dev/null
 printf '%s' "$prompt" | grep -F "$CLASSIFICATION_AUDIT" >/dev/null
+printf '%s' "$prompt" | grep -F "$EXPECTED_INSTRUCTION" >/dev/null
+[ "$resume" = "$EXPECTED_SESSION" ]
 if [ "$CHECK_HISTORY" = 1 ]; then
   printf '%s' "$prompt" | grep -F "$HISTORY_REVIEW" >/dev/null
   printf '%s' "$prompt" | grep -F 'prior request for more host evidence remains historical context' >/dev/null
   grep -F 'Additional-Proof: Attach a rerun' "$HISTORY_REVIEW" >/dev/null
 fi
-grep -F 'sentinel-7841' "$CLASSIFICATION_AUDIT" >/dev/null
+grep -F "$EXPECTED_INSTRUCTION" "$CLASSIFICATION_AUDIT" >/dev/null
 if [ "$REQUIRE_HOST" = 1 ]; then
   if cat "$CLASSIFICATION_SIBLING" >/dev/null 2>&1; then exit 91; fi
-fi
-if [ "$RETRY_ONCE" = 1 ] && [ ! -e "$RETRY_MARKER" ]; then
-  printf 'retry\n' > "$RETRY_MARKER"
-  exit 73
 fi
 printf '\nread\n' >> "$WRITER_MARKER"
 printf 'Apply classified input\n' >> README.md
@@ -41884,10 +41909,14 @@ git commit -m 'Apply classified input' >/dev/null
         .env("CLASSIFICATION_AUDIT", &audit)
         .env("CLASSIFICATION_SIBLING", &sibling)
         .env("REQUIRE_HOST", if require_host { "1" } else { "0" })
-        .env("RETRY_ONCE", if retry_once { "1" } else { "0" })
-        .env("RETRY_MARKER", &retry_marker)
+        .env("EXPECTED_INSTRUCTION", &instruction)
+        .env(
+            "EXPECTED_SESSION",
+            if resume_session { &saved_session } else { "" },
+        )
         .env("CHECK_HISTORY", if check_history { "1" } else { "0" })
         .env("HISTORY_REVIEW", project.join(&review))
+        .env("WRITER_INVOKED", &invocation)
         .env("WRITER_MARKER", &marker)
         .output()
         .unwrap();
@@ -41898,9 +41927,39 @@ git commit -m 'Apply classified input' >/dev/null
         fs::read_to_string(&marker).unwrap_or_default()
     );
     assert!(fs::read_to_string(&marker).unwrap().ends_with("\nread\n"));
-    assert_eq!(retry_marker.exists(), retry_once);
-    if !check_history && !retry_once {
-        record_classified_writer_trace(&project, &work_id, &classified, &audit, &marker);
+    assert!(fs::read_to_string(&marker).unwrap().contains(&format!(
+        "resume={}\n",
+        if resume_session { &saved_session } else { "" }
+    )));
+    if check_history {
+        let after = work_item_value(&project, &work_id);
+        let before_attempt = &classified["attempts"][0];
+        let after_attempt = &after["attempts"][0];
+        assert_eq!(
+            after_attempt["evidence_recoveries"], before_attempt["evidence_recoveries"],
+            "source correction changed the earlier evidence or authorization"
+        );
+        assert_eq!(
+            after_attempt["tasks"][0], before_attempt["tasks"][0],
+            "source correction changed the original candidate binding"
+        );
+        assert!(
+            after["merge_candidates"]
+                .as_array()
+                .is_none_or(Vec::is_empty),
+            "Writer completion bypassed remaining readiness gates"
+        );
+        assert_ne!(after_attempt["review_state"], "passed");
+    }
+    if !check_history && !resume_session {
+        record_classified_writer_trace(
+            &project,
+            &work_id,
+            &classified,
+            &audit,
+            &invocation,
+            &marker,
+        );
     }
 }
 
@@ -41909,6 +41968,7 @@ fn record_classified_writer_trace(
     work_id: &str,
     classified: &serde_json::Value,
     audit: &Path,
+    invocation: &Path,
     observation: &Path,
 ) {
     let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/formal/workflow/writer-inputs");
@@ -41924,6 +41984,7 @@ fn record_classified_writer_trace(
             serde_json::to_vec_pretty(&completed).unwrap(),
         ),
         ("classification.json", fs::read(audit).unwrap()),
+        ("provider-invocation.txt", fs::read(invocation).unwrap()),
         ("provider-observation.txt", fs::read(observation).unwrap()),
     ];
     let artifacts = files
@@ -41954,8 +42015,15 @@ fn record_classified_writer_trace(
             {"sequence":1,"actor":"operator","operation-id":classification["operation_id"],
              "generation":null,"boundary":"classify-source-correction","causal-predecessors":[],
              "raw-facts":{"exit-code":0,"work":classified}},
-            {"sequence":2,"actor":"worker","operation-id":classification["writer_task_id"],
-             "generation":null,"boundary":"writer-launch","causal-predecessors":[1],
+            {"sequence":2,"actor":"provider","operation-id":classification["writer_task_id"],
+             "generation":null,"boundary":"provider-invoked","causal-predecessors":[1],
+             "raw-facts":{"invocation":fs::read_to_string(invocation).unwrap()}},
+            {"sequence":3,"actor":"provider","operation-id":classification["writer_task_id"],
+             "generation":null,"boundary":"read-required-input","causal-predecessors":[2],
+             "raw-facts":{"observation":fs::read_to_string(observation).unwrap(),
+                          "audit-sha256":format!("{:x}", Sha256::digest(fs::read(audit).unwrap()))}},
+            {"sequence":4,"actor":"worker","operation-id":classification["writer_task_id"],
+             "generation":null,"boundary":"writer-complete","causal-predecessors":[3],
              "raw-facts":{"exit-code":0,"work":completed}}
         ]
     });

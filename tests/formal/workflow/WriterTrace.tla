@@ -1,22 +1,21 @@
 ------------------------ MODULE WriterTrace ------------------------
 EXTENDS Workflow, Sequences
 
-CONSTANTS WriterState1, WriterState2, WriterState3, WriterState4,
-          WriterState5, WriterState6, WriterState7, WriterWork
-WriterStates == <<WriterState1, WriterState2, WriterState3, WriterState4,
-                  WriterState5, WriterState6, WriterState7>>
+CONSTANTS WriterState1, WriterState2, WriterWork
+WriterStates == <<WriterState1, WriterState2>>
 
 VARIABLE writerIndex
 writerVars == <<s, writerIndex>>
-WriterInit == Init /\ writerIndex = 0
+\* The classified snapshot and observed provider invocation establish the
+\* dispatch precondition. Earlier fixture setup is outside this checked path.
+WriterInit == /\ s = [w \in Works |->
+                       [InitialWork(w) EXCEPT !.phase = "dispatched",
+                                              !.routeMode = "foreground",
+                                              !.serviceOwner = ServiceId(1)]]
+              /\ writerIndex = 0
 WriterAction ==
-    CASE writerIndex = 0 -> Intake(WriterWork)
-      [] writerIndex = 1 -> AttemptCreate(WriterWork)
-      [] writerIndex = 2 -> Authorize(WriterWork)
-      [] writerIndex = 3 -> ChooseForeground(WriterWork)
-      [] writerIndex = 4 -> Dispatch(WriterWork)
-      [] writerIndex = 5 -> Deliver(WriterWork)
-      [] writerIndex = 6 -> Writer(WriterWork)
+    CASE writerIndex = 0 -> Deliver(WriterWork)
+      [] writerIndex = 1 -> Writer(WriterWork)
 WriterNext == /\ writerIndex < Len(WriterStates)
               /\ WriterAction
               /\ writerIndex' = writerIndex + 1
