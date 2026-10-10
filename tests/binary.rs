@@ -66035,6 +66035,44 @@ fn workflow_evidence_satisfies_only_validly_bound_requirements() {
 
 #[test]
 fn workflow_changed_bindings_reassess_evidence_before_advancement() {
+    for binding in ["review-candidate", "review-source", "review-workspace"] {
+        let tmp = TempDir::new().unwrap();
+        let (project, bin, _) = setup_rebased_tester_candidate(&tmp, ":");
+        let before = git_head(&project);
+        WorkModelStore::new(&project)
+            .mutate_work_item("work-1", |item| {
+                let review = item.attempts[0]
+                    .tasks
+                    .iter_mut()
+                    .find(|task| {
+                        task.kind == fluent::work_model::TaskKind::Review && task.role == "tests"
+                    })
+                    .unwrap();
+                let context = review.review_context.as_mut().unwrap();
+                match binding {
+                    "review-candidate" => context.candidate_commit = "0".repeat(40),
+                    "review-source" => context.source_branch = "other".into(),
+                    "review-workspace" => {
+                        context.candidate_workspace_path = "../other-candidate".into();
+                        review.workspace_access.reads[0].path = "../other-candidate".into();
+                    }
+                    _ => unreachable!(),
+                }
+                Ok(())
+            })
+            .unwrap();
+        fluent_cmd()
+            .current_dir(&project)
+            .args(["merge-candidate", "land", "work-1", "--no-sandbox"])
+            .env("PATH", mock_path(&bin))
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(
+                "ordinary tests review binding changed before landing",
+            ));
+        assert_eq!(git_head(&project), before, "{binding} advanced main");
+    }
+
     let tmp = TempDir::new().unwrap();
     let (project, bin, _) = setup_rebased_tester_candidate(&tmp, ":");
     let target = advance_tester_target(&project);

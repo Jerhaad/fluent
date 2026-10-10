@@ -329,6 +329,18 @@ def evidence_status_suite(source, root, output, jar, java):
         results.append({"case": "evidence-production-projection", "pass": valid,
                         "log": "projection.log"})
         controls = (
+            ("wrong-review-candidate", "ready-work.json", lambda value: next(
+                task for task in value["attempts"][0]["tasks"] if task["kind"] == "review" and
+                task["role"] == "tests")["review_context"].update(candidate_commit="0" * 40),
+             "ordinary review binding differs"),
+            ("wrong-review-context", "ready-work.json", lambda value: next(
+                task for task in value["attempts"][0]["tasks"] if task["kind"] == "review" and
+                task["role"] == "tests")["review_context"].update(source_branch="other"),
+             "ordinary review binding differs"),
+            ("wrong-review-authority", "ready-work.json", lambda value: next(
+                task for task in value["attempts"][0]["tasks"] if task["kind"] == "review" and
+                task["role"] == "tests")["workspace_access"]["reads"][0].update(path="../other"),
+             "ordinary review authority differs"),
             ("wrong-candidate", "landing-results.json", lambda value: value.update(
                 candidate_commit="0" * 40), "candidate binding differs"),
             ("wrong-command", "landing-results.json", lambda value: value["commands"][0]

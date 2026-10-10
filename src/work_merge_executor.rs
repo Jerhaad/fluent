@@ -112,6 +112,49 @@ fn landing_authorization_digest(item: &WorkItem) -> Result<String> {
     ))
 }
 
+fn ensure_review_bindings_current(item: &WorkItem, candidate: &MergeCandidate) -> Result<()> {
+    let attempt = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == candidate.attempt_id)
+        .context("landing Attempt is missing")?;
+    let reviewed_commit = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Tester && task.status == TaskStatus::Complete)
+        .and_then(|task| task.review_context.as_ref())
+        .context("landing Attempt Tester context is missing")?
+        .candidate_commit
+        .as_str();
+    for role in crate::review::REVIEWERS {
+        let review = attempt.tasks.iter().rev().find(|task| {
+            task.kind == TaskKind::Review
+                && task.role == *role
+                && task.evidence_review_context.is_none()
+                && task.status == TaskStatus::Complete
+        });
+        let Some(review) = review else {
+            bail!("ordinary {role} review is missing before landing");
+        };
+        let Some(context) = review.review_context.as_ref() else {
+            bail!("ordinary {role} review context is missing before landing");
+        };
+        anyhow::ensure!(
+            context.candidate_commit == reviewed_commit
+                && context.candidate_workspace_id == candidate.source_workspace.id
+                && context.candidate_workspace_path == candidate.source_workspace.path
+                && context.source_branch == candidate.source_branch
+                && review
+                    .workspace_access
+                    .reads
+                    .contains(&candidate.source_workspace),
+            "ordinary {role} review binding changed before landing"
+        );
+    }
+    Ok(())
+}
+
 fn persist_landing_intent(
     config: &WorkMergeConfig<'_>,
     candidate: &MergeCandidate,
@@ -269,6 +312,7 @@ fn recognized_landing_intent(
         "target moved before the authorized landing effect"
     );
     item.ensure_execution_ready()?;
+    ensure_review_bindings_current(&item, &candidate)?;
     anyhow::ensure!(
         intent.authorization_digest == landing_authorization_digest(item)?,
         "landing authorization changed before Git effect"
@@ -569,6 +613,7 @@ pub fn merge_candidate(config: WorkMergeConfig<'_>) -> Result<WorkMergeOutcome> 
     }
 
     item.ensure_execution_ready()?;
+    ensure_review_bindings_current(&item, &candidate)?;
 
     // A fresh, unmerged no-expertise candidate whose Learning succeeded lands its
     // frozen reviewed SHA exactly: an identity-preserving preflight runs BEFORE any

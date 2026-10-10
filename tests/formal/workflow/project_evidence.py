@@ -85,14 +85,50 @@ def project(trace, root):
     require(ready_attempt["status"] == "complete" and
             ready_attempt["review_state"] == "passed" and
             ready_attempt["learning"]["status"] == "succeeded", "ready gates are missing")
+    ready_candidate = ready["merge_candidates"][0]
+    require(ready["authorization"] == {"state": "execution-ready", "authority": "human"},
+            "ready authority differs")
+    writes = [task for task in ready_attempt["tasks"] if task["kind"] == "write" and
+              task["status"] == "complete" and task.get("output")]
+    require(writes and writes[-1]["output"]["commit"] == ready_candidate["candidate_commit"],
+            "ready Writer binding differs")
+    expected_context = {"candidate_commit": ready_candidate["candidate_commit"],
+                        "candidate_workspace_id": ready_candidate["source_workspace"]["id"],
+                        "candidate_workspace_path": ready_candidate["source_workspace"]["path"],
+                        "source_branch": ready_candidate["source_branch"]}
     reviews = [task for task in ready_attempt["tasks"] if task["kind"] == "review" and
-               task["status"] == "complete"]
-    require({task["role"] for task in reviews} >=
-            {"architecture", "behaviors", "documentation", "skills", "tests"},
+               task["status"] == "complete" and task.get("evidence_review_context") is None]
+    credited = set()
+    for role in ("architecture", "behaviors", "documentation", "skills", "tests"):
+        review = next((task for task in reversed(reviews) if task["role"] == role), None)
+        if review is None:
+            continue
+        context = review.get("review_context") or {}
+        bound = all(context.get(key) == value for key, value in expected_context.items())
+        if not bound:
+            # A later Writer can explicitly carry a completed review forward when
+            # its output still identifies the reviewed candidate.
+            carried = any(write["output"]["commit"] == ready_candidate["candidate_commit"] and
+                          any(ref["producer_id"] == review["id"] for ref in
+                              write["input_artifacts"]) and
+                          context.get("candidate_commit") in
+                          {prior["output"]["commit"] for prior in writes}
+                          for write in writes[1:])
+            require(carried and all(context.get(key) == expected_context[key] for key in
+                                    ("candidate_workspace_id", "candidate_workspace_path",
+                                     "source_branch")),
+                    "ordinary review binding differs")
+        require({"id": context["candidate_workspace_id"],
+                 "path": context["candidate_workspace_path"]} in
+                review["workspace_access"]["reads"], "ordinary review authority differs")
+        credited.add(role)
+    require(credited >= {"architecture", "behaviors", "documentation", "skills", "tests"},
             "ordinary review coverage is incomplete")
     tester = [task for task in ready_attempt["tasks"] if task["kind"] == "tester" and
               task["status"] == "complete"]
     require(len(tester) == 1, "canonical Attempt Tester is missing")
+    require(all(tester[0]["review_context"].get(key) == value for key, value in
+                expected_context.items()), "Attempt Tester context differs")
     require(attempt_results["candidate_commit"] ==
             tester[0]["review_context"]["candidate_commit"] and
             attempt_results["candidate_commit"] != merged, "Attempt Tester identity is wrong")
