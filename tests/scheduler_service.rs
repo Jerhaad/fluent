@@ -369,6 +369,89 @@ fn observed_release_worker(
     None
 }
 
+fn release_failure_diagnostics(
+    projects: &[(&std::path::Path, &str)],
+    home: &std::path::Path,
+) -> String {
+    fn collect(
+        root: &std::path::Path,
+        path: &std::path::Path,
+        output: &mut String,
+        files: &mut usize,
+    ) {
+        if *files >= 120 {
+            return;
+        }
+        let Ok(entries) = fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect(root, &path, output, files);
+            } else if let Ok(bytes) = fs::read(&path) {
+                *files += 1;
+                let length = bytes.len().min(1600);
+                output.push_str(&format!(
+                    "\n{} ({} bytes): {}",
+                    path.strip_prefix(root).unwrap_or(&path).display(),
+                    bytes.len(),
+                    String::from_utf8_lossy(&bytes[..length])
+                ));
+            }
+            if *files >= 120 {
+                break;
+            }
+        }
+    }
+    let mut output = String::new();
+    for (project, work) in projects {
+        output.push_str(&format!("\nproject {} work {work}", project.display()));
+        let mut files = 0;
+        collect(
+            project,
+            &project.join(".fluent/work"),
+            &mut output,
+            &mut files,
+        );
+    }
+    for name in [
+        "released-service.stdout",
+        "released-service.stderr",
+        "replacement-service.stdout",
+        "replacement-service.stderr",
+    ] {
+        let path = home.join(name);
+        if let Ok(bytes) = fs::read(&path) {
+            output.push_str(&format!(
+                "\n{name}: {}",
+                String::from_utf8_lossy(&bytes[..bytes.len().min(8192)])
+            ));
+        }
+    }
+    output
+}
+
+#[test]
+fn released_service_fixture_reports_bounded_dispatch_diagnostics() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let artifact = project
+        .path()
+        .join(".fluent/work/artifacts/work/attempt/task");
+    fs::create_dir_all(&artifact).unwrap();
+    fs::write(artifact.join("execution.json"), "blocked dispatch receipt").unwrap();
+    fs::write(
+        home.path().join("released-service.stderr"),
+        vec![b'x'; 16_000],
+    )
+    .unwrap();
+    let diagnostic = release_failure_diagnostics(&[(project.path(), "work")], home.path());
+    assert!(diagnostic.contains("blocked dispatch receipt"));
+    assert!(diagnostic.contains("released-service.stderr"));
+    assert!(diagnostic.len() < 10_000, "diagnostic must stay bounded");
+}
+
 #[test]
 fn scheduler_released_upgrade_preserves_shared_ownership() {
     use sha2::{Digest, Sha256};
@@ -396,6 +479,19 @@ fn scheduler_released_upgrade_preserves_shared_ownership() {
         command
             .current_dir(project)
             .env("HOME", home.path())
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", home.path().join("bin").display()),
+            )
+            .env("ANTHROPIC_API_KEY", "fixture-key-not-valid")
+            .env_remove("ANTHROPIC_AUTH_TOKEN")
+            .env("CLAUDE_CODE_OAUTH_TOKEN", "fixture-oauth-token")
+            .env_remove("OPENAI_API_KEY")
+            .env("FLUENT_TEST_HERMETIC_PROVIDERS", "1")
+            .env(
+                "FLUENT_TEST_FIXTURE_PROVIDER_CREDENTIAL",
+                "CLAUDE_CODE_OAUTH_TOKEN",
+            )
             .env("FLUENT_NO_UPDATE_CHECK", "1")
             .env_remove("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT")
             .args(args)
@@ -482,13 +578,16 @@ fn scheduler_released_upgrade_preserves_shared_ownership() {
     fs::create_dir_all(&provider_bin).unwrap();
     let provider = provider_bin.join("claude");
     fs::write(&provider,
-        "#!/bin/sh\nset -eu\ncase \" $* \" in *' --safe-mode '*|*' --version '*) printf 'ok\\n'; exit 0;; esac\nprintf '%s\\t%s\\n' \"$$\" \"$PWD\" >> \"$RELEASE_SERVICE_STARTED\"\nwhile [ ! -e \"$RELEASE_SERVICE_RELEASE\" ]; do sleep 0.05; done\nexit 1\n").unwrap();
+        "#!/bin/sh\nset -eu\ncase \" $* \" in *' --version '*) printf 'fixture-claude\\n'; exit 0;; *' auth status --json '*) printf '{\"loggedIn\":true}\\n'; exit 0;; *' --safe-mode '*) printf 'ok\\n'; exit 0;; esac\ntest \"${CLAUDE_CODE_OAUTH_TOKEN:-}\" = fixture-oauth-token\nprintf '%s\\t%s\\n' \"$$\" \"$PWD\" >> \"$RELEASE_SERVICE_STARTED\"\nwhile [ ! -e \"$RELEASE_SERVICE_RELEASE\" ]; do sleep 0.05; done\nexit 1\n").unwrap();
     fs::set_permissions(&provider, fs::Permissions::from_mode(0o755)).unwrap();
     for name in ["codex", "pi", "opencode", "gemini"] {
         let unavailable = provider_bin.join(name);
         fs::write(&unavailable, "#!/bin/sh\nexit 97\n").unwrap();
         fs::set_permissions(&unavailable, fs::Permissions::from_mode(0o755)).unwrap();
     }
+    let security = provider_bin.join("security");
+    fs::write(&security, "#!/bin/sh\nexit 98\n").unwrap();
+    fs::set_permissions(&security, fs::Permissions::from_mode(0o755)).unwrap();
     let started = home.path().join("workers-started");
     let release_workers = home.path().join("release-workers");
     let provider_path = format!("{}:/usr/bin:/bin", provider_bin.display());
@@ -526,21 +625,35 @@ fn scheduler_released_upgrade_preserves_shared_ownership() {
         .current_dir(first.path())
         .env("HOME", home.path())
         .env("PATH", &provider_path)
+        .env("ANTHROPIC_API_KEY", "fixture-key-not-valid")
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
+        .env("CLAUDE_CODE_OAUTH_TOKEN", "fixture-oauth-token")
+        .env_remove("OPENAI_API_KEY")
         .env("RELEASE_SERVICE_STARTED", &started)
         .env("RELEASE_SERVICE_RELEASE", &release_workers)
         .env("FLUENT_NO_UPDATE_CHECK", "1")
-        .args(["scheduler", "run", "--poll-seconds", "1"]);
+        .args(["scheduler", "run", "--poll-seconds", "1"])
+        .stdout(fs::File::create(home.path().join("released-service.stdout")).unwrap())
+        .stderr(fs::File::create(home.path().join("released-service.stderr")).unwrap());
     let mut old_service = ReleaseServiceChild::spawn(&mut old_command);
     let socket = scheduler_service::socket_path(home.path());
     let deadline = Instant::now() + Duration::from_secs(10);
     while scheduler_service::send_health_request(&socket).is_err() {
         assert!(
             Instant::now() < deadline,
-            "released service failed to start"
+            "released service failed to start: {}",
+            release_failure_diagnostics(
+                &[(first.path(), "first"), (second.path(), "second")],
+                home.path()
+            )
         );
         assert!(
             old_service.try_wait().unwrap().is_none(),
-            "released service exited"
+            "released service exited: {}",
+            release_failure_diagnostics(
+                &[(first.path(), "first"), (second.path(), "second")],
+                home.path()
+            )
         );
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -610,7 +723,11 @@ fn scheduler_released_upgrade_preserves_shared_ownership() {
         }
         assert!(
             Instant::now() < deadline,
-            "released service did not launch identifiable owned Work"
+            "released service did not launch identifiable owned Work: {}",
+            release_failure_diagnostics(
+                &[(first.path(), "first"), (second.path(), "second")],
+                home.path()
+            )
         );
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -739,17 +856,32 @@ fn scheduler_released_upgrade_preserves_shared_ownership() {
         .current_dir(first.path())
         .env("HOME", home.path())
         .env("PATH", &provider_path)
+        .env("ANTHROPIC_API_KEY", "fixture-key-not-valid")
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
+        .env("CLAUDE_CODE_OAUTH_TOKEN", "fixture-oauth-token")
+        .env_remove("OPENAI_API_KEY")
+        .env("FLUENT_TEST_HERMETIC_PROVIDERS", "1")
+        .env(
+            "FLUENT_TEST_FIXTURE_PROVIDER_CREDENTIAL",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+        )
         .env("RELEASE_SERVICE_STARTED", &started)
         .env("RELEASE_SERVICE_RELEASE", &release_workers)
         .env("FLUENT_NO_UPDATE_CHECK", "1")
         .env_remove("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT")
-        .args(["scheduler", "run", "--poll-seconds", "1"]);
+        .args(["scheduler", "run", "--poll-seconds", "1"])
+        .stdout(fs::File::create(home.path().join("replacement-service.stdout")).unwrap())
+        .stderr(fs::File::create(home.path().join("replacement-service.stderr")).unwrap());
     let mut replacement = ReleaseServiceChild::spawn(&mut replacement_command);
     let deadline = Instant::now() + Duration::from_secs(10);
     while scheduler_service::send_health_request(&socket).is_err() {
         assert!(
             Instant::now() < deadline,
-            "replacement did not acquire service"
+            "replacement did not acquire service: {}",
+            release_failure_diagnostics(
+                &[(first.path(), "first"), (second.path(), "second")],
+                home.path()
+            )
         );
         std::thread::sleep(Duration::from_millis(20));
     }
