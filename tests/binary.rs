@@ -7727,6 +7727,692 @@ fn writer_completion_recovery_later_rejects_stale_source_at_start() {
     assert_eq!(fs::read(&fixture.audit).unwrap(), old_audit);
 }
 
+fn writer_completion_plan_fixture(tmp: &TempDir) -> WriterRecoveryFixture {
+    use fluent::work_model::{
+        AttemptStatus, NoChangeOutput, NoChangeVerification, NoChangeVerificationResult, PauseKind,
+    };
+    let fixture = writer_recovery_fixture_with_authority(tmp, false);
+    let store = WorkModelStore::new(&fixture.project);
+    store
+        .mutate_work_item(&fixture.work, |item| {
+            let attempt = &mut item.attempts[0];
+            attempt.tasks.pop();
+            let contract = attempt.writer_completion_contract.as_mut().unwrap();
+            contract.requirements[0].verification_refs =
+                vec!["Untestable: fixture-only source behavior".into()];
+            contract.requirements.push(WriterCompletionRequirement {
+                responsibility: Some(CompletionResponsibility::Writer),
+                id: "plan:step-1".into(),
+                kind: WriterCompletionRequirementKind::Plan,
+                source: "plan.md#step-1".into(),
+                requirement: "Complete the integration".into(),
+                verification_refs: vec!["`true`".into()],
+                command: None,
+            });
+            contract.requirements.push(WriterCompletionRequirement {
+                responsibility: Some(CompletionResponsibility::Host),
+                id: "plan:step-2".into(),
+                kind: WriterCompletionRequirementKind::Plan,
+                source: "plan.md#step-2".into(),
+                requirement: "Check on the host".into(),
+                verification_refs: vec!["`true`".into()],
+                command: Some(fluent::work_model::PlanCommand {
+                    applicability: Default::default(),
+                    command: "true".into(),
+                    working_directory: ".".into(),
+                    environment: Default::default(),
+                    source_row: "plan:step-2".into(),
+                }),
+            });
+            let source = &mut attempt.tasks[0];
+            let area = fixture
+                .project
+                .join(&source.artifact_area.as_ref().unwrap().path);
+            let declaration_path = format!(
+                "{}/no-change.json",
+                source.artifact_area.as_ref().unwrap().path
+            );
+            let declaration = NoChangeOutput {
+                schema_version: 1,
+                declaration_path: declaration_path.clone(),
+                reason: "The previous change needs integration work".into(),
+                verification: vec![NoChangeVerification {
+                    command: "true".into(),
+                    result: NoChangeVerificationResult::Pass,
+                }],
+            };
+            fs::write(
+                fixture.project.join(declaration_path),
+                serde_json::to_vec(&declaration).unwrap(),
+            )
+            .unwrap();
+            let output = source.output.as_mut().unwrap();
+            output.base_commit = Some(output.commit.clone());
+            output.no_change = Some(declaration);
+            let mut matrix =
+                WriterCompletionMatrix::skeleton(contract, &source.id, &[], None).unwrap();
+            matrix.rows[0].state = WriterCompletionState::Complete;
+            matrix.rows[0].implementation_evidence =
+                vec!["candidate.txt: prior implementation".into()];
+            matrix.rows[0].verification = vec![WriterVerificationClaim {
+                command: "true".into(),
+                result: WriterVerificationResult::Pass,
+            }];
+            fs::write(
+                area.join("writer-completion.json"),
+                serde_json::to_vec_pretty(&matrix).unwrap(),
+            )
+            .unwrap();
+            attempt.status = AttemptStatus::NeedsUser;
+            attempt.pause_kind = Some(PauseKind::WriterCompletion);
+            Ok(())
+        })
+        .unwrap();
+    fs::remove_dir_all(&fixture.area).unwrap();
+    fixture
+}
+
+fn run_writer_completion_plan_successor(fixture: &WriterRecoveryFixture, tmp: &TempDir) {
+    let store = WorkModelStore::new(&fixture.project);
+    let approved = store.read_work_item(&fixture.work).unwrap();
+    assert_eq!(approved.attempts[0].tasks.len(), 2);
+    assert_eq!(approved.attempts[0].tasks[1].status, TaskStatus::Planned);
+    let successor = &approved.attempts[0].tasks[1];
+    let area = fixture
+        .project
+        .join(&successor.artifact_area.as_ref().unwrap().path);
+    let bin = tmp.path().join("plan-correction-provider");
+    write_mock_claude(
+        &bin,
+        r#"#!/bin/bash
+set -eu
+python3 - <<'PY'
+import json, os
+from pathlib import Path
+path = Path(os.environ['RECOVERY_AREA']) / 'writer-completion.json'
+matrix = json.loads(path.read_text())
+for row in matrix['rows']:
+    if row.get('responsibility', 'writer') == 'writer':
+        row['state'] = 'complete'
+        row['implementation-evidence'] = ['integration.txt: completed work']
+        row['verification'] = [{'command': 'true', 'result': 'pass'}]
+path.write_text(json.dumps(matrix))
+PY
+printf 'integration complete\n' > "$RECOVERY_WORKSPACE/integration.txt"
+git -C "$RECOVERY_WORKSPACE" add integration.txt
+git -C "$RECOVERY_WORKSPACE" commit -m 'Complete integration work'
+"#,
+    );
+    fluent_cmd()
+        .current_dir(&fixture.project)
+        .args(["attempt", "run", &fixture.work, "attempt-1", "--no-sandbox"])
+        .env("PATH", mock_path(&bin))
+        .env("RECOVERY_AREA", &area)
+        .env("RECOVERY_WORKSPACE", &fixture.workspace)
+        .assert()
+        .success();
+    let completed = store.read_work_item(&fixture.work).unwrap();
+    assert_eq!(completed.attempts[0].tasks[1].status, TaskStatus::Complete);
+    assert_eq!(
+        completed.attempts[0].tasks[0],
+        approved.attempts[0].tasks[0]
+    );
+    fluent_cmd()
+        .current_dir(&fixture.project)
+        .args(["attempt", "run", &fixture.work, "attempt-1", "--no-sandbox"])
+        .env("PATH", mock_path(&bin))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("requires host action plan:step-2"));
+    let next = read_work_show_json(&fixture.project, &fixture.work)["next-action"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(next.contains("evidence attach"), "{next}");
+}
+
+#[test]
+fn writer_completion_plan_public_continuation() {
+    let tmp = TempDir::new().unwrap();
+    let fixture = writer_completion_plan_fixture(&tmp);
+    let store = WorkModelStore::new(&fixture.project);
+    let before = store.read_work_item(&fixture.work).unwrap();
+    let action = read_work_show_json(&fixture.project, &fixture.work)["next-action"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(action.contains("repair-writer-completion"), "{action}");
+    let status = fluent_cmd()
+        .current_dir(&fixture.project)
+        .arg("status")
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    assert!(String::from_utf8_lossy(&status.stdout).contains("repair-writer-completion"));
+    fluent_cmd()
+        .current_dir(&fixture.project)
+        .args([
+            "attempt",
+            "repair-writer-completion",
+            &fixture.work,
+            "attempt-1",
+            "--resolution",
+            &fixture.resolution,
+        ])
+        .assert()
+        .success();
+    let approved = store.read_work_item(&fixture.work).unwrap();
+    assert_eq!(approved.attempts[0].tasks[0], before.attempts[0].tasks[0]);
+    run_writer_completion_plan_successor(&fixture, &tmp);
+    let completed = store.read_work_item(&fixture.work).unwrap();
+    fluent_cmd()
+        .current_dir(&fixture.project)
+        .args([
+            "attempt",
+            "repair-writer-completion",
+            &fixture.work,
+            "attempt-1",
+            "--resolution",
+            &fixture.resolution,
+        ])
+        .assert()
+        .success();
+    assert_eq!(
+        store.read_work_item(&fixture.work).unwrap().attempts[0].tasks,
+        completed.attempts[0].tasks
+    );
+}
+
+#[test]
+fn writer_completion_plan_existing_approval_continues() {
+    let tmp = TempDir::new().unwrap();
+    let fixture = writer_completion_plan_fixture(&tmp);
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "kebab-case")]
+    struct PriorAuthority {
+        schema_version: u32,
+        work_item_id: String,
+        attempt_id: String,
+        task_id: String,
+        source_writer_task_id: String,
+        candidate_commit: String,
+        protected_base_commit: Option<String>,
+        superseded_task_ids: Vec<String>,
+        resolution: String,
+        resolution_sha256: String,
+        created_at: String,
+    }
+    let store = WorkModelStore::new(&fixture.project);
+    let resolution = "Earlier no-change approval";
+    let audit_path = fluent::work_model::work_artifact_path(
+        &fixture.work,
+        "attempt-1",
+        "writer-completion-recoveries/attempt-1-write-1/recovery.json",
+    );
+    let authority = PriorAuthority {
+        schema_version: 1,
+        work_item_id: fixture.work.clone(),
+        attempt_id: "attempt-1".into(),
+        task_id: "attempt-1-write-1".into(),
+        source_writer_task_id: "attempt-1-write-1".into(),
+        candidate_commit: fixture.candidate.clone(),
+        protected_base_commit: Some(fixture.candidate.clone()),
+        superseded_task_ids: vec![],
+        resolution: resolution.into(),
+        resolution_sha256: format!("sha256:{:x}", Sha256::digest(resolution.as_bytes())),
+        created_at: "2026-10-09T18:00:00Z".into(),
+    };
+    let audit = serde_json::to_vec_pretty(&authority).unwrap();
+    let audit_file = fixture.project.join(&audit_path);
+    fs::create_dir_all(audit_file.parent().unwrap()).unwrap();
+    fs::write(&audit_file, &audit).unwrap();
+    store
+        .mutate_work_item(&fixture.work, |item| {
+            let attempt = &mut item.attempts[0];
+            let reference = ArtifactRef {
+                producer_id: "writer-completion-recovery".into(),
+                path: audit_path.clone(),
+            };
+            attempt.tasks[0].input_artifacts.push(reference.clone());
+            attempt.artifacts.push(reference);
+            let request = fluent::work_model::RecoveryOperationRequest::new(
+                "writer-completion-recovery",
+                &fixture.work,
+                "attempt-1",
+                Some(fixture.candidate.clone()),
+                Some("attempt-1-write-1".into()),
+                None,
+                Some(
+                    attempt.tasks[0]
+                        .output
+                        .as_ref()
+                        .unwrap()
+                        .workspace_path
+                        .clone(),
+                ),
+                Some(resolution.into()),
+                Some(format!(
+                    "sha256:{:x}",
+                    Sha256::digest(serde_json::to_vec(&authority).unwrap())
+                )),
+            );
+            attempt.record_recovery_operation(&request, None)?;
+            Ok(())
+        })
+        .unwrap();
+    let old_state = store.read_work_item(&fixture.work).unwrap();
+    assert_eq!(old_state.attempts[0].tasks.len(), 1);
+    let old_audit = fs::read(&audit_file).unwrap();
+    fluent_cmd()
+        .current_dir(&fixture.project)
+        .args([
+            "attempt",
+            "repair-writer-completion",
+            &fixture.work,
+            "attempt-1",
+            "--resolution",
+            "Complete pending Writer Plan row",
+        ])
+        .assert()
+        .success();
+    let current = store.read_work_item(&fixture.work).unwrap();
+    assert_eq!(current.attempts[0].tasks.len(), 2);
+    assert_eq!(
+        current.attempts[0].tasks[0].output,
+        old_state.attempts[0].tasks[0].output
+    );
+    assert_eq!(fs::read(&audit_file).unwrap(), old_audit);
+    fs::write(&audit_file, b"changed prior approval").unwrap();
+    fluent_cmd()
+        .current_dir(&fixture.project)
+        .args([
+            "attempt",
+            "repair-writer-completion",
+            &fixture.work,
+            "attempt-1",
+            "--resolution",
+            "Complete pending Writer Plan row",
+        ])
+        .assert()
+        .failure();
+    fs::write(&audit_file, &old_audit).unwrap();
+    fluent_cmd()
+        .current_dir(&fixture.project)
+        .args([
+            "attempt",
+            "repair-writer-completion",
+            &fixture.work,
+            "attempt-1",
+            "--resolution",
+            "Complete pending Writer Plan row",
+        ])
+        .assert()
+        .success();
+    assert_eq!(
+        store.read_work_item(&fixture.work).unwrap().attempts[0].tasks,
+        current.attempts[0].tasks
+    );
+    run_writer_completion_plan_successor(&fixture, &tmp);
+}
+
+#[test]
+fn writer_completion_plan_replays_same_successor() {
+    let tmp = TempDir::new().unwrap();
+    let fixture = writer_completion_plan_fixture(&tmp);
+    let command = || {
+        fluent_cmd()
+            .current_dir(&fixture.project)
+            .args([
+                "attempt",
+                "repair-writer-completion",
+                &fixture.work,
+                "attempt-1",
+                "--resolution",
+                &fixture.resolution,
+            ])
+            .assert()
+            .success();
+    };
+    command();
+    let store = WorkModelStore::new(&fixture.project);
+    let first = store.read_work_item(&fixture.work).unwrap();
+    let audit = fs::read(fixture.project.join(format!(
+        ".fluent/work/artifacts/{}/attempt-1/writer-completion-recoveries/attempt-1-write-2/recovery.json", fixture.work,
+    ))).unwrap();
+    command();
+    let second = store.read_work_item(&fixture.work).unwrap();
+    assert_eq!(first.attempts[0].tasks, second.attempts[0].tasks);
+    assert_eq!(
+        first.attempts[0].recovery_operations,
+        second.attempts[0].recovery_operations
+    );
+    assert_eq!(fs::read(fixture.project.join(format!(
+        ".fluent/work/artifacts/{}/attempt-1/writer-completion-recoveries/attempt-1-write-2/recovery.json", fixture.work,
+    ))).unwrap(), audit);
+    fluent_cmd()
+        .current_dir(&fixture.project)
+        .args(["queue", "resume", &fixture.work, "--attempt", "attempt-1"])
+        .assert()
+        .success();
+    assert_eq!(
+        store.read_work_item(&fixture.work).unwrap().attempts[0].tasks,
+        second.attempts[0].tasks
+    );
+}
+
+#[test]
+fn writer_completion_plan_rejects_changed_authority() {
+    for defect in ["matrix", "contract", "candidate"] {
+        let tmp = TempDir::new().unwrap();
+        let fixture = writer_completion_plan_fixture(&tmp);
+        fluent_cmd()
+            .current_dir(&fixture.project)
+            .args([
+                "attempt",
+                "repair-writer-completion",
+                &fixture.work,
+                "attempt-1",
+                "--resolution",
+                &fixture.resolution,
+            ])
+            .assert()
+            .success();
+        let store = WorkModelStore::new(&fixture.project);
+        let approved = store.read_work_item(&fixture.work).unwrap();
+        match defect {
+            "matrix" => {
+                let path = fixture
+                    .project
+                    .join(
+                        &approved.attempts[0].tasks[0]
+                            .artifact_area
+                            .as_ref()
+                            .unwrap()
+                            .path,
+                    )
+                    .join("writer-completion.json");
+                fs::write(path, b"changed source matrix").unwrap();
+            }
+            "contract" => store
+                .mutate_work_item(&fixture.work, |item| {
+                    item.attempts[0]
+                        .writer_completion_contract
+                        .as_mut()
+                        .unwrap()
+                        .requirements[1]
+                        .requirement
+                        .push_str(" changed");
+                    Ok(())
+                })
+                .unwrap(),
+            "candidate" => commit_file(
+                &fixture.workspace,
+                "drift.txt",
+                "drift\n",
+                "Change candidate",
+            ),
+            _ => unreachable!(),
+        }
+        let bin = tmp.path().join("must-not-launch");
+        let launched = tmp.path().join("launched");
+        write_mock_claude(
+            &bin,
+            "#!/bin/bash\nprintf launched > \"$RECOVERY_PROVIDER_LAUNCHED\"\nexit 73\n",
+        );
+        fluent_cmd()
+            .current_dir(&fixture.project)
+            .args(["attempt", "run", &fixture.work, "attempt-1", "--no-sandbox"])
+            .env("PATH", mock_path(&bin))
+            .env("RECOVERY_PROVIDER_LAUNCHED", &launched)
+            .assert()
+            .failure();
+        assert!(!launched.exists(), "{defect}");
+    }
+    let tmp = TempDir::new().unwrap();
+    let fixture = writer_completion_plan_fixture(&tmp);
+    fluent_cmd()
+        .current_dir(&fixture.project)
+        .args([
+            "attempt",
+            "repair-writer-completion",
+            &fixture.work,
+            "attempt-1",
+            "--resolution",
+            &fixture.resolution,
+        ])
+        .assert()
+        .success();
+    fluent_cmd()
+        .current_dir(&fixture.project)
+        .args(["attempt", "cancel", &fixture.work, "attempt-1"])
+        .assert()
+        .success();
+    let store = WorkModelStore::new(&fixture.project);
+    assert!(store.read_work_item(&fixture.work).unwrap().attempts[0].cancellation_requested());
+    fluent_cmd()
+        .current_dir(&fixture.project)
+        .args([
+            "attempt",
+            "repair-writer-completion",
+            &fixture.work,
+            "attempt-1",
+            "--resolution",
+            &fixture.resolution,
+        ])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn writer_completion_plan_preserves_host_only_handoff() {
+    let tmp = TempDir::new().unwrap();
+    let fixture = writer_completion_plan_fixture(&tmp);
+    let store = WorkModelStore::new(&fixture.project);
+    let item = store.read_work_item(&fixture.work).unwrap();
+    let path = fixture
+        .project
+        .join(
+            &item.attempts[0].tasks[0]
+                .artifact_area
+                .as_ref()
+                .unwrap()
+                .path,
+        )
+        .join("writer-completion.json");
+    let mut matrix: WriterCompletionMatrix =
+        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    matrix.rows[1].state = WriterCompletionState::Complete;
+    matrix.rows[1].implementation_evidence = vec!["candidate.txt: finished".into()];
+    matrix.rows[1].verification = vec![WriterVerificationClaim {
+        command: "true".into(),
+        result: WriterVerificationResult::Pass,
+    }];
+    fs::write(path, serde_json::to_vec_pretty(&matrix).unwrap()).unwrap();
+    let action = read_work_show_json(&fixture.project, &fixture.work)["next-action"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    assert!(!action.contains("repair-writer-completion"), "{action}");
+    fluent_cmd()
+        .current_dir(&fixture.project)
+        .args([
+            "attempt",
+            "repair-writer-completion",
+            &fixture.work,
+            "attempt-1",
+            "--resolution",
+            &fixture.resolution,
+        ])
+        .assert()
+        .failure();
+    assert_eq!(
+        store.read_work_item(&fixture.work).unwrap().attempts[0]
+            .tasks
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn writer_completion_plan_context_preserves_obligations() {
+    let tmp = TempDir::new().unwrap();
+    let fixture = writer_completion_plan_fixture(&tmp);
+    fluent_cmd()
+        .current_dir(&fixture.project)
+        .args([
+            "attempt",
+            "repair-writer-completion",
+            &fixture.work,
+            "attempt-1",
+            "--resolution",
+            &fixture.resolution,
+        ])
+        .assert()
+        .success();
+    run_writer_completion_plan_successor(&fixture, &tmp);
+    let store = WorkModelStore::new(&fixture.project);
+    let item = store.read_work_item(&fixture.work).unwrap();
+    let source = &item.attempts[0].tasks[0];
+    let successor = &item.attempts[0].tasks[1];
+    let source_matrix: WriterCompletionMatrix = serde_json::from_slice(
+        &fs::read(
+            fixture
+                .project
+                .join(&source.artifact_area.as_ref().unwrap().path)
+                .join("writer-completion.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(source_matrix.rows[0].state, WriterCompletionState::Complete);
+    assert_eq!(source_matrix.rows[1].state, WriterCompletionState::Pending);
+    assert_eq!(source_matrix.rows[2].state, WriterCompletionState::Pending);
+    let area = fixture
+        .project
+        .join(&successor.artifact_area.as_ref().unwrap().path);
+    let context: serde_json::Value =
+        serde_json::from_slice(&fs::read(area.join("execution-context.json")).unwrap()).unwrap();
+    let pending = context["pending-writer-rows"].as_array().unwrap();
+    assert!(
+        pending.iter().any(|row| row["id"] == "plan:step-1"),
+        "{context}"
+    );
+    assert!(
+        !pending.iter().any(|row| row["id"] == "plan:step-2"),
+        "{context}"
+    );
+    let matrix: WriterCompletionMatrix =
+        serde_json::from_slice(&fs::read(area.join("writer-completion.json")).unwrap()).unwrap();
+    assert_eq!(matrix.rows[0].state, WriterCompletionState::Complete);
+    assert_eq!(matrix.rows[1].state, WriterCompletionState::Complete);
+    assert_eq!(matrix.rows[2].state, WriterCompletionState::Pending);
+}
+
+#[test]
+fn writer_completion_plan_real_sandbox_inputs() {
+    if std::env::var("FLUENT_WORKFLOW_REQUIRE_HOST").as_deref() != Ok("1") {
+        return;
+    }
+    assert!(
+        Path::new("/usr/bin/sandbox-exec").is_file(),
+        "strict host probe requires sandbox-exec"
+    );
+    let tmp = TempDir::new().unwrap();
+    let fixture = writer_completion_plan_fixture(&tmp);
+    fluent_cmd()
+        .current_dir(&fixture.project)
+        .args([
+            "attempt",
+            "repair-writer-completion",
+            &fixture.work,
+            "attempt-1",
+            "--resolution",
+            &fixture.resolution,
+        ])
+        .assert()
+        .success();
+    let store = WorkModelStore::new(&fixture.project);
+    let item = store.read_work_item(&fixture.work).unwrap();
+    let source = &item.attempts[0].tasks[0];
+    let successor = &item.attempts[0].tasks[1];
+    let area = fixture
+        .project
+        .join(&successor.artifact_area.as_ref().unwrap().path);
+    let source_matrix = fixture
+        .project
+        .join(&source.artifact_area.as_ref().unwrap().path)
+        .join("writer-completion.json");
+    let audit = fixture.project.join(format!(
+        ".fluent/work/artifacts/{}/attempt-1/writer-completion-recoveries/{}/recovery.json",
+        fixture.work, successor.id,
+    ));
+    let source_bytes = fs::read(&source_matrix).unwrap();
+    let audit_bytes = fs::read(&audit).unwrap();
+    let unrelated = tmp.path().join("unrelated.txt");
+    fs::write(&unrelated, "outside fixture\n").unwrap();
+    let bin = tmp.path().join("plan-sandbox-provider");
+    write_mock_claude(
+        &bin,
+        r#"#!/bin/bash
+set -eu
+test -r "$RECOVERY_SOURCE_MATRIX"
+test -r "$RECOVERY_AUDIT"
+if printf tamper > "$RECOVERY_SOURCE_MATRIX" 2>/dev/null; then exit 91; fi
+if printf tamper > "$RECOVERY_AUDIT" 2>/dev/null; then exit 92; fi
+if printf tamper > "$RECOVERY_UNRELATED" 2>/dev/null; then exit 93; fi
+python3 - <<'PY'
+import json, os
+from pathlib import Path
+area = Path(os.environ['RECOVERY_AREA'])
+matrix = area / 'writer-completion.json'
+value = json.loads(matrix.read_text())
+for row in value['rows']:
+    if row.get('responsibility', 'writer') == 'writer':
+        row['state'] = 'complete'
+        row['implementation-evidence'] = ['candidate.txt: retained implementation']
+        row['verification'] = [{'command': 'true', 'result': 'pass'}]
+matrix.write_text(json.dumps(value))
+(area / 'no-change.json').write_text(json.dumps({
+    'schema_version': 1,
+    'declaration_path': os.environ['RECOVERY_AREA_REL'] + '/no-change.json',
+    'reason': 'The retained candidate already satisfies the Plan row.',
+    'verification': [{'command': 'true', 'result': 'pass'}]}))
+(area / 'confinement-observed').write_text('denied\n')
+PY
+"#,
+    );
+    write_mock_executable(
+        &bin,
+        "sandbox-exec",
+        "#!/bin/bash\nexec /usr/bin/sandbox-exec \"$@\"\n",
+    );
+    fluent_cmd()
+        .current_dir(&fixture.project)
+        .args(["attempt", "run", &fixture.work, "attempt-1"])
+        .env("PATH", mock_path(&bin))
+        .env("RECOVERY_SOURCE_MATRIX", &source_matrix)
+        .env("RECOVERY_AUDIT", &audit)
+        .env("RECOVERY_UNRELATED", &unrelated)
+        .env("RECOVERY_AREA", &area)
+        .env(
+            "RECOVERY_AREA_REL",
+            &successor.artifact_area.as_ref().unwrap().path,
+        )
+        .assert()
+        .success();
+    assert_eq!(fs::read(&source_matrix).unwrap(), source_bytes);
+    assert_eq!(fs::read(&audit).unwrap(), audit_bytes);
+    assert_eq!(fs::read(&unrelated).unwrap(), b"outside fixture\n");
+    assert_eq!(
+        fs::read(area.join("confinement-observed")).unwrap(),
+        b"denied\n"
+    );
+    assert_eq!(
+        store.read_work_item(&fixture.work).unwrap().attempts[0].tasks[1].status,
+        TaskStatus::Complete
+    );
+}
+
 #[test]
 fn workflow_reachable_failures_have_public_continuation() {
     let tmp = TempDir::new().unwrap();

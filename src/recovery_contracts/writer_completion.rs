@@ -1,8 +1,10 @@
 //! Validate recorded Writer-completion authority without lifecycle mutation.
 use crate::{
     follow_up::content_digest,
+    git,
     work_model::{
-        ArtifactRef, Attempt, RecoveryOperationRequest, TaskKind, TaskStatus, work_artifact_path,
+        ArtifactRef, Attempt, RecoveryOperationRequest, TaskKind, TaskStatus,
+        resolve_managed_sibling_workspace_path, work_artifact_path,
     },
 };
 use anyhow::{Context, Result, bail};
@@ -86,6 +88,22 @@ pub(crate) fn validate_terminal_superseded_history(
             .output
             .as_ref()
             .context("Writer-completion recovery source has no output")?;
+        if source_index == replacement_index
+            && output.no_change.is_some()
+            && authority.source_matrix_sha256.is_none()
+        {
+            anyhow::ensure!(
+                source.kind == TaskKind::Write
+                    && source.status == TaskStatus::Complete
+                    && output.commit == authority.candidate_commit
+                    && output.base_commit == authority.protected_base_commit
+                    && source.input_artifacts.contains(reference)
+                    && authority.superseded_task_ids.is_empty(),
+                "historical no-change Writer-completion approval changed"
+            );
+            validate_task_recovery_source(project_root, attempt, source)?;
+            continue;
+        }
         anyhow::ensure!(
             source_index < replacement_index
                 && source.kind == TaskKind::Write
@@ -241,11 +259,44 @@ pub(crate) fn validated_writer_context(
             .iter()
             .find(|source| source.id == authority.source_writer_task_id)
             .context("Writer-completion recovery source Writer is missing")?;
+        if source.id != task.id
+            && source
+                .input_artifacts
+                .iter()
+                .any(|input| input.producer_id == PRODUCER)
+        {
+            validate_task_recovery_source(project_root, attempt, source)?;
+        }
         validate_committed_source_evidence(project_root, attempt, source, &authority)?;
         let output = source
             .output
             .as_ref()
             .context("Writer-completion recovery source has no output")?;
+        if output.no_change.is_some()
+            && authority.source_matrix_sha256.is_some()
+            && task.output.is_none()
+            && matches!(task.status, TaskStatus::Planned | TaskStatus::Executing)
+        {
+            let workspace = resolve_managed_sibling_workspace_path(
+                project_root,
+                &output.workspace_path,
+                "Writer-completion recovery candidate workspace",
+            )?;
+            let head = git::run_stdout(
+                &workspace,
+                &["rev-parse", "HEAD"],
+                "check Writer-completion recovery candidate HEAD before launch",
+            )?;
+            let status = git::run_stdout(
+                &workspace,
+                &["status", "--porcelain", "--untracked-files=all", "--", "."],
+                "check Writer-completion recovery candidate cleanliness before launch",
+            )?;
+            anyhow::ensure!(
+                head == authority.candidate_commit && status.is_empty(),
+                "Writer-completion recovery candidate changed or is dirty before launch"
+            );
+        }
         let authorized = attempt
             .tasks
             .iter()

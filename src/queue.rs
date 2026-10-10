@@ -1312,6 +1312,13 @@ fn ensure_resume_eligible(
                 .unwrap_or_default()
         );
     }
+    if crate::writer_completion_recovery::planned_successor_resume_ready(
+        project_root,
+        item,
+        attempt,
+    )? {
+        return Ok(());
+    }
     if candidate_ancestry_repair {
         return Ok(());
     }

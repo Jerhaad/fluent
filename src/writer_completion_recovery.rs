@@ -90,7 +90,7 @@ pub fn recovery_action(project_root: &Path, attempt: &Attempt) -> Option<String>
     ))
 }
 
-/// Report a repair for the latest malformed Writer or unresolved no-change findings.
+/// Report a repair for the latest malformed Writer or unfinished no-change work.
 pub(crate) fn status_recovery_action(project_root: &Path, attempt: &Attempt) -> Option<String> {
     let eligible = inspect_eligible(project_root, attempt).ok()?;
     if eligible.existing_no_change {
@@ -98,7 +98,7 @@ pub(crate) fn status_recovery_action(project_root: &Path, attempt: &Attempt) -> 
             .tasks
             .iter()
             .find(|task| task.id == eligible.source_writer_task_id)?;
-        if !writer_matrix_has_pending_finding(project_root, source).ok()? {
+        if !writer_matrix_has_pending_writer_work(project_root, attempt, source).ok()? {
             return None;
         }
     }
@@ -115,6 +115,33 @@ pub(crate) fn status_recovery_action(project_root: &Path, attempt: &Attempt) -> 
         "fluent attempt repair-writer-completion {} {} --resolution \"<describe the approved retry>\"",
         attempt.work_item_id, attempt.id
     ))
+}
+
+/// Admit queue resume for the one planned corrective Writer created by an
+/// audited completion repair. Ordinary planned Attempts still use queue add.
+pub(crate) fn planned_successor_resume_ready(
+    project_root: &Path,
+    item: &crate::work_model::WorkItem,
+    attempt: &Attempt,
+) -> Result<bool> {
+    if attempt.status != AttemptStatus::Planned || attempt.pause_kind.is_some() {
+        return Ok(false);
+    }
+    let Some(task) = attempt.tasks.last() else {
+        return Ok(false);
+    };
+    if task.kind != TaskKind::Write
+        || task.status != TaskStatus::Planned
+        || !task
+            .input_artifacts
+            .iter()
+            .any(|artifact| artifact.producer_id == PRODUCER)
+    {
+        return Ok(false);
+    }
+    attempt.ensure_not_canceled()?;
+    ensure_settled_ownership(project_root, attempt)?;
+    Ok(validated_writer_context(project_root, item, task)?.is_some())
 }
 
 fn validate_prior_recoveries(
@@ -175,6 +202,34 @@ fn validate_prior_recoveries(
             .output
             .as_ref()
             .context("prior recovery source output is missing")?;
+        // Older releases approved a completed no-change Writer in place but
+        // reserved no successor. Retain that operation as history; a distinct
+        // decision with current source bindings may authorize the next Task.
+        if source_index == replacement_index
+            && source_output.no_change.is_some()
+            && authority.source_matrix_sha256.is_none()
+        {
+            anyhow::ensure!(
+                source.kind == TaskKind::Write
+                    && source.status == TaskStatus::Complete
+                    && source_output.commit == authority.candidate_commit
+                    && source_output.base_commit == authority.protected_base_commit
+                    && source.input_artifacts.contains(reference),
+                "prior no-change Writer-completion recovery source changed"
+            );
+            crate::recovery_contracts::writer_completion::validate_task_recovery_source(
+                project_root,
+                attempt,
+                source,
+            )?;
+            if let Some(resolution) = resolution {
+                anyhow::ensure!(
+                    authority.resolution != resolution,
+                    "later Writer-completion recovery needs a distinct authorization decision"
+                );
+            }
+            continue;
+        }
         anyhow::ensure!(
             source_index <= replacement_index
                 && replacement_index < current_index
@@ -284,7 +339,7 @@ pub fn repair(
         work_item_id,
         attempt_id,
         Some(eligible.candidate_commit.clone()),
-        Some(if eligible.malformed_source_matrix {
+        Some(if eligible.source_matrix_sha256.is_some() {
             eligible.source_writer_task_id.clone()
         } else {
             eligible.task_id.clone()
@@ -321,7 +376,13 @@ pub fn repair(
                     .iter()
                     .find(|task| task.id == expected_eligible.source_writer_task_id)
             })
-            .map(|task| task.input_artifacts.clone())
+            .map(|task| {
+                task.input_artifacts
+                    .iter()
+                    .filter(|artifact| artifact.producer_id != PRODUCER)
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default()
     } else {
         Vec::new()
@@ -361,7 +422,7 @@ pub fn repair(
                 });
             }
             if expected_eligible.schedule_corrective_writer {
-                if !expected_eligible.malformed_source_matrix {
+                if !expected_eligible.malformed_source_matrix && !expected_eligible.existing_no_change {
                     let attempt = fresh
                         .attempts
                         .iter_mut()
@@ -384,7 +445,7 @@ pub fn repair(
                 if !inputs.contains(&audit_ref) {
                     inputs.push(audit_ref.clone());
                 }
-                if expected_eligible.malformed_source_matrix {
+                if expected_eligible.source_matrix_sha256.is_some() {
                     let source = &expected_eligible.source_writer_task_id;
                     let matrix = ArtifactRef {
                         producer_id: source.clone(),
@@ -403,10 +464,10 @@ pub fn repair(
                     .map_err(|error| WorkModelError::AttemptResumeIneligible {
                         attempt_id: attempt_id.to_string(),
                         reason: format!(
-                            "could not schedule the corrective Writer for the pending completion finding: {error}"
+                            "could not schedule the corrective Writer for unfinished Writer work: {error}"
                         ),
                     })?;
-                if expected_eligible.malformed_source_matrix && next_task_id != task_id {
+                if next_task_id != task_id {
                     return Err(WorkModelError::AttemptResumeIneligible {
                         attempt_id: attempt_id.to_string(),
                         reason: "corrective Writer identity changed before authorization".to_string(),
@@ -663,7 +724,7 @@ fn reconcile_existing_recovery(
         .output
         .as_ref()
         .is_some_and(|output| output.no_change.is_some())
-        && writer_matrix_has_pending_finding(project_root, source)?
+        && writer_matrix_has_pending_writer_work(project_root, attempt, source)?
     {
         return schedule_pending_finding_writer(
             project_root,
@@ -885,7 +946,7 @@ fn reconcile_existing_recovery(
 }
 
 /// Turn an already-authorized completed no-change Writer into one normal
-/// corrective Writer when its matrix still contains a review finding. This
+/// corrective Writer when its matrix still contains Writer-owned work. This
 /// path is needed for authorities created by an older Fluent binary before it
 /// learned that shape; the authority remains immutable and the new
 /// reconciliation record makes the follow-up idempotent.
@@ -1211,6 +1272,18 @@ fn existing_recovery(
         .iter()
         .find(|task| task.id == authority.source_writer_task_id)
         .ok_or_else(|| anyhow::anyhow!("recovery source Writer is missing"))?;
+    if source.id != task.id
+        && source
+            .input_artifacts
+            .iter()
+            .any(|input| input.producer_id == PRODUCER)
+    {
+        crate::recovery_contracts::writer_completion::validate_task_recovery_source(
+            project_root,
+            attempt,
+            source,
+        )?;
+    }
     crate::recovery_contracts::writer_completion::validate_committed_source_evidence(
         project_root,
         attempt,
@@ -1236,7 +1309,25 @@ fn existing_recovery(
         &["status", "--porcelain", "--untracked-files=all", "--", "."],
         "check recovered candidate cleanliness",
     )?;
-    if head != authority.candidate_commit || !status.is_empty() {
+    let settled_successor = task.id != source.id
+        && task.status == TaskStatus::Complete
+        && task.output.as_ref().is_some_and(|output| {
+            output.base_commit.as_deref() == Some(authority.candidate_commit.as_str())
+                && output.commit == head
+                && output.workspace_path == source_output.workspace_path
+        })
+        && git::run(
+            &workspace,
+            &[
+                "merge-base",
+                "--is-ancestor",
+                &authority.candidate_commit,
+                &head,
+            ],
+            "check settled Writer-completion successor ancestry",
+        )
+        .is_ok();
+    if (head != authority.candidate_commit && !settled_successor) || !status.is_empty() {
         bail!("Writer-completion recovery candidate changed or is dirty");
     }
     let operation = crate::work_model::RecoveryOperationRequest::new(
@@ -1369,7 +1460,21 @@ fn inspect_eligible(project_root: &Path, attempt: &Attempt) -> Result<EligibleRe
             {
                 bail!("completed no-change Writer has no completion matrix to review");
             }
-            (source_writer.id.clone(), true, false)
+            let next_task_id = format!(
+                "{}-write-{}",
+                attempt.id,
+                attempt
+                    .tasks
+                    .iter()
+                    .filter(|task| task.kind == TaskKind::Write)
+                    .count()
+                    + 1
+            );
+            anyhow::ensure!(
+                !attempt.tasks.iter().any(|task| task.id == next_task_id),
+                "corrective Writer identity is already reserved"
+            );
+            (next_task_id, true, false)
         } else {
             attempt.writer_completion_contract.as_ref().ok_or_else(|| {
                 anyhow::anyhow!("committed Writer has no immutable completion contract")
@@ -1413,13 +1518,10 @@ fn inspect_eligible(project_root: &Path, attempt: &Attempt) -> Result<EligibleRe
         };
     let schedule_corrective_writer = malformed_source_matrix
         || existing_no_change
-            && attempt
-                .tasks
-                .iter()
-                .find(|task| task.id == task_id)
-                .is_some_and(|task| {
-                    writer_matrix_has_pending_finding(project_root, task).unwrap_or(false)
-                });
+            && writer_matrix_has_pending_writer_work(project_root, attempt, source_writer)?;
+    if existing_no_change && !schedule_corrective_writer {
+        bail!("completed no-change Writer has no pending Writer-owned work");
+    }
     let workspace = resolve_managed_sibling_workspace_path(
         project_root,
         &source_output.workspace_path,
@@ -1454,7 +1556,8 @@ fn inspect_eligible(project_root: &Path, attempt: &Attempt) -> Result<EligibleRe
         })
         .map(|task| task.id.clone())
         .collect::<Vec<_>>();
-    let source_matrix_sha256 = if malformed_source_matrix {
+    let bind_source = malformed_source_matrix || existing_no_change && schedule_corrective_writer;
+    let source_matrix_sha256 = if bind_source {
         let area = source_writer.artifact_area.as_ref().unwrap();
         let bytes = fs::read(
             project_root
@@ -1465,14 +1568,14 @@ fn inspect_eligible(project_root: &Path, attempt: &Attempt) -> Result<EligibleRe
     } else {
         None
     };
-    let requirement_contract_sha256 = if malformed_source_matrix {
+    let requirement_contract_sha256 = if bind_source {
         Some(content_digest(&serde_json::to_vec(
             attempt.writer_completion_contract.as_ref().unwrap(),
         )?))
     } else {
         None
     };
-    let source_assignment_sha256 = if malformed_source_matrix {
+    let source_assignment_sha256 = if bind_source {
         Some(content_digest(&serde_json::to_vec(&(
             &source_writer.workspace_access,
             &source_writer.writer_correction_assignment,
@@ -1480,7 +1583,7 @@ fn inspect_eligible(project_root: &Path, attempt: &Attempt) -> Result<EligibleRe
     } else {
         None
     };
-    let source_transcript_sha256 = if malformed_source_matrix {
+    let source_transcript_sha256 = if bind_source {
         let area = source_writer.artifact_area.as_ref().unwrap();
         Some(content_digest(
             &fs::read(project_root.join(&area.path).join("transcript.jsonl"))
@@ -1489,7 +1592,7 @@ fn inspect_eligible(project_root: &Path, attempt: &Attempt) -> Result<EligibleRe
     } else {
         None
     };
-    let source_output_sha256 = if malformed_source_matrix {
+    let source_output_sha256 = if bind_source {
         Some(content_digest(&serde_json::to_vec(source_output)?))
     } else {
         None
@@ -1512,13 +1615,12 @@ fn inspect_eligible(project_root: &Path, attempt: &Attempt) -> Result<EligibleRe
     })
 }
 
-/// A completed no-change Writer can still be paused when its completion matrix
-/// contains an unresolved review finding. That is different from a normal
-/// no-change declaration with only host-owned evidence still pending: the
-/// former needs a corrective Writer, while the latter should proceed to the
-/// existing host-evidence path.
-fn writer_matrix_has_pending_finding(
+/// A completed no-change Writer needs a corrective Writer when its validated
+/// matrix still contains an unfinished Writer-owned requirement. External rows
+/// cannot grant another Writer round.
+fn writer_matrix_has_pending_writer_work(
     project_root: &Path,
+    attempt: &Attempt,
     task: &crate::work_model::Task,
 ) -> Result<bool> {
     let area = task
@@ -1532,9 +1634,18 @@ fn writer_matrix_has_pending_finding(
         .with_context(|| format!("read Writer completion matrix {}", path.display()))?;
     let matrix: crate::work_model::WriterCompletionMatrix = serde_json::from_str(&source)
         .with_context(|| format!("parse Writer completion matrix {}", path.display()))?;
+    let contract = attempt
+        .writer_completion_contract
+        .as_ref()
+        .context("Writer completion contract is missing")?;
+    let findings = crate::recovery_contracts::writer_completion_findings(project_root, task)?;
+    matrix
+        .status_against(contract, &task.id, &findings)
+        .map_err(|reason| anyhow::anyhow!("Writer completion matrix is invalid: {reason}"))?;
     Ok(matrix.rows.iter().any(|row| {
-        row.kind == crate::work_model::WriterCompletionRequirementKind::Finding
-            && row.state == crate::work_model::WriterCompletionState::Pending
+        row.responsibility.is_none_or(|responsibility| {
+            responsibility == crate::work_model::CompletionResponsibility::Writer
+        }) && row.state == crate::work_model::WriterCompletionState::Pending
     }))
 }
 
