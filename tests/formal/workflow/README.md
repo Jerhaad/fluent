@@ -1,5 +1,52 @@
 # Workflow foundation checks
 
+## Recovery observation
+
+The `recovery-observation` suite checks repeated failure and recovery profiles,
+the existing service competition profile, cancellation, repeated-effect,
+observation and cleanup negative controls, and a joint service/child settlement
+boundary. `JointSettlement.tla` keeps a child's ownership receipt across two
+service crashes. It permits publication of a completed stop only after the
+child settles; its negative configuration allows early publication and must
+violate the invariant. This closes the atomic worker-clear assumption in the
+separate `ServiceLifecycle` model at the modeled handoff. The Rust cancellation
+test remains the production check for stale authority, while a live child
+crash trace remains a separate connection obligation.
+
+The fresh public continuation trace starts with a completed Writer whose
+matrix has the malformed verification result `pass; extra text`. The public
+`work-item show` response names `attempt repair-writer-completion` as the next
+action. The trace then records that repair and a public `attempt run` which
+completes one corrective Writer while preserving the original matrix and
+candidate. The next action names evidence attachment for the remaining host
+row. `project_recovery.py` derives `paused → authorized → continued` from
+the Work snapshots and commands. Rebound stale guidance and a missing Writer
+transition fail its negative controls. `RecoveryTrace.tla` checks the derived
+transition order. The trace proves this recovery case; the other public
+failure routes remain covered by their focused Rust tests.
+
+Run the focused projector on an already captured trace with:
+
+```sh
+python3 tests/formal/workflow/project_recovery.py target/formal/workflow/recovery-observation/production-trace.json
+```
+
+The required host suite is:
+
+```sh
+python3 tests/formal/workflow/check.py --suite=recovery-observation --jar=target/fluent-tools/tla2tools-1.7.4.jar
+```
+
+It refreshes the public trace, checks that the source commit and binary match
+the candidate, and writes model logs, negative-control logs and `result.json`
+under `target/formal/workflow/recovery-observation/`. A missing JAR, Java 21,
+fresh trace, completed model search or required negative control fails the
+suite. The operator can resume a malformed Writer completion with the exact
+`repair-writer-completion` command shown by `work-item show`; after the Writer
+completes, use its newly displayed `evidence attach` command for any remaining
+host-owned obligation. Cleanup retains an origin while required follow-up
+publication is unfinished and rechecks eligibility before removing it.
+
 ## Evidence status
 
 The `evidence-status` suite captures a public Attempt, advances the target,
