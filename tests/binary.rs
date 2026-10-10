@@ -118,6 +118,8 @@ fn released_upgrade_preserves_workflow_state() {
     let before = WorkModelStore::new(&project)
         .read_work_item_snapshot("released-planned")
         .unwrap();
+    let work_root = project.join(".fluent/work");
+    let before_read = snapshot_tree(&work_root);
     fluent_cmd()
         .current_dir(&project)
         .args(["work-item", "show", "released-planned"])
@@ -127,6 +129,7 @@ fn released_upgrade_preserves_workflow_state() {
         .read_work_item_snapshot("released-planned")
         .unwrap();
     assert_eq!(after_read.id, before.id);
+    assert_eq!(snapshot_tree(&work_root), before_read);
     fluent_cmd()
         .current_dir(&project)
         .args(["work-item", "upgrade", "released-planned"])
@@ -243,6 +246,159 @@ fn released_upgrade_recovers_interrupted_publication() {
             .join(".fluent/work/transactions/released-pending.json")
             .exists()
     );
+}
+
+#[test]
+fn released_upgrade_preserves_landed_work() {
+    let tmp = TempDir::new().unwrap();
+    let release = released_050_binary(&tmp);
+    let project = released_work_fixture(&tmp, &release, "work-1");
+    let bin = tmp.path().join("release-provider");
+    write_mock_claude(
+        &bin,
+        &learner_land_mock_script(r#"{"learning_summary":"none","follow_ups":[]}"#),
+    );
+    let run = Command::new(&release)
+        .current_dir(&project)
+        .env("HOME", tmp.path())
+        .env("PATH", mock_path(&bin))
+        .env("FLUENT_NO_UPDATE_CHECK", "1")
+        .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "released Attempt run: {}\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let before = released_command(&release, &project, &["work-item", "show", "work-1"]);
+    assert!(before.status.success());
+    let before: serde_json::Value = serde_json::from_slice(&before.stdout).unwrap();
+    assert_eq!(before["attempts"][0]["status"], "complete");
+    let landed = Command::new(&release)
+        .current_dir(&project)
+        .env("HOME", tmp.path())
+        .env("PATH", mock_path(&bin))
+        .env("FLUENT_NO_UPDATE_CHECK", "1")
+        .args(["merge-candidate", "land", "work-1", "--no-sandbox"])
+        .output()
+        .unwrap();
+    assert!(
+        landed.status.success(),
+        "released landing: {}\n{}",
+        String::from_utf8_lossy(&landed.stdout),
+        String::from_utf8_lossy(&landed.stderr)
+    );
+    let released_landed = released_command(&release, &project, &["work-item", "show", "work-1"]);
+    assert!(released_landed.status.success());
+    let released_landed: serde_json::Value =
+        serde_json::from_slice(&released_landed.stdout).unwrap();
+    assert_eq!(
+        released_landed["merge_candidates"][0]["merge_state"]["status"],
+        "merged"
+    );
+    fluent_cmd()
+        .current_dir(&project)
+        .args(["work-item", "upgrade", "work-1"])
+        .assert()
+        .success();
+    let after = fluent_cmd()
+        .current_dir(&project)
+        .args(["work-item", "show", "work-1"])
+        .output()
+        .unwrap();
+    assert!(after.status.success());
+    let after: serde_json::Value = serde_json::from_slice(&after.stdout).unwrap();
+    assert_eq!(after["attempts"][0]["id"], before["attempts"][0]["id"]);
+    assert_eq!(after["attempts"][0]["status"], "complete");
+    assert_eq!(
+        after["merge_candidates"][0]["merge_state"]["status"],
+        "merged"
+    );
+    assert_eq!(
+        after["merge_candidates"][0]["id"],
+        released_landed["merge_candidates"][0]["id"]
+    );
+    let historical_tasks = |work: &serde_json::Value| -> Vec<_> {
+        work["attempts"][0]["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|task| (task["id"].clone(), task["status"].clone()))
+            .collect()
+    };
+    assert_eq!(historical_tasks(&after), historical_tasks(&released_landed));
+}
+
+#[test]
+fn released_upgrade_preserves_running_before_stop() {
+    let tmp = TempDir::new().unwrap();
+    let release = released_050_binary(&tmp);
+    let project = released_work_fixture(&tmp, &release, "released-running");
+    let bin = tmp.path().join("blocking-provider");
+    write_mock_claude(
+        &bin,
+        "#!/bin/sh\nset -eu\nprintf 'started\\n' > \"$RELEASE_STARTED\"\nwhile [ ! -e \"$RELEASE_FINISH\" ]; do sleep 0.05; done\n",
+    );
+    let started = tmp.path().join("writer-started");
+    let finish = tmp.path().join("writer-finish");
+    let mut running = OwnedFixtureProcess::spawn(
+        Command::new(&release)
+            .current_dir(&project)
+            .env("HOME", tmp.path())
+            .env("PATH", mock_path(&bin))
+            .env("RELEASE_STARTED", &started)
+            .env("RELEASE_FINISH", &finish)
+            .env("FLUENT_NO_UPDATE_CHECK", "1")
+            .args([
+                "attempt",
+                "run",
+                "released-running",
+                "attempt-1",
+                "--no-sandbox",
+            ]),
+    );
+    assert!(poll_until(std::time::Duration::from_secs(10), || started.exists()));
+    let before = released_command(
+        &release,
+        &project,
+        &["work-item", "show", "released-running"],
+    );
+    assert!(before.status.success());
+    let before: serde_json::Value = serde_json::from_slice(&before.stdout).unwrap();
+    assert_eq!(before["attempts"][0]["status"], "executing");
+    let stopped = released_command(
+        &release,
+        &project,
+        &["attempt", "cancel", "released-running", "attempt-1"],
+    );
+    assert!(
+        stopped.status.success(),
+        "released cancel: {}\n{}",
+        String::from_utf8_lossy(&stopped.stdout),
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    fs::write(&finish, "finish").unwrap();
+    let _ = running.wait();
+    fluent_cmd()
+        .current_dir(&project)
+        .args(["work-item", "upgrade", "released-running"])
+        .assert()
+        .success();
+    let after = fluent_cmd()
+        .current_dir(&project)
+        .args(["work-item", "show", "released-running"])
+        .output()
+        .unwrap();
+    assert!(after.status.success());
+    let after: serde_json::Value = serde_json::from_slice(&after.stdout).unwrap();
+    assert_eq!(after["attempts"][0]["id"], before["attempts"][0]["id"]);
+    assert_eq!(
+        after["attempts"][0]["tasks"][0]["id"],
+        before["attempts"][0]["tasks"][0]["id"]
+    );
+    assert_eq!(after["attempts"][0]["status"], "needs-user");
 }
 
 #[test]

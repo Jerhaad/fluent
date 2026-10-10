@@ -683,7 +683,9 @@ def release_transition_suite(source, root, output, jar, java):
     results = []
     cases = (
         ("binary", ("released_upgrade_preserves_workflow_state",
-                    "released_upgrade_recovers_interrupted_publication")),
+                    "released_upgrade_recovers_interrupted_publication",
+                    "released_upgrade_preserves_running_before_stop",
+                    "released_upgrade_preserves_landed_work")),
         ("binary", ("released_predecessor_refuses_current_authority",
                     "released_predecessor_refuses_pending_current_publication")),
         ("scheduler_service", ("scheduler_released_upgrade_preserves_shared_ownership",)),
@@ -724,6 +726,27 @@ def release_transition_suite(source, root, output, jar, java):
                 negative.stdout + negative.stderr)
             results.append({"case": f"{scenario}-negative", "pass": negative.returncode != 0,
                             "log": f"{scenario}-negative.log"})
+    service_trace = output / "service-ownership.json"
+    service_command = ["python3", str(source / "project_release.py"), str(service_trace),
+                       str(candidate), commit]
+    service_projection = subprocess.run(service_command, cwd=root, capture_output=True, text=True)
+    (output / "service-projection.log").write_text(
+        "$ " + " ".join(service_command) + "\n" +
+        service_projection.stdout + service_projection.stderr)
+    results.append({"case": "service-projection", "pass": service_projection.returncode == 0,
+                    "log": "service-projection.log"})
+    if service_projection.returncode == 0:
+        corrupted = json.loads(service_trace.read_text())
+        corrupted["events"][2]["raw-facts"]["health"]["instance_id"] = \
+            corrupted["events"][0]["raw-facts"]["health"]["instance_id"]
+        negative_path = output / "service-negative.json"
+        negative_path.write_text(json.dumps(corrupted))
+        negative = subprocess.run([*service_command[:2], str(negative_path),
+                                   *service_command[3:]], cwd=root,
+                                  capture_output=True, text=True)
+        (output / "service-negative.log").write_text(negative.stdout + negative.stderr)
+        results.append({"case": "service-negative", "pass": negative.returncode != 0,
+                        "log": "service-negative.log"})
     results.append(run_case(source, output, jar, java, "service-competition.cfg", None))
     results.append(run_case(source, output, jar, java, "negative-guardversion.cfg",
                             CONTROLS["guardversion"]))

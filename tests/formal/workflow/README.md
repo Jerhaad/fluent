@@ -1,5 +1,31 @@
 # Workflow foundation checks
 
+## Release transition
+
+The `release-transition` suite runs the installed, SHA-pinned v0.5.0 binary in
+isolated projects. Its Work tests exercise planned, queued, paused, running
+before cancellation, interrupted, and landed records. The strict host service
+test registers two projects, holds an owned worker during service-wide stop,
+then starts the replacement only after the old owner exits.
+
+`project_release.py` checks protected-state equality for both predecessor
+refusals and binds the service transition to the two observed instance IDs,
+builds, registered projects, stop result, and queues. Mutating the protected
+state or reusing the old instance ID fails its negative controls. The suite
+also checks `service-competition.cfg` and `negative-guardversion.cfg` through
+TLC. A joint production trace across all workflow boundaries remains for the
+later integrated assurance work.
+
+Run the required host check with:
+
+```sh
+python3 tests/formal/workflow/check.py --suite=release-transition --jar=target/fluent-tools/tla2tools-1.7.4.jar
+```
+
+The suite requires the pinned JAR, Java 21, and permission to bind an isolated
+Unix socket. It writes command logs, traces, projections, controls, and
+`result.json` under `target/formal/workflow/release-transition/`.
+
 ## Recovery observation
 
 The `recovery-observation` suite checks repeated failure and recovery profiles,

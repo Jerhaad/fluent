@@ -10,6 +10,14 @@ use tempfile::TempDir;
 
 struct ReleaseServiceChild(std::process::Child);
 
+struct ReleaseWorkers(PathBuf);
+
+impl Drop for ReleaseWorkers {
+    fn drop(&mut self) {
+        let _ = fs::write(&self.0, "settle");
+    }
+}
+
 impl Drop for ReleaseServiceChild {
     fn drop(&mut self) {
         if self.0.try_wait().ok().flatten().is_none() {
@@ -60,33 +68,85 @@ fn scheduler_released_upgrade_preserves_shared_ownership() {
                 .unwrap()
                 .success()
         );
-        let created = fixture(
-            &predecessor,
-            project,
-            &[
-                "work-item",
-                "create",
-                work,
-                "--title",
-                "Queued predecessor Work",
-            ],
+        for args in [
+            vec!["config", "user.email", "fixture@example.invalid"],
+            vec!["config", "user.name", "Fixture"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .current_dir(project)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        fs::write(project.join("README.md"), "released service fixture\n").unwrap();
+        fs::write(project.join(".gitignore"), ".fluent/work/\n").unwrap();
+        fs::create_dir_all(project.join(".fluent")).unwrap();
+        fs::write(
+            project.join(".fluent/config.yaml"),
+            "scheduler:\n  local-concurrency: 1\n",
+        )
+        .unwrap();
+        assert!(
+            Command::new("git")
+                .current_dir(project)
+                .args(["add", "."])
+                .status()
+                .unwrap()
+                .success()
         );
         assert!(
-            created.status.success(),
-            "{}",
-            String::from_utf8_lossy(&created.stderr)
+            Command::new("git")
+                .current_dir(project)
+                .args(["commit", "-qm", "Initialize fixture"])
+                .status()
+                .unwrap()
+                .success()
         );
-        let attempt = fixture(
-            &predecessor,
-            project,
-            &["attempt", "create", work, "attempt-1"],
-        );
-        assert!(
-            attempt.status.success(),
-            "{}",
-            String::from_utf8_lossy(&attempt.stderr)
-        );
+        for id in [work.to_string(), format!("{work}-queued")] {
+            let created = fixture(
+                &predecessor,
+                project,
+                &[
+                    "work-item",
+                    "create",
+                    &id,
+                    "--title",
+                    "Queued predecessor Work",
+                ],
+            );
+            assert!(
+                created.status.success(),
+                "{}",
+                String::from_utf8_lossy(&created.stderr)
+            );
+            let attempt = fixture(
+                &predecessor,
+                project,
+                &["attempt", "create", &id, "attempt-1"],
+            );
+            assert!(
+                attempt.status.success(),
+                "{}",
+                String::from_utf8_lossy(&attempt.stderr)
+            );
+        }
     }
+    let provider_bin = home.path().join("bin");
+    fs::create_dir_all(&provider_bin).unwrap();
+    let provider = provider_bin.join("claude");
+    fs::write(&provider,
+        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$PWD\" >> \"$RELEASE_SERVICE_STARTED\"\nwhile [ ! -e \"$RELEASE_SERVICE_RELEASE\" ]; do sleep 0.05; done\nexit 1\n").unwrap();
+    fs::set_permissions(&provider, fs::Permissions::from_mode(0o755)).unwrap();
+    let started = home.path().join("workers-started");
+    let release_workers = home.path().join("release-workers");
+    let provider_path = format!(
+        "{}:{}",
+        provider_bin.display(),
+        std::env::var("PATH").unwrap()
+    );
     // The released Unix service cannot bind a socket inside the Writer's
     // sandbox. The host-owned strict run executes the process transition.
     if std::env::var("FLUENT_WORKFLOW_REQUIRE_HOST").as_deref() != Ok("1") {
@@ -115,14 +175,18 @@ fn scheduler_released_upgrade_preserves_shared_ownership() {
         Command::new(&predecessor)
             .current_dir(first.path())
             .env("HOME", home.path())
+            .env("PATH", &provider_path)
+            .env("RELEASE_SERVICE_STARTED", &started)
+            .env("RELEASE_SERVICE_RELEASE", &release_workers)
             .env("FLUENT_NO_UPDATE_CHECK", "1")
-            .args(["scheduler", "run", "--poll-seconds", "30"])
+            .args(["scheduler", "run", "--poll-seconds", "1"])
             .spawn()
             .unwrap(),
     );
+    let _release_guard = ReleaseWorkers(release_workers.clone());
     let socket = scheduler_service::socket_path(home.path());
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !socket.exists() {
+    while scheduler_service::send_health_request(&socket).is_err() {
         assert!(
             Instant::now() < deadline,
             "released service failed to start"
@@ -133,6 +197,7 @@ fn scheduler_released_upgrade_preserves_shared_ownership() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+    let old_health = scheduler_service::send_health_request(&socket).unwrap();
     let reused = fixture(
         &predecessor,
         second.path(),
@@ -162,17 +227,71 @@ fn scheduler_released_upgrade_preserves_shared_ownership() {
             String::from_utf8_lossy(&queued.stderr)
         );
     }
-    let stopped = fixture(&predecessor, first.path(), &["scheduler", "stop", "--all"]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !started.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "released service did not launch owned Work"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    for (project, work) in [
+        (first.path(), "first-queued"),
+        (second.path(), "second-queued"),
+    ] {
+        let queued = fixture(&predecessor, project, &["queue", "add", work]);
+        assert!(
+            queued.status.success(),
+            "{}",
+            String::from_utf8_lossy(&queued.stderr)
+        );
+    }
+    let stop_binary = predecessor.clone();
+    let stop_project = first.path().to_path_buf();
+    let stop_home = home.path().to_path_buf();
+    let stopping = std::thread::spawn(move || {
+        Command::new(stop_binary)
+            .current_dir(stop_project)
+            .env("HOME", stop_home)
+            .env("FLUENT_NO_UPDATE_CHECK", "1")
+            .args(["scheduler", "stop", "--all"])
+            .output()
+            .unwrap()
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    fs::write(&release_workers, "settle").unwrap();
+    let stopped = stopping.join().unwrap();
     assert!(
         stopped.status.success(),
         "{}",
         String::from_utf8_lossy(&stopped.stderr)
     );
     assert!(old_service.0.wait().unwrap().success());
+    let mut active_after_stop = Vec::new();
     for (project, work) in [(first.path(), "first"), (second.path(), "second")] {
+        let result = fixture(&predecessor, project, &["queue", "show", work]);
+        assert!(result.status.success());
+        let dispatch: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+        assert!(!matches!(
+            dispatch["status"].as_str(),
+            Some("running" | "claimed")
+        ));
+        active_after_stop.push(dispatch);
+    }
+    assert!(active_after_stop.iter().any(|dispatch| matches!(
+        dispatch["status"].as_str(),
+        Some("candidate-ready" | "failed" | "needs-user" | "canceled" | "blocked")
+    )));
+    let mut queues_after_stop = Vec::new();
+    for (project, work) in [
+        (first.path(), "first-queued"),
+        (second.path(), "second-queued"),
+    ] {
         let queued = fixture(&predecessor, project, &["queue", "show", work]);
         assert!(queued.status.success());
         assert!(String::from_utf8_lossy(&queued.stdout).contains("queued"));
+        queues_after_stop
+            .push(serde_json::from_slice::<serde_json::Value>(&queued.stdout).unwrap());
     }
     let mut replacement = ReleaseServiceChild(
         Command::new(env!("CARGO_BIN_EXE_fluent"))
@@ -191,6 +310,9 @@ fn scheduler_released_upgrade_preserves_shared_ownership() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+    let new_health = scheduler_service::send_health_request(&socket).unwrap();
+    assert_ne!(old_health.instance_id, new_health.instance_id);
+    assert_ne!(old_health.build, new_health.build);
     assert_eq!(
         scheduler_service::read_registry(home.path()).unwrap().len(),
         2
@@ -198,6 +320,63 @@ fn scheduler_released_upgrade_preserves_shared_ownership() {
     let stale = scheduler_service::stop_service_instance(home.path(), "stale-instance");
     assert!(stale.is_err());
     assert!(scheduler_service::send_health_request(&socket).is_ok());
+    let mut queues_after_replacement = Vec::new();
+    for (project, work) in [
+        (first.path(), "first-queued"),
+        (second.path(), "second-queued"),
+    ] {
+        let queue = fixture(
+            std::path::Path::new(env!("CARGO_BIN_EXE_fluent")),
+            project,
+            &["queue", "show", work],
+        );
+        assert!(queue.status.success());
+        queues_after_replacement
+            .push(serde_json::from_slice::<serde_json::Value>(&queue.stdout).unwrap());
+    }
+    let current_binary = fs::read(env!("CARGO_BIN_EXE_fluent")).unwrap();
+    let head = Command::new("git")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(head.status.success());
+    let trace = serde_json::json!({
+        "schema-version":1,"scenario":"released-shared-service-transition",
+        "fluent-commit":String::from_utf8_lossy(&head.stdout).trim(),
+        "fluent-binary-sha256":format!("{:x}", Sha256::digest(current_binary)),
+        "model-profile":"release-transition","collection-complete":true,
+        "artifacts":[],"events":[
+            {"sequence":1,"actor":"released-service","operation-id":"scheduler-run",
+             "generation":old_health.generation,"boundary":"old-owner",
+             "causal-predecessors":[],"raw-facts":{"health":{
+                "generation":old_health.generation,"build":old_health.build,
+                "instance_id":old_health.instance_id,"state":old_health.state},
+                "registered-projects":registry.len(),
+                "predecessor-sha256":"8bb76717be942e4a0c97c297c318c0a1331e92105180edb386354dddbae12974"}},
+            {"sequence":2,"actor":"operator","operation-id":"scheduler-stop-all",
+             "generation":null,"boundary":"old-owner-settled",
+             "causal-predecessors":[1],"raw-facts":{"stop-exit-code":stopped.status.code(),
+                "stop-stdout":String::from_utf8_lossy(&stopped.stdout),
+                "queues":queues_after_stop,"active-work":active_after_stop,
+                "owned-worker-started":started.exists()}},
+            {"sequence":3,"actor":"current-service","operation-id":"scheduler-run",
+             "generation":new_health.generation,"boundary":"new-owner",
+             "causal-predecessors":[2],"raw-facts":{"health":{
+                "generation":new_health.generation,"build":new_health.build,
+                "instance_id":new_health.instance_id,"state":new_health.state},
+                "registered-projects":scheduler_service::read_registry(home.path()).unwrap().len(),
+                "queues":queues_after_replacement,"stale-stop-refused":stale.is_err()}}
+        ]
+    });
+    let output = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target/formal/workflow/release-transition");
+    fs::create_dir_all(&output).unwrap();
+    fs::write(
+        output.join("service-ownership.json"),
+        serde_json::to_vec_pretty(&trace).unwrap(),
+    )
+    .unwrap();
     let stopped = fixture(
         std::path::Path::new(env!("CARGO_BIN_EXE_fluent")),
         first.path(),
