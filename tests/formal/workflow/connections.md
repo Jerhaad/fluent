@@ -1,6 +1,11 @@
 # Workflow connection inventory
 
-The whole-workflow model is an abstraction. Each row names the concrete state that a later check must relate to it. `pending` means neither the existing protocol model nor the first public trace proves that connection. The owner is the follow-on Work Item responsible for production coverage. The six scheduler models remain separate checks.
+The whole-workflow model is an abstraction. Each row names the concrete state
+that a check must relate to it. The integrated report credits a row only when
+its evidence starts with `Verified: ` and names a checked source mapping,
+discharged assumption, bounded model result, production scenario, and negative
+control. A passing component model alone does not complete a connection. The
+six scheduler models remain separate checks.
 
 | Boundary and property | Detailed model and state mapping | Assumption and required check | Production scenario, control, owner | Evidence |
 | --- | --- | --- | --- | --- |
@@ -30,4 +35,4 @@ The whole-workflow model is an abstraction. Each row names the concrete state th
 | Cleanup eligibility | `Workflow.Cleanup` ↔ managed worktree and artifact cleanup | Retained landing evidence must survive source checkout removal until authorized cleanup | Cleanup after land and before result; `negative-guardcleanup.cfg`; `recovery-observation` | `workflow_cleanup_retains_pending_recovery` lands through the public route, obstructs required Observation publication, applies cleanup, then recovers publication. `workflow_cleanup_rechecks_current_eligibility` changes eligibility after candidate selection at a test barrier and before the re-read; it also confirms an unrelated terminal item is removed. |
 | Version transitions | `Workflow.VersionTransition` ↔ schema/build compatibility guards | Older readers must refuse mutation of new-protocol live state | Replace executable during unfinished Work; `negative-guardversion.cfg`; `release-transition` | `released_predecessor_refuses_*` runs the SHA-pinned v0.5.0 binary against current records and a pending transaction. `project_release.py` checks both protected-state comparisons and rejects a changed comparison. The bounded `negative-guardversion.cfg` checks the abstract guard; a single joint production-to-model trace remains for integrated assurance. |
 
-The first trace covers public intake, Attempt creation, cancellation, read-only snapshots, and refusal of a Task run while canceled. `project.py` checks those facts and their artifact digests. It does not turn the remaining rows into accepted evidence. The later `integrated-assurance` Work Item owns a joint mapping review and broader cross-boundary production sequences.
+The first trace covers public intake, Attempt creation, cancellation, read-only snapshots, and refusal of a Task run while canceled. `project.py` checks those facts and their artifact digests. It does not turn the remaining rows into accepted evidence. Integrated assurance retains the unfinished joint mapping and broader cross-boundary production sequences as explicit gaps.

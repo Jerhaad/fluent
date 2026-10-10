@@ -1,5 +1,23 @@
 # Workflow foundation checks
 
+## Integrated candidate check
+
+Run `python3 tests/formal/workflow/check.py --suite=integrated
+--jar=target/fluent-tools/tla2tools-1.7.4.jar` from the candidate checkout.
+The checker runs the five maintained workflow suites and the scheduler recovery,
+lifecycle, launch, and landing suites. It writes full command logs under
+`target/formal/workflow/integrated/` and a candidate-bound `report.json` with
+suite results, log digests, model hashes, and every connection row from
+`connections.md`. The integrated result fails if any required suite, log,
+binary binding, or connection is missing. An inventory row needs `Verified: `
+evidence naming its checked mapping, assumptions, model result, production
+scenario, and control before the report may credit it. Existing descriptive
+evidence is retained as an explicit gap until those checks pass.
+
+The report is produced by `report.py` after the suite commands. Host results
+and final lifecycle gates remain separate candidate-bound records. A green
+focused Writer test does not complete those external gates.
+
 ## Release transition
 
 The `release-transition` suite runs the installed, SHA-pinned v0.5.0 binary in

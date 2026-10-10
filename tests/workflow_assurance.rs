@@ -205,3 +205,203 @@ fn workflow_foundation_projection_rejects_bad_observations() {
     invented["artifacts"][3]["sha256"] = json!(digest(&refused_bytes));
     reject(&invented, "run advanced canceled state");
 }
+
+#[test]
+fn workflow_release_build_public_workflow() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let built = run(
+        root,
+        "cargo",
+        &["build", "--offline", "--release", "--no-default-features"],
+    );
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let binary = root.join("target/release/fluent");
+    let version = run(root, binary.to_str().unwrap(), &["version"]);
+    assert!(version.status.success());
+    assert!(String::from_utf8_lossy(&version.stdout).contains("fluent 0.6.0"));
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path();
+    assert!(
+        run(project, "git", &["init", "-b", "main"])
+            .status
+            .success()
+    );
+    assert!(
+        run(
+            project,
+            "git",
+            &["config", "user.email", "test@example.com"]
+        )
+        .status
+        .success()
+    );
+    assert!(
+        run(project, "git", &["config", "user.name", "Test"])
+            .status
+            .success()
+    );
+    fs::write(project.join("README.md"), "fixture\n").unwrap();
+    assert!(run(project, "git", &["add", "README.md"]).status.success());
+    assert!(
+        run(project, "git", &["commit", "-m", "Initialize fixture"])
+            .status
+            .success()
+    );
+    for args in [
+        vec!["init"],
+        vec![
+            "work-item",
+            "create",
+            "ordinary-release",
+            "--title",
+            "Ordinary release",
+        ],
+        vec!["attempt", "create", "ordinary-release", "attempt-1"],
+        vec!["attempt", "cancel", "ordinary-release", "attempt-1"],
+    ] {
+        let result = run(project, binary.to_str().unwrap(), &args);
+        assert!(
+            result.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    let shown = run(
+        project,
+        binary.to_str().unwrap(),
+        &["work-item", "show", "ordinary-release"],
+    );
+    assert!(
+        shown.status.success(),
+        "{}",
+        String::from_utf8_lossy(&shown.stderr)
+    );
+    let work: Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert_eq!(work["attempts"][0]["status"], "needs-user");
+    assert!(work["attempts"][0]["cancellation"]["requested_at"].is_string());
+    let refused = run(
+        project,
+        binary.to_str().unwrap(),
+        &[
+            "task",
+            "run",
+            "ordinary-release",
+            "attempt-1",
+            "attempt-1-write-1",
+        ],
+    );
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("cancel"));
+    let after = run(
+        project,
+        binary.to_str().unwrap(),
+        &["work-item", "show", "ordinary-release"],
+    );
+    assert!(after.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&after.stdout).unwrap(),
+        work
+    );
+    let queued = run(
+        project,
+        binary.to_str().unwrap(),
+        &[
+            "work-item",
+            "create",
+            "queued-release",
+            "--title",
+            "Queued release",
+        ],
+    );
+    assert!(
+        queued.status.success(),
+        "{}",
+        String::from_utf8_lossy(&queued.stderr)
+    );
+    let add = run(
+        project,
+        binary.to_str().unwrap(),
+        &["queue", "add", "queued-release"],
+    );
+    assert!(
+        add.status.success(),
+        "{}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+    let list = run(project, binary.to_str().unwrap(), &["queue", "list"]);
+    assert!(list.status.success());
+    assert!(String::from_utf8_lossy(&list.stdout).contains("queued-release"));
+}
+
+#[test]
+fn workflow_assurance_report_rejects_missing_and_misbound_evidence() {
+    let tmp = TempDir::new().unwrap();
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let report = source.join("tests/formal/workflow/report.py");
+    let output = tmp.path().join("report.json");
+    let args = [
+        "--results",
+        tmp.path().to_str().unwrap(),
+        "--candidate",
+        "candidate-a",
+        "--binary",
+        env!("CARGO_BIN_EXE_fluent"),
+        "--output",
+        output.to_str().unwrap(),
+    ];
+    let command = std::iter::once(report.to_str().unwrap())
+        .chain(args)
+        .collect::<Vec<_>>();
+    let missing = run(source, "python3", &command);
+    assert!(!missing.status.success());
+    let result: Value = serde_json::from_slice(&fs::read(&output).unwrap()).unwrap();
+    assert_eq!(result["pass"], false);
+    assert!(result["missing"].as_array().unwrap().len() > 0);
+    assert!(
+        result["missing"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item.as_str().unwrap().starts_with("connection: "))
+    );
+    let suite = tmp.path().join("foundation");
+    fs::create_dir(&suite).unwrap();
+    fs::write(suite.join("case.log"), "Model checking completed\n").unwrap();
+    fs::write(
+        suite.join("result.json"),
+        json!({"schema-version":1,"suite":"foundation",
+        "candidate-commit":"candidate-b",
+        "fluent-binary-sha256":digest(&fs::read(env!("CARGO_BIN_EXE_fluent")).unwrap()),
+        "pass":true,
+        "cases":[{"case":"foundation.cfg","pass":true,"log":"case.log"}]})
+        .to_string(),
+    )
+    .unwrap();
+    let misbound = run(source, "python3", &command);
+    assert!(!misbound.status.success());
+    let result: Value = serde_json::from_slice(&fs::read(&output).unwrap()).unwrap();
+    assert_eq!(result["suites"]["foundation"]["pass"], false);
+}
+
+#[test]
+fn workflow_integrated_rejects_missing_model_tool() {
+    let tmp = TempDir::new().unwrap();
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let checker = source.join("tests/formal/workflow/check.py");
+    let missing_jar = tmp.path().join("missing.jar");
+    let result = run(
+        source,
+        "python3",
+        &[
+            checker.to_str().unwrap(),
+            "--suite=integrated",
+            &format!("--jar={}", missing_jar.display()),
+        ],
+    );
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("pinned TLC 1.7.4 JAR"));
+}

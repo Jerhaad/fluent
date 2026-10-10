@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -72,6 +73,62 @@ GUARDED_CASES = {
                 "misbound", "reference-fail"),
     "target": ("cleared", "untrusted", "misbound"),
 }
+
+
+def candidate_commit(root):
+    return subprocess.run(["git", "rev-parse", "HEAD"], cwd=root,
+                          check=True, capture_output=True, text=True).stdout.strip()
+
+
+def candidate_binary_digest(root):
+    return hashlib.sha256((root / "target/debug/fluent").read_bytes()).hexdigest()
+
+
+def integrated_suite(source, root, output, jar, java):
+    """Run each maintained suite, then retain a fail-closed candidate report."""
+    results = []
+    for name in ("foundation", "writer-inputs", "evidence-status",
+                 "recovery-observation", "release-transition"):
+        command = ["python3", str(source / "check.py"), "--suite=" + name,
+                   "--jar=" + str(jar)]
+        result = subprocess.run(command, cwd=root, capture_output=True, text=True)
+        log = output / (name + ".log")
+        log.write_text("$ " + " ".join(command) + "\n" + result.stdout + result.stderr)
+        results.append({"case": name, "pass": result.returncode == 0,
+                        "log": log.name})
+    scheduler = source.parent / "scheduler/check.py"
+    for name in ("recovery", "lifecycle", "launch", "landing"):
+        command = ["python3", str(scheduler), "--suite=" + name,
+                   "--jar=" + str(jar)]
+        environment = dict(os.environ)
+        java_path = Path(shutil.which(java) or java).resolve()
+        environment["PATH"] = str(java_path.parent) + os.pathsep + environment.get("PATH", "")
+        result = subprocess.run(command, cwd=root, env=environment,
+                                capture_output=True, text=True)
+        log = output / ("scheduler-" + name + ".log")
+        log.write_text("$ " + " ".join(command) + "\n" + result.stdout + result.stderr)
+        results.append({"case": "scheduler-" + name, "pass": result.returncode == 0,
+                        "log": log.name})
+    binary = root / "target/debug/fluent"
+    if binary.is_file():
+        command = ["python3", str(source / "report.py"), "--results",
+                   str(output.parent), "--candidate", candidate_commit(root),
+                   "--binary", str(binary), "--jar", str(jar),
+                   "--java", str(Path(shutil.which(java) or java).resolve()),
+                   "--output", str(output / "report.json")]
+        report = subprocess.run(command, cwd=root, capture_output=True, text=True)
+        (output / "report.log").write_text("$ " + " ".join(command) + "\n" +
+                                           report.stdout + report.stderr)
+        results.append({"case": "candidate-report", "pass": report.returncode == 0,
+                        "log": "report.log"})
+    else:
+        results.append({"case": "candidate-report", "pass": False,
+                        "reason": "ordinary candidate binary is missing"})
+    summary = {"schema-version": 1, "suite": "integrated",
+               "candidate-commit": candidate_commit(root), "cases": results,
+               "pass": all(row["pass"] for row in results)}
+    (output / "result.json").write_text(json.dumps(summary, indent=2) + "\n")
+    return 0 if summary["pass"] else 1
 
 
 def run_case(source, output_dir, jar, java, config, expected, module="Workflow"):
@@ -286,7 +343,9 @@ def writer_inputs_suite(source, root, output, jar, java):
                               + "INVARIANT InputSafe\nPROPERTY WriterComplete\n")
             results.append(run_case(source, output, jar, java, str(config), None,
                                     module="WriterTrace"))
-    result = {"schema-version": 1, "suite": "writer-inputs", "cases": results,
+    result = {"schema-version": 1, "suite": "writer-inputs",
+              "candidate-commit": candidate_commit(root),
+              "fluent-binary-sha256": candidate_binary_digest(root), "cases": results,
               "pass": all(row["pass"] for row in results)}
     (output / "result.json").write_text(json.dumps(result, indent=2) + "\n")
     for row in results:
@@ -554,7 +613,9 @@ def evidence_status_suite(source, root, output, jar, java):
                               + "PROPERTY EvidenceComplete\n")
             results.append(run_case(source, output, jar, java, str(config), None,
                                     module="EvidenceTrace"))
-    result = {"schema-version": 1, "suite": "evidence-status", "cases": results,
+    result = {"schema-version": 1, "suite": "evidence-status",
+              "candidate-commit": candidate_commit(root),
+              "fluent-binary-sha256": candidate_binary_digest(root), "cases": results,
               "pass": all(row["pass"] for row in results)}
     (output / "result.json").write_text(json.dumps(result, indent=2) + "\n")
     for row in results:
@@ -672,7 +733,9 @@ def recovery_observation_suite(source, root, output, jar, java):
             (output / f"{name}.log").write_text(rejected.stdout + rejected.stderr)
             results.append({"case": name, "pass": rejected.returncode != 0,
                             "log": f"{name}.log"})
-    result = {"schema-version": 1, "suite": "recovery-observation", "cases": results,
+    result = {"schema-version": 1, "suite": "recovery-observation",
+              "candidate-commit": candidate_commit(root),
+              "fluent-binary-sha256": candidate_binary_digest(root), "cases": results,
               "pass": all(row["pass"] for row in results)}
     (output / "result.json").write_text(json.dumps(result, indent=2) + "\n")
     return 0 if result["pass"] else 1
@@ -804,7 +867,9 @@ def release_transition_suite(source, root, output, jar, java):
     results.append(run_case(source, output, jar, java, "service-competition.cfg", None))
     results.append(run_case(source, output, jar, java, "negative-guardversion.cfg",
                             CONTROLS["guardversion"]))
-    summary = {"schema-version": 1, "suite": "release-transition", "cases": results,
+    summary = {"schema-version": 1, "suite": "release-transition",
+               "candidate-commit": candidate_commit(root),
+               "fluent-binary-sha256": candidate_binary_digest(root), "cases": results,
                "pass": all(row["pass"] for row in results)}
     (output / "result.json").write_text(json.dumps(summary, indent=2) + "\n")
     return 0 if summary["pass"] else 1
@@ -817,7 +882,7 @@ def main():
     parser.add_argument("--focus", choices=("combined-one-failure", "guarded"))
     args = parser.parse_args()
     if args.suite not in ("foundation", "writer-inputs", "evidence-status",
-                          "recovery-observation", "release-transition"):
+                          "recovery-observation", "release-transition", "integrated"):
         parser.error(f"unknown or incomplete suite: {args.suite}")
     jar = args.jar.resolve()
     if not jar.is_file() or hashlib.sha256(jar.read_bytes()).hexdigest() != JAR_SHA256:
@@ -827,6 +892,12 @@ def main():
     java = java_21(root)
     if java is None:
         parser.error("Java 21 is required")
+    if args.suite == "integrated":
+        if args.focus:
+            parser.error("--focus is only supported for foundation")
+        output = root / "target/formal/workflow/integrated"
+        output.mkdir(parents=True, exist_ok=True)
+        return integrated_suite(source, root, output, jar, java)
     if args.suite == "release-transition":
         if args.focus:
             parser.error("--focus is only supported for foundation")
@@ -952,7 +1023,9 @@ def main():
             results.append(run_trace_case(source, output, jar, java,
                                           "negative-model-path",
                                           json.loads(negative.stdout)["states"], False))
-    result = {"schema-version": 1, "suite": args.suite, "cases": results,
+    result = {"schema-version": 1, "suite": args.suite,
+              "candidate-commit": candidate_commit(root),
+              "fluent-binary-sha256": candidate_binary_digest(root), "cases": results,
               "pass": all(row["pass"] for row in results)}
     (output / "result.json").write_text(json.dumps(result, indent=2) + "\n")
     return 0 if result["pass"] else 1
