@@ -37877,20 +37877,127 @@ fn setup_failed_evidence_recovery_fixture(
     tmp: &TempDir,
     work_item_id: &str,
 ) -> (PathBuf, String, String, PathBuf) {
+    setup_failed_evidence_recovery_fixture_with_session(tmp, work_item_id, false)
+}
+
+fn setup_failed_evidence_recovery_fixture_with_session(
+    tmp: &TempDir,
+    work_item_id: &str,
+    real_session: bool,
+) -> (PathBuf, String, String, PathBuf) {
     use fluent::work_model::{
         ArtifactRef, AttemptStatus, TaskOutput, TaskStatus, WorkItem, WorkModelStore,
     };
 
     let project = setup_git_project(tmp);
-    let candidate = git_head(&project);
     let store = WorkModelStore::new(&project);
     let mut item = WorkItem::planned(work_item_id, "Recover failed evidence-only Writer");
     item.add_initial_attempt("attempt-1").unwrap();
+    if real_session {
+        store.create_work_item(&item).unwrap();
+        let bin = tmp.path().join("initial-writer-provider");
+        write_mock_claude(
+            &bin,
+            r##"#!/bin/bash
+set -euo pipefail
+[ -n "${INITIAL_PROMPT:-}" ] || exit 73
+prompt=""
+next=0
+for arg in "$@"; do
+  if [ "$next" = 1 ]; then prompt="$arg"; next=0; continue; fi
+  [ "$arg" != "--resume" ]
+  if [ "$arg" = "-p" ]; then next=1; fi
+done
+printf '%s' "$prompt" > "$INITIAL_PROMPT"
+printf 'Initial writer work\n' >> README.md
+git add README.md
+git commit -m 'Add initial writer work' >/dev/null
+printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$INITIAL_SESSION"
+"##,
+        );
+        let initial_prompt = tmp.path().join("initial-writer-prompt");
+        let run = fluent_cmd()
+            .current_dir(&project)
+            .args([
+                "task",
+                "run",
+                work_item_id,
+                "attempt-1",
+                "attempt-1-write-1",
+                "--no-sandbox",
+            ])
+            .env("PATH", mock_path(&bin))
+            .env("INITIAL_SESSION", format!("saved-{work_item_id}"))
+            .env("INITIAL_PROMPT", &initial_prompt)
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "initial Writer failed: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let transcript = project.join(format!(
+            ".fluent/work/artifacts/{work_item_id}/attempt-1/attempt-1-write-1/transcript.jsonl"
+        ));
+        assert!(
+            fs::read_to_string(transcript)
+                .unwrap()
+                .contains(&format!("saved-{work_item_id}")),
+            "Fluent did not capture the initial provider session"
+        );
+        assert!(
+            !fs::read_to_string(&initial_prompt)
+                .unwrap()
+                .contains(&format!(
+                    "Repair the runner and its result parser: {work_item_id}."
+                )),
+            "initial provider received instructions that were classified later"
+        );
+        // Fluent records the WriterRun before its ordinary review phase stops.
+        let completion = fluent_cmd()
+            .current_dir(&project)
+            .args(["attempt", "run", work_item_id, "attempt-1", "--no-sandbox"])
+            .env("PATH", mock_path(&bin))
+            .env("INITIAL_SESSION", format!("saved-{work_item_id}"))
+            .output()
+            .unwrap();
+        item = store.read_work_item(work_item_id).unwrap();
+        assert_eq!(
+            item.attempts[0]
+                .writer_runs
+                .last()
+                .and_then(|run| run.session_id.as_deref()),
+            Some(format!("saved-{work_item_id}").as_str()),
+            "Fluent did not persist the provider session: {}",
+            String::from_utf8_lossy(&completion.stderr)
+        );
+        item.attempts[0].tasks.truncate(1);
+    }
+    let candidate = if real_session {
+        item.attempts[0].tasks[0]
+            .output
+            .as_ref()
+            .unwrap()
+            .commit
+            .clone()
+    } else {
+        git_head(&project)
+    };
     let writer = &mut item.attempts[0].tasks[0];
     writer.status = TaskStatus::Complete;
+    let candidate_workspace = if real_session {
+        project
+            .join(&writer.workspace_access.writes[0].path)
+            .canonicalize()
+            .unwrap()
+            .display()
+            .to_string()
+    } else {
+        project.display().to_string()
+    };
     writer.output = Some(TaskOutput {
         workspace_id: "candidate".to_string(),
-        workspace_path: project.display().to_string(),
+        workspace_path: candidate_workspace,
         source_branch: "main".to_string(),
         base_commit: None,
         commit: candidate.clone(),
@@ -37898,7 +38005,11 @@ fn setup_failed_evidence_recovery_fixture(
         learner_canonicalization: None,
     });
     item.add_review_tasks("attempt-1", &["tests"]).unwrap();
-    let reviewer = item.attempts[0].tasks.last_mut().unwrap();
+    let reviewer = item.attempts[0]
+        .tasks
+        .iter_mut()
+        .find(|task| task.kind == fluent::work_model::TaskKind::Review && task.role == "tests")
+        .unwrap();
     reviewer.status = TaskStatus::Complete;
     let review_path = format!(
         "{}/review.md",
@@ -37923,7 +38034,11 @@ fn setup_failed_evidence_recovery_fixture(
     failed_writer.status = TaskStatus::Failed;
     failed_writer.output = None;
     item.attempts[0].status = AttemptStatus::Failed;
-    store.create_work_item(&item).unwrap();
+    if real_session {
+        store.write_work_item(&item).unwrap();
+    } else {
+        store.create_work_item(&item).unwrap();
+    }
 
     let evidence = tmp.path().join(format!("{work_item_id}-evidence.json"));
     fs::write(&evidence, br#"{"schema_version":1,"producer":"host","check":"check","working_directory":"/repo","result":"pass","run_at":"2026-08-03T17:59:47Z","output":"ok"}"#).unwrap();
@@ -37934,7 +38049,20 @@ fn setup_paused_code_change_classification_fixture(
     tmp: &TempDir,
     work_item_id: &str,
 ) -> (PathBuf, String, String, String, String, String) {
-    setup_paused_code_change_classification_fixture_with_result(tmp, work_item_id, "fail")
+    setup_paused_code_change_classification_fixture_with_session(tmp, work_item_id, false)
+}
+
+fn setup_paused_code_change_classification_fixture_with_session(
+    tmp: &TempDir,
+    work_item_id: &str,
+    real_session: bool,
+) -> (PathBuf, String, String, String, String, String) {
+    setup_paused_code_change_classification_fixture_with_result_and_session(
+        tmp,
+        work_item_id,
+        "fail",
+        real_session,
+    )
 }
 
 fn setup_paused_code_change_classification_fixture_with_result(
@@ -37942,8 +38070,22 @@ fn setup_paused_code_change_classification_fixture_with_result(
     work_item_id: &str,
     evidence_result: &str,
 ) -> (PathBuf, String, String, String, String, String) {
+    setup_paused_code_change_classification_fixture_with_result_and_session(
+        tmp,
+        work_item_id,
+        evidence_result,
+        false,
+    )
+}
+
+fn setup_paused_code_change_classification_fixture_with_result_and_session(
+    tmp: &TempDir,
+    work_item_id: &str,
+    evidence_result: &str,
+    real_session: bool,
+) -> (PathBuf, String, String, String, String, String) {
     let (project, candidate, prior_review_path, evidence) =
-        setup_failed_evidence_recovery_fixture(tmp, work_item_id);
+        setup_failed_evidence_recovery_fixture_with_session(tmp, work_item_id, real_session);
     let mut evidence_document: serde_json::Value =
         serde_json::from_slice(&fs::read(&evidence).unwrap()).unwrap();
     evidence_document["result"] = serde_json::Value::String(evidence_result.to_string());
@@ -38157,18 +38299,22 @@ fn bind_candidate_to_managed_sibling(
         .parent()
         .expect("fixture project has a parent")
         .join(workspace_name);
-    git::run(
-        project,
-        &[
-            "worktree",
-            "add",
-            "--detach",
-            workspace_path.to_str().unwrap(),
-            candidate,
-        ],
-        "create managed candidate fixture worktree",
-    )
-    .unwrap();
+    if workspace_path.exists() {
+        assert_eq!(git_head(&workspace_path), candidate);
+    } else {
+        git::run(
+            project,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                workspace_path.to_str().unwrap(),
+                candidate,
+            ],
+            "create managed candidate fixture worktree",
+        )
+        .unwrap();
+    }
     let cleanup = ManagedWorktreeCleanup {
         project: project.to_path_buf(),
         workspace: workspace_path,
@@ -41767,9 +41913,25 @@ fn classified_writer_delivery_probe(check_history: bool, resume_session: bool) {
     let suffix = tmp.path().file_name().unwrap().to_string_lossy();
     let work_id = format!("classified-writer-inputs-{suffix}");
     let (project, candidate, _, review, digest, _) =
-        setup_paused_code_change_classification_fixture(&tmp, &work_id);
+        setup_paused_code_change_classification_fixture_with_session(
+            &tmp,
+            &work_id,
+            resume_session,
+        );
     let workspace = bind_candidate_to_managed_sibling(&project, &work_id, &candidate);
     let instruction = format!("Repair the runner and its result parser: {work_id}.");
+    if resume_session {
+        let prior = work_item_value(&project, &work_id);
+        assert_eq!(
+            prior["attempts"][0]["writer_runs"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()["session_id"],
+            format!("saved-{work_id}"),
+            "the prior session must come from a completed Fluent provider invocation"
+        );
+    }
     fluent_cmd()
         .current_dir(&project)
         .args([
@@ -41794,28 +41956,6 @@ fn classified_writer_delivery_probe(check_history: bool, resume_session: bool) {
         &classified["attempts"][0]["evidence_recoveries"][0]["code_change_classification"];
     let writer_id = classification["writer_task_id"].as_str().unwrap();
     let saved_session = format!("saved-{work_id}");
-    if resume_session {
-        let store = WorkModelStore::new(&project);
-        store
-            .mutate_work_item(&work_id, |item| {
-                let previous_id = item.attempts[0].tasks[0].id.clone();
-                item.attempts[0]
-                    .writer_runs
-                    .push(fluent::work_model::WriterRun {
-                        task_id: previous_id,
-                        outcome: fluent::work_model::WriterOutcome::Complete,
-                        kind: fluent::work_model::WriterRunKind::Initial,
-                        provider: "claude".into(),
-                        session_id: Some(saved_session.clone()),
-                        continuation: 0,
-                        checked_required: 0,
-                        completed_matrix: 0,
-                        candidate_commit: candidate.clone(),
-                    });
-                Ok(())
-            })
-            .unwrap();
-    }
     let audit = project.join(classification["audit_artifact"]["path"].as_str().unwrap());
     let writer = classified["attempts"][0]["tasks"]
         .as_array()
