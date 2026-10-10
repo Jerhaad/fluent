@@ -140,6 +140,20 @@ fi
         no_change: None,
         learner_canonicalization: None,
     });
+    let reviews = item
+        .add_review_tasks("attempt-1", fluent::review::REVIEWERS)
+        .unwrap();
+    for id in reviews {
+        let review = item.attempts[0]
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == id)
+            .unwrap();
+        review.status = TaskStatus::Complete;
+        let area = root.join(&review.artifact_area.as_ref().unwrap().path);
+        fs::create_dir_all(&area).unwrap();
+        fs::write(area.join("review.md"), "Verdict: pass\n").unwrap();
+    }
     let tester_id = item.add_final_tester_task("attempt-1").unwrap();
     item.attempts[0].status = AttemptStatus::Complete;
     item.attempts[0].review_state = Some(AttemptReviewState::Passed);

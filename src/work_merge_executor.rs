@@ -11,7 +11,7 @@ use crate::hooks::{self, HookContext, HookOutcome};
 use crate::work_model::{
     ArtifactRef, DurableTransitionMetadata, DurableTransitionOrigin, LandingIntent, MergeCandidate,
     MergeCandidateMergeState, MergeCandidateMergeStatus, MergeReviewState, Task, TaskKind,
-    TaskStatus, WORK_ARTIFACTS_DIR, WorkItem, WorkModelError, WorkModelStorageError,
+    TaskOutput, TaskStatus, WORK_ARTIFACTS_DIR, WorkItem, WorkModelError, WorkModelStorageError,
     WorkModelStore, WorkspaceAccess, resolve_expected_candidate_workspace_path, work_artifact_path,
 };
 use crate::worktree;
@@ -105,7 +105,34 @@ fn ensure_review_bindings_current(
         &item.id,
         &candidate.attempt_id,
     )?;
-    for task in &attempt.tasks {
+    let last_writer = attempt
+        .tasks
+        .iter()
+        .rposition(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete);
+    let tested_commit = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Tester && task.status == TaskStatus::Complete)
+        .and_then(|task| task.review_context.as_ref())
+        .map(|context| context.candidate_commit.as_str());
+    let rebased_from = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Rebase && task.status == TaskStatus::Complete)
+        .and_then(|task| task.output.as_ref())
+        .filter(|output| {
+            output.workspace_id == candidate.source_workspace.id
+                && output.workspace_path == candidate.source_workspace.path
+                && output.source_branch == candidate.source_branch
+        })
+        .and_then(|output| output.base_commit.as_deref());
+    let mut preceding_writer = None;
+    for (index, task) in attempt.tasks.iter().enumerate() {
+        if task.kind == TaskKind::Write && task.status == TaskStatus::Complete {
+            preceding_writer = task.output.as_ref();
+        }
         if task.kind != TaskKind::Review
             || task.status != TaskStatus::Complete
             || task.evidence_review_context.is_some()
@@ -113,8 +140,23 @@ fn ensure_review_bindings_current(
         {
             continue;
         }
+        let authentic_commit = preceding_writer.is_some_and(|output| {
+            task.review_context.as_ref().is_some_and(|context| {
+                context.candidate_commit == output.commit
+                    || (last_writer.is_some_and(|writer_index| index > writer_index)
+                        && (tested_commit == Some(context.candidate_commit.as_str())
+                            || rebased_from == Some(context.candidate_commit.as_str())))
+                    || output
+                        .learner_canonicalization
+                        .as_ref()
+                        .is_some_and(|transition| {
+                            context.candidate_commit == transition.from_commit
+                        })
+            })
+        });
         let valid = task.review_context.as_ref().is_some_and(|context| {
-            context.candidate_workspace_id == candidate.source_workspace.id
+            authentic_commit
+                && context.candidate_workspace_id == candidate.source_workspace.id
                 && context.candidate_workspace_path == candidate.source_workspace.path
                 && context.source_branch == candidate.source_branch
                 && task
@@ -139,9 +181,8 @@ fn ensure_review_bindings_current(
     }
     // Checking recorded Tasks alone misses a role removed after a later Writer
     // invalidated its domain. Reconstruct coverage from the Writer history.
-    // Landing provenance can rewrite Review bindings to the rebased tip; use
-    // each Review's position after its Writer to recover the pre-rebase binding
-    // solely for this read-only coverage calculation.
+    // Landing provenance can rewrite Writer outputs to the rebased tip. The
+    // bindings above must be authentic before coverage uses their Writer slot.
     let mut coverage_attempt = attempt.clone();
     let mut writer_commit = None;
     for task in &mut coverage_attempt.tasks {
@@ -670,21 +711,28 @@ pub fn merge_candidate(config: WorkMergeConfig<'_>) -> Result<WorkMergeOutcome> 
     let live_tip = head_commit(&source_workspace)?;
     // A failed capture landing can leave a completed rebase at a new source
     // HEAD while provenance regeneration has not updated the candidate yet.
-    let retrying_settled_rebase = item
+    let recorded_rebase_tip = item
         .attempts
         .iter()
         .find(|attempt| attempt.id == candidate.attempt_id)
-        .is_some_and(|attempt| {
-            attempt.tasks.iter().any(|task| {
-                task.kind == TaskKind::Rebase
-                    && matches!(
-                        task.status,
-                        TaskStatus::Complete | TaskStatus::Failed | TaskStatus::NeedsUser
-                    )
-            })
+        .and_then(|attempt| {
+            attempt
+                .tasks
+                .iter()
+                .rev()
+                .find(|task| task.kind == TaskKind::Rebase)
+                .filter(|task| task.status == TaskStatus::Complete)
+                .and_then(|task| task.output.as_ref())
+                .filter(|output| {
+                    output.base_commit.as_deref() == Some(candidate.candidate_commit.as_str())
+                        && output.workspace_id == candidate.source_workspace.id
+                        && output.workspace_path == candidate.source_workspace.path
+                        && output.source_branch == candidate.source_branch
+                })
+                .map(|output| output.commit.as_str())
         });
     anyhow::ensure!(
-        live_tip == candidate.candidate_commit || retrying_settled_rebase,
+        live_tip == candidate.candidate_commit || recorded_rebase_tip == Some(live_tip.as_str()),
         "candidate HEAD {live_tip} differs from reviewed Merge Candidate {}; rerun the Attempt before landing",
         candidate.candidate_commit
     );
@@ -3332,6 +3380,7 @@ fn run_reserved_rebase(
             &candidate.attempt_id,
             rebase_task_id,
             TaskStatus::Complete,
+            Some((candidate, &new_tip)),
         )?;
         Ok(RebaseOutcome::Success { new_tip })
     } else {
@@ -3675,6 +3724,7 @@ fn update_rebase_task_status(
     attempt_id: &str,
     task_id: &str,
     status: TaskStatus,
+    result: Option<(&MergeCandidate, &str)>,
 ) -> Result<()> {
     let mut item = read_work_item_or_not_found(store, work_item_id)?;
     let attempt = item
@@ -3697,6 +3747,17 @@ fn update_rebase_task_status(
                 attempt_id
             )
         })?;
+    if let Some((candidate, tip)) = result {
+        task.output = Some(TaskOutput {
+            workspace_id: candidate.source_workspace.id.clone(),
+            workspace_path: candidate.source_workspace.path.clone(),
+            source_branch: candidate.source_branch.clone(),
+            base_commit: Some(candidate.candidate_commit.clone()),
+            commit: tip.to_string(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+    }
     if matches!(
         status,
         TaskStatus::Complete | TaskStatus::Failed | TaskStatus::NeedsUser
@@ -6183,6 +6244,7 @@ mod tests {
             "attempt-1",
             "attempt-1-rebase",
             TaskStatus::Failed,
+            None,
         )
         .expect_err("a missing reserved Rebase Task must fail, not silently no-op");
         assert!(
@@ -6514,6 +6576,22 @@ exit 0
             no_change: None,
             learner_canonicalization: None,
         });
+        let review_ids = item
+            .add_review_tasks("attempt-1", crate::review::REVIEWERS)
+            .unwrap();
+        for id in review_ids {
+            let review = item.attempts[0]
+                .tasks
+                .iter_mut()
+                .find(|task| task.id == id)
+                .unwrap();
+            review.status = TaskStatus::Complete;
+            let area = project_root.join(&review.artifact_area.as_ref().unwrap().path);
+            fs::create_dir_all(&area).unwrap();
+            fs::write(area.join("review.md"), "Verdict: pass\n").unwrap();
+        }
+        item.attempts[0].review_state = Some(AttemptReviewState::Passed);
+        item.attempts[0].status = AttemptStatus::Complete;
         item.create_or_get_merge_candidate("attempt-1").unwrap();
         configure(&mut item, &reviewed_sha);
         store.create_work_item(&item).unwrap();
@@ -8040,6 +8118,22 @@ exit 0
             no_change: None,
             learner_canonicalization: None,
         });
+        let review_ids = item
+            .add_review_tasks("attempt-1", crate::review::REVIEWERS)
+            .unwrap();
+        for id in review_ids {
+            let review = item.attempts[0]
+                .tasks
+                .iter_mut()
+                .find(|task| task.id == id)
+                .unwrap();
+            review.status = TaskStatus::Complete;
+            let area = project_root.join(&review.artifact_area.as_ref().unwrap().path);
+            fs::create_dir_all(&area).unwrap();
+            fs::write(area.join("review.md"), "Verdict: pass\n").unwrap();
+        }
+        item.attempts[0].review_state = Some(AttemptReviewState::Passed);
+        item.attempts[0].status = AttemptStatus::Complete;
         item.create_or_get_merge_candidate("attempt-1").unwrap();
         item.attempts[0].coder_mapping.write = crate::work_model::CoderModelPair {
             coder: CoderKind::Codex,

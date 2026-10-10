@@ -28649,6 +28649,53 @@ fn work_merge_candidate_retries_same_candidate_after_provenance_failure() {
 }
 
 #[test]
+fn work_merge_candidate_rejects_new_commit_after_settled_rebase() {
+    let tmp = TempDir::new().unwrap();
+    let (main_dir, merge_bin, _) = prepare_historical_no_change_candidate(&tmp);
+    commit_file(
+        &main_dir,
+        "target-only.txt",
+        "advance target\n",
+        "Advance target",
+    );
+    let target_before = git_head(&main_dir);
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args([
+            "merge-candidate",
+            "land",
+            "work-1",
+            "attempt-1-merge-candidate",
+            "--no-sandbox",
+        ])
+        .env("PATH", mock_path(&merge_bin))
+        .env("FLUENT_TEST_FAIL_CAPTURE_PROVENANCE_REGENERATION", "1")
+        .assert()
+        .failure();
+    let source = main_dir.join("../work-6-work-1-attempt-1");
+    git::run(
+        &source,
+        &["commit", "--allow-empty", "-m", "Unreviewed source change"],
+        "append source commit",
+    )
+    .unwrap();
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args([
+            "merge-candidate",
+            "land",
+            "work-1",
+            "attempt-1-merge-candidate",
+            "--no-sandbox",
+        ])
+        .env("PATH", mock_path(&merge_bin))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("candidate HEAD"));
+    assert_eq!(git_head(&main_dir), target_before);
+}
+
+#[test]
 fn initial_writer_rejects_no_change_declaration_without_commit() {
     let tmp = TempDir::new().unwrap();
     let main_dir = setup_git_project(&tmp);
@@ -66147,7 +66194,12 @@ fn workflow_evidence_satisfies_only_validly_bound_requirements() {
 
 #[test]
 fn workflow_changed_bindings_reassess_evidence_before_advancement() {
-    for binding in ["review-candidate", "review-source", "review-workspace"] {
+    for binding in [
+        "review-candidate",
+        "review-unrelated-commit",
+        "review-source",
+        "review-workspace",
+    ] {
         let tmp = TempDir::new().unwrap();
         let (project, bin, _) = setup_rebased_tester_candidate(&tmp, ":");
         let before = git_head(&project);
@@ -66163,6 +66215,7 @@ fn workflow_changed_bindings_reassess_evidence_before_advancement() {
                 let context = review.review_context.as_mut().unwrap();
                 match binding {
                     "review-candidate" => context.candidate_commit = "0".repeat(40),
+                    "review-unrelated-commit" => context.candidate_commit = git_head(&project),
                     "review-source" => context.source_branch = "other".into(),
                     "review-workspace" => {
                         context.candidate_workspace_path = "../other-candidate".into();
