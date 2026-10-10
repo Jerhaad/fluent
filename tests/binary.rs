@@ -41958,7 +41958,7 @@ fn record_classified_writer_trace(
 
 #[test]
 fn classified_writer_rejects_invalid_required_inputs_before_launch() {
-    for invalid in ["changed-authority", "missing-audit", "oversized"] {
+    for invalid in ["changed-authority", "missing-audit", "escaped-audit", "oversized"] {
         let tmp = TempDir::new().unwrap();
         let suffix = tmp.path().file_name().unwrap().to_string_lossy();
         let work_id = format!("classified-invalid-{invalid}-{suffix}");
@@ -42034,6 +42034,12 @@ fn classified_writer_rejects_invalid_required_inputs_before_launch() {
                     .unwrap();
             }
             "missing-audit" => fs::remove_file(audit).unwrap(),
+            "escaped-audit" => {
+                let outside = tmp.path().join("escaped-classification.json");
+                fs::write(&outside, fs::read(&audit).unwrap()).unwrap();
+                fs::remove_file(&audit).unwrap();
+                std::os::unix::fs::symlink(&outside, &audit).unwrap();
+            }
             _ => unreachable!(),
         }
         let invoked = tmp.path().join("invoked");
@@ -42062,6 +42068,7 @@ fn classified_writer_rejects_invalid_required_inputs_before_launch() {
         let expected = match invalid {
             "changed-authority" => "classification authorization digest changed",
             "missing-audit" => "does not exist or is not a file",
+            "escaped-audit" => "artifact path must not traverse a symlink",
             _ => unreachable!(),
         };
         assert!(stderr.contains(expected), "{invalid}: {stderr}");
