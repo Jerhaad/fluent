@@ -138,8 +138,23 @@ fn validate_prior_recoveries(
             .position(|task| task.id == authority.task_id)
             .context("prior recovery Writer is missing")?;
         let replacement = &attempt.tasks[replacement_index];
+        let source_index = attempt
+            .tasks
+            .iter()
+            .position(|task| task.id == authority.source_writer_task_id)
+            .context("prior recovery source Writer is missing")?;
+        let source = &attempt.tasks[source_index];
+        let source_output = source
+            .output
+            .as_ref()
+            .context("prior recovery source output is missing")?;
         anyhow::ensure!(
-            replacement_index < current_index
+            source_index <= replacement_index
+                && replacement_index < current_index
+                && source.kind == TaskKind::Write
+                && source.status == TaskStatus::Complete
+                && source_output.commit == authority.candidate_commit
+                && source_output.base_commit == authority.protected_base_commit
                 && replacement.status == TaskStatus::Complete
                 && replacement.input_artifacts.contains(reference),
             "prior Writer-completion recovery has not settled"
