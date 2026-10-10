@@ -54,10 +54,24 @@ PROFILE_ACTIONS = {
                         "Observe", "VersionTransition"),
     "service-competition.cfg": ("ChooseForeground", "Enqueue", "Dispatch",
                                 "Writer", "Crash", "Recover", "ReplaceGeneration"),
+    "combined-one-failure.cfg": ("Crash", "Recover", "FailWrite", "RecoverIO",
+                                  "CorrectCandidate",
+                                  "CarryForward", "Observe", "VersionTransition",
+                                  "TargetBaseline", "GitEffect", "PublishResult"),
+}
+
+GUARDED_CASES = {
+    "canonical": ("new", "incomplete", "harness", "leak", "unexplained",
+                  "misbound", "reference-fail"),
+    "prewrite": ("untrusted", "misbound"),
+    "landing": ("new", "incomplete", "harness", "leak", "unexplained",
+                "misbound", "reference-fail"),
+    "target": ("cleared", "untrusted", "misbound"),
 }
 
 
 def run_case(source, output_dir, jar, java, config, expected):
+    name = Path(config).name
     with tempfile.TemporaryDirectory(prefix="tlc-", dir=output_dir) as metadir:
         command = [java, "-XX:+UseParallelGC", "-Xmx512m", "-cp", str(jar),
                    "tlc2.TLC", "-deadlock", "-coverage", "1", "-workers", "1", "-fp", "0",
@@ -70,19 +84,64 @@ def run_case(source, output_dir, jar, java, config, expected):
         except subprocess.TimeoutExpired as error:
             result = None
             log = f"TLC timed out: {error}\n"
-    (output_dir / f"{config}.log").write_text("$ " + " ".join(command) + "\n" + log)
+    (output_dir / f"{name}.log").write_text("$ " + " ".join(command) + "\n" + log)
     missing_actions = []
     if expected:
         ok = result is not None and result.returncode != 0 and expected in log
     else:
         ok = result is not None and result.returncode == 0 and "Model checking completed" in log
-        for action in PROFILE_ACTIONS.get(config, ()):
+        for action in PROFILE_ACTIONS.get(name, ()):
             counts = re.findall(rf"<{action} line [^>]+>: (\d+):(\d+)", log)
             if not any(int(generated) > 0 for _, generated in counts):
                 missing_actions.append(action)
         ok = ok and not missing_actions
-    return {"case": config, "pass": ok, "expected": expected,
-            "missing-actions": missing_actions, "log": f"{config}.log"}
+    return {"case": name, "pass": ok, "expected": expected,
+            "missing-actions": missing_actions, "log": f"{name}.log"}
+
+
+def guarded_cases(source, output, jar, java, only=None):
+    """Complete each guarded boundary search and witness its rejected input."""
+    base = (source / "foundation.cfg").read_text()
+    results = []
+    for boundary, kinds in GUARDED_CASES.items():
+        for kind in kinds:
+            if only is not None and (boundary, kind) != only:
+                continue
+            config = base.replace("CONSTRAINT FoundationBound",
+                                  "CONSTRAINT GuardedCanonicalBound" if boundary in
+                                  ("canonical", "prewrite") else
+                                  "CONSTRAINT GuardedLandingBound")
+            replacements = {
+                "canonical": ("CanonicalKinds = {\"pass\"}",
+                              f'CanonicalKinds = {{"{kind}"}}'),
+                "prewrite": ("CorruptPrewrite = FALSE", "CorruptPrewrite = TRUE"),
+                "landing": ("LandingKinds = {\"pass\"}",
+                            f'LandingKinds = {{"{kind}"}}'),
+                "target": ("TargetKinds = {\"unchanged\"}",
+                           f'TargetKinds = {{"{kind}"}}'),
+            }
+            old, new = replacements[boundary]
+            if boundary == "prewrite":
+                config = config.replace('CanonicalKinds = {"pass"}',
+                                        'CanonicalKinds = {"known"}')
+            if boundary == "target" and kind == "cleared":
+                config = config.replace('LandingKinds = {"pass"}',
+                                        'LandingKinds = {"known"}')
+            assert config.count(old) == 1
+            config = config.replace(old, new)
+            stem = f"guarded-{boundary}-{kind}"
+            positive = output / f"{stem}.cfg"
+            positive.write_text(config)
+            results.append(run_case(source, output, jar, java, str(positive), None))
+            witness = output / f"{stem}-witness.cfg"
+            invariant = ("CanonicalRejectionUnreachable" if boundary == "canonical"
+                         else f"{kind.capitalize()}PrewriteRejectionUnreachable"
+                         if boundary == "prewrite" else
+                         "LandingRejectionUnreachable")
+            witness.write_text(config + f"INVARIANT {invariant}\n")
+            results.append(run_case(source, output, jar, java, str(witness),
+                                    f"Invariant {invariant} is violated"))
+    return results
 
 
 def run_trace_case(source, output, jar, java, name, states, expect_pass):
@@ -141,6 +200,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--suite", required=True)
     parser.add_argument("--jar", type=Path, required=True)
+    parser.add_argument("--focus", choices=("combined-one-failure", "guarded"))
     args = parser.parse_args()
     if args.suite != "foundation":
         parser.error(f"unknown or incomplete suite: {args.suite}")
@@ -154,8 +214,22 @@ def main():
         parser.error("Java 21 is required")
     output = root / "target/formal/workflow/foundation"
     output.mkdir(parents=True, exist_ok=True)
+    if args.focus:
+        focused = ([run_case(source, output, jar, java,
+                             "combined-one-failure.cfg", None),
+                    run_case(source, output, jar, java,
+                             "combined-one-failure-witness.cfg",
+                             "Invariant RecoveredPublicationUnreachable is violated")]
+                   if args.focus == "combined-one-failure" else
+                   guarded_cases(source, output, jar, java))
+        for row in focused:
+            print(("PASS" if row["pass"] else "FAIL") + " " + row["case"])
+        return 0 if all(row["pass"] for row in focused) else 1
     results = []
     for config, expected in [("foundation.cfg", None),
+                             ("combined-one-failure.cfg", None),
+                             ("combined-one-failure-witness.cfg",
+                              "Invariant RecoveredPublicationUnreachable is violated"),
                              ("repeated-recovery.cfg", None),
                              ("review-only.cfg", None),
                              ("service-competition.cfg", None),
@@ -167,6 +241,9 @@ def main():
                                for name, violation in CONTROLS.items()]]:
         results.append(run_case(source, output, jar, java, config, expected))
         print(("PASS" if results[-1]["pass"] else "FAIL") + " " + config)
+    for row in guarded_cases(source, output, jar, java):
+        results.append(row)
+        print(("PASS" if row["pass"] else "FAIL") + " " + row["case"])
     command = ["cargo", "nextest", "run", "--offline", "--features", "test-support",
                "--test", "workflow_assurance", "--no-tests", "fail",
                "workflow_foundation_public_trace"]

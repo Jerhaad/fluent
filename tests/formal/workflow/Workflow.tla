@@ -69,6 +69,7 @@ Init == s = [w \in Works |->
      canceled |-> FALSE, authority |-> 0, generation |-> 1,
      serviceOwner |-> Unowned, version |-> 1,
      failures |-> 0, failed |-> FALSE, ioFailed |-> FALSE,
+     recoveredBeforeEffect |-> FALSE,
      effects |-> 0, observed |-> "none", cleaned |-> FALSE,
      pending |-> FALSE, published |-> FALSE, git |-> FALSE,
      badResume |-> FALSE, badVersion |-> FALSE,
@@ -378,6 +379,8 @@ Crash(w) == /\ w \notin ReviewOnly
 Recover(w) == /\ s[w].failed
               /\ s[w].recovery = RecoveryId(w, s[w].generation)
               /\ s' = [s EXCEPT ![w].failed = FALSE,
+                                    ![w].recoveredBeforeEffect =
+                                        @ \/ ~s[w].git,
                                     ![w].phase = IF s[w].phase \in
                                         {"dispatched", "delivered"}
                                         THEN "authorized" ELSE @,
@@ -392,7 +395,10 @@ FailWrite(w) == /\ w \notin ReviewOnly
                 /\ s[w].phase \in {"intent", "git", "follow-up-pending"}
                 /\ s' = [s EXCEPT ![w].ioFailed = TRUE,
                                       ![w].failures = @ + 1]
-RecoverIO(w) == /\ s[w].ioFailed /\ s' = [s EXCEPT ![w].ioFailed = FALSE]
+RecoverIO(w) == /\ s[w].ioFailed
+                /\ s' = [s EXCEPT ![w].ioFailed = FALSE,
+                                      ![w].recoveredBeforeEffect =
+                                          @ \/ ~s[w].git]
 VersionTransition(w) == /\ s[w].version = 1 /\ ~s[w].badVersion
                         /\ (s[w].phase \in {"new", "follow-up", "review-only-complete"}
                             \/ s[w].canceled \/ ~GuardVersion)
@@ -476,6 +482,33 @@ ServiceCompetitionBound == \A w \in Works:
     /\ s[w].observed = "none" /\ s[w].version = 1
     /\ ~s[w].cleaned /\ ~s[w].ioFailed
 FoundationBound == \A w \in Works: s[w].generation = 1
+\* Combine one failure with correction, carry-forward, and landing without
+\* multiplying the search by unrelated dispatch and evidence alternatives.
+CombinedBound == \A w \in Works:
+    /\ s[w].generation = 1
+    /\ s[w].routeMode \in {"unset", "foreground"}
+    /\ s[w].reviewKind \in {"none", "fresh", "carried"}
+    /\ ~(s[w].correction /\ s[w].rechecked)
+    /\ (s[w].failures = 0 \/ s[w].phase \notin
+         {"new", "intake", "planned", "authorized", "dispatched",
+          "delivered", "written"})
+    /\ (s[w].observed = "none" \/ s[w].phase = "follow-up")
+    /\ (s[w].version = 1 \/ s[w].phase = "follow-up")
+\* These bounds retain the applicable acceptance boundary while keeping
+\* unrelated completion branches out of each guarded search.
+GuardedCanonicalBound == \A w \in Works:
+    /\ s[w].phase \in {"new", "intake", "planned", "authorized",
+                       "dispatched", "delivered", "written", "reviewed", "tested"}
+    /\ ~s[w].correction /\ ~s[w].rechecked
+    /\ s[w].generation = 1 /\ s[w].observed = "none"
+    /\ s[w].version = 1 /\ ~s[w].cleaned
+GuardedLandingBound == \A w \in Works:
+    /\ s[w].phase \in {"new", "intake", "planned", "authorized",
+                       "dispatched", "delivered", "written", "reviewed",
+                       "tested", "learned", "ready", "verified"}
+    /\ ~s[w].correction /\ ~s[w].rechecked
+    /\ s[w].generation = 1 /\ s[w].observed = "none"
+    /\ s[w].version = 1 /\ ~s[w].cleaned
 RecoveryBound == \A w \in Works:
     /\ ~s[w].correction /\ ~s[w].rechecked
     /\ s[w].routeMode \in {"unset", "foreground"}
@@ -496,6 +529,22 @@ KnownFailureUnreachable == \A w \in Works:
     ~(s[w].phase = "tested" /\ s[w].testedFailures = {<<"test", "known">>})
 KnownLandingUnreachable == \A w \in Works:
     ~(s[w].phase = "verified" /\ s[w].landingFailures = {<<"test", "known">>})
+CanonicalRejectionUnreachable == \A w \in Works:
+    ~(s[w].phase = "reviewed" /\ s[w].canonicalOutcome # "unset"
+      /\ ~TesterBaselineSafe(w))
+UntrustedPrewriteRejectionUnreachable == \A w \in Works:
+    ~(s[w].phase = "reviewed" /\ s[w].canonicalOutcome # "unset"
+      /\ ~s[w].prewriteTrusted)
+MisboundPrewriteRejectionUnreachable == \A w \in Works:
+    ~(s[w].phase = "reviewed" /\ s[w].canonicalOutcome # "unset"
+      /\ s[w].prewriteCommit # <<"source", w>>)
+LandingRejectionUnreachable == \A w \in Works:
+    ~(s[w].phase = "ready" /\ s[w].landingOutcome # "unset"
+      /\ ~LandingBaselineSafe(w))
+RecoveredPublicationUnreachable == \A w \in Works:
+    ~(s[w].phase = "published" /\ s[w].failures = 1
+      /\ s[w].recoveredBeforeEffect
+      /\ ~s[w].failed /\ ~s[w].ioFailed)
 LandingAcceptanceSafe == \A w \in Works:
     s[w].phase \notin {"verified", "intent", "git", "published",
                        "follow-up-pending", "follow-up"}
