@@ -1744,6 +1744,11 @@ fn reconcile_reusable_derived_work(
     Ok(())
 }
 
+/// Share the cleanup dependency lock with human authorization.
+pub(crate) fn cleanup_dependency_lock_path(project_root: &Path) -> PathBuf {
+    project_root.join(".fluent/work/locks/follow-up-cleanup.lock")
+}
+
 /// Authorize one proposed derived Work Item under human authority and reconcile
 /// its durable queue intent. Human and automatic charging share the same root
 /// lineage lock, while the Work lock protects the item-level transition.
@@ -1762,6 +1767,9 @@ pub fn authorize_derived_work_item(
         Err(error) => return Err(error.into()),
     };
     let root_id = initial.lineage.root_id(&initial.id).to_string();
+    // Cleanup holds this lock from its final follow-up check through removal.
+    // A descendant's authorization does not change the origin's revision.
+    let dependency_lock = crate::land_lock::acquire(&cleanup_dependency_lock_path(project_root))?;
     let lineage_lock = crate::lineage_lock::acquire_human(project_root, &root_id)
         .with_context(|| format!("acquire lineage lock for {root_id:?}"))?;
     let work_lock_path = project_root
@@ -1799,6 +1807,7 @@ pub fn authorize_derived_work_item(
     store.write_work_item(&item)?;
     drop(work_lock);
     drop(lineage_lock);
+    drop(dependency_lock);
 
     crate::queue::ensure_dispatch(
         project_root,

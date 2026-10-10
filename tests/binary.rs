@@ -21225,6 +21225,51 @@ fn workflow_cleanup_rechecks_current_eligibility() {
 }
 
 #[test]
+fn workflow_cleanup_rechecks_descendant_authorization() {
+    let tmp = TempDir::new().unwrap();
+    let project = setup_git_project(&tmp);
+    land_one_proposed_corrective(&project, &tmp, "bin-cleanup-authorize");
+    assert_eq!(
+        work_item_value(&project, DERIVED_FU1)["authorization"]["state"],
+        "proposed"
+    );
+    let origin = project.join(".fluent/work/items/work-1.json");
+    let artifacts = project.join(".fluent/work/artifacts/work-1");
+    let reached = tmp.path().join("cleanup-prelock-reached");
+    let release = tmp.path().join("cleanup-prelock-release");
+    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("fluent"));
+    command
+        .current_dir(&project)
+        .args(["cleanup", "--apply"])
+        .env("FLUENT_TEST_CLEANUP_PRELOCK_ITEM", "work-1")
+        .env("FLUENT_TEST_CLEANUP_PRELOCK_REACHED", &reached)
+        .env("FLUENT_TEST_CLEANUP_PRELOCK_RELEASE", &release)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = OwnedFixtureProcess::spawn(&mut command);
+    for _ in 0..500 {
+        if reached.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(reached.exists(), "cleanup did not check the landed origin");
+    authorize_work_item(&project, DERIVED_FU1);
+    fs::write(&release, b"continue").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(origin.exists(), "cleanup removed pending recovery origin");
+    assert!(
+        artifacts.is_dir(),
+        "cleanup removed pending recovery artifacts"
+    );
+}
+
+#[test]
 fn workflow_cleanup_retains_artifacts_created_after_selection() {
     let tmp = TempDir::new().unwrap();
     let project = setup_git_project(&tmp);

@@ -106,6 +106,38 @@ pub fn cleanup_work_items(
             }
             _ => continue,
         };
+        #[cfg(feature = "test-support")]
+        if options.apply
+            && std::env::var("FLUENT_TEST_CLEANUP_PRELOCK_ITEM")
+                .ok()
+                .as_deref()
+                == Some(work_item.id.as_str())
+        {
+            if let (Ok(reached), Ok(release)) = (
+                std::env::var("FLUENT_TEST_CLEANUP_PRELOCK_REACHED"),
+                std::env::var("FLUENT_TEST_CLEANUP_PRELOCK_RELEASE"),
+            ) {
+                fs::write(&reached, b"checked")?;
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while !Path::new(&release).exists() {
+                    anyhow::ensure!(
+                        std::time::Instant::now() < deadline,
+                        "cleanup prelock barrier timed out"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
+        // Human authorization can change a descendant without changing this
+        // origin. Recheck under the shared dependency lock and hold it through
+        // removal. Verify before taking the land or origin model locks to keep
+        // the operation lock order intact.
+        let _dependency_lock = crate::land_lock::acquire(
+            &crate::follow_up::cleanup_dependency_lock_path(&source_root),
+        )?;
+        if retains_for_follow_up_recovery(&source_root, &checked) {
+            continue;
+        }
         // Landing takes the land lock before mutating the Work Item. Keep that
         // order and hold both locks through every destructive action. Reject a
         // changed snapshot rather than using an eligibility result from before
