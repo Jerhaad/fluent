@@ -65898,6 +65898,67 @@ fn workflow_changed_bindings_reassess_evidence_before_advancement() {
 }
 
 #[test]
+fn workflow_readiness_requires_current_gates() {
+    let tmp = TempDir::new().unwrap();
+    let project = setup_git_project(&tmp);
+    let bin = tmp.path().join("failed-learner");
+    write_mock_claude(&bin, &learner_failing_mock_script());
+    create_and_run_failed_learner_attempt(&project, &bin);
+    let before = git_head(&project);
+    let shown = read_work_show_json(&project, "work-1");
+    assert_eq!(shown["attempts"][0]["review_state"], "passed");
+    assert_eq!(shown["attempts"][0]["learning"]["status"], "failed");
+    let tasks = shown["attempts"][0]["tasks"].as_array().unwrap();
+    for role in review::REVIEWERS {
+        assert!(tasks.iter().any(|task| task["kind"] == "review"
+            && task["role"] == *role
+            && task["status"] == "complete"));
+    }
+    assert!(
+        tasks
+            .iter()
+            .any(|task| task["kind"] == "tester" && task["status"] == "complete")
+    );
+    assert_eq!(
+        fluent::work_status::load_work_status(&project)
+            .unwrap()
+            .rows[0]
+            .action,
+        "learner-not-ready"
+    );
+    fluent_cmd()
+        .current_dir(&project)
+        .args(["merge-candidate", "land", "work-1", "--no-sandbox"])
+        .env("PATH", mock_path(&bin))
+        .assert()
+        .failure();
+    assert_eq!(git_head(&project), before);
+}
+
+#[test]
+fn workflow_landing_requires_exact_final_commit_evidence() {
+    let tmp = TempDir::new().unwrap();
+    let (project, bin, _) = setup_rebased_tester_candidate(
+        &tmp,
+        "if [ -f loop-output.txt ]; then printf 'not ok new-failure\\n'; exit 1; fi",
+    );
+    let target = advance_tester_target(&project);
+    fluent_cmd()
+        .current_dir(&project)
+        .args(["merge-candidate", "land", "work-1", "--no-sandbox"])
+        .env("PATH", mock_path(&bin))
+        .assert()
+        .failure();
+    assert_eq!(git_head(&project), target);
+    let failed = read_work_show_json(&project, "work-1");
+    let candidate = &failed["merge_candidates"][0];
+    let result = merge_tester_results(&project, candidate);
+    assert_eq!(result["candidate_commit"], candidate["candidate_commit"]);
+    assert!(result["summary"]["fail"].as_u64().unwrap() > 0);
+    assert_eq!(candidate["merge_state"]["status"], "failed");
+}
+
+#[test]
 fn landed_status_preserves_result_after_source_retirement() {
     let tmp = TempDir::new().unwrap();
     let project = landed_status_fixture(&tmp);
