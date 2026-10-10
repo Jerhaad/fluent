@@ -474,6 +474,12 @@ fn scheduler_released_upgrade_preserves_shared_ownership() {
     assert!(release_version.status.success());
     assert!(String::from_utf8_lossy(&release_version.stdout).contains("0.5.0 6875b409"));
 
+    let provider_bin = home.path().join("bin");
+    fs::create_dir_all(&provider_bin).unwrap();
+    let security = provider_bin.join("security");
+    fs::write(&security, "#!/bin/sh\nexit 98\n").unwrap();
+    fs::set_permissions(&security, fs::Permissions::from_mode(0o755)).unwrap();
+
     let fixture = |binary: &std::path::Path, project: &std::path::Path, args: &[&str]| {
         let mut command = Command::new(binary);
         command
@@ -574,8 +580,6 @@ fn scheduler_released_upgrade_preserves_shared_ownership() {
             );
         }
     }
-    let provider_bin = home.path().join("bin");
-    fs::create_dir_all(&provider_bin).unwrap();
     let provider = provider_bin.join("claude");
     fs::write(&provider,
         "#!/bin/sh\nset -eu\ncase \" $* \" in *' --version '*) printf 'fixture-claude\\n'; exit 0;; *' auth status --json '*) printf '{\"loggedIn\":true}\\n'; exit 0;; *' --safe-mode '*) printf 'ok\\n'; exit 0;; esac\ntest \"${CLAUDE_CODE_OAUTH_TOKEN:-}\" = fixture-oauth-token\nprintf '%s\\t%s\\n' \"$$\" \"$PWD\" >> \"$RELEASE_SERVICE_STARTED\"\nwhile [ ! -e \"$RELEASE_SERVICE_RELEASE\" ]; do sleep 0.05; done\nexit 1\n").unwrap();
@@ -585,9 +589,6 @@ fn scheduler_released_upgrade_preserves_shared_ownership() {
         fs::write(&unavailable, "#!/bin/sh\nexit 97\n").unwrap();
         fs::set_permissions(&unavailable, fs::Permissions::from_mode(0o755)).unwrap();
     }
-    let security = provider_bin.join("security");
-    fs::write(&security, "#!/bin/sh\nexit 98\n").unwrap();
-    fs::set_permissions(&security, fs::Permissions::from_mode(0o755)).unwrap();
     let started = home.path().join("workers-started");
     let release_workers = home.path().join("release-workers");
     let provider_path = format!("{}:/usr/bin:/bin", provider_bin.display());
