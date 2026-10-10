@@ -225,7 +225,12 @@ def main():
                              "Invariant RecoveredCorrectionUnreachable is violated"),
                     run_case(source, output, jar, java,
                              "combined-pending-observation-witness.cfg",
-                             "Invariant InterruptedPendingObservationUnreachable is violated")]
+                             "Invariant InterruptedPendingObservationUnreachable is violated"),
+                    run_case(source, output, jar, java,
+                             "combined-observed-recovery-witness.cfg",
+                             "Invariant ObservedRecoveryPublicationUnreachable is violated"),
+                    run_case(source, output, jar, java,
+                             "combined-observed-recovery-excluded.cfg", None)]
                    if args.focus == "combined-one-failure" else
                    guarded_cases(source, output, jar, java))
         for row in focused:
@@ -240,6 +245,9 @@ def main():
                               "Invariant RecoveredCorrectionUnreachable is violated"),
                              ("combined-pending-observation-witness.cfg",
                               "Invariant InterruptedPendingObservationUnreachable is violated"),
+                             ("combined-observed-recovery-witness.cfg",
+                              "Invariant ObservedRecoveryPublicationUnreachable is violated"),
+                             ("combined-observed-recovery-excluded.cfg", None),
                              ("repeated-recovery.cfg", None),
                              ("review-only.cfg", None),
                              ("service-competition.cfg", None),

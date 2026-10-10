@@ -72,6 +72,7 @@ Init == s = [w \in Works |->
      failedDuringOwnership |-> FALSE,
      recoveredBeforeEffect |-> FALSE,
      effects |-> 0, observed |-> "none", cleaned |-> FALSE,
+     observedFailedWrite |-> FALSE,
      pending |-> FALSE, published |-> FALSE, git |-> FALSE,
      badResume |-> FALSE, badVersion |-> FALSE,
      routeMode |-> "unset", queued |-> FALSE,
@@ -344,7 +345,9 @@ RetryEffect(w) == /\ s[w].phase = "git" /\ ~s[w].failed
                   /\ s' = [s EXCEPT ![w].effects = IF GuardEffect THEN @ ELSE @ + 1]
 Observe(w) == /\ s[w].observed = "none"
               /\ s' = [s EXCEPT ![w].observed =
-                          IF TruthfulObservation THEN s[w].phase ELSE "bad"]
+                          IF TruthfulObservation THEN s[w].phase ELSE "bad",
+                                    ![w].observedFailedWrite =
+                          s[w].pending /\ s[w].ioFailed]
 Cleanup(w) == /\ ~s[w].cleaned
               /\ (s[w].phase \in {"follow-up", "review-only-complete"} \/ ~GuardCleanup)
               /\ s' = [s EXCEPT ![w].cleaned = TRUE]
@@ -498,8 +501,11 @@ CombinedBound == \A w \in Works:
     /\ s[w].reviewKind \in {"none", "fresh", "carried"}
     /\ ~(s[w].correction /\ s[w].rechecked)
     /\ (s[w].observed = "none" \/ s[w].phase = "follow-up"
-        \/ (s[w].pending /\ s[w].ioFailed /\ s[w].phase = "intent"
-            /\ s[w].observed = "intent"))
+        \/ (s[w].observedFailedWrite /\ s[w].failures = 1
+            /\ s[w].observed = "intent"
+            /\ ((s[w].pending /\ s[w].phase \in {"intent", "git"})
+                \/ (s[w].published /\ s[w].phase \in
+                    {"published", "follow-up-pending", "follow-up"}))))
     /\ (s[w].version = 1 \/ s[w].phase = "follow-up")
 \* These bounds retain the applicable acceptance boundary while keeping
 \* unrelated completion branches out of each guarded search.
@@ -560,6 +566,11 @@ RecoveredCorrectionUnreachable == \A w \in Works:
 InterruptedPendingObservationUnreachable == \A w \in Works:
     ~(CombinedBound /\ s[w].pending /\ s[w].ioFailed /\ s[w].failures = 1
       /\ s[w].observed = s[w].phase /\ s[w].observed = "intent")
+ObservedRecoveryPublicationUnreachable == \A w \in Works:
+    ~(s[w].observedFailedWrite /\ s[w].failures = 1
+      /\ s[w].phase = "published" /\ ~s[w].ioFailed)
+CombinedObservedRecoveryExcluded == CombinedBound /\ \A w \in Works:
+    s[w].observedFailedWrite => s[w].ioFailed
 LandingAcceptanceSafe == \A w \in Works:
     s[w].phase \notin {"verified", "intent", "git", "published",
                        "follow-up-pending", "follow-up"}
