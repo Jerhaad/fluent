@@ -9,7 +9,7 @@ lifecycle, launch, and landing suites. It writes full command logs under
 `target/formal/workflow/integrated/` and a candidate-bound `report.json` with
 suite results, log digests, model hashes, and every connection row from
 `connections.md`. The integrated result fails if any required suite, log,
-binary binding, or connection is missing. An inventory row needs `Verified: `
+binary binding, required case, or connection is missing. An inventory row needs `Verified: `
 evidence naming its checked mapping, assumptions, model result, production
 scenario, and control before the report may credit it. Existing descriptive
 evidence is retained as an explicit gap until those checks pass.

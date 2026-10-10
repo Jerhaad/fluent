@@ -385,6 +385,16 @@ fn workflow_assurance_report_rejects_missing_and_misbound_evidence() {
     assert!(!misbound.status.success());
     let result: Value = serde_json::from_slice(&fs::read(&output).unwrap()).unwrap();
     assert_eq!(result["suites"]["foundation"]["pass"], false);
+    let partial = json!({"schema-version":1,"suite":"foundation",
+        "candidate-commit":"candidate-a",
+        "fluent-binary-sha256":digest(&fs::read(env!("CARGO_BIN_EXE_fluent")).unwrap()),
+        "pass":true,
+        "cases":[{"case":"foundation.cfg","pass":true,"log":"case.log"}]});
+    fs::write(suite.join("result.json"), partial.to_string()).unwrap();
+    let incomplete = run(source, "python3", &command);
+    assert!(!incomplete.status.success());
+    let result: Value = serde_json::from_slice(&fs::read(&output).unwrap()).unwrap();
+    assert_eq!(result["suites"]["foundation"]["pass"], false);
 }
 
 #[test]

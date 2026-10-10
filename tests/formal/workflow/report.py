@@ -9,6 +9,30 @@ from pathlib import Path
 
 SUITES = ("foundation", "writer-inputs", "evidence-status",
           "recovery-observation", "release-transition")
+REQUIRED_CASES = {
+    "foundation": ("foundation.cfg", "combined-one-failure.cfg",
+                   "repeated-recovery.cfg", "review-only.cfg", "service-competition.cfg",
+                   "negative-deliverinputs.cfg", "negative-checkevidence.cfg",
+                   "negative-reviewroute.cfg", "negative-guardversion.cfg",
+                   "fresh-production-fixture", "production-projection",
+                   "production-model-path", "negative-trace-projection",
+                   "negative-model-path"),
+    "writer-inputs": ("negative-deliverinputs.cfg", "fresh-writer-fixture",
+                      "writer-production-projection", "omitted-instruction-control",
+                      "missing-delivery-boundary-control", "writer-production-path.cfg"),
+    "evidence-status": ("negative-checkevidence.cfg", "negative-landing-new.cfg",
+                        "fresh-evidence-fixture", "public-carried-review-fixture",
+                        "public-stale-carried-review-landing",
+                        "evidence-production-projection", "evidence-production-path.cfg",
+                        "missing-observation"),
+    "recovery-observation": ("repeated-recovery.cfg", "joint-settlement.cfg",
+                             "negative-joint-settlement.cfg", "fresh-public-recovery",
+                             "recovery-projection", "recovery-production.cfg"),
+    "release-transition": ("released-fixture-1", "released-fixture-2",
+                           "released-fixture-3", "current-authority-projection",
+                           "pending-publication-projection", "service-projection",
+                           "service-competition.cfg", "negative-guardversion.cfg"),
+}
 BOUNDARIES = (
     "Intake and authorization scope", "Foreground execution", "Queued claim and lease",
     "Recovered dispatch", "Generation fence", "Shared service ownership",
@@ -77,10 +101,15 @@ def report(results, candidate, binary, source, jar=None, java=None):
                     log_path = directory / log
                     assert log_path.is_file()
                     logs[log] = digest(log_path)
+            observed = [case["case"] for case in cases]
+            required = set(REQUIRED_CASES[name])
+            complete = len(observed) == len(set(observed)) and required <= set(observed)
             bound = value.get("candidate-commit") == candidate and \
                 value.get("fluent-binary-sha256") == digest(binary)
-            passed = bool(value["pass"]) and bound and all(case["pass"] for case in cases)
+            passed = bool(value["pass"]) and bound and complete and \
+                all(case["pass"] for case in cases)
             suites[name] = {"pass": passed, "candidate-bound": bound,
+                            "required-cases-present": complete,
                             "result-sha256": digest(path), "log-sha256": logs,
                             "cases": cases}
             if not passed:
