@@ -695,6 +695,27 @@ assignment, contract, or source evidence invalidates stale authority. Host
 evidence, targeted Tests Review, ordinary review, final Tester, and Learner
 remain required after the correction.
 
+## Continue a no-change Writer with unfinished Plan rows
+
+When a completed no-change Writer is paused with pending Writer-owned rows in
+its completion matrix, inspect `fluent work-item show <work-item>` and the
+source matrix. An explicit decision schedules one corrective Writer on the
+same Attempt:
+
+```sh
+fluent attempt repair-writer-completion <work-item> <attempt> --resolution "<approved correction>"
+fluent attempt run <work-item> <attempt>
+```
+
+For a queued Attempt, use `fluent queue resume <work-item> --attempt
+<attempt>` after the repair command. The repair records the decision and
+source evidence, while resume runs the Writer. A prior approval that reserved
+no successor remains historical; use a new, distinct resolution to bind the
+current source and create the successor. Repeating that new decision keeps the
+same Task. Pending host, review, Tester, and Learner rows do not authorize a
+Writer. Once Writer work is complete, attach host evidence through the action
+shown by `work-item show` before resuming review.
+
 ## Recover an output-free failed Writer
 
 For an output-free failed Writer, recovery requires the original saved assignment,
