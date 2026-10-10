@@ -64,32 +64,6 @@ fn landing_repository_identity(workspace: &Path) -> Result<String> {
     .into_owned())
 }
 
-pub(crate) fn landing_evidence_digest(
-    project_root: &Path,
-    checks: &[ArtifactRef],
-    reviews: &[ArtifactRef],
-) -> Result<String> {
-    let mut hash = Sha256::new();
-    for artifact in checks.iter().chain(reviews) {
-        hash.update(artifact.producer_id.as_bytes());
-        hash.update([0]);
-        hash.update(artifact.path.as_bytes());
-        hash.update([0]);
-        let path = Path::new(&artifact.path);
-        let path = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            project_root.join(path)
-        };
-        hash.update(
-            fs::read(&path)
-                .with_context(|| format!("read accepted landing evidence {}", path.display()))?,
-        );
-        hash.update([0]);
-    }
-    Ok(format!("{:x}", hash.finalize()))
-}
-
 fn accepted_landing_model_digest(item: &WorkItem, candidate: &MergeCandidate) -> Result<String> {
     let attempt = item
         .attempts
@@ -162,7 +136,11 @@ fn persist_landing_intent(
     let target_workspace_identity = fs::canonicalize(target_workspace)?
         .to_string_lossy()
         .into_owned();
-    let evidence_digest = landing_evidence_digest(config.project_root, &checks, &reviews)?;
+    let evidence_digest = crate::verification_assessment::landing_evidence_digest(
+        config.project_root,
+        &checks,
+        &reviews,
+    )?;
     let current_item = config.store.read_work_item(config.work_item_id)?;
     current_item.ensure_execution_ready()?;
     let current_candidate = current_item
@@ -273,7 +251,7 @@ fn recognized_landing_intent(
             && intent.verified_commit == candidate.candidate_commit
             && intent.accepted_model_digest == accepted_landing_model_digest(item, candidate)?
             && intent.evidence_digest
-                == landing_evidence_digest(
+                == crate::verification_assessment::landing_evidence_digest(
                     config.project_root,
                     &intent.check_artifacts,
                     &intent.review_artifacts
