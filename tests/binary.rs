@@ -41758,10 +41758,11 @@ exit 0
 
 #[test]
 fn classified_writer_receives_current_authorized_instructions() {
-    classified_writer_delivery_probe(false);
+    classified_writer_delivery_probe(false, false);
+    classified_writer_delivery_probe(false, true);
 }
 
-fn classified_writer_delivery_probe(check_history: bool) {
+fn classified_writer_delivery_probe(check_history: bool, retry_once: bool) {
     let tmp = TempDir::new_in("target").unwrap();
     let suffix = tmp.path().file_name().unwrap().to_string_lossy();
     let work_id = format!("classified-writer-inputs-{suffix}");
@@ -41801,6 +41802,7 @@ fn classified_writer_delivery_probe(check_history: bool) {
         .unwrap();
     let area = project.join(writer["artifact_area"]["path"].as_str().unwrap());
     let marker = area.join("writer-read-confirmed");
+    let retry_marker = area.join("first-provider-attempt");
     let require_host = std::env::var("FLUENT_WORKFLOW_REQUIRE_HOST").as_deref() == Ok("1");
     let bin = if require_host {
         area.join("provider-double")
@@ -41850,6 +41852,10 @@ grep -F 'sentinel-7841' "$CLASSIFICATION_AUDIT" >/dev/null
 if [ "$REQUIRE_HOST" = 1 ]; then
   if cat "$CLASSIFICATION_SIBLING" >/dev/null 2>&1; then exit 91; fi
 fi
+if [ "$RETRY_ONCE" = 1 ] && [ ! -e "$RETRY_MARKER" ]; then
+  printf 'retry\n' > "$RETRY_MARKER"
+  exit 73
+fi
 printf '\nread\n' >> "$WRITER_MARKER"
 printf 'Apply classified input\n' >> README.md
 git add README.md
@@ -41878,6 +41884,8 @@ git commit -m 'Apply classified input' >/dev/null
         .env("CLASSIFICATION_AUDIT", &audit)
         .env("CLASSIFICATION_SIBLING", &sibling)
         .env("REQUIRE_HOST", if require_host { "1" } else { "0" })
+        .env("RETRY_ONCE", if retry_once { "1" } else { "0" })
+        .env("RETRY_MARKER", &retry_marker)
         .env("CHECK_HISTORY", if check_history { "1" } else { "0" })
         .env("HISTORY_REVIEW", project.join(&review))
         .env("WRITER_MARKER", &marker)
@@ -41890,7 +41898,8 @@ git commit -m 'Apply classified input' >/dev/null
         fs::read_to_string(&marker).unwrap_or_default()
     );
     assert!(fs::read_to_string(&marker).unwrap().ends_with("\nread\n"));
-    if !check_history {
+    assert_eq!(retry_marker.exists(), retry_once);
+    if !check_history && !retry_once {
         record_classified_writer_trace(&project, &work_id, &classified, &audit, &marker);
     }
 }
@@ -42083,7 +42092,7 @@ fn classified_writer_rejects_invalid_required_inputs_before_launch() {
 
 #[test]
 fn classified_writer_context_identifies_current_assignment() {
-    classified_writer_delivery_probe(true);
+    classified_writer_delivery_probe(true, false);
 }
 
 #[test]
