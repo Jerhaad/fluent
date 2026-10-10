@@ -41843,6 +41843,7 @@ printf '%s' "$prompt" | grep -F 'Current assigned action: source correction' >/d
 printf '%s' "$prompt" | grep -F "$CLASSIFICATION_AUDIT" >/dev/null
 if [ "$CHECK_HISTORY" = 1 ]; then
   printf '%s' "$prompt" | grep -F "$HISTORY_REVIEW" >/dev/null
+  printf '%s' "$prompt" | grep -F 'prior request for more host evidence remains historical context' >/dev/null
   grep -F 'Additional-Proof: Attach a rerun' "$HISTORY_REVIEW" >/dev/null
 fi
 grep -F 'sentinel-7841' "$CLASSIFICATION_AUDIT" >/dev/null
