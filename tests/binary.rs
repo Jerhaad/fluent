@@ -224,6 +224,70 @@ fn released_upgrade_preserves_workflow_state() {
         upgraded_work["attempts"][0]["status"],
         paused_work["attempts"][0]["status"]
     );
+    let paused_attempt = &paused_work["attempts"][0];
+    let upgraded_attempt = &upgraded_work["attempts"][0];
+    assert_eq!(upgraded_attempt["status"], "needs-user");
+    assert_eq!(upgraded_attempt["pause_kind"], "interrupted");
+    assert_eq!(upgraded_attempt["pause_kind"], paused_attempt["pause_kind"]);
+    assert_eq!(
+        upgraded_attempt["pause_recovery"],
+        paused_attempt["pause_recovery"]
+    );
+    assert!(upgraded_attempt["pause_recovery"].is_null());
+    assert_eq!(
+        upgraded_attempt["cancellation"],
+        paused_attempt["cancellation"]
+    );
+    let stop = &upgraded_attempt["cancellation"];
+    assert!(stop["requested_at"].as_str().is_some());
+    assert!(stop["settled_at"].as_str().is_some());
+    assert!(stop["resumed_at"].is_null());
+    assert_eq!(upgraded_attempt["tasks"], paused_attempt["tasks"]);
+    assert_eq!(upgraded_attempt["tasks"][0]["id"], "attempt-1-write-1");
+    assert_eq!(upgraded_attempt["tasks"][0]["kind"], "write");
+    assert!(upgraded_attempt["tasks"][0]["output"].is_null());
+    let upgraded_snapshot = WorkModelStore::new(&paused)
+        .read_work_item_snapshot("released-paused")
+        .unwrap();
+    assert_eq!(
+        upgraded_snapshot.attempts[0].tasks[0].status,
+        TaskStatus::Planned
+    );
+    assert_eq!(
+        upgraded_work["next-action"],
+        "fluent queue resume released-paused --attempt attempt-1"
+    );
+    fluent_cmd()
+        .current_dir(&paused)
+        .args([
+            "queue",
+            "resume",
+            "released-paused",
+            "--attempt",
+            "attempt-1",
+        ])
+        .assert()
+        .success();
+    let queued = fluent_cmd()
+        .current_dir(&paused)
+        .args(["queue", "show", "released-paused"])
+        .output()
+        .unwrap();
+    assert!(queued.status.success());
+    let dispatch: serde_json::Value = serde_json::from_slice(&queued.stdout).unwrap();
+    assert_eq!(dispatch["status"], "queued");
+    assert_eq!(dispatch["bound_attempt_id"], "attempt-1");
+    assert_eq!(
+        dispatch["resume_cancellation_requested_at"],
+        stop["requested_at"]
+    );
+    let after_resume = WorkModelStore::new(&paused)
+        .read_work_item_snapshot("released-paused")
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&after_resume.attempts[0]).unwrap()["tasks"],
+        upgraded_attempt["tasks"]
+    );
 }
 
 #[test]
