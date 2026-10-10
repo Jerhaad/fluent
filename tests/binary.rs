@@ -41959,7 +41959,12 @@ fn record_classified_writer_trace(
 
 #[test]
 fn classified_writer_rejects_invalid_required_inputs_before_launch() {
-    for invalid in ["changed-authority", "missing-audit", "escaped-audit", "oversized"] {
+    for invalid in [
+        "changed-authority",
+        "missing-audit",
+        "escaped-audit",
+        "oversized",
+    ] {
         let tmp = TempDir::new().unwrap();
         let suffix = tmp.path().file_name().unwrap().to_string_lossy();
         let work_id = format!("classified-invalid-{invalid}-{suffix}");
