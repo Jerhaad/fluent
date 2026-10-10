@@ -82,12 +82,81 @@ struct EligibleRecovery {
 /// Return the command that recovers this exact Writer-completion pause, when
 /// the saved Attempt has the narrow supported shape.
 pub fn recovery_action(project_root: &Path, attempt: &Attempt) -> Option<String> {
-    inspect_eligible(project_root, attempt).ok().map(|_| {
-        format!(
-            "fluent attempt repair-writer-completion {} {} --resolution \"<describe the approved retry>\"",
-            attempt.work_item_id, attempt.id
-        )
-    })
+    let eligible = inspect_eligible(project_root, attempt).ok()?;
+    validate_prior_recoveries(project_root, attempt, &eligible, None).ok()?;
+    Some(format!(
+        "fluent attempt repair-writer-completion {} {} --resolution \"<describe the approved retry>\"",
+        attempt.work_item_id, attempt.id
+    ))
+}
+
+fn validate_prior_recoveries(
+    project_root: &Path,
+    attempt: &Attempt,
+    eligible: &EligibleRecovery,
+    resolution: Option<&str>,
+) -> Result<()> {
+    let current_index = attempt
+        .tasks
+        .iter()
+        .position(|task| task.id == eligible.source_writer_task_id)
+        .context("current recovery source Writer is missing")?;
+    for reference in attempt
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.producer_id == PRODUCER)
+    {
+        let path =
+            crate::recovery_contracts::resolve_input_artifact_path(project_root, &reference.path)?;
+        let bytes = fs::read(&path)?;
+        let authority: RecoveryAuthority = serde_json::from_slice(&bytes)
+            .context("parse prior Writer-completion recovery authority")?;
+        anyhow::ensure!(
+            bytes == serde_json::to_vec_pretty(&authority)?
+                && authority.schema_version == SCHEMA_VERSION
+                && authority.work_item_id == attempt.work_item_id
+                && authority.attempt_id == attempt.id
+                && authority.resolution == normalize_resolution(&authority.resolution)?
+                && authority.resolution_sha256 == content_digest(authority.resolution.as_bytes())
+                && reference.path
+                    == work_artifact_path(
+                        &attempt.work_item_id,
+                        &attempt.id,
+                        &format!(
+                            "writer-completion-recoveries/{}/recovery.json",
+                            authority.task_id
+                        ),
+                    ),
+            "prior Writer-completion recovery authority changed"
+        );
+        if authority.task_id == eligible.task_id {
+            continue;
+        }
+        let replacement_index = attempt
+            .tasks
+            .iter()
+            .position(|task| task.id == authority.task_id)
+            .context("prior recovery Writer is missing")?;
+        let replacement = &attempt.tasks[replacement_index];
+        anyhow::ensure!(
+            replacement_index < current_index
+                && replacement.status == TaskStatus::Complete
+                && replacement.input_artifacts.contains(reference),
+            "prior Writer-completion recovery has not settled"
+        );
+        crate::recovery_contracts::writer_completion::validate_task_recovery_source(
+            project_root,
+            attempt,
+            replacement,
+        )?;
+        if let Some(resolution) = resolution {
+            anyhow::ensure!(
+                authority.resolution != resolution,
+                "later Writer-completion recovery needs a distinct authorization decision"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Retry the exact paused Writer through one audited, idempotent operation.
@@ -1050,19 +1119,19 @@ fn existing_recovery(
         return Ok(None);
     };
     ensure_settled_ownership(project_root, attempt)?;
-    let authority: RecoveryAuthority = serde_json::from_slice(
-        &fs::read(project_root.join(&reference.path)).with_context(|| {
-            format!(
-                "read Writer-completion recovery authority {}",
-                reference.path
-            )
-        })?,
-    )
-    .context("parse Writer-completion recovery authority")?;
+    let authority_bytes = fs::read(project_root.join(&reference.path)).with_context(|| {
+        format!(
+            "read Writer-completion recovery authority {}",
+            reference.path
+        )
+    })?;
+    let authority: RecoveryAuthority = serde_json::from_slice(&authority_bytes)
+        .context("parse Writer-completion recovery authority")?;
     if authority.schema_version != SCHEMA_VERSION
         || authority.work_item_id != attempt.work_item_id
         || authority.attempt_id != attempt.id
-        || authority.resolution != resolution
+        || authority_bytes != serde_json::to_vec_pretty(&authority)?
+        || authority.resolution != normalize_resolution(&authority.resolution)?
         || authority.resolution_sha256 != content_digest(authority.resolution.as_bytes())
         || reference.path
             != work_artifact_path(
@@ -1074,6 +1143,18 @@ fn existing_recovery(
                 ),
             )
     {
+        bail!("existing Writer-completion recovery does not match this authorization or Attempt");
+    }
+    // A settled recovery is history once a later completed Writer has its own
+    // malformed completion matrix. Validate the old authority before selecting
+    // the current incident; its resolution must not authorize the new Writer.
+    if let Ok(eligible) = inspect_eligible(project_root, attempt)
+        && eligible.task_id != authority.task_id
+    {
+        validate_prior_recoveries(project_root, attempt, &eligible, Some(resolution))?;
+        return Ok(None);
+    }
+    if authority.resolution != resolution {
         bail!("existing Writer-completion recovery does not match this authorization or Attempt");
     }
     let task = attempt
