@@ -69,12 +69,14 @@ Init == s = [w \in Works |->
      canceled |-> FALSE, authority |-> 0, generation |-> 1,
      serviceOwner |-> Unowned, version |-> 1,
      failures |-> 0, failed |-> FALSE, ioFailed |-> FALSE,
+     failedDuringOwnership |-> FALSE,
      recoveredBeforeEffect |-> FALSE,
      effects |-> 0, observed |-> "none", cleaned |-> FALSE,
      pending |-> FALSE, published |-> FALSE, git |-> FALSE,
      badResume |-> FALSE, badVersion |-> FALSE,
      routeMode |-> "unset", queued |-> FALSE,
-     correction |-> FALSE, rechecked |-> FALSE,
+     correction |-> FALSE, correctedAfterRecovery |-> FALSE,
+     rechecked |-> FALSE,
      acceptedCandidate |-> "none",
      prewriteCommit |-> <<"source", w>>,
      prewriteTrusted |-> TRUE,
@@ -181,7 +183,11 @@ CorrectCandidate(w) == /\ s[w].phase \in {"reviewed", "tested"}
                                              ![w].delivered = {},
                                              ![w].context = <<"context", w, 2>>,
                                              ![w].reviewScope = <<"scope", w, <<"candidate", w, 2>>>>,
-                                             ![w].correction = TRUE, ![w].credit = {},
+                                             ![w].correction = TRUE,
+                                             ![w].correctedAfterRecovery =
+                                                 s[w].failedDuringOwnership
+                                                 /\ s[w].recoveredBeforeEffect,
+                                             ![w].credit = {},
                                              ![w].reviewKind = "none",
                                              ![w].routeMode = "unset",
                                              ![w].canonicalOutcome = "unset",
@@ -375,6 +381,8 @@ Crash(w) == /\ w \notin ReviewOnly
             /\ s[w].phase \notin {"new", "follow-up"}
             /\ s' = [s EXCEPT ![w].failed = TRUE,
                                   ![w].serviceOwner = Unowned,
+                                  ![w].failedDuringOwnership = @ \/ s[w].phase \in
+                                      {"dispatched", "delivered"},
                                   ![w].failures = @ + 1]
 Recover(w) == /\ s[w].failed
               /\ s[w].recovery = RecoveryId(w, s[w].generation)
@@ -489,10 +497,9 @@ CombinedBound == \A w \in Works:
     /\ s[w].routeMode \in {"unset", "foreground"}
     /\ s[w].reviewKind \in {"none", "fresh", "carried"}
     /\ ~(s[w].correction /\ s[w].rechecked)
-    /\ (s[w].failures = 0 \/ s[w].phase \notin
-         {"new", "intake", "planned", "authorized", "dispatched",
-          "delivered", "written"})
-    /\ (s[w].observed = "none" \/ s[w].phase = "follow-up")
+    /\ (s[w].observed = "none" \/ s[w].phase = "follow-up"
+        \/ (s[w].pending /\ s[w].ioFailed /\ s[w].phase = "intent"
+            /\ s[w].observed = "intent"))
     /\ (s[w].version = 1 \/ s[w].phase = "follow-up")
 \* These bounds retain the applicable acceptance boundary while keeping
 \* unrelated completion branches out of each guarded search.
@@ -545,6 +552,14 @@ RecoveredPublicationUnreachable == \A w \in Works:
     ~(s[w].phase = "published" /\ s[w].failures = 1
       /\ s[w].recoveredBeforeEffect
       /\ ~s[w].failed /\ ~s[w].ioFailed)
+RecoveredCorrectionUnreachable == \A w \in Works:
+    ~(CombinedBound /\ s[w].correction /\ s[w].failures = 1
+      /\ s[w].failedDuringOwnership /\ s[w].correctedAfterRecovery
+      /\ s[w].phase = "reviewed"
+      /\ ~s[w].failed /\ ~s[w].ioFailed)
+InterruptedPendingObservationUnreachable == \A w \in Works:
+    ~(CombinedBound /\ s[w].pending /\ s[w].ioFailed /\ s[w].failures = 1
+      /\ s[w].observed = s[w].phase /\ s[w].observed = "intent")
 LandingAcceptanceSafe == \A w \in Works:
     s[w].phase \notin {"verified", "intent", "git", "published",
                        "follow-up-pending", "follow-up"}
