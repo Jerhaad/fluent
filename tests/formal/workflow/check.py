@@ -199,7 +199,10 @@ def integrated_suite(source, root, output, jar, java):
         complete = discovered == {test["name"] for test in selected}
         command = base + ["run", "--offline", "--features", "test-support", "--test",
                           binary_name, "--no-tests", "fail", "-E", expression]
-        run = subprocess.run(command, cwd=root, capture_output=True, text=True) if complete else None
+        environment = dict(os.environ)
+        environment["FLUENT_WORKFLOW_REQUIRE_HOST"] = "1"
+        run = subprocess.run(command, cwd=root, env=environment, capture_output=True,
+                             text=True) if complete else None
         log = output / ("named-" + binary_name + ".log")
         log.write_text("$ " + " ".join(list_command) + "\n" + listed.stdout + listed.stderr +
                        ("$ " + " ".join(command) + "\n" + run.stdout + run.stderr
