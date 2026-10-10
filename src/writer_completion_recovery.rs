@@ -90,6 +90,24 @@ pub fn recovery_action(project_root: &Path, attempt: &Attempt) -> Option<String>
     ))
 }
 
+/// Report a repair only while its malformed source is the latest completed Writer.
+pub(crate) fn status_recovery_action(project_root: &Path, attempt: &Attempt) -> Option<String> {
+    let eligible = inspect_eligible(project_root, attempt).ok()?;
+    let latest = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)?;
+    if latest.id != eligible.source_writer_task_id {
+        return None;
+    }
+    validate_prior_recoveries(project_root, attempt, &eligible, None).ok()?;
+    Some(format!(
+        "fluent attempt repair-writer-completion {} {} --resolution \"<describe the approved retry>\"",
+        attempt.work_item_id, attempt.id
+    ))
+}
+
 fn validate_prior_recoveries(
     project_root: &Path,
     attempt: &Attempt,

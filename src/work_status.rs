@@ -1187,6 +1187,17 @@ fn derive_attempt_recovery_guidance(
             Ok(None) => {}
         }
     }
+    if attempt.status == AttemptStatus::NeedsUser
+        && attempt.pause_kind == Some(PauseKind::WriterCompletion)
+        && let Some(action) = project_root.and_then(|root| {
+            crate::writer_completion_recovery::status_recovery_action(root, attempt)
+        })
+    {
+        return AttemptRecoveryGuidance {
+            next_action: Some(action),
+            blocker: None,
+        };
+    }
     let blocker =
         project_root.and_then(
             |root| match crate::recovery_contracts::required_check_recovery_status(root, attempt) {
@@ -1307,8 +1318,9 @@ fn derive_other_attempt_recovery_next_action(
     if attempt.status == AttemptStatus::NeedsUser
         && attempt.pause_kind == Some(PauseKind::WriterCompletion)
     {
-        return project_root
-            .and_then(|root| crate::writer_completion_recovery::recovery_action(root, attempt));
+        return project_root.and_then(|root| {
+            crate::writer_completion_recovery::status_recovery_action(root, attempt)
+        });
     }
     if attempt.status == AttemptStatus::NeedsUser
         && attempt.review_state == Some(AttemptReviewState::Failed)
