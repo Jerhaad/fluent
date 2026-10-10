@@ -40994,7 +40994,7 @@ fn review_coverage_resume_keeps_targeted_and_ordinary_scope_separate() {
     }
 }
 
-fn review_coverage_carry_forward_landing(stale: bool) {
+fn review_coverage_carry_forward_landing(stale: bool, matching_target_content: bool) {
     use fluent::work_model::*;
     let tmp = TempDir::new().unwrap();
     let work = format!(
@@ -41135,7 +41135,25 @@ fn review_coverage_carry_forward_landing(stale: bool) {
     }
     write_mock_claude(&bin, "#!/bin/bash\ngit rebase main >/dev/null 2>&1\n");
     let ready = work_item_value(&project, &work);
-    let before_land = advance_tester_target(&project);
+    let before_land = if matching_target_content {
+        fs::create_dir_all(project.join("tests")).unwrap();
+        fs::write(project.join("tests/corrected.rs"), "later correction").unwrap();
+        git::run(
+            &project,
+            &["add", "tests/corrected.rs"],
+            "stage matching target test",
+        )
+        .unwrap();
+        git::run(
+            &project,
+            &["commit", "-m", "Add matching target test"],
+            "commit matching target test",
+        )
+        .unwrap();
+        git_head(&project)
+    } else {
+        advance_tester_target(&project)
+    };
     let landing = fluent_cmd()
         .current_dir(&project)
         .args([
@@ -41167,12 +41185,17 @@ fn review_coverage_carry_forward_landing(stale: bool) {
 
 #[test]
 fn review_coverage_preserves_valid_ordinary_carry_forward() {
-    review_coverage_carry_forward_landing(false);
+    review_coverage_carry_forward_landing(false, false);
 }
 
 #[test]
 fn workflow_landing_rejects_stale_carried_review() {
-    review_coverage_carry_forward_landing(true);
+    review_coverage_carry_forward_landing(true, false);
+}
+
+#[test]
+fn workflow_landing_rejects_stale_review_with_matching_target_content() {
+    review_coverage_carry_forward_landing(true, true);
 }
 
 #[test]

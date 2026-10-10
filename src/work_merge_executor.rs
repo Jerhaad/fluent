@@ -194,14 +194,21 @@ fn ensure_review_bindings_current(
             }
         }
     }
-    let target = resolve_workspace_path(project_root, &candidate.target_workspace.path);
-    let target_tip = resolve_target_head(&target, &candidate.target_branch)?;
-    let candidate_tip = head_commit(&source)?;
+    let pre_rebase_tip = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Rebase && task.status == TaskStatus::Complete)
+        .map(|task| {
+            task.output
+                .as_ref()
+                .and_then(|output| output.base_commit.as_deref())
+                .unwrap_or("")
+        });
     let ordinary = crate::recovery_contracts::review_coverage::ordinary_review_tasks_for_landing(
         project_root,
         &coverage_attempt,
-        &candidate_tip,
-        &target_tip,
+        pre_rebase_tip,
     );
     for role in crate::review::REVIEWERS {
         anyhow::ensure!(

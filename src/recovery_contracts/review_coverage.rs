@@ -21,21 +21,20 @@ pub(crate) fn ordinary_review_tasks<'a>(
 }
 
 /// Reconstruct landing coverage after rebase rewrites the last Writer output.
-/// Ignore target-only paths added by that rebase when deciding which ordinary
-/// reviews a Writer invalidated.
+/// Compare with the recorded pre-rebase tip so target-only paths do not count
+/// as Writer changes, even when the target later matches a Writer's contents.
 pub(crate) fn ordinary_review_tasks_for_landing<'a>(
     project_root: &Path,
     attempt: &'a Attempt,
-    candidate_tip: &str,
-    target_tip: &str,
+    pre_rebase_tip: Option<&str>,
 ) -> Vec<(&'a Task, Verdict)> {
-    ordinary_review_tasks_with_target(project_root, attempt, Some((candidate_tip, target_tip)))
+    ordinary_review_tasks_with_target(project_root, attempt, pre_rebase_tip)
 }
 
 fn ordinary_review_tasks_with_target<'a>(
     project_root: &Path,
     attempt: &'a Attempt,
-    landing_tips: Option<(&str, &str)>,
+    pre_rebase_tip: Option<&str>,
 ) -> Vec<(&'a Task, Verdict)> {
     let mut current: Option<&TaskOutput> = None;
     let mut reviews: Vec<(&Task, Verdict)> = Vec::new();
@@ -59,25 +58,17 @@ fn ordinary_review_tasks_with_target<'a>(
                 )
                 .map_err(anyhow::Error::from)
                 .and_then(|workspace| {
+                    let compared_tip = if Some(index) == last_writer {
+                        pre_rebase_tip.unwrap_or(&output.commit)
+                    } else {
+                        &output.commit
+                    };
                     crate::review_invalidation::changed_paths_between(
                         &workspace,
                         &prior.commit,
-                        &output.commit,
+                        compared_tip,
                     )
-                    .map(|mut paths| {
-                        if Some(index) == last_writer {
-                            if let Some((candidate_tip, target_tip)) = landing_tips {
-                                paths.retain(|path| {
-                                    !crate::git::run_raw(
-                                        &workspace,
-                                        &["diff", "--quiet", candidate_tip, target_tip, "--", path],
-                                    )
-                                    .is_ok_and(|output| output.status.success())
-                                });
-                            }
-                        }
-                        crate::review_invalidation::affected_review_roles(&paths)
-                    })
+                    .map(|paths| crate::review_invalidation::affected_review_roles(&paths))
                 })
                 .unwrap_or_else(|_| review::REVIEWERS.to_vec()),
                 _ => review::REVIEWERS.to_vec(),
