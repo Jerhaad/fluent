@@ -1,5 +1,26 @@
 # Workflow foundation checks
 
+## Classified Writer inputs
+
+The `writer-inputs` suite runs the exact classified Writer launch test, checks
+its captured classification, prompt, and Work snapshots with
+`project_writer.py`, and maps the observed sequence through `WriterTrace.tla`
+to the `Workflow` actions. The projector checks the instruction bytes and the
+audit's candidate and evidence bindings before it marks delivery. A digest
+consistent trace with the instruction removed must fail projection; the model's
+`negative-deliverinputs.cfg` independently checks that an omitted delivery
+violates `InputSafe`. Run the suite with:
+
+```sh
+python3 tests/formal/workflow/check.py --suite=writer-inputs --jar=target/fluent-tools/tla2tools-1.7.4.jar
+```
+
+The suite writes its trace, artifacts, model logs, and structured result under
+`target/formal/workflow/writer-inputs/`. Its ordinary provider probe records
+actual instruction reads. The separate required host command sets
+`FLUENT_WORKFLOW_REQUIRE_HOST=1` and applies Seatbelt to test exact-file access
+and denial of an unrelated sibling.
+
 From the repository root, run the focused public-command and projection tests:
 
 ```sh

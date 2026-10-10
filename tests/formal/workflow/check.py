@@ -70,13 +70,13 @@ GUARDED_CASES = {
 }
 
 
-def run_case(source, output_dir, jar, java, config, expected):
+def run_case(source, output_dir, jar, java, config, expected, module="Workflow"):
     name = Path(config).name
     with tempfile.TemporaryDirectory(prefix="tlc-", dir=output_dir) as metadir:
         command = [java, "-XX:+UseParallelGC", "-Xmx512m", "-cp", str(jar),
                    "tlc2.TLC", "-deadlock", "-coverage", "1", "-workers", "1", "-fp", "0",
                    "-seed", "1", "-metadir", metadir, "-config", config,
-                   "Workflow.tla"]
+                   f"{module}.tla"]
         try:
             result = subprocess.run(command, cwd=source, capture_output=True,
                                     text=True, timeout=240)
@@ -196,13 +196,92 @@ def java_21(root):
     return None
 
 
+def writer_inputs_suite(source, root, output, jar, java):
+    results = [run_case(source, output, jar, java, "negative-deliverinputs.cfg",
+                        CONTROLS["deliverinputs"])]
+    command = ["cargo", "nextest", "run", "--offline", "--features", "test-support",
+               "--test", "binary", "--no-tests", "fail",
+               "classified_writer_receives_current_authorized_instructions"]
+    trace_path = output / "production-trace.json"
+    for name in ("production-trace.json", "classified-work.json", "writer-work.json",
+                 "classification.json", "provider-observation.txt"):
+        (output / name).unlink(missing_ok=True)
+    fixture = subprocess.run(command, cwd=root, capture_output=True, text=True)
+    (output / "production-fixture.log").write_text("$ " + " ".join(command) + "\n"
+                                                    + fixture.stdout + fixture.stderr)
+    fixture_ok = fixture.returncode == 0 and trace_path.is_file()
+    results.append({"case": "fresh-writer-fixture", "pass": fixture_ok,
+                    "log": "production-fixture.log"})
+    if fixture_ok:
+        trace = json.loads(trace_path.read_text())
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root,
+                              capture_output=True, text=True, check=True).stdout.strip()
+        binary = root / "target/debug/fluent"
+        bound = trace["fluent-commit"] == head and binary.is_file() and \
+            trace["fluent-binary-sha256"] == hashlib.sha256(binary.read_bytes()).hexdigest()
+        projection = subprocess.run(["python3", str(source / "project_writer.py"),
+                                     str(trace_path)], capture_output=True, text=True)
+        (output / "projection.log").write_text(projection.stdout + projection.stderr)
+        valid = bound and projection.returncode == 0
+        results.append({"case": "writer-production-projection", "pass": valid,
+                        "log": "projection.log"})
+        omitted = json.loads(json.dumps(trace))
+        negative_dir = output / "omitted-instruction"
+        negative_dir.mkdir(exist_ok=True)
+        for name in ("classified-work.json", "writer-work.json", "classification.json"):
+            (negative_dir / name).write_bytes((output / name).read_bytes())
+        observation = (output / "provider-observation.txt").read_text()
+        authorization = json.loads((output / "classification.json").read_text())["authorization"]
+        require_omission = authorization in observation
+        changed = observation.replace(authorization, "[instruction omitted]")
+        (negative_dir / "provider-observation.txt").write_text(changed)
+        for artifact in omitted["artifacts"]:
+            if artifact["path"] == "provider-observation.txt":
+                artifact["sha256"] = hashlib.sha256(changed.encode()).hexdigest()
+        omitted_path = negative_dir / "production-trace.json"
+        omitted_path.write_text(json.dumps(omitted))
+        negative = subprocess.run(["python3", str(source / "project_writer.py"),
+                                   str(omitted_path)], capture_output=True, text=True)
+        (output / "omitted-instruction.log").write_text(negative.stdout + negative.stderr)
+        results.append({"case": "omitted-instruction-control",
+                        "pass": require_omission and negative.returncode != 0 and
+                                "provider did not observe current instructions" in negative.stderr,
+                        "log": "omitted-instruction.log"})
+        if valid:
+            states = json.loads(projection.stdout)["states"]
+            config = output / "writer-production-path.cfg"
+            config.write_text("SPECIFICATION WriterSpec\nCONSTANTS\n"
+                              "  Works = {w1}\n  WriterWork = w1\n  ReviewOnly = {}\n"
+                              "  MaxFailures = 0\n"
+                              + '  CanonicalKinds = {"pass"}\n'
+                              + '  LandingKinds = {"pass"}\n'
+                              + '  TargetKinds = {"unchanged"}\n'
+                              + '  CorruptPrewrite = FALSE\n'
+                              + "".join(f"  {control} = TRUE\n" for control in
+                                         ("DeliverInputs", "CheckEvidence", "FenceResume",
+                                          "GuardEffect", "TruthfulObservation", "GuardCleanup",
+                                          "GuardVersion", "GuardBaseline",
+                                          "GuardLandingBaseline", "GuardReviewRoute"))
+                              + "".join(f"  WriterState{i} = {json.dumps(state)}\n"
+                                        for i, state in enumerate(states, 1))
+                              + "INVARIANT InputSafe\nPROPERTY WriterComplete\n")
+            results.append(run_case(source, output, jar, java, str(config), None,
+                                    module="WriterTrace"))
+    result = {"schema-version": 1, "suite": "writer-inputs", "cases": results,
+              "pass": all(row["pass"] for row in results)}
+    (output / "result.json").write_text(json.dumps(result, indent=2) + "\n")
+    for row in results:
+        print(("PASS" if row["pass"] else "FAIL") + " " + row["case"])
+    return 0 if result["pass"] else 1
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--suite", required=True)
     parser.add_argument("--jar", type=Path, required=True)
     parser.add_argument("--focus", choices=("combined-one-failure", "guarded"))
     args = parser.parse_args()
-    if args.suite != "foundation":
+    if args.suite not in ("foundation", "writer-inputs"):
         parser.error(f"unknown or incomplete suite: {args.suite}")
     jar = args.jar.resolve()
     if not jar.is_file() or hashlib.sha256(jar.read_bytes()).hexdigest() != JAR_SHA256:
@@ -212,6 +291,12 @@ def main():
     java = java_21(root)
     if java is None:
         parser.error("Java 21 is required")
+    if args.suite == "writer-inputs":
+        if args.focus:
+            parser.error("--focus is only supported for foundation")
+        output = root / "target/formal/workflow/writer-inputs"
+        output.mkdir(parents=True, exist_ok=True)
+        return writer_inputs_suite(source, root, output, jar, java)
     output = root / "target/formal/workflow/foundation"
     output.mkdir(parents=True, exist_ok=True)
     if args.focus:
