@@ -19,13 +19,34 @@ CONTROLS = {
     "truthfulobservation": "Invariant ObservationSafe is violated",
     "guardcleanup": "Invariant CleanupSafe is violated",
     "guardversion": "Invariant VersionSafe is violated",
+    "guardbaseline": "Invariant AcceptedBaselineSafe is violated",
+    "guardlandingbaseline": "Invariant LandingAcceptanceSafe is violated",
+    "canonical-incomplete": "Invariant AcceptedBaselineSafe is violated",
+    "canonical-harness": "Invariant AcceptedBaselineSafe is violated",
+    "canonical-leak": "Invariant AcceptedBaselineSafe is violated",
+    "canonical-unexplained": "Invariant AcceptedBaselineSafe is violated",
+    "canonical-misbound": "Invariant AcceptedBaselineSafe is violated",
+    "canonical-reference-fail": "Invariant AcceptedBaselineSafe is violated",
+    "prewritebinding": "Invariant AcceptedBaselineSafe is violated",
+    "reviewroute": "Invariant ReviewOnlyNoGit is violated",
+    "landing-new": "Invariant LandingAcceptanceSafe is violated",
+    "landing-incomplete": "Invariant LandingAcceptanceSafe is violated",
+    "landing-harness": "Invariant LandingAcceptanceSafe is violated",
+    "landing-leak": "Invariant LandingAcceptanceSafe is violated",
+    "landing-unexplained": "Invariant LandingAcceptanceSafe is violated",
+    "landing-misbound": "Invariant LandingAcceptanceSafe is violated",
+    "landing-reference-fail": "Invariant LandingAcceptanceSafe is violated",
+    "target-untrusted": "Invariant LandingAcceptanceSafe is violated",
+    "target-misbound": "Invariant LandingAcceptanceSafe is violated",
 }
 PROFILE_ACTIONS = {
     "foundation.cfg": ("ChooseForeground", "Enqueue", "Dispatch", "Writer",
                        "Review", "TargetedReview", "RecheckSameCandidate",
                        "CarryForward", "CorrectCandidate", "Tester",
                        "LearnCapture", "LearnNoExpertise", "Ready",
-                       "LandingVerify", "GitEffect", "PublishResult"),
+                       "CanonicalResult", "LandingResult", "TargetBaseline",
+                       "LandingVerify",
+                       "GitEffect", "PublishResult"),
     "repeated-recovery.cfg": ("Crash", "Recover", "FailWrite", "RecoverIO",
                               "ReplaceGeneration", "GrantResumeAuthority"),
     "review-only.cfg": ("ReviewOnlyStart", "ReviewOnlyReview", "ReviewOnlyReady",
@@ -68,10 +89,15 @@ def run_trace_case(source, output, jar, java, name, states, expect_pass):
     config = output / f"{name}.cfg"
     config.write_text("SPECIFICATION TraceSpec\nCONSTANTS\n"
                       "  Works = {w1}\n  TraceWork = w1\n  ReviewOnly = {}\n  MaxFailures = 0\n"
+                      + '  CanonicalKinds = {"pass"}\n'
+                      + '  LandingKinds = {"pass"}\n'
+                      + '  CorruptPrewrite = FALSE\n'
+                      + '  TargetKinds = {"unchanged"}\n'
                       + "".join(f"  {control} = TRUE\n" for control in
                                 ("DeliverInputs", "CheckEvidence", "FenceResume",
                                  "GuardEffect", "TruthfulObservation", "GuardCleanup",
-                                 "GuardVersion"))
+                                 "GuardVersion", "GuardBaseline",
+                                 "GuardLandingBaseline", "GuardReviewRoute"))
                       + "".join(f"  TraceState{i} = {json.dumps(state)}\n"
                                 for i, state in enumerate(states, 1))
                       + "PROPERTY TraceComplete\n")
@@ -133,6 +159,10 @@ def main():
                              ("repeated-recovery.cfg", None),
                              ("review-only.cfg", None),
                              ("service-competition.cfg", None),
+                             ("known-failure-accepted.cfg",
+                              "Invariant KnownFailureUnreachable is violated"),
+                             ("known-landing-accepted.cfg",
+                              "Invariant KnownLandingUnreachable is violated"),
                              *[(f"negative-{name}.cfg", violation)
                                for name, violation in CONTROLS.items()]]:
         results.append(run_case(source, output, jar, java, config, expected))

@@ -3,13 +3,24 @@ EXTENDS Naturals, FiniteSets, TLC
 
 CONSTANTS Works, ReviewOnly, MaxFailures, DeliverInputs, CheckEvidence,
           FenceResume, GuardEffect, TruthfulObservation, GuardCleanup,
-          GuardVersion
+          GuardVersion, GuardBaseline, GuardLandingBaseline, CanonicalKinds,
+          CorruptPrewrite, TargetKinds, GuardReviewRoute, LandingKinds
 ASSUME /\ Works # {} /\ ReviewOnly \subseteq Works
        /\ MaxFailures \in Nat
        /\ DeliverInputs \in BOOLEAN /\ CheckEvidence \in BOOLEAN
        /\ FenceResume \in BOOLEAN /\ GuardEffect \in BOOLEAN
        /\ TruthfulObservation \in BOOLEAN /\ GuardCleanup \in BOOLEAN
        /\ GuardVersion \in BOOLEAN
+       /\ GuardBaseline \in BOOLEAN /\ GuardLandingBaseline \in BOOLEAN
+       /\ CanonicalKinds \subseteq {"pass", "known", "new", "incomplete",
+                                     "harness", "leak", "unexplained",
+                                     "misbound", "reference-fail"}
+       /\ CorruptPrewrite \in BOOLEAN
+       /\ GuardReviewRoute \in BOOLEAN
+       /\ TargetKinds \subseteq {"unchanged", "cleared", "untrusted", "misbound"}
+       /\ LandingKinds \subseteq {"pass", "known", "new", "incomplete",
+                                   "harness", "leak", "unexplained",
+                                   "misbound", "reference-fail"}
 
 \* Typed tuples keep protocol identities distinct even when two Work Items
 \* have the same local ordinal. They are abstract names, not persisted paths.
@@ -64,6 +75,23 @@ Init == s = [w \in Works |->
      routeMode |-> "unset", queued |-> FALSE,
      correction |-> FALSE, rechecked |-> FALSE,
      acceptedCandidate |-> "none",
+     prewriteCommit |-> <<"source", w>>,
+     prewriteTrusted |-> TRUE,
+     prewriteFailures |-> {<<"test", "known">>},
+     targetCommit |-> <<"target", w, 1>>,
+     targetBaselineCommit |-> <<"target", w, 1>>,
+     targetFailures |-> {<<"test", "known">>},
+     targetTrusted |-> TRUE,
+     canonicalOutcome |-> "unset", canonicalFailures |-> {},
+     canonicalComplete |-> FALSE, canonicalHarnessError |-> FALSE,
+     canonicalProcessLeak |-> FALSE, canonicalUnexplained |-> FALSE,
+     canonicalCandidate |-> "none", canonicalReferencePassed |-> FALSE,
+     testedFailures |-> {}, testedComplete |-> FALSE,
+     testedReferencePassed |-> FALSE,
+     landingOutcome |-> "unset", landingCandidate |-> "none",
+     landingFailures |-> {}, landingComplete |-> FALSE,
+     landingHarnessError |-> FALSE, landingProcessLeak |-> FALSE,
+     landingUnexplained |-> FALSE, landingReferencePassed |-> FALSE,
      learnerMode |-> "unset", expertise |-> 0,
      expertiseBeforeLearning |-> 0]]
 
@@ -155,13 +183,59 @@ CorrectCandidate(w) == /\ s[w].phase \in {"reviewed", "tested"}
                                              ![w].correction = TRUE, ![w].credit = {},
                                              ![w].reviewKind = "none",
                                              ![w].routeMode = "unset",
+                                             ![w].canonicalOutcome = "unset",
+                                             ![w].testedComplete = FALSE,
                                              ![w].learnerMode = "unset"]
+\* A complete canonical command can still contain known assertion failures.
+\* Reference evidence must independently pass. All cases retain exact test IDs.
+CanonicalResult(w, kind) ==
+    /\ w \notin ReviewOnly /\ s[w].phase = "reviewed"
+    /\ s[w].canonicalOutcome = "unset"
+    /\ kind \in {"pass", "known", "new", "incomplete", "harness",
+                 "leak", "unexplained", "misbound", "reference-fail"}
+    /\ kind \in CanonicalKinds
+    /\ s' = [s EXCEPT ![w].canonicalOutcome = kind,
+                         ![w].canonicalFailures =
+                             IF kind = "known" THEN {<<"test", "known">>}
+                             ELSE IF kind = "new" THEN {<<"test", "new">>}
+                             ELSE {},
+                         ![w].canonicalComplete = kind # "incomplete",
+                         ![w].canonicalHarnessError = kind = "harness",
+                         ![w].canonicalProcessLeak = kind = "leak",
+                         ![w].canonicalUnexplained = kind = "unexplained",
+                         ![w].canonicalCandidate = IF kind = "misbound"
+                             THEN <<"candidate", "other">> ELSE s[w].candidate,
+                         ![w].canonicalReferencePassed = kind # "reference-fail"]
+CanonicalSafe(w) ==
+    /\ s[w].canonicalOutcome # "unset"
+    /\ s[w].canonicalComplete /\ ~s[w].canonicalHarnessError
+    /\ ~s[w].canonicalProcessLeak /\ ~s[w].canonicalUnexplained
+    /\ s[w].canonicalCandidate = s[w].candidate
+    /\ s[w].canonicalReferencePassed
+TesterBaselineSafe(w) ==
+    /\ CanonicalSafe(w)
+    /\ s[w].canonicalFailures \subseteq s[w].prewriteFailures
+    /\ s[w].prewriteTrusted
+    /\ s[w].prewriteCommit = <<"source", w>>
+PrewriteBaselineCorrupt(w, kind) ==
+    /\ w \notin ReviewOnly /\ s[w].phase = "reviewed"
+    /\ CorruptPrewrite
+    /\ kind \in {"untrusted", "misbound"}
+    /\ s[w].prewriteTrusted /\ s[w].prewriteCommit = <<"source", w>>
+    /\ s' = [s EXCEPT ![w].prewriteTrusted = kind # "untrusted",
+                         ![w].prewriteCommit = IF kind = "misbound"
+                             THEN <<"source", "other">> ELSE @]
 Tester(w) == /\ s[w].phase = "reviewed" /\ ~s[w].failed
              /\ ~s[w].canceled
              /\ w \notin ReviewOnly
+             /\ s[w].canonicalOutcome # "unset"
              /\ (CheckEvidence => s[w].credit = {CurrentEvidence(w, s[w].generation)})
+             /\ (GuardBaseline => TesterBaselineSafe(w))
              /\ s' = [s EXCEPT ![w].phase = "tested",
                                    ![w].acceptedCandidate = s[w].candidate,
+                                   ![w].testedFailures = s[w].canonicalFailures,
+                                   ![w].testedComplete = CanonicalSafe(w),
+                                   ![w].testedReferencePassed = s[w].canonicalReferencePassed,
                                    ![w].expertiseBeforeLearning = s[w].expertise]
 LearnCapture(w) == /\ s[w].phase = "tested" /\ ~s[w].failed
                    /\ ~s[w].canceled
@@ -176,10 +250,50 @@ Ready(w) == /\ s[w].phase = "learned" /\ ~s[w].failed
             /\ ~s[w].canceled
             /\ s[w].acceptedCandidate = s[w].candidate
             /\ s' = [s EXCEPT ![w].phase = "ready"]
-LandingVerify(w) == /\ w \notin ReviewOnly
+\* Landing uses the target captured at landing start, not the retained
+\* pre-write baseline. A rebase can invalidate an earlier acceptance.
+LandingResult(w, kind) ==
+    /\ w \notin ReviewOnly /\ s[w].phase = "ready"
+    /\ s[w].landingOutcome = "unset" /\ kind \in LandingKinds
+    /\ s' = [s EXCEPT ![w].landingOutcome = kind,
+                         ![w].landingCandidate = IF kind = "misbound"
+                             THEN <<"candidate", "other">> ELSE s[w].candidate,
+                         ![w].landingFailures =
+                             IF kind = "known" THEN {<<"test", "known">>}
+                             ELSE IF kind = "new" THEN {<<"test", "new">>}
+                             ELSE {},
+                         ![w].landingComplete = kind # "incomplete",
+                         ![w].landingHarnessError = kind = "harness",
+                         ![w].landingProcessLeak = kind = "leak",
+                         ![w].landingUnexplained = kind = "unexplained",
+                         ![w].landingReferencePassed = kind # "reference-fail"]
+LandingBaselineSafe(w) ==
+    /\ s[w].targetTrusted
+    /\ s[w].targetBaselineCommit = s[w].targetCommit
+    /\ s[w].landingOutcome # "unset"
+    /\ s[w].landingCandidate = s[w].candidate
+    /\ s[w].landingComplete /\ ~s[w].landingHarnessError
+    /\ ~s[w].landingProcessLeak /\ ~s[w].landingUnexplained
+    /\ s[w].landingReferencePassed
+    /\ s[w].landingFailures \subseteq s[w].targetFailures
+LandingVerify(w) == /\ (w \notin ReviewOnly \/ ~GuardReviewRoute)
                     /\ s[w].phase = "ready" /\ ~s[w].failed
                     /\ ~s[w].canceled
+                    /\ (s[w].landingOutcome # "unset"
+                        \/ (w \in ReviewOnly /\ ~GuardReviewRoute))
+                    /\ (GuardLandingBaseline =>
+                        (w \in ReviewOnly \/ LandingBaselineSafe(w)))
                     /\ s' = [s EXCEPT ![w].phase = "verified"]
+TargetBaseline(w, kind) ==
+    /\ w \notin ReviewOnly /\ s[w].phase = "ready"
+    /\ kind \in {"unchanged", "cleared", "untrusted", "misbound"}
+    /\ kind \in TargetKinds
+    /\ s[w].targetCommit = <<"target", w, 1>>
+    /\ s' = [s EXCEPT ![w].targetCommit = <<"target", w, 2>>,
+                         ![w].targetBaselineCommit = IF kind = "misbound"
+                             THEN <<"target", w, 1>> ELSE <<"target", w, 2>>,
+                         ![w].targetFailures = IF kind = "cleared" THEN {} ELSE @,
+                         ![w].targetTrusted = kind # "untrusted"]
 ReviewOnlyStart(w) == /\ w \in ReviewOnly
                       /\ s[w].phase = "authorized" /\ ~s[w].failed
                       /\ ~s[w].canceled
@@ -198,8 +312,9 @@ ReviewOnlyReady(w) == /\ w \in ReviewOnly /\ s[w].phase = "reviewed"
                       /\ ~s[w].failed /\ ~s[w].canceled
                       /\ s[w].credit = {CurrentEvidence(w, s[w].generation)}
                       /\ s[w].acceptedCandidate = s[w].candidate
-                      /\ s' = [s EXCEPT ![w].phase = "review-only-complete"]
-Intent(w) == /\ w \notin ReviewOnly
+                      /\ s' = [s EXCEPT ![w].phase = IF GuardReviewRoute
+                          THEN "review-only-complete" ELSE "ready"]
+Intent(w) == /\ (w \notin ReviewOnly \/ ~GuardReviewRoute)
              /\ s[w].phase = "verified" /\ ~s[w].failed
              /\ ~s[w].canceled
              /\ s' = [s EXCEPT ![w].phase = "intent",
@@ -294,8 +409,20 @@ Next == \E w \in Works:
     \/ (\E kind \in {"candidate", "requirement", "context", "scope"}:
            MisboundEvidence(w, kind))
     \/ TargetedReview(w) \/ RecheckSameCandidate(w) \/ CarryForward(w)
-    \/ CorrectCandidate(w) \/ Tester(w) \/ LearnCapture(w)
-    \/ LearnNoExpertise(w) \/ Ready(w) \/ LandingVerify(w)
+    \/ CorrectCandidate(w) \/ CanonicalResult(w, "pass")
+    \/ (\E kind \in {"known", "new", "incomplete", "harness",
+                       "leak", "unexplained", "misbound", "reference-fail"}:
+           CanonicalResult(w, kind))
+    \/ (\E kind \in {"untrusted", "misbound"}:
+           PrewriteBaselineCorrupt(w, kind))
+    \/ Tester(w) \/ LearnCapture(w)
+    \/ LearnNoExpertise(w) \/ Ready(w) \/ LandingResult(w, "pass")
+    \/ (\E kind \in {"known", "new", "incomplete", "harness", "leak",
+                       "unexplained", "misbound", "reference-fail"}:
+           LandingResult(w, kind))
+    \/ LandingVerify(w)
+    \/ (\E kind \in {"unchanged", "cleared", "untrusted", "misbound"}:
+           TargetBaseline(w, kind))
     \/ ReviewOnlyStart(w) \/ ReviewOnlyReview(w) \/ ReviewOnlyReady(w)
     \/ Intent(w) \/ GitEffect(w) \/ PublishResult(w)
     \/ FollowUpStart(w) \/ FollowUp(w) \/ RetryEffect(w)
@@ -355,7 +482,20 @@ AcceptedBaselineSafe == \A w \in Works:
     s[w].phase \notin {"learned", "ready", "verified", "intent", "git",
                        "published", "follow-up-pending", "follow-up",
                        "review-only-complete"}
-    \/ s[w].acceptedCandidate = s[w].candidate
+    \/ (s[w].acceptedCandidate = s[w].candidate
+        /\ (w \in ReviewOnly \/
+            (s[w].testedComplete /\ s[w].testedReferencePassed
+             /\ s[w].prewriteTrusted
+             /\ s[w].prewriteCommit = <<"source", w>>
+             /\ s[w].testedFailures \subseteq s[w].prewriteFailures)))
+KnownFailureUnreachable == \A w \in Works:
+    ~(s[w].phase = "tested" /\ s[w].testedFailures = {<<"test", "known">>})
+KnownLandingUnreachable == \A w \in Works:
+    ~(s[w].phase = "verified" /\ s[w].landingFailures = {<<"test", "known">>})
+LandingAcceptanceSafe == \A w \in Works:
+    s[w].phase \notin {"verified", "intent", "git", "published",
+                       "follow-up-pending", "follow-up"}
+    \/ LandingBaselineSafe(w)
 LearnerModeSafe == \A w \in Works:
     s[w].phase \notin {"learned", "ready", "verified", "intent", "git",
                        "published", "follow-up-pending", "follow-up"}
@@ -382,6 +522,7 @@ ReviewOnlySafe == \A w \in ReviewOnly:
     /\ s[w].phase \notin {"dispatched", "delivered", "written", "tested",
                           "learned", "verified", "intent", "git", "published",
                           "follow-up-pending", "follow-up"}
+ReviewOnlyNoGit == \A w \in ReviewOnly: ~s[w].git
 
 \* Progress depends on a finite failure budget, enabled recovery, and a
 \* continuing public scheduler/operator. FairSpec states only local recovery
