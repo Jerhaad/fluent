@@ -7812,7 +7812,11 @@ fn writer_completion_plan_fixture(tmp: &TempDir) -> WriterRecoveryFixture {
     fixture
 }
 
-fn run_writer_completion_plan_successor(fixture: &WriterRecoveryFixture, tmp: &TempDir) {
+fn run_writer_completion_plan_successor(
+    fixture: &WriterRecoveryFixture,
+    tmp: &TempDir,
+    queued: bool,
+) {
     let store = WorkModelStore::new(&fixture.project);
     let approved = store.read_work_item(&fixture.work).unwrap();
     assert_eq!(approved.attempts[0].tasks.len(), 2);
@@ -7843,14 +7847,68 @@ git -C "$RECOVERY_WORKSPACE" add integration.txt
 git -C "$RECOVERY_WORKSPACE" commit -m 'Complete integration work'
 "#,
     );
-    fluent_cmd()
-        .current_dir(&fixture.project)
-        .args(["attempt", "run", &fixture.work, "attempt-1", "--no-sandbox"])
-        .env("PATH", mock_path(&bin))
-        .env("RECOVERY_AREA", &area)
-        .env("RECOVERY_WORKSPACE", &fixture.workspace)
-        .assert()
-        .success();
+    if queued {
+        struct PlanQueueRunner {
+            bin: PathBuf,
+            area: PathBuf,
+            workspace: PathBuf,
+        }
+        impl fluent::scheduler::AttemptRunner for PlanQueueRunner {
+            fn run(
+                &self,
+                project: &Path,
+                work: &str,
+                attempt: &str,
+                _: bool,
+            ) -> anyhow::Result<fluent::scheduler::AttemptOutcome> {
+                let ledger = fluent::queue::read_ledger(project, work)?.unwrap();
+                let dispatch = ledger.active().unwrap();
+                let output = fluent_cmd()
+                    .current_dir(project)
+                    .env("PATH", mock_path(&self.bin))
+                    .env("RECOVERY_AREA", &self.area)
+                    .env("RECOVERY_WORKSPACE", &self.workspace)
+                    .args([
+                        "attempt",
+                        "run",
+                        work,
+                        attempt,
+                        "--dispatch-id",
+                        &dispatch.dispatch_id,
+                        "--no-sandbox",
+                    ])
+                    .output()?;
+                anyhow::ensure!(
+                    output.status.success(),
+                    "queued correction failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                fluent::scheduler::classify_attempt_outcome(project, work, attempt)
+            }
+        }
+        let dispatch = fluent::scheduler::pick_next_queued(&fixture.project)
+            .unwrap()
+            .unwrap();
+        fluent::scheduler::dispatch_one(
+            &fixture.project,
+            &dispatch,
+            &PlanQueueRunner {
+                bin: bin.clone(),
+                area,
+                workspace: fixture.workspace.clone(),
+            },
+        )
+        .unwrap();
+    } else {
+        fluent_cmd()
+            .current_dir(&fixture.project)
+            .args(["attempt", "run", &fixture.work, "attempt-1", "--no-sandbox"])
+            .env("PATH", mock_path(&bin))
+            .env("RECOVERY_AREA", &area)
+            .env("RECOVERY_WORKSPACE", &fixture.workspace)
+            .assert()
+            .success();
+    }
     let completed = store.read_work_item(&fixture.work).unwrap();
     assert_eq!(completed.attempts[0].tasks[1].status, TaskStatus::Complete);
     assert_eq!(
@@ -7903,7 +7961,7 @@ fn writer_completion_plan_public_continuation() {
         .success();
     let approved = store.read_work_item(&fixture.work).unwrap();
     assert_eq!(approved.attempts[0].tasks[0], before.attempts[0].tasks[0]);
-    run_writer_completion_plan_successor(&fixture, &tmp);
+    run_writer_completion_plan_successor(&fixture, &tmp, false);
     let completed = store.read_work_item(&fixture.work).unwrap();
     fluent_cmd()
         .current_dir(&fixture.project)
@@ -8052,7 +8110,7 @@ fn writer_completion_plan_existing_approval_continues() {
         store.read_work_item(&fixture.work).unwrap().attempts[0].tasks,
         current.attempts[0].tasks
     );
-    run_writer_completion_plan_successor(&fixture, &tmp);
+    run_writer_completion_plan_successor(&fixture, &tmp, false);
 }
 
 #[test]
@@ -8094,9 +8152,84 @@ fn writer_completion_plan_replays_same_successor() {
         .args(["queue", "resume", &fixture.work, "--attempt", "attempt-1"])
         .assert()
         .success();
+    let queued = fluent::queue::read_ledger(&fixture.project, &fixture.work)
+        .unwrap()
+        .unwrap();
+    let dispatch_id = queued.active().unwrap().dispatch_id.clone();
+    command();
+    assert_eq!(
+        fluent::queue::read_ledger(&fixture.project, &fixture.work)
+            .unwrap()
+            .unwrap()
+            .active()
+            .unwrap()
+            .dispatch_id,
+        dispatch_id
+    );
     assert_eq!(
         store.read_work_item(&fixture.work).unwrap().attempts[0].tasks,
         second.attempts[0].tasks
+    );
+    run_writer_completion_plan_successor(&fixture, &tmp, true);
+    let completed = store.read_work_item(&fixture.work).unwrap();
+    assert_eq!(completed.attempts[0].tasks.len(), 2);
+    assert_eq!(completed.attempts[0].tasks[0], first.attempts[0].tasks[0]);
+    let reconciled = fluent::queue::read_ledger(&fixture.project, &fixture.work)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        reconciled.dispatches.last().unwrap().status,
+        fluent::queue::DispatchStatus::NeedsUser
+    );
+}
+
+#[test]
+fn writer_completion_plan_queue_claim_rejects_changed_source() {
+    let tmp = TempDir::new().unwrap();
+    let fixture = writer_completion_plan_fixture(&tmp);
+    fluent_cmd()
+        .current_dir(&fixture.project)
+        .args([
+            "attempt",
+            "repair-writer-completion",
+            &fixture.work,
+            "attempt-1",
+            "--resolution",
+            &fixture.resolution,
+        ])
+        .assert()
+        .success();
+    fluent_cmd()
+        .current_dir(&fixture.project)
+        .args(["queue", "resume", &fixture.work, "--attempt", "attempt-1"])
+        .assert()
+        .success();
+    let store = WorkModelStore::new(&fixture.project);
+    let before = store.read_work_item(&fixture.work).unwrap();
+    let ledger_before = fluent::queue::read_ledger(&fixture.project, &fixture.work)
+        .unwrap()
+        .unwrap();
+    let source_matrix = fixture
+        .project
+        .join(
+            &before.attempts[0].tasks[0]
+                .artifact_area
+                .as_ref()
+                .unwrap()
+                .path,
+        )
+        .join("writer-completion.json");
+    fs::write(source_matrix, b"changed source matrix").unwrap();
+    let error = fluent::queue::claim(&fixture.project, &fixture.work, "attempt-1")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("source matrix changed"), "{error}");
+    assert_eq!(store.read_work_item(&fixture.work).unwrap(), before);
+    assert_eq!(
+        fluent::queue::read_ledger(&fixture.project, &fixture.work)
+            .unwrap()
+            .unwrap(),
+        ledger_before
     );
 }
 
@@ -8269,7 +8402,7 @@ fn writer_completion_plan_context_preserves_obligations() {
         ])
         .assert()
         .success();
-    run_writer_completion_plan_successor(&fixture, &tmp);
+    run_writer_completion_plan_successor(&fixture, &tmp, false);
     let store = WorkModelStore::new(&fixture.project);
     let item = store.read_work_item(&fixture.work).unwrap();
     let source = &item.attempts[0].tasks[0];
