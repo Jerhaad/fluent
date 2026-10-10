@@ -75,10 +75,6 @@ pub fn cleanup_work_items(
         let _land_lock = crate::land_lock::acquire(&crate::land_lock::lock_path(&source_root))?;
         store.list_work_items()?
     };
-    let stored_work_item_ids = work_items
-        .iter()
-        .map(|work_item| work_item.id.clone())
-        .collect::<HashSet<_>>();
     let candidates = cleanup_work_item_candidates(&source_root, work_items);
     #[cfg(feature = "test-support")]
     if let (Ok(reached), Ok(release)) = (
@@ -142,9 +138,23 @@ pub fn cleanup_work_items(
     }
 
     let _land_lock = crate::land_lock::acquire(&crate::land_lock::lock_path(&source_root))?;
+    let stored_work_item_ids = store
+        .list_work_item_ids()?
+        .into_iter()
+        .collect::<HashSet<_>>();
     for plan in
         orphan_work_artifact_cleanup_plans(&source_root, &stored_work_item_ids, options.apply)?
     {
+        // Creation takes the same model lock. Keep it through removal so a
+        // newly published Work Item cannot lose its artifact root.
+        let model_lock = if crate::work_model::validate_work_item_id(&plan.work_item_id).is_ok() {
+            Some(store.lock_work_item_model(&plan.work_item_id)?)
+        } else {
+            None
+        };
+        if model_lock.is_some() && store.work_item_path(&plan.work_item_id)?.exists() {
+            continue;
+        }
         if options.apply {
             apply_orphan_work_artifact_cleanup(&plan)?;
         }

@@ -21225,6 +21225,58 @@ fn workflow_cleanup_rechecks_current_eligibility() {
 }
 
 #[test]
+fn workflow_cleanup_retains_artifacts_created_after_selection() {
+    let tmp = TempDir::new().unwrap();
+    let project = setup_git_project(&tmp);
+    let artifacts = project.join(".fluent/work/artifacts");
+    let orphan = artifacts.join("cleanup-orphan");
+    fs::create_dir_all(&orphan).unwrap();
+    fs::write(orphan.join("evidence.txt"), b"orphan").unwrap();
+    let reached = tmp.path().join("cleanup-selected");
+    let release = tmp.path().join("cleanup-release");
+    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("fluent"));
+    command
+        .current_dir(&project)
+        .args(["cleanup", "--apply"])
+        .env("FLUENT_TEST_CLEANUP_SELECTED", &reached)
+        .env("FLUENT_TEST_CLEANUP_RELEASE", &release)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = OwnedFixtureProcess::spawn(&mut command);
+    for _ in 0..500 {
+        if reached.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(reached.exists(), "cleanup did not reach selection barrier");
+    fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "work-item",
+            "create",
+            "cleanup-new",
+            "--title",
+            "New work during cleanup",
+        ])
+        .assert()
+        .success();
+    let retained = artifacts.join("cleanup-new");
+    fs::create_dir_all(&retained).unwrap();
+    fs::write(retained.join("evidence.txt"), b"retain").unwrap();
+    fs::write(&release, b"continue").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(project.join(".fluent/work/items/cleanup-new.json").exists());
+    assert_eq!(fs::read(retained.join("evidence.txt")).unwrap(), b"retain");
+    assert!(!orphan.exists(), "genuine orphan was not removed");
+}
+
+#[test]
 fn workflow_cleanup_holds_eligibility_through_removal() {
     use fluent::work_model::{AttemptStatus, WorkItem};
     let tmp = TempDir::new().unwrap();
