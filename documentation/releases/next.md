@@ -2,12 +2,13 @@
 
 ## Move unfinished Work forward
 
-Stop the old shared scheduler before the new binary writes Work state. Use
-`fluent scheduler stop --all` from any registered project, then wait for the
-command to finish. `fluent scheduler stop` without `--all` stops claims only
-for the current project. If the old service cannot report a completed drain,
-stop its original supervised process and settle its active Work before
-starting the replacement. Do not start a second service while the old owner
+Stop the old shared scheduler before the new binary writes Work state. With
+v0.5.0, run `fluent scheduler stop` from a registered project and wait for the
+old service process to exit. The `--all` flag belongs to the newer binary and
+is not accepted by v0.5.0. Confirm active Work in each registered project has
+settled before starting the replacement. If the old service cannot report a
+completed drain, stop its original supervised process and settle its active
+Work before starting the replacement. Do not start a second service while the old owner
 still holds the service socket or lock.
 
 Inspect Work with `fluent work-item show <id>` and run

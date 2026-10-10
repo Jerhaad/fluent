@@ -60,7 +60,7 @@ def project_service(trace):
     for index, (event, boundary, operation) in enumerate(zip(
             (old, stopped, new),
             ("old-owner", "old-owner-settled", "new-owner"),
-            ("scheduler-run", "scheduler-stop-all", "scheduler-run")), 1):
+            ("scheduler-run", "scheduler-stop", "scheduler-run")), 1):
         assert event["sequence"] == index
         assert event["boundary"] == boundary and event["operation-id"] == operation
         assert event["causal-predecessors"] == ([] if index == 1 else [index - 1])
@@ -74,14 +74,33 @@ def project_service(trace):
     assert old_health["build"] != new_health["build"]
     assert old_health["generation"] == new_health["generation"]
     assert settled["stop-exit-code"] == 0
-    assert "Stopped shared scheduler" in settled["stop-stdout"]
+    assert isinstance(settled["stop-stdout"], str)
     assert settled["owned-worker-started"] is True
+    owned = settled["owned-workers"]
+    assert len(owned) > 0
+    assert all(worker["work_item_id"] in {"first", "second"}
+               and worker["attempt_id"] == "attempt-1"
+               and worker["dispatch_id"]
+               and isinstance(worker["project"], str) and worker["project"]
+               and type(worker["pid"]) is int and worker["pid"] > 0
+               and worker["status-before-stop"] in {"claimed", "running"}
+               and worker["status-after-stop"] in {"candidate-ready", "failed", "needs-user", "canceled", "blocked"}
+               for worker in owned)
+    assert len({(worker["project"], worker["dispatch_id"]) for worker in owned}) == len(owned)
     active = settled["active-work"]
     terminal = {"candidate-ready", "failed", "needs-user", "canceled", "blocked"}
     assert len(active) == 2
     assert all(work["status"] in terminal | {"queued"} for work in active)
     assert any(work["status"] in terminal for work in active)
-    assert replacement["stale-stop-refused"] is True
+    assert all(any(work["work_item_id"] == worker["work_item_id"]
+                   and work["dispatch_id"] == worker["dispatch_id"]
+                   and work["bound_attempt_id"] == worker["attempt_id"]
+                   and work["status"] == worker["status-after-stop"]
+                   for work in active) for worker in owned)
+    stale = replacement["stale-stop"]
+    assert stale["requested-instance"] == old_health["instance_id"]
+    assert f"stale drain request for {stale['requested-instance']} rejected" in stale["error"]
+    assert stale["health-after"] == new_health
     assert len(settled["queues"]) == len(replacement["queues"]) == 2
     assert all(queue["status"] == "queued" for queue in settled["queues"])
     assert all(queue["work_item_id"] == prior["work_item_id"]

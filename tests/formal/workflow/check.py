@@ -736,17 +736,23 @@ def release_transition_suite(source, root, output, jar, java):
     results.append({"case": "service-projection", "pass": service_projection.returncode == 0,
                     "log": "service-projection.log"})
     if service_projection.returncode == 0:
-        corrupted = json.loads(service_trace.read_text())
-        corrupted["events"][2]["raw-facts"]["health"]["instance_id"] = \
-            corrupted["events"][0]["raw-facts"]["health"]["instance_id"]
-        negative_path = output / "service-negative.json"
-        negative_path.write_text(json.dumps(corrupted))
-        negative = subprocess.run([*service_command[:2], str(negative_path),
-                                   *service_command[3:]], cwd=root,
-                                  capture_output=True, text=True)
-        (output / "service-negative.log").write_text(negative.stdout + negative.stderr)
-        results.append({"case": "service-negative", "pass": negative.returncode != 0,
-                        "log": "service-negative.log"})
+        for name, mutate in (
+                ("service-identity-negative", lambda trace: trace["events"][2]["raw-facts"]["health"].update(
+                    instance_id=trace["events"][0]["raw-facts"]["health"]["instance_id"])),
+                ("service-worker-negative", lambda trace: trace["events"][1]["raw-facts"]["owned-workers"][0].update(
+                    dispatch_id="unobserved-dispatch")),
+                ("service-stale-stop-negative", lambda trace: trace["events"][2]["raw-facts"]["stale-stop"].update(
+                    error="invalid scheduler service instance identity"))):
+            corrupted = json.loads(service_trace.read_text())
+            mutate(corrupted)
+            negative_path = output / f"{name}.json"
+            negative_path.write_text(json.dumps(corrupted))
+            negative = subprocess.run([*service_command[:2], str(negative_path),
+                                       *service_command[3:]], cwd=root,
+                                      capture_output=True, text=True)
+            (output / f"{name}.log").write_text(negative.stdout + negative.stderr)
+            results.append({"case": name, "pass": negative.returncode != 0,
+                            "log": f"{name}.log"})
     results.append(run_case(source, output, jar, java, "service-competition.cfg", None))
     results.append(run_case(source, output, jar, java, "negative-guardversion.cfg",
                             CONTROLS["guardversion"]))
