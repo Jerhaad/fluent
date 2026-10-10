@@ -1881,6 +1881,14 @@ enforce the same candidate-bound contract.
 The queue and executor therefore depend on this boundary without importing the
 host-evidence implementation.
 
+For a classified source correction, the executor admits the exact
+`classification.json` audit as a correction input. The prompt identifies source
+correction as the current action, includes the authorized instructions, and
+names the audit that retains the earlier evidence and candidate binding.
+`recovery_contracts` checks the audit bytes again when the prompt is built
+after reservation. The sandbox grants that file without granting its parent
+directory. Missing, changed, or oversized required input stops launch.
+
 If that code-change disposition plans a corrective Writer and the operator
 interrupts it before it produces output, replacement evidence remains eligible
 only against that exact evidence Review and unchanged clean candidate. Accepting

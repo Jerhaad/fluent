@@ -10633,12 +10633,16 @@ separate.
 
 ### B1
 
-WHEN a Writer starts or resumes under a valid recorded completion recovery,
-THE SYSTEM SHALL deliver the complete authorized instructions and exact readable
-evidence references through the selected Writer prompt path, including the
-applicable no-change declaration path and completion contract.
+WHEN a Writer starts or resumes under an approved recovery, THE SYSTEM SHALL
+deliver its complete current authorized instructions and validated evidence
+references through the context actually supplied to that Writer, including
+host-evidence source corrections and the other supported Writer recovery paths.
+The applicable no-change declaration and completion contract remain available.
+Full content may use a permitted readable reference within the current prompt
+and access limits.
 Test: tests/binary.rs (writer_recovery_context_delivers_recorded_resolution)
 Test: tests/binary.rs (declared_sandbox_input_reads_exact_writer_recovery)
+Test: tests/binary.rs (classified_writer_receives_current_authorized_instructions)
 
 ### B2
 
@@ -10650,11 +10654,22 @@ Test: tests/binary.rs (writer_recovery_context_preserves_pending_obligations)
 
 ### B3
 
-IF required recovery instructions or evidence are invalid, unreadable, or exceed
-the existing delivery bounds, THEN THE SYSTEM SHALL reject launch with the
-specific missing condition. Historical metadata text alone SHALL NOT authorize
-rewriting the recorded candidate's ancestry.
+IF required recovery instructions or evidence cannot be validated or delivered
+within the permitted access and context limits, THEN THE SYSTEM SHALL reject
+Writer launch with the specific blocking condition. Historical metadata text
+alone SHALL NOT authorize rewriting the recorded candidate's ancestry, and
+invalid input cannot be repaired by widening worker access.
 Test: tests/binary.rs (writer_recovery_context_rejects_invalid_delivery)
+Test: tests/binary.rs (classified_writer_rejects_invalid_required_inputs_before_launch)
+
+### B4
+
+WHEN an approved source correction follows an earlier request for more host
+evidence, THE SYSTEM SHALL identify the source correction as the current
+assigned action in the Writer context. It SHALL retain the earlier evidence,
+classification authorization, exact candidate bindings, and remaining
+verification gates.
+Test: tests/binary.rs (classified_writer_context_identifies_current_assignment)
 
 ## Interrupted candidate restoration
 
