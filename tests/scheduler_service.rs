@@ -108,10 +108,24 @@ struct ReleasedServiceFixtureDirs {
 }
 
 fn released_service_fixture_dirs() -> ReleasedServiceFixtureDirs {
-    let root = TempDir::new().unwrap();
+    // The service socket must fit sockaddr_un.sun_path on macOS. The default
+    // temporary directory is already long before we add the private root.
+    let root = TempDir::new_in("/tmp").unwrap();
     let home = TempDir::new_in(root.path()).unwrap();
     let first = TempDir::new_in(root.path()).unwrap();
     let second = TempDir::new_in(root.path()).unwrap();
+    use std::os::unix::ffi::OsStrExt;
+    let socket = scheduler_service::socket_path(home.path());
+    let socket_bytes = socket.as_os_str().as_bytes().len();
+    let sun_path_bytes = std::mem::size_of::<libc::sockaddr_un>()
+        - std::mem::offset_of!(libc::sockaddr_un, sun_path);
+    assert!(
+        socket_bytes < sun_path_bytes,
+        "released service socket path needs a terminating NUL: {} bytes in a {}-byte sun_path: {}",
+        socket_bytes,
+        sun_path_bytes,
+        socket.display()
+    );
     ReleasedServiceFixtureDirs {
         home,
         first,
@@ -124,6 +138,18 @@ fn released_service_fixture_dirs() -> ReleasedServiceFixtureDirs {
 fn released_service_fixture_cleans_managed_worktrees_between_allocations() {
     let previous_workspace = {
         let dirs = released_service_fixture_dirs();
+        use std::os::unix::ffi::OsStrExt;
+        let socket = scheduler_service::socket_path(dirs.home.path());
+        let socket_bytes = socket.as_os_str().as_bytes().len();
+        let sun_path_bytes = std::mem::size_of::<libc::sockaddr_un>()
+            - std::mem::offset_of!(libc::sockaddr_un, sun_path);
+        assert!(
+            socket_bytes < sun_path_bytes,
+            "released service socket path needs a terminating NUL: {} bytes in a {}-byte sun_path: {}",
+            socket_bytes,
+            sun_path_bytes,
+            socket.display()
+        );
         for project in [&dirs.home, &dirs.first, &dirs.second] {
             assert!(project.path().starts_with(dirs.root.path()));
         }
