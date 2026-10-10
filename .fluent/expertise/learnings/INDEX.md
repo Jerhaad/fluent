@@ -78,6 +78,7 @@
 - [legacy-evidence-compatibility-stays-isolated](legacy-evidence-compatibility-stays-isolated.md) — Recover historical evidence through a separate exact compatibility classifier that cannot weaken current execution rules
 - [legacy-plan-commands-use-complete-approved-row](legacy-plan-commands-use-complete-approved-row.md) — Recover missing host commands from the complete approved Plan row while preserving stored command metadata and rejecting ambiguity
 - [legacy-recovery-rechecks-active-blockers](legacy-recovery-rechecks-active-blockers.md) — Historical hook output can authorize retired findings only; recheck active blockers across the complete candidate range
+- [legacy-scheduler-stop-is-project-scoped](legacy-scheduler-stop-is-project-scoped.md) — The v0.5.0 scheduler stop command drains one project coordinator but leaves its shared service running
 - [local-execution-identity-requires-receipt](local-execution-identity-requires-receipt.md) — Resolve versioned local execution ownership from a generation-bound child receipt and inherited lock, not record state alone
 - [lock-ordering-across-subsystems](lock-ordering-across-subsystems.md) — Release the queue lock before mutating the Work model; the codebase has a lock hierarchy that must not be inverted
 - [log-append-across-retries](log-append-across-retries.md) — Retried operation logs must append with timestamps rather than truncate so prior failures are preserved
@@ -129,6 +130,7 @@
 - [registry-read-modify-write-needs-flock](registry-read-modify-write-needs-flock.md) — JSON registry read-modify-write operations need flock around the full read-write pair; atomic_write alone only protects the individual write
 - [rejection-tests-snapshot-owned-trees](rejection-tests-snapshot-owned-trees.md) — A CLI rejection that promises no mutation must snapshot every project and home tree it can manage, byte-for-byte, including pre-existing files and empty directories
 - [release-fixture-process-group-ownership](release-fixture-process-group-ownership.md) — Own every process group a long-lived release fixture launches and verify cleanup during unwinding before fallback teardown
+- [release-fixture-roots-cover-managed-worktrees](release-fixture-roots-cover-managed-worktrees.md) — Isolate release fixture projects with their sibling managed worktrees while keeping the scheduler socket path short
 - [release-suite-scoped-process-guard](release-suite-scoped-process-guard.md) — Declared release commands compare root-scoped process inventories before and after each suite to report surviving Fluent or provider processes
 - [reloaded-authority-config-validates-before-ingress](reloaded-authority-config-validates-before-ingress.md) — Validate every live authority configuration reload before persisting ingress or evaluating an approval
 - [required-checks-outlive-individual-results](required-checks-outlive-individual-results.md) — Retain independent check obligations after proof changes or finding acceptance, regardless of Task ordering
