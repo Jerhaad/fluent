@@ -369,11 +369,13 @@ fn workflow_assurance_report_rejects_missing_and_misbound_evidence() {
             .sum::<usize>(),
         22
     );
-    assert!(behaviors.iter().all(|behavior| behavior["tests"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .all(|test| test["state"] == "pending")));
+    assert!(behaviors.iter().all(|behavior| {
+        behavior["tests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|test| test["state"] == "pending")
+    }));
     assert!(result["approved-contracts-sha256"].is_string());
     assert!(result["suite-source-sha256"]["integrated-projector"].is_string());
     assert!(result["connection-inventory-sha256"].is_string());
