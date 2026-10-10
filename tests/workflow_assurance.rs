@@ -544,6 +544,14 @@ with tempfile.TemporaryDirectory() as temporary:
     rows, missing = report.approved_contracts(source, results, 'candidate-a', binary)
     assert not missing and all(test['state'] == 'pass'
                                for row in rows for test in row['tests'])
+    receipt['cases'][0]['pass'] = False
+    path.write_text(json.dumps(receipt))
+    rows, missing = report.approved_contracts(source, results, 'candidate-a', binary)
+    assert len(missing) == 1 and rows[0]['tests'][0]['state'] == 'fail'
+    assert all(test['state'] == 'pass' for row in rows
+               for test in row['tests'] if test['name'] != cases[0]['name'])
+    receipt['cases'][0]['pass'] = True
+    path.write_text(json.dumps(receipt))
     (output / cases[0]['log']).write_text('changed\n')
     rows, missing = report.approved_contracts(source, results, 'candidate-a', binary)
     assert missing and rows[0]['tests'][0]['state'] == 'pending'

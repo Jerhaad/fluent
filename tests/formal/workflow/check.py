@@ -197,24 +197,27 @@ def integrated_suite(source, root, output, jar, java):
             except (KeyError, TypeError, ValueError):
                 pass
         complete = discovered == {test["name"] for test in selected}
-        command = base + ["run", "--offline", "--features", "test-support", "--test",
-                          binary_name, "--no-tests", "fail", "-E", expression]
+        discovery_log = output / ("named-discovery-" + binary_name + ".log")
+        discovery_log.write_text("$ " + " ".join(list_command) + "\n" +
+                                 listed.stdout + listed.stderr)
         environment = dict(os.environ)
         environment["FLUENT_WORKFLOW_REQUIRE_HOST"] = "1"
-        run = subprocess.run(command, cwd=root, env=environment, capture_output=True,
-                             text=True) if complete else None
-        log = output / ("named-" + binary_name + ".log")
-        log.write_text("$ " + " ".join(list_command) + "\n" + listed.stdout + listed.stderr +
-                       ("$ " + " ".join(command) + "\n" + run.stdout + run.stderr
-                        if run is not None else "named test discovery incomplete\n"))
-        summary = re.search(r"Summary[^\n]*?\b(\d+) tests run:", run.stdout + run.stderr) \
-            if run is not None else None
-        passed = complete and run is not None and run.returncode == 0 and \
-            summary is not None and int(summary.group(1)) == len(selected)
-        named_rows.extend({"binary": test["binary"], "name": test["name"],
-                           "pass": passed, "log": log.name,
-                           "log-sha256": hashlib.sha256(log.read_bytes()).hexdigest()}
-                          for test in selected)
+        for test in selected:
+            command = base + ["run", "--offline", "--features", "test-support", "--test",
+                              binary_name, "--no-tests", "fail", "-E",
+                              f'test(={test["name"]})']
+            run = subprocess.run(command, cwd=root, env=environment, capture_output=True,
+                                 text=True) if complete else None
+            log = output / ("named-" + test["name"] + ".log")
+            log.write_text("$ " + " ".join(command) + "\n" + run.stdout + run.stderr
+                           if run is not None else "named test discovery incomplete\n")
+            summary = re.search(r"Summary[^\n]*?\b(\d+) tests run:", run.stdout + run.stderr) \
+                if run is not None else None
+            passed = run is not None and run.returncode == 0 and summary is not None and \
+                int(summary.group(1)) == 1
+            named_rows.append({"binary": test["binary"], "name": test["name"],
+                               "pass": passed, "log": log.name,
+                               "log-sha256": hashlib.sha256(log.read_bytes()).hexdigest()})
     named_receipt = {"schema-version": 1, "candidate-commit": candidate_commit(root),
                      "fluent-binary-sha256": candidate_binary_digest(root),
                      "cases": named_rows, "pass": all(row["pass"] for row in named_rows)}
