@@ -37,6 +37,12 @@ fn released_050_binary(tmp: &TempDir) -> PathBuf {
     copy
 }
 
+fn released_fixture_cargo_home(tmp: &TempDir) -> PathBuf {
+    let home = tmp.path().join("released-cargo-home");
+    fs::create_dir_all(&home).unwrap();
+    home
+}
+
 fn released_command(binary: &Path, project: &Path, args: &[&str]) -> std::process::Output {
     Command::new(binary)
         .current_dir(project)
@@ -375,10 +381,12 @@ fn released_upgrade_recovers_predecessor_interrupted_work() {
         "#!/bin/sh\nset -eu\nprintf 'started\\n' > \"$RELEASE_STARTED\"\nwhile :; do sleep 0.05; done\n",
     );
     let started = tmp.path().join("writer-started");
+    let cargo_home = released_fixture_cargo_home(&tmp);
     let mut running = OwnedFixtureProcess::spawn(
         Command::new(&release)
             .current_dir(&project)
             .env("HOME", tmp.path())
+            .env("CARGO_HOME", &cargo_home)
             .env("PATH", mock_path(&bin))
             .env("RELEASE_STARTED", &started)
             .env("FLUENT_NO_UPDATE_CHECK", "1")
@@ -439,6 +447,7 @@ fn released_upgrade_preserves_landed_work() {
     let release = released_050_binary(&tmp);
     let project = released_work_fixture(&tmp, &release, "work-1");
     let bin = tmp.path().join("release-provider");
+    let cargo_home = released_fixture_cargo_home(&tmp);
     write_mock_claude(
         &bin,
         &learner_land_mock_script(r#"{"learning_summary":"none","follow_ups":[]}"#),
@@ -446,6 +455,7 @@ fn released_upgrade_preserves_landed_work() {
     let run = Command::new(&release)
         .current_dir(&project)
         .env("HOME", tmp.path())
+        .env("CARGO_HOME", &cargo_home)
         .env("PATH", mock_path(&bin))
         .env("FLUENT_NO_UPDATE_CHECK", "1")
         .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
@@ -464,6 +474,7 @@ fn released_upgrade_preserves_landed_work() {
     let landed = Command::new(&release)
         .current_dir(&project)
         .env("HOME", tmp.path())
+        .env("CARGO_HOME", &cargo_home)
         .env("PATH", mock_path(&bin))
         .env("FLUENT_NO_UPDATE_CHECK", "1")
         .args(["merge-candidate", "land", "work-1", "--no-sandbox"])
@@ -545,11 +556,13 @@ fn released_upgrade_preserves_running_before_stop() {
         "#!/bin/sh\nset -eu\nprintf 'started\\n' > \"$RELEASE_STARTED\"\nwhile [ ! -e \"$RELEASE_FINISH\" ]; do sleep 0.05; done\n",
     );
     let started = tmp.path().join("writer-started");
+    let cargo_home = released_fixture_cargo_home(&tmp);
     let finish = tmp.path().join("writer-finish");
     let mut running = OwnedFixtureProcess::spawn(
         Command::new(&release)
             .current_dir(&project)
             .env("HOME", tmp.path())
+            .env("CARGO_HOME", &cargo_home)
             .env("PATH", mock_path(&bin))
             .env("RELEASE_STARTED", &started)
             .env("RELEASE_FINISH", &finish)

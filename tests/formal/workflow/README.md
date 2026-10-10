@@ -24,6 +24,15 @@ production=SUITE/CASE; control=SUITE/CASE` evidence described in
 `connections.md` before the report may credit it. Existing descriptive
 evidence is retained as an explicit gap until those checks pass.
 
+`approved-contracts.json` records the approved parent statements by section,
+statement digest, and named test identity. The integrated checker discovers
+each exact test and executes all 22 with `test-support`; its candidate-bound
+`named-tests-result.json` retains per-test outcome and command-log digests.
+`report.py` refuses to credit missing or changed receipts and lists each
+approved behavior with its test state. The inventory covers the six changed
+statements and A1–A9. Its `source-sha256` identifies the approved parent
+Behavior draft used to prepare this Work Item.
+
 The report is produced by `report.py` after the suite commands. Host results
 and final lifecycle gates remain separate candidate-bound records. A green
 focused Writer test does not complete those external gates.

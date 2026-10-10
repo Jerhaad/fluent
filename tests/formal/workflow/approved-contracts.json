@@ -1,0 +1,228 @@
+{
+  "schema-version": 1,
+  "source-sha256": "6017a927fe202e6373d8da14d95dd16ae3e0e63c956054fabd36cbc821108c8e",
+  "behaviors": [
+    {
+      "id": "Required Writer inputs:B1",
+      "statement-sha256": "f4d7b2576c4e5373818eeeb05dab88f64de896416dec03c24c15188b6d110f9a",
+      "tests": [
+        {
+          "kind": "named-test",
+          "path": "tests/binary.rs",
+          "name": "classified_writer_receives_current_authorized_instructions",
+          "binary": "fluent::binary"
+        }
+      ]
+    },
+    {
+      "id": "Required Writer inputs:B2",
+      "statement-sha256": "126bc03900a2b360e55e23292dad5432bdc2c92709004f87462b73f71791f0cf",
+      "tests": [
+        {
+          "kind": "named-test",
+          "path": "tests/binary.rs",
+          "name": "classified_writer_rejects_invalid_required_inputs_before_launch",
+          "binary": "fluent::binary"
+        }
+      ]
+    },
+    {
+      "id": "Required Writer inputs:B3",
+      "statement-sha256": "7a258fe40dab2eec3d3b45d288446222fe7b8d40d55b9d607d034a75e36fdc3e",
+      "tests": [
+        {
+          "kind": "named-test",
+          "path": "tests/binary.rs",
+          "name": "classified_writer_context_identifies_current_assignment",
+          "binary": "fluent::binary"
+        }
+      ]
+    },
+    {
+      "id": "Public workflow continuation:B1",
+      "statement-sha256": "60af35b642bcecd0eea5b15a18431b0329e2bcec34320c31ea41dfe06b67f895",
+      "tests": [
+        {
+          "kind": "named-test",
+          "path": "tests/binary.rs",
+          "name": "workflow_reachable_failures_have_public_continuation",
+          "binary": "fluent::binary"
+        }
+      ]
+    },
+    {
+      "id": "Landed evidence history:B1",
+      "statement-sha256": "ba8e43bad4177f7bc6b2755a22c8f264853d6afe548eea068c75340200e61dd3",
+      "tests": [
+        {
+          "kind": "named-test",
+          "path": "tests/binary.rs",
+          "name": "landed_status_uses_final_landing_tester_evidence",
+          "binary": "fluent::binary"
+        },
+        {
+          "kind": "named-test",
+          "path": "tests/binary.rs",
+          "name": "landed_status_validates_retained_landing_evidence",
+          "binary": "fluent::binary"
+        }
+      ]
+    },
+    {
+      "id": "Cleanup retention:B1",
+      "statement-sha256": "4ad2200ffa96d191dcdfbcdd49acf15c0406a726753ef9bb1efb56b046cb682d",
+      "tests": [
+        {
+          "kind": "named-test",
+          "path": "tests/binary.rs",
+          "name": "workflow_cleanup_retains_pending_recovery",
+          "binary": "fluent::binary"
+        },
+        {
+          "kind": "named-test",
+          "path": "tests/binary.rs",
+          "name": "workflow_cleanup_rechecks_current_eligibility",
+          "binary": "fluent::binary"
+        }
+      ]
+    },
+    {
+      "id": "A1",
+      "statement-sha256": "48a6bc238488ef39af74c902aa7f3178d000ecb9c1b23cb5f31a71787a890ecd",
+      "tests": [
+        {
+          "kind": "named-test",
+          "path": "tests/binary.rs",
+          "name": "workflow_evidence_satisfies_only_validly_bound_requirements",
+          "binary": "fluent::binary"
+        },
+        {
+          "kind": "named-test",
+          "path": "tests/binary.rs",
+          "name": "workflow_changed_bindings_reassess_evidence_before_advancement",
+          "binary": "fluent::binary"
+        }
+      ]
+    },
+    {
+      "id": "A2",
+      "statement-sha256": "571a35a84e8018ccba82e94608627f05087fd9e382a89b36d7da6417cb5bba0c",
+      "tests": [
+        {
+          "kind": "named-test",
+          "path": "tests/binary.rs",
+          "name": "workflow_readiness_requires_current_gates",
+          "binary": "fluent::binary"
+        }
+      ]
+    },
+    {
+      "id": "A3",
+      "statement-sha256": "8b4aa074e00052208e12cc95f358a03c456806e1a5e99a770f6060698e0683c0",
+      "tests": [
+        {
+          "kind": "named-test",
+          "path": "tests/binary.rs",
+          "name": "workflow_landing_requires_exact_final_commit_evidence",
+          "binary": "fluent::binary"
+        }
+      ]
+    },
+    {
+      "id": "A4",
+      "statement-sha256": "34dc09a4eda3cbbd7c4adf0cf402df8c3e19b3da1a29f633b0701c18db4cb131",
+      "tests": [
+        {
+          "kind": "named-test",
+          "path": "tests/binary.rs",
+          "name": "workflow_recovery_preserves_settled_effects",
+          "binary": "fluent::binary"
+        },
+        {
+          "kind": "named-test",
+          "path": "tests/binary.rs",
+          "name": "workflow_recovery_preserves_intervening_changes",
+          "binary": "fluent::binary"
+        }
+      ]
+    },
+    {
+      "id": "A5",
+      "statement-sha256": "7d3cadfb5e2628547dddba6fc517e19acb39415e7e4133890c9d95c9201962c0",
+      "tests": [
+        {
+          "kind": "named-test",
+          "path": "tests/binary.rs",
+          "name": "workflow_recovery_requires_current_resume_authority",
+          "binary": "fluent::binary"
+        }
+      ]
+    },
+    {
+      "id": "A6",
+      "statement-sha256": "a77c677d84325480a8727580d7917490620ad1b4d55b6cab7c23a7ac3d306cb3",
+      "tests": [
+        {
+          "kind": "named-test",
+          "path": "tests/binary.rs",
+          "name": "workflow_observation_preserves_state",
+          "binary": "fluent::binary"
+        },
+        {
+          "kind": "named-test",
+          "path": "tests/binary.rs",
+          "name": "workflow_observation_reports_consistent_recovery",
+          "binary": "fluent::binary"
+        }
+      ]
+    },
+    {
+      "id": "A7",
+      "statement-sha256": "4a00c53bb83687a244ff22f627d25a7f0a7d20d7085634e3471d3e57a6299a03",
+      "tests": [
+        {
+          "kind": "named-test",
+          "path": "tests/binary.rs",
+          "name": "released_upgrade_preserves_workflow_state",
+          "binary": "fluent::binary"
+        },
+        {
+          "kind": "named-test",
+          "path": "tests/binary.rs",
+          "name": "released_upgrade_recovers_interrupted_publication",
+          "binary": "fluent::binary"
+        }
+      ]
+    },
+    {
+      "id": "A8",
+      "statement-sha256": "25d25e12cdaee5587fd3c98f174aa9af0aa3ab044f33247d1f74103048844711",
+      "tests": [
+        {
+          "kind": "named-test",
+          "path": "tests/scheduler_service.rs",
+          "name": "scheduler_released_upgrade_preserves_shared_ownership",
+          "binary": "fluent::scheduler_service"
+        }
+      ]
+    },
+    {
+      "id": "A9",
+      "statement-sha256": "4325f92537eebc5d78f6a00fe99269912194a87cb3f0974e999581d6cfe041df",
+      "tests": [
+        {
+          "kind": "named-test",
+          "path": "tests/binary.rs",
+          "name": "released_predecessor_refuses_current_authority",
+          "binary": "fluent::binary"
+        },
+        {
+          "kind": "named-test",
+          "path": "tests/binary.rs",
+          "name": "released_predecessor_refuses_pending_current_publication",
+          "binary": "fluent::binary"
+        }
+      ]
+    }
+  ]
+}

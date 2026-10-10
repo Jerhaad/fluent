@@ -177,6 +177,47 @@ def integrated_suite(source, root, output, jar, java):
         log.write_text("$ " + " ".join(command) + "\n" + result.stdout + result.stderr)
         results.append({"case": "scheduler-" + name, "pass": result.returncode == 0,
                         "log": log.name})
+    contracts = json.loads((source / "approved-contracts.json").read_text())
+    named = [test for row in contracts["behaviors"] for test in row["tests"]]
+    named_rows = []
+    for binary_name in ("binary", "scheduler_service"):
+        selected = [test for test in named if test["binary"] == "fluent::" + binary_name]
+        expression = " | ".join(f'test(={test["name"]})' for test in selected)
+        base = ["cargo", "nextest"]
+        list_command = base + ["list", "--offline", "--features", "test-support", "--test",
+                               binary_name, "-E", expression, "--message-format", "json"]
+        listed = subprocess.run(list_command, cwd=root, capture_output=True, text=True)
+        discovered = set()
+        if listed.returncode == 0:
+            try:
+                listing = json.loads(listed.stdout)
+                cases = listing["rust-suites"]["fluent::" + binary_name]["testcases"]
+                discovered = {name for name, case in cases.items()
+                              if case["filter-match"]["status"] == "matches"}
+            except (KeyError, TypeError, ValueError):
+                pass
+        complete = discovered == {test["name"] for test in selected}
+        command = base + ["run", "--offline", "--features", "test-support", "--test",
+                          binary_name, "--no-tests", "fail", "-E", expression]
+        run = subprocess.run(command, cwd=root, capture_output=True, text=True) if complete else None
+        log = output / ("named-" + binary_name + ".log")
+        log.write_text("$ " + " ".join(list_command) + "\n" + listed.stdout + listed.stderr +
+                       ("$ " + " ".join(command) + "\n" + run.stdout + run.stderr
+                        if run is not None else "named test discovery incomplete\n"))
+        summary = re.search(r"Summary[^\n]*?\b(\d+) tests run:", run.stdout + run.stderr) \
+            if run is not None else None
+        passed = complete and run is not None and run.returncode == 0 and \
+            summary is not None and int(summary.group(1)) == len(selected)
+        named_rows.extend({"binary": test["binary"], "name": test["name"],
+                           "pass": passed, "log": log.name,
+                           "log-sha256": hashlib.sha256(log.read_bytes()).hexdigest()}
+                          for test in selected)
+    named_receipt = {"schema-version": 1, "candidate-commit": candidate_commit(root),
+                     "fluent-binary-sha256": candidate_binary_digest(root),
+                     "cases": named_rows, "pass": all(row["pass"] for row in named_rows)}
+    (output / "named-tests-result.json").write_text(json.dumps(named_receipt, indent=2) + "\n")
+    results.append({"case": "approved-named-tests", "pass": named_receipt["pass"],
+                    "log": "named-tests-result.json"})
     binary = root / "target/debug/fluent"
     if binary.is_file():
         command = ["python3", str(source / "report.py"), "--results",

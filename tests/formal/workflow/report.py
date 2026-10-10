@@ -60,10 +60,77 @@ EXTERNAL_GATES = {
     "plan:step-9": "canonical final Tester from .fluent/tester.yaml",
     "plan:step-10": "capture-mode Learner",
 }
+APPROVED_BEHAVIORS = (
+    "Required Writer inputs:B1", "Required Writer inputs:B2",
+    "Required Writer inputs:B3", "Public workflow continuation:B1",
+    "Landed evidence history:B1", "Cleanup retention:B1",
+    *(f"A{number}" for number in range(1, 10)),
+)
 
 
 def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def approved_contracts(source, results, candidate, binary):
+    """Account for every approved statement and its exact named test."""
+    manifest = source / "approved-contracts.json"
+    try:
+        data = json.loads(manifest.read_text())
+        rows = data["behaviors"]
+        assert data["schema-version"] == 1
+        assert data["source-sha256"] == \
+            "6017a927fe202e6373d8da14d95dd16ae3e0e63c956054fabd36cbc821108c8e"
+        assert [row["id"] for row in rows] == list(APPROVED_BEHAVIORS)
+        assert sum(len(row["tests"]) for row in rows) == 22
+        tests = [test for row in rows for test in row["tests"]]
+        assert len({(test["binary"], test["name"]) for test in tests}) == 22
+        assert all(re.fullmatch(r"[0-9a-f]{64}", row["statement-sha256"])
+                   for row in rows)
+        for test in tests:
+            assert test["kind"] == "named-test"
+            assert test["binary"] in ("fluent::binary", "fluent::scheduler_service")
+            assert test["path"] == "tests/" + test["binary"].split("::")[1] + ".rs"
+            assert re.search(r"(?m)^fn " + re.escape(test["name"]) + r"\(",
+                             (source.parents[2] / test["path"]).read_text())
+    except (AssertionError, KeyError, TypeError, ValueError, OSError) as error:
+        return [], [f"approved contract inventory: invalid ({error})"]
+
+    receipt_path = results / "integrated/named-tests-result.json"
+    receipts = {}
+    receipt_ok = False
+    if receipt_path.is_file():
+        try:
+            receipt = json.loads(receipt_path.read_text())
+            cases = receipt["cases"]
+            assert receipt["schema-version"] == 1
+            assert receipt["candidate-commit"] == candidate
+            assert receipt["fluent-binary-sha256"] == digest(binary)
+            assert {(row["binary"], row["name"]) for row in cases} == \
+                {(test["binary"], test["name"]) for test in tests}
+            assert len(cases) == len(tests)
+            for case in cases:
+                assert type(case["pass"]) is bool
+                log = receipt_path.parent / case["log"]
+                assert log.is_file() and case["log-sha256"] == digest(log)
+                receipts[(case["binary"], case["name"])] = case
+            receipt_ok = True
+        except (AssertionError, KeyError, TypeError, ValueError, OSError):
+            pass
+    accounted = []
+    for row in rows:
+        accounted.append({"id": row["id"],
+                          "statement-sha256": row["statement-sha256"],
+                          "tests": [{**test,
+                                     "state": "pass" if receipt_ok and receipts[
+                                         (test["binary"], test["name"])]["pass"] else
+                                     "fail" if receipt_ok else "pending"}
+                                    for test in row["tests"]]})
+    missing = [] if receipt_ok else ["approved named tests: missing or invalid result"]
+    if receipt_ok:
+        missing.extend(f"named test: {case['binary']}::{case['name']}" for case in
+                       receipts.values() if not case["pass"])
+    return accounted, missing
 
 
 def connection_credit(evidence, passing_cases):
@@ -149,6 +216,8 @@ def scheduler_results(results, candidate, jar, scheduler):
 def report(results, candidate, binary, source, jar=None, java=None):
     suites = {}
     missing = []
+    approved, approved_missing = approved_contracts(source, results, candidate, binary)
+    missing.extend(approved_missing)
     for name in SUITES:
         directory = results / ("integrated" if name == "integrated-production" else name)
         filename = "production-result.json" if name == "integrated-production" else "result.json"
@@ -220,6 +289,8 @@ def report(results, candidate, binary, source, jar=None, java=None):
                                     "report": digest(source / "report.py"),
                                     "integrated-projector": digest(source / "project_integrated.py")},
             "connection-inventory-sha256": digest(source / "connections.md"),
+            "approved-contracts-sha256": digest(source / "approved-contracts.json"),
+            "approved-behaviors": approved,
             "suites": suites, "scheduler-suites": scheduler_suites,
             "connections": mappings,
             "external-gates": {name: {"state": "pending", "command": command}

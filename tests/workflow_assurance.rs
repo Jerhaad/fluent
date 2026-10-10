@@ -360,6 +360,21 @@ fn workflow_assurance_report_rejects_missing_and_misbound_evidence() {
     assert!(!missing.status.success());
     let result: Value = serde_json::from_slice(&fs::read(&output).unwrap()).unwrap();
     assert_eq!(result["pass"], false);
+    let behaviors = result["approved-behaviors"].as_array().unwrap();
+    assert_eq!(behaviors.len(), 15);
+    assert_eq!(
+        behaviors
+            .iter()
+            .map(|behavior| behavior["tests"].as_array().unwrap().len())
+            .sum::<usize>(),
+        22
+    );
+    assert!(behaviors.iter().all(|behavior| behavior["tests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|test| test["state"] == "pending")));
+    assert!(result["approved-contracts-sha256"].is_string());
     assert!(result["suite-source-sha256"]["integrated-projector"].is_string());
     assert!(result["connection-inventory-sha256"].is_string());
     assert_eq!(result["scheduler-suites"]["recovery"]["pass"], false);
@@ -487,6 +502,62 @@ with tempfile.TemporaryDirectory() as temporary:
 "#;
     let source = root.join("tests/formal/workflow");
     let result = run(root, "python3", &["-c", script, source.to_str().unwrap()]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+#[test]
+fn workflow_assurance_report_binds_approved_named_tests() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script = r#"
+import json
+import sys
+import tempfile
+from pathlib import Path
+source = Path(sys.argv[1])
+sys.path.insert(0, str(source))
+import report
+binary = Path(sys.argv[2])
+with tempfile.TemporaryDirectory() as temporary:
+    results = Path(temporary)
+    output = results / 'integrated'
+    output.mkdir()
+    rows, missing = report.approved_contracts(source, results, 'candidate-a', binary)
+    assert len(rows) == 15 and sum(len(row['tests']) for row in rows) == 22
+    assert missing and all(test['state'] == 'pending'
+                           for row in rows for test in row['tests'])
+    cases = []
+    for row in rows:
+        for test in row['tests']:
+            log = test['name'] + '.log'
+            (output / log).write_text('PASS ' + test['name'] + '\n')
+            cases.append({'binary':test['binary'], 'name':test['name'],
+                          'pass':True, 'log':log,
+                          'log-sha256':report.digest(output / log)})
+    receipt = {'schema-version':1, 'candidate-commit':'candidate-a',
+               'fluent-binary-sha256':report.digest(binary), 'cases':cases}
+    path = output / 'named-tests-result.json'
+    path.write_text(json.dumps(receipt))
+    rows, missing = report.approved_contracts(source, results, 'candidate-a', binary)
+    assert not missing and all(test['state'] == 'pass'
+                               for row in rows for test in row['tests'])
+    (output / cases[0]['log']).write_text('changed\n')
+    rows, missing = report.approved_contracts(source, results, 'candidate-a', binary)
+    assert missing and rows[0]['tests'][0]['state'] == 'pending'
+"#;
+    let result = run(
+        root,
+        "python3",
+        &[
+            "-c",
+            script,
+            root.join("tests/formal/workflow").to_str().unwrap(),
+            env!("CARGO_BIN_EXE_fluent"),
+        ],
+    );
     assert!(
         result.status.success(),
         "{}",
