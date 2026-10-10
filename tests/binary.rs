@@ -66889,6 +66889,21 @@ fn workflow_recovery_requires_current_resume_authority() {
     );
     fluent_cmd()
         .current_dir(&fixture.main_dir)
+        .args([
+            "attempt",
+            "run",
+            "work-1",
+            "attempt-1",
+            "--no-sandbox",
+            "--dispatch-id",
+            first_dispatch["dispatch_id"].as_str().unwrap(),
+        ])
+        .env("PATH", mock_path(&bin))
+        .assert()
+        .failure();
+    assert_eq!(fixture.store.read_work_item("work-1").unwrap(), second);
+    fluent_cmd()
+        .current_dir(&fixture.main_dir)
         .args(["queue", "resume", "work-1", "--attempt", "attempt-1"])
         .assert()
         .success();
