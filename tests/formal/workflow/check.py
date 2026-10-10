@@ -621,6 +621,17 @@ def recovery_observation_suite(source, root, output, jar, java):
                               "INVARIANT TraceSafe\nPROPERTY TraceComplete\n")
             results.append(run_case(source, output, jar, java, str(config), None,
                                     "RecoveryTrace"))
+            # Change only the projected completion commit. The projector has
+            # already accepted the source trace, so TLC must reject this
+            # impossible Run transition on its own.
+            wrong_commit = output / "recovery-wrong-output.cfg"
+            correct_binding = f'Trace3outputCommit = "{states[2]["outputCommit"]}"'
+            assert config.read_text().count(correct_binding) == 1
+            wrong_commit.write_text(config.read_text().replace(
+                correct_binding, 'Trace3outputCommit = "wrong"'))
+            results.append(run_case(source, output, jar, java, str(wrong_commit),
+                                    "Invariant TraceSafe is violated",
+                                    "RecoveryTrace"))
         for name, edit in (
             ("stale-action", lambda work: work.__setitem__("next-action", "queue resume")),
             ("missing-transition", lambda work: work["attempts"][0]["tasks"][1]

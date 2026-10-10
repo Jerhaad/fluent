@@ -3890,10 +3890,13 @@ Test: tests/behaviors/operations/test-cleanup.sh (Work cleanup ignores unmanaged
 
 ### B6
 
-WHEN Work cleanup sees active Work Items or Work Items with active Merge
-Candidates,
+WHEN Work cleanup sees active Work Items, Work Items with active Merge
+Candidates, or Work Items needed to finish a required recovery operation,
 THE SYSTEM SHALL leave them out of cleanup results.
-Test: tests/binary.rs (cleanup_work_items_dry_run_and_apply_manage_state_worktree_and_branch), tests/binary.rs (cleanup_work_items_selects_failed_terminal_and_skips_pending_merge_candidate)
+Cleanup SHALL recheck eligibility after selecting a candidate and before
+removing its state or managed artifacts. An optional future retry of terminal
+failed Work does not by itself require retention.
+Test: tests/binary.rs (cleanup_work_items_dry_run_and_apply_manage_state_worktree_and_branch), tests/binary.rs (cleanup_work_items_selects_failed_terminal_and_skips_pending_merge_candidate), tests/binary.rs (workflow_cleanup_retains_pending_recovery), tests/binary.rs (workflow_cleanup_rechecks_current_eligibility)
 
 ### B7
 

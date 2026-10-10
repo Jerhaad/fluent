@@ -5,13 +5,16 @@
 The `recovery-observation` suite checks repeated failure and recovery profiles,
 the existing service competition profile, cancellation, repeated-effect,
 observation and cleanup negative controls, and a joint service/child settlement
-boundary. `JointSettlement.tla` keeps a child's ownership receipt across two
-service crashes. It permits publication of a completed stop only after the
+boundary. `JointSettlement.tla` maps the service's worker count to its owned
+child and keeps the child's ownership receipt across two service crashes.
+Its `Crash` action clears the worker count as `ServiceLifecycle.Crash` does,
+while its publication action also requires the child to settle. It permits publication of a completed stop only after the
 child settles; its negative configuration allows early publication and must
 violate the invariant. This is a bounded abstract control: it does not connect
-`ServiceLifecycle.Crash` worker clearing to the child receipt or publication.
-The project decision is to retain that live connection as a future model
-extension rather than claim the atomic worker-clear assumption is discharged.
+the full `ServiceLifecycle` state and production child records in one trace.
+The project decision is to retain that broader live connection for the later
+integrated assurance work. The local worker-clear to child-settlement boundary
+is checked here.
 The Rust cancellation
 test remains the production check for stale authority, while a live child
 crash trace remains a separate connection obligation.

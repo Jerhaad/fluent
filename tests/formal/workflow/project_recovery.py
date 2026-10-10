@@ -134,18 +134,20 @@ def project(path):
             operation["authorization"] in correction["instructions"],
             "recovery authorization is not bound to source Work, Task, candidate, and authority")
     states = []
-    for phase, work, task_status in (("paused", paused, "absent"),
-                                     ("authorized", authorized, "planned"),
-                                     ("continued", continued, "complete")):
+    for work in works:
         attempt = work["attempts"][0]
-        states.append({"phase": phase, "work": work_id,
+        task = attempt["tasks"][1] if len(attempt["tasks"]) > 1 else None
+        states.append({"attemptStatus": attempt["status"], "work": work["id"],
                        "attempt": attempt["id"], "source": source["id"],
                        "candidate": source["output"]["commit"],
-                       "correction": correction["id"] if len(attempt["tasks"]) > 1 else "absent",
-                       "correctionStatus": task_status,
-                       "operation": operation["operation-id"] if attempt.get("recovery_operations") else "absent",
+                       "correction": task["id"] if task else "absent",
+                       "correctionStatus": task.get("status", "planned") if task else "absent",
+                       "operation": attempt["recovery_operations"][0]["operation-id"]
+                       if attempt.get("recovery_operations") else "absent",
                        "authority": authority_path if attempt.get("recovery_operations") else "absent",
-                       "published": phase == "continued"})
+                       "outputCommit": task.get("output", {}).get("commit", "absent")
+                       if task else "absent",
+                       "published": bool(task and task.get("output"))})
     return {"states": states,
             "work-id": work_id, "attempt-id": "attempt-1"}
 

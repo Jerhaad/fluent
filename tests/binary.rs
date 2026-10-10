@@ -66764,8 +66764,28 @@ fn workflow_recovery_preserves_settled_effects() {
     let tmp = TempDir::new().unwrap();
     let project = setup_git_project(&tmp);
     let bin = run_plain_attempt(&project, &tmp, "workflow-recovery-provider");
+    fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "merge-candidate",
+            "land",
+            "work-1",
+            "attempt-1-merge-candidate",
+            "--no-sandbox",
+            "--no-post-merge-review",
+        ])
+        .env("PATH", mock_path(&bin))
+        .env("FLUENT_TEST_INTERRUPT_AFTER_LANDING_GIT", "1")
+        .assert()
+        .failure();
+    let after_effect = git_head(&project);
+    assert_ne!(
+        after_effect,
+        work_item_value(&project, "work-1")["merge_candidates"][0]["merge_state"]["merged_commit"]
+    );
     fs::write(project.join(".fluent/observations"), "block publication\n").unwrap();
     land_work_1(&project, &bin, true);
+    assert_eq!(git_head(&project), after_effect);
     assert_eq!(follow_up_failure_stage(&project), "observation");
     let head = git_head(&project);
     let merged = work_item_value(&project, "work-1");
@@ -66784,8 +66804,24 @@ fn workflow_recovery_preserves_intervening_changes() {
     let tmp = TempDir::new().unwrap();
     let project = setup_git_project(&tmp);
     let bin = run_plain_attempt(&project, &tmp, "workflow-recovery-provider");
+    fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "merge-candidate",
+            "land",
+            "work-1",
+            "attempt-1-merge-candidate",
+            "--no-sandbox",
+            "--no-post-merge-review",
+        ])
+        .env("PATH", mock_path(&bin))
+        .env("FLUENT_TEST_INTERRUPT_AFTER_LANDING_GIT", "1")
+        .assert()
+        .failure();
+    let after_effect = git_head(&project);
     fs::write(project.join(".fluent/observations"), "block publication\n").unwrap();
     land_work_1(&project, &bin, true);
+    assert_eq!(git_head(&project), after_effect);
     assert_eq!(follow_up_failure_stage(&project), "observation");
     commit_file(
         &project,
@@ -66915,6 +66951,24 @@ fn workflow_recovery_requires_current_resume_authority() {
         .unwrap();
     assert_eq!(latest["resume_cancellation_requested_at"], second_stop);
     assert_ne!(latest["dispatch_id"], first_dispatch["dispatch_id"]);
+    run_scheduler_until_dispatch_status(&fixture.main_dir, "work-1", &bin, "needs-user");
+    let continued = fixture.store.read_work_item("work-1").unwrap();
+    assert_eq!(
+        continued.attempts[0]
+            .cancellation
+            .as_ref()
+            .unwrap()
+            .requested_at,
+        second_stop
+    );
+    assert!(
+        continued.attempts[0]
+            .cancellation
+            .as_ref()
+            .unwrap()
+            .resumed_at
+            .is_some()
+    );
 }
 
 #[test]
