@@ -337,7 +337,7 @@ fn observed_release_worker(
         if record.state != fluent::execution::ExecutionState::Running {
             continue;
         }
-        if owner.project_root != project
+        if !release_project_matches(&owner.project_root, project)
             || owner.work_item_id != work
             || owner.attempt_id != "attempt-1"
         {
@@ -367,6 +367,109 @@ fn observed_release_worker(
         return Some((task.id.clone(), workspace, receipt, group));
     }
     None
+}
+
+fn release_project_matches(recorded: &std::path::Path, project: &std::path::Path) -> bool {
+    match (fs::canonicalize(recorded), fs::canonicalize(project)) {
+        (Ok(recorded), Ok(project)) => recorded == project,
+        _ => false,
+    }
+}
+
+const RELEASED_PROVIDER_SCRIPT: &str = r#"#!/bin/sh
+set -eu
+if [ "$#" -eq 1 ] && [ "$1" = '--version' ]; then
+    printf 'fixture-claude\n'
+    exit 0
+fi
+if [ "$#" -eq 3 ] && [ "$1" = 'auth' ] && [ "$2" = 'status' ] && [ "$3" = '--json' ]; then
+    printf '{"loggedIn":true}\n'
+    exit 0
+fi
+if [ "$#" -eq 3 ] && [ "$1" = '--safe-mode' ] && [ "$2" = '-p' ] && [ "$3" = 'ok' ]; then
+    printf 'ok\n'
+    exit 0
+fi
+if [ "$#" -ge 10 ] && [ "$1" = '--safe-mode' ] && [ "$2" = '--tools' ] && [ "$3" = '' ] && [ "$4" = '--effort' ] && [ "$5" = 'low' ] && [ "$6" = '--output-format' ] && [ "$7" = 'json' ] && [ "$8" = '--no-session-persistence' ]; then
+    shift 8
+    if [ "$#" -ge 2 ] && [ "$1" = '--model' ]; then shift 2; fi
+    if [ "$#" -eq 2 ] && [ "$1" = '-p' ] && [ "$2" = 'Reply with exactly: FLUENT_CLAUDE_READY' ]; then
+        printf '{"type":"result","result":"FLUENT_CLAUDE_READY"}\n'
+        exit 0
+    fi
+fi
+test "${CLAUDE_CODE_OAUTH_TOKEN:-}" = fixture-oauth-token
+printf '%s\t%s\n' "$$" "$PWD" >> "$RELEASE_SERVICE_STARTED"
+while [ ! -e "$RELEASE_SERVICE_RELEASE" ]; do sleep 0.05; done
+exit 1
+"#;
+
+#[test]
+fn released_provider_fixture_distinguishes_probes_from_writers() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::{Command, Stdio};
+
+    let home = TempDir::new().unwrap();
+    let provider = home.path().join("claude");
+    fs::write(&provider, RELEASED_PROVIDER_SCRIPT).unwrap();
+    fs::set_permissions(&provider, fs::Permissions::from_mode(0o755)).unwrap();
+    let started = home.path().join("started");
+    let release = home.path().join("release");
+    fs::write(&release, "settle").unwrap();
+    let invoke = |args: &[&str]| {
+        Command::new(&provider)
+            .args(args)
+            .current_dir(home.path())
+            .env("CLAUDE_CODE_OAUTH_TOKEN", "fixture-oauth-token")
+            .env("RELEASE_SERVICE_STARTED", &started)
+            .env("RELEASE_SERVICE_RELEASE", &release)
+            .stdout(Stdio::piped())
+            .output()
+            .unwrap()
+    };
+    for args in [
+        vec!["--safe-mode", "-p", "ok"],
+        vec![
+            "--safe-mode",
+            "--tools",
+            "",
+            "--effort",
+            "low",
+            "--output-format",
+            "json",
+            "--no-session-persistence",
+            "-p",
+            "Reply with exactly: FLUENT_CLAUDE_READY",
+        ],
+    ] {
+        assert!(invoke(&args).status.success());
+        assert!(!started.exists(), "readiness probe launched a Worker");
+    }
+    for args in [
+        vec!["--safe-mode", "--append-system-prompt", "fixture"],
+        vec![
+            "--dangerously-skip-permissions",
+            "--safe-mode",
+            "--append-system-prompt",
+            "fixture",
+        ],
+    ] {
+        assert!(!invoke(&args).status.success());
+    }
+    assert_eq!(fs::read_to_string(started).unwrap().lines().count(), 2);
+}
+
+#[test]
+fn released_worker_project_matches_canonical_alias() {
+    let home = TempDir::new().unwrap();
+    let project = home.path().join("project");
+    let alias = home.path().join("alias");
+    fs::create_dir(&project).unwrap();
+    std::os::unix::fs::symlink(&project, &alias).unwrap();
+    assert!(release_project_matches(&alias, &project));
+    let unrelated = home.path().join("unrelated");
+    fs::create_dir(&unrelated).unwrap();
+    assert!(!release_project_matches(&unrelated, &project));
 }
 
 fn release_failure_diagnostics(
@@ -581,8 +684,7 @@ fn scheduler_released_upgrade_preserves_shared_ownership() {
         }
     }
     let provider = provider_bin.join("claude");
-    fs::write(&provider,
-        "#!/bin/sh\nset -eu\ncase \" $* \" in *' --version '*) printf 'fixture-claude\\n'; exit 0;; *' auth status --json '*) printf '{\"loggedIn\":true}\\n'; exit 0;; *' --safe-mode '*) printf 'ok\\n'; exit 0;; esac\ntest \"${CLAUDE_CODE_OAUTH_TOKEN:-}\" = fixture-oauth-token\nprintf '%s\\t%s\\n' \"$$\" \"$PWD\" >> \"$RELEASE_SERVICE_STARTED\"\nwhile [ ! -e \"$RELEASE_SERVICE_RELEASE\" ]; do sleep 0.05; done\nexit 1\n").unwrap();
+    fs::write(&provider, RELEASED_PROVIDER_SCRIPT).unwrap();
     fs::set_permissions(&provider, fs::Permissions::from_mode(0o755)).unwrap();
     for name in ["codex", "pi", "opencode", "gemini"] {
         let unavailable = provider_bin.join(name);
