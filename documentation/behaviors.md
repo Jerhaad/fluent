@@ -7319,6 +7319,9 @@ supported public route to continue that Work from its retained state once
 required access, evidence, and authorization are supplied.
 Test: tests/binary.rs (writer_completion_recovery_committed_matrix_public_continuation)
 Test: tests/binary.rs (writer_completion_recovery_later_committed_matrix_public_continuation)
+Test: tests/binary.rs (writer_completion_plan_public_continuation)
+Test: tests/binary.rs (writer_completion_plan_existing_approval_continues)
+Test: tests/binary.rs (writer_completion_plan_replays_same_successor)
 
 For a completed Writer with a committed candidate and malformed completion
 matrix, the public repair command records explicit authorization and schedules
@@ -10533,6 +10536,7 @@ WHEN completed Writer work leaves a host-only action next, THE SYSTEM SHALL
 pause at `needs-user` with the exact candidate, action, and required evidence
 before launching another Writer, including after earlier reviews.
 Test: src/work_attempt_loop.rs (pending_host_action_pauses_before_another_writer)
+Test: tests/binary.rs (writer_completion_plan_preserves_host_only_handoff)
 
 ### B3
 
@@ -10656,6 +10660,8 @@ and access limits.
 Test: tests/binary.rs (writer_recovery_context_delivers_recorded_resolution)
 Test: tests/binary.rs (declared_sandbox_input_reads_exact_writer_recovery)
 Test: tests/binary.rs (classified_writer_receives_current_authorized_instructions)
+Test: tests/binary.rs (writer_completion_plan_context_preserves_obligations)
+Test: tests/binary.rs (writer_completion_plan_real_sandbox_inputs)
 
 ### B2
 
@@ -10674,6 +10680,7 @@ alone SHALL NOT authorize rewriting the recorded candidate's ancestry, and
 invalid input cannot be repaired by widening worker access.
 Test: tests/binary.rs (writer_recovery_context_rejects_invalid_delivery)
 Test: tests/binary.rs (classified_writer_rejects_invalid_required_inputs_before_launch)
+Test: tests/binary.rs (writer_completion_plan_rejects_changed_authority)
 
 ### B4
 
