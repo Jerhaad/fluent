@@ -15,10 +15,11 @@ shapes: older output-free audits and committed-matrix audits have different
 source and operation bindings.
 
 Status must use the current incident's eligibility and validated history before
-offering a repair command. A valid no-change completion with no pending finding
-continues on its host-evidence route. Public-route tests should cover a later
-repair after both authority shapes, including intervening targeted Review
-history, exact replay, stale evidence, and the action shown by status.
+offering a repair command. A valid no-change completion with no pending
+Writer-owned work continues on its host-evidence route. Public-route tests
+should cover a later repair after both authority shapes, including intervening
+targeted Review history, exact replay, stale evidence, and the action shown by
+status.
 
 Related: [[committed-writer-matrix-recovery-authority]],
 [[next-action-guidance-is-an-executable-interface]],
