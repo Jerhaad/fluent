@@ -6204,6 +6204,7 @@ set -eu
 if [ "${FLUENT_WORKFLOW_REQUIRE_HOST:-}" = 1 ]; then
   test -r "$RECOVERY_SOURCE_MATRIX"
   test -r "$RECOVERY_OLD_AUDIT"
+  test -r "$RECOVERY_CURRENT_AUDIT"
   if printf 'tamper\n' > "$RECOVERY_SOURCE_MATRIX" 2>/dev/null; then exit 91; fi
   if printf 'tamper\n' > "$RECOVERY_OLD_AUDIT" 2>/dev/null; then exit 92; fi
   printf 'denied\n' > "$RECOVERY_AREA/confinement-observed"
@@ -6259,6 +6260,7 @@ PY
                 .join("writer-completion.json"),
         )
         .env("RECOVERY_OLD_AUDIT", &fixture.audit)
+        .env("RECOVERY_CURRENT_AUDIT", &fixture.audit)
         .assert()
         .success();
     if require_host {
@@ -6348,6 +6350,10 @@ fn writer_completion_recovery_later_committed_matrix_public_continuation() {
     assert_eq!(after.attempts[0].tasks[3], before.attempts[0].tasks[3]);
     assert_eq!(after.attempts[0].tasks[4].status, TaskStatus::Planned);
     let second = &after.attempts[0].tasks[4];
+    let current_audit = fixture.project.join(format!(
+        ".fluent/work/artifacts/{}/attempt-1/writer-completion-recoveries/attempt-1-write-4/recovery.json",
+        fixture.work,
+    ));
     let second_area = fixture
         .project
         .join(&second.artifact_area.as_ref().unwrap().path);
@@ -6376,6 +6382,7 @@ fn writer_completion_recovery_later_committed_matrix_public_continuation() {
         )
         .env("RECOVERY_SOURCE_MATRIX", &source_matrix)
         .env("RECOVERY_OLD_AUDIT", &fixture.audit)
+        .env("RECOVERY_CURRENT_AUDIT", &current_audit)
         .assert()
         .success();
     if require_host {
@@ -6595,6 +6602,54 @@ fn writer_completion_recovery_later_rejects_live_owner_and_invalid_history() {
         .failure();
     assert_eq!(store.read_work_item(&fixture.work).unwrap(), before);
     assert_ne!(fs::read(&fixture.audit).unwrap(), old_audit);
+}
+
+#[test]
+fn writer_completion_recovery_later_rejects_stale_source_at_start() {
+    let tmp = TempDir::new().unwrap();
+    let (fixture, old_audit) = later_committed_matrix_recovery_fixture(&tmp);
+    fluent_cmd()
+        .current_dir(&fixture.project)
+        .args([
+            "attempt",
+            "repair-writer-completion",
+            &fixture.work,
+            "attempt-1",
+            "--resolution",
+            "Approve the later Writer correction",
+        ])
+        .assert()
+        .success();
+    let store = WorkModelStore::new(&fixture.project);
+    let approved = store.read_work_item(&fixture.work).unwrap();
+    let source_matrix = fixture
+        .project
+        .join(
+            &approved.attempts[0].tasks[3]
+                .artifact_area
+                .as_ref()
+                .unwrap()
+                .path,
+        )
+        .join("writer-completion.json");
+    fs::write(&source_matrix, b"changed malformed source matrix").unwrap();
+    let bin = tmp.path().join("stale-later-provider");
+    let launched = tmp.path().join("provider-launched");
+    write_mock_claude(
+        &bin,
+        "#!/bin/bash\nprintf 'launched\\n' > \"$RECOVERY_PROVIDER_LAUNCHED\"\nexit 73\n",
+    );
+    fluent_cmd()
+        .current_dir(&fixture.project)
+        .args(["attempt", "run", &fixture.work, "attempt-1", "--no-sandbox"])
+        .env("PATH", mock_path(&bin))
+        .env("RECOVERY_PROVIDER_LAUNCHED", &launched)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("recovery source matrix changed"));
+    assert!(!launched.exists());
+    assert_eq!(store.read_work_item(&fixture.work).unwrap(), approved);
+    assert_eq!(fs::read(&fixture.audit).unwrap(), old_audit);
 }
 
 #[test]
