@@ -21128,6 +21128,82 @@ fn concurrent_learner_retry_and_land_never_mutate_after_merge() {
 }
 
 #[test]
+fn workflow_cleanup_retains_pending_recovery() {
+    let tmp = TempDir::new().unwrap();
+    let project = setup_git_project(&tmp);
+    let bin = run_plain_attempt(&project, &tmp, "workflow-cleanup-provider");
+    fs::write(project.join(".fluent/observations"), "block publication\n").unwrap();
+    land_work_1(&project, &bin, true);
+    let before = work_item_value(&project, "work-1");
+    assert_eq!(
+        before["merge_candidates"][0]["merge_state"]["status"],
+        "merged"
+    );
+    assert_eq!(
+        before["merge_candidates"][0]["merge_state"]["follow_up_failure"]["stage"],
+        "observation"
+    );
+    let artifact_root = project.join(".fluent/work/artifacts/work-1");
+    assert!(artifact_root.is_dir());
+    fluent_cmd()
+        .current_dir(&project)
+        .args(["cleanup", "--apply"])
+        .assert()
+        .success();
+    assert_eq!(work_item_value(&project, "work-1"), before);
+    assert!(artifact_root.is_dir());
+    fs::remove_file(project.join(".fluent/observations")).unwrap();
+    land_work_1(&project, &bin, true);
+    assert_eq!(follow_up_failure_stage(&project), "");
+    assert_eq!(open_observation_files(&project).len(), 1);
+}
+
+#[test]
+fn workflow_cleanup_rechecks_current_eligibility() {
+    use fluent::work_model::{AttemptStatus, WorkItem};
+    let tmp = TempDir::new().unwrap();
+    let project = setup_git_project(&tmp);
+    let store = WorkModelStore::new(&project);
+    let mut item = WorkItem::planned("cleanup-recheck", "Recheck cleanup eligibility");
+    item.add_initial_attempt("attempt-1").unwrap();
+    item.attempts[0].status = AttemptStatus::Failed;
+    item.attempts[0].tasks[0].status = TaskStatus::Failed;
+    store.create_work_item(&item).unwrap();
+    let mut eligible = WorkItem::planned("cleanup-eligible", "Remove terminal Work");
+    eligible.add_initial_attempt("attempt-1").unwrap();
+    eligible.attempts[0].status = AttemptStatus::Failed;
+    eligible.attempts[0].tasks[0].status = TaskStatus::Failed;
+    store.create_work_item(&eligible).unwrap();
+    let lock = fluent::land_lock::acquire(&fluent::land_lock::lock_path(&project)).unwrap();
+    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("fluent"));
+    command
+        .current_dir(&project)
+        .args(["cleanup", "--apply"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = OwnedFixtureProcess::spawn(&mut command);
+    store
+        .mutate_work_item("cleanup-recheck", |item| {
+            item.attempts[0].status = AttemptStatus::NeedsUser;
+            item.attempts[0].tasks[0].status = TaskStatus::NeedsUser;
+            Ok(())
+        })
+        .unwrap();
+    drop(lock);
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        store.read_work_item("cleanup-recheck").unwrap().attempts[0].status,
+        AttemptStatus::NeedsUser
+    );
+    assert!(store.read_work_item("cleanup-eligible").is_err());
+}
+
+#[test]
 fn cleanup_waits_for_recovery_then_rereads_the_completed_origin() {
     let tmp = TempDir::new().unwrap();
     let main_dir = setup_git_project(&tmp);
