@@ -27,10 +27,12 @@ fn scheduler_released_upgrade_preserves_shared_ownership() {
     let home = TempDir::new().unwrap();
     let first = TempDir::new().unwrap();
     let second = TempDir::new().unwrap();
-    let source = fs::read("/Users/mrinal/.local/bin/fluent")
-        .expect("actual v0.5.0 executable is required");
-    assert_eq!(format!("{:x}", Sha256::digest(&source)),
-        "8bb76717be942e4a0c97c297c318c0a1331e92105180edb386354dddbae12974");
+    let source =
+        fs::read("/Users/mrinal/.local/bin/fluent").expect("actual v0.5.0 executable is required");
+    assert_eq!(
+        format!("{:x}", Sha256::digest(&source)),
+        "8bb76717be942e4a0c97c297c318c0a1331e92105180edb386354dddbae12974"
+    );
     let predecessor = home.path().join("fluent-v0.5.0");
     fs::write(&predecessor, source).unwrap();
     use std::os::unix::fs::PermissionsExt;
@@ -40,81 +42,172 @@ fn scheduler_released_upgrade_preserves_shared_ownership() {
     assert!(String::from_utf8_lossy(&release_version.stdout).contains("0.5.0 6875b409"));
 
     let fixture = |binary: &std::path::Path, project: &std::path::Path, args: &[&str]| {
-        Command::new(binary).current_dir(project).env("HOME", home.path())
+        Command::new(binary)
+            .current_dir(project)
+            .env("HOME", home.path())
             .env("FLUENT_NO_UPDATE_CHECK", "1")
             .env_remove("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT")
-            .args(args).output().unwrap()
+            .args(args)
+            .output()
+            .unwrap()
     };
     for (project, work) in [(first.path(), "first"), (second.path(), "second")] {
-        assert!(Command::new("git").current_dir(project)
-            .args(["init", "-q", "-b", "main"]).status().unwrap().success());
-        let created = fixture(&predecessor, project,
-            &["work-item", "create", work, "--title", "Queued predecessor Work"]);
-        assert!(created.status.success(), "{}", String::from_utf8_lossy(&created.stderr));
-        let attempt = fixture(&predecessor, project,
-            &["attempt", "create", work, "attempt-1"]);
-        assert!(attempt.status.success(), "{}", String::from_utf8_lossy(&attempt.stderr));
+        assert!(
+            Command::new("git")
+                .current_dir(project)
+                .args(["init", "-q", "-b", "main"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let created = fixture(
+            &predecessor,
+            project,
+            &[
+                "work-item",
+                "create",
+                work,
+                "--title",
+                "Queued predecessor Work",
+            ],
+        );
+        assert!(
+            created.status.success(),
+            "{}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        let attempt = fixture(
+            &predecessor,
+            project,
+            &["attempt", "create", work, "attempt-1"],
+        );
+        assert!(
+            attempt.status.success(),
+            "{}",
+            String::from_utf8_lossy(&attempt.stderr)
+        );
     }
     // The released Unix service cannot bind a socket inside the Writer's
     // sandbox. The host-owned strict run executes the process transition.
     if std::env::var("FLUENT_WORKFLOW_REQUIRE_HOST").as_deref() != Ok("1") {
         for (project, work) in [(first.path(), "first"), (second.path(), "second")] {
             let queued = fixture(&predecessor, project, &["queue", "add", work]);
-            assert!(queued.status.success(), "{}", String::from_utf8_lossy(&queued.stderr));
-            let visible = fixture(std::path::Path::new(env!("CARGO_BIN_EXE_fluent")), project,
-                &["queue", "show", work]);
-            assert!(visible.status.success(), "{}", String::from_utf8_lossy(&visible.stderr));
+            assert!(
+                queued.status.success(),
+                "{}",
+                String::from_utf8_lossy(&queued.stderr)
+            );
+            let visible = fixture(
+                std::path::Path::new(env!("CARGO_BIN_EXE_fluent")),
+                project,
+                &["queue", "show", work],
+            );
+            assert!(
+                visible.status.success(),
+                "{}",
+                String::from_utf8_lossy(&visible.stderr)
+            );
             assert!(String::from_utf8_lossy(&visible.stdout).contains("queued"));
         }
         return;
     }
-    let mut old_service = ReleaseServiceChild(Command::new(&predecessor).current_dir(first.path())
-        .env("HOME", home.path()).env("FLUENT_NO_UPDATE_CHECK", "1")
-        .args(["scheduler", "run", "--poll-seconds", "30"])
-        .spawn().unwrap());
+    let mut old_service = ReleaseServiceChild(
+        Command::new(&predecessor)
+            .current_dir(first.path())
+            .env("HOME", home.path())
+            .env("FLUENT_NO_UPDATE_CHECK", "1")
+            .args(["scheduler", "run", "--poll-seconds", "30"])
+            .spawn()
+            .unwrap(),
+    );
     let socket = scheduler_service::socket_path(home.path());
     let deadline = Instant::now() + Duration::from_secs(10);
     while !socket.exists() {
-        assert!(Instant::now() < deadline, "released service failed to start");
-        assert!(old_service.0.try_wait().unwrap().is_none(), "released service exited");
+        assert!(
+            Instant::now() < deadline,
+            "released service failed to start"
+        );
+        assert!(
+            old_service.0.try_wait().unwrap().is_none(),
+            "released service exited"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
-    let reused = fixture(&predecessor, second.path(),
-        &["scheduler", "run", "--poll-seconds", "30"]);
-    assert!(reused.status.success(), "{}", String::from_utf8_lossy(&reused.stderr));
+    let reused = fixture(
+        &predecessor,
+        second.path(),
+        &["scheduler", "run", "--poll-seconds", "30"],
+    );
+    assert!(
+        reused.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reused.stderr)
+    );
     let registry = scheduler_service::read_registry(home.path()).unwrap();
     assert_eq!(registry.len(), 2);
-    let incompatible = fixture(std::path::Path::new(env!("CARGO_BIN_EXE_fluent")), first.path(),
-        &["scheduler", "run", "--poll-seconds", "30"]);
-    assert!(!incompatible.status.success(), "current build replaced live release");
+    let incompatible = fixture(
+        std::path::Path::new(env!("CARGO_BIN_EXE_fluent")),
+        first.path(),
+        &["scheduler", "run", "--poll-seconds", "30"],
+    );
+    assert!(
+        !incompatible.status.success(),
+        "current build replaced live release"
+    );
     for (project, work) in [(first.path(), "first"), (second.path(), "second")] {
         let queued = fixture(&predecessor, project, &["queue", "add", work]);
-        assert!(queued.status.success(), "{}", String::from_utf8_lossy(&queued.stderr));
+        assert!(
+            queued.status.success(),
+            "{}",
+            String::from_utf8_lossy(&queued.stderr)
+        );
     }
     let stopped = fixture(&predecessor, first.path(), &["scheduler", "stop", "--all"]);
-    assert!(stopped.status.success(), "{}", String::from_utf8_lossy(&stopped.stderr));
+    assert!(
+        stopped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
     assert!(old_service.0.wait().unwrap().success());
     for (project, work) in [(first.path(), "first"), (second.path(), "second")] {
         let queued = fixture(&predecessor, project, &["queue", "show", work]);
         assert!(queued.status.success());
         assert!(String::from_utf8_lossy(&queued.stdout).contains("queued"));
     }
-    let mut replacement = ReleaseServiceChild(Command::new(env!("CARGO_BIN_EXE_fluent"))
-        .current_dir(first.path()).env("HOME", home.path())
-        .env_remove("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT")
-        .args(["scheduler", "run", "--poll-seconds", "1"]).spawn().unwrap());
+    let mut replacement = ReleaseServiceChild(
+        Command::new(env!("CARGO_BIN_EXE_fluent"))
+            .current_dir(first.path())
+            .env("HOME", home.path())
+            .env_remove("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT")
+            .args(["scheduler", "run", "--poll-seconds", "1"])
+            .spawn()
+            .unwrap(),
+    );
     let deadline = Instant::now() + Duration::from_secs(10);
     while scheduler_service::send_health_request(&socket).is_err() {
-        assert!(Instant::now() < deadline, "replacement did not acquire service");
+        assert!(
+            Instant::now() < deadline,
+            "replacement did not acquire service"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
-    assert_eq!(scheduler_service::read_registry(home.path()).unwrap().len(), 2);
+    assert_eq!(
+        scheduler_service::read_registry(home.path()).unwrap().len(),
+        2
+    );
     let stale = scheduler_service::stop_service_instance(home.path(), "stale-instance");
     assert!(stale.is_err());
     assert!(scheduler_service::send_health_request(&socket).is_ok());
-    let stopped = fixture(std::path::Path::new(env!("CARGO_BIN_EXE_fluent")), first.path(),
-        &["scheduler", "stop", "--all"]);
-    assert!(stopped.status.success(), "{}", String::from_utf8_lossy(&stopped.stderr));
+    let stopped = fixture(
+        std::path::Path::new(env!("CARGO_BIN_EXE_fluent")),
+        first.path(),
+        &["scheduler", "stop", "--all"],
+    );
+    assert!(
+        stopped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
     assert!(replacement.0.wait().unwrap().success());
 }
 

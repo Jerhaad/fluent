@@ -53,14 +53,19 @@ fn record_release_refusal(
     after: &[SnapshotEntry],
     refusal: &std::process::Output,
 ) {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("target/formal/workflow/release-transition");
+    let root =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("target/formal/workflow/release-transition");
     fs::create_dir_all(&root).unwrap();
     let facts = |snapshot: &[SnapshotEntry]| -> Vec<_> {
-        snapshot.iter().map(|entry| serde_json::json!({
-            "path":entry.path.to_string_lossy(), "kind":entry.kind,
-            "sha256":format!("{:x}", Sha256::digest(&entry.bytes))
-        })).collect()
+        snapshot
+            .iter()
+            .map(|entry| {
+                serde_json::json!({
+                    "path":entry.path.to_string_lossy(), "kind":entry.kind,
+                    "sha256":format!("{:x}", Sha256::digest(&entry.bytes))
+                })
+            })
+            .collect()
     };
     let release_bytes = fs::read(release).unwrap();
     let candidate_bytes = fs::read(assert_cmd::cargo::cargo_bin("fluent")).unwrap();
@@ -82,7 +87,11 @@ fn record_release_refusal(
                  "protected":facts(after)}}
         ]
     });
-    fs::write(root.join(format!("{scenario}.json")), serde_json::to_vec_pretty(&trace).unwrap()).unwrap();
+    fs::write(
+        root.join(format!("{scenario}.json")),
+        serde_json::to_vec_pretty(&trace).unwrap(),
+    )
+    .unwrap();
 }
 
 fn released_work_fixture(tmp: &TempDir, binary: &Path, id: &str) -> PathBuf {
@@ -92,7 +101,11 @@ fn released_work_fixture(tmp: &TempDir, binary: &Path, id: &str) -> PathBuf {
         vec!["attempt", "create", id, "attempt-1"],
     ] {
         let result = released_command(binary, &project, &args);
-        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
     }
     project
 }
@@ -105,65 +118,99 @@ fn released_upgrade_preserves_workflow_state() {
     let before = WorkModelStore::new(&project)
         .read_work_item_snapshot("released-planned")
         .unwrap();
-    fluent_cmd().current_dir(&project)
+    fluent_cmd()
+        .current_dir(&project)
         .args(["work-item", "show", "released-planned"])
-        .assert().success();
+        .assert()
+        .success();
     let after_read = WorkModelStore::new(&project)
         .read_work_item_snapshot("released-planned")
         .unwrap();
     assert_eq!(after_read.id, before.id);
-    fluent_cmd().current_dir(&project)
+    fluent_cmd()
+        .current_dir(&project)
         .args(["work-item", "upgrade", "released-planned"])
-        .assert().success();
+        .assert()
+        .success();
     let after = WorkModelStore::new(&project)
         .read_work_item_snapshot("released-planned")
         .unwrap();
     assert_eq!(after.id, before.id);
     assert_eq!(after.attempts[0].id, before.attempts[0].id);
-    assert_eq!(after.attempts[0].tasks[0].id, before.attempts[0].tasks[0].id);
-    fluent_cmd().current_dir(&project)
+    assert_eq!(
+        after.attempts[0].tasks[0].id,
+        before.attempts[0].tasks[0].id
+    );
+    fluent_cmd()
+        .current_dir(&project)
         .args(["attempt", "cancel", "released-planned", "attempt-1"])
-        .assert().success();
-    assert_eq!(WorkModelStore::new(&project).read_work_item_snapshot("released-planned")
-        .unwrap().attempts[0].tasks[0].id, before.attempts[0].tasks[0].id);
+        .assert()
+        .success();
+    assert_eq!(
+        WorkModelStore::new(&project)
+            .read_work_item_snapshot("released-planned")
+            .unwrap()
+            .attempts[0]
+            .tasks[0]
+            .id,
+        before.attempts[0].tasks[0].id
+    );
 
     let queued_tmp = TempDir::new().unwrap();
     let queued = released_work_fixture(&queued_tmp, &release, "released-queued");
-    let queue = released_command(&release, &queued,
-        &["queue", "add", "released-queued"]);
-    assert!(queue.status.success(), "{}", String::from_utf8_lossy(&queue.stderr));
-    let queued_before = released_command(&release, &queued,
-        &["queue", "show", "released-queued"]);
+    let queue = released_command(&release, &queued, &["queue", "add", "released-queued"]);
+    assert!(
+        queue.status.success(),
+        "{}",
+        String::from_utf8_lossy(&queue.stderr)
+    );
+    let queued_before = released_command(&release, &queued, &["queue", "show", "released-queued"]);
     assert!(queued_before.status.success());
     assert!(String::from_utf8_lossy(&queued_before.stdout).contains("queued"));
-    fluent_cmd().current_dir(&queued)
+    fluent_cmd()
+        .current_dir(&queued)
         .args(["work-item", "upgrade", "released-queued"])
-        .assert().success();
-    let queued_after = fluent_cmd().current_dir(&queued)
+        .assert()
+        .success();
+    let queued_after = fluent_cmd()
+        .current_dir(&queued)
         .args(["queue", "show", "released-queued"])
-        .output().unwrap();
+        .output()
+        .unwrap();
     assert!(queued_after.status.success());
     assert!(String::from_utf8_lossy(&queued_after.stdout).contains("queued"));
 
     let paused_tmp = TempDir::new().unwrap();
     let paused = released_work_fixture(&paused_tmp, &release, "released-paused");
-    let paused_before = released_command(&release, &paused,
-        &["attempt", "cancel", "released-paused", "attempt-1"]);
+    let paused_before = released_command(
+        &release,
+        &paused,
+        &["attempt", "cancel", "released-paused", "attempt-1"],
+    );
     assert!(paused_before.status.success());
-    let saved = released_command(&release, &paused,
-        &["work-item", "show", "released-paused"]);
+    let saved = released_command(&release, &paused, &["work-item", "show", "released-paused"]);
     assert!(saved.status.success());
     let paused_work: serde_json::Value = serde_json::from_slice(&saved.stdout).unwrap();
-    fluent_cmd().current_dir(&paused)
+    fluent_cmd()
+        .current_dir(&paused)
         .args(["work-item", "upgrade", "released-paused"])
-        .assert().success();
-    let upgraded = fluent_cmd().current_dir(&paused)
+        .assert()
+        .success();
+    let upgraded = fluent_cmd()
+        .current_dir(&paused)
         .args(["work-item", "show", "released-paused"])
-        .output().unwrap();
+        .output()
+        .unwrap();
     assert!(upgraded.status.success());
     let upgraded_work: serde_json::Value = serde_json::from_slice(&upgraded.stdout).unwrap();
-    assert_eq!(upgraded_work["attempts"][0]["id"], paused_work["attempts"][0]["id"]);
-    assert_eq!(upgraded_work["attempts"][0]["status"], paused_work["attempts"][0]["status"]);
+    assert_eq!(
+        upgraded_work["attempts"][0]["id"],
+        paused_work["attempts"][0]["id"]
+    );
+    assert_eq!(
+        upgraded_work["attempts"][0]["status"],
+        paused_work["attempts"][0]["status"]
+    );
 }
 
 #[test]
@@ -171,16 +218,31 @@ fn released_upgrade_recovers_interrupted_publication() {
     let tmp = TempDir::new().unwrap();
     let release = released_050_binary(&tmp);
     let project = released_work_fixture(&tmp, &release, "released-pending");
-    let result = fluent_cmd().current_dir(&project)
-        .env("FLUENT_TEST_WORK_MODEL_INTERRUPT", "before-child-publication")
+    let result = fluent_cmd()
+        .current_dir(&project)
+        .env(
+            "FLUENT_TEST_WORK_MODEL_INTERRUPT",
+            "before-child-publication",
+        )
         .args(["attempt", "cancel", "released-pending", "attempt-1"])
-        .output().unwrap();
+        .output()
+        .unwrap();
     assert!(!result.status.success());
-    assert!(project.join(".fluent/work/transactions/released-pending.json").exists());
-    fluent_cmd().current_dir(&project)
+    assert!(
+        project
+            .join(".fluent/work/transactions/released-pending.json")
+            .exists()
+    );
+    fluent_cmd()
+        .current_dir(&project)
         .args(["attempt", "cancel", "released-pending", "attempt-1"])
-        .assert().success();
-    assert!(!project.join(".fluent/work/transactions/released-pending.json").exists());
+        .assert()
+        .success();
+    assert!(
+        !project
+            .join(".fluent/work/transactions/released-pending.json")
+            .exists()
+    );
 }
 
 #[test]
@@ -188,18 +250,38 @@ fn released_predecessor_refuses_current_authority() {
     let tmp = TempDir::new().unwrap();
     let release = released_050_binary(&tmp);
     let project = released_work_fixture(&tmp, &release, "released-refusal");
-    let legacy_read = released_command(&release, &project,
-        &["work-item", "show", "released-refusal"]);
+    let legacy_read = released_command(
+        &release,
+        &project,
+        &["work-item", "show", "released-refusal"],
+    );
     assert!(legacy_read.status.success());
-    fluent_cmd().current_dir(&project)
+    fluent_cmd()
+        .current_dir(&project)
         .args(["work-item", "upgrade", "released-refusal"])
-        .assert().success();
+        .assert()
+        .success();
     let root = project.join(".fluent/work");
     let before = snapshot_tree(&root);
-    let result = released_command(&release, &project,
-        &["work-item", "abandon", "released-refusal", "--reason", "old reader"]);
-    assert!(!result.status.success(), "old release changed current authority");
-    assert!(!result.stderr.is_empty(), "refusal must explain the incompatible record");
+    let result = released_command(
+        &release,
+        &project,
+        &[
+            "work-item",
+            "abandon",
+            "released-refusal",
+            "--reason",
+            "old reader",
+        ],
+    );
+    assert!(
+        !result.status.success(),
+        "old release changed current authority"
+    );
+    assert!(
+        !result.stderr.is_empty(),
+        "refusal must explain the incompatible record"
+    );
     let after = snapshot_tree(&root);
     assert_eq!(after, before);
     record_release_refusal("current-authority", &release, &before, &after, &result);
@@ -210,24 +292,50 @@ fn released_predecessor_refuses_pending_current_publication() {
     let tmp = TempDir::new().unwrap();
     let release = released_050_binary(&tmp);
     let project = released_work_fixture(&tmp, &release, "released-pending-refusal");
-    let result = fluent_cmd().current_dir(&project)
-        .env("FLUENT_TEST_WORK_MODEL_INTERRUPT", "before-child-publication")
+    let result = fluent_cmd()
+        .current_dir(&project)
+        .env(
+            "FLUENT_TEST_WORK_MODEL_INTERRUPT",
+            "before-child-publication",
+        )
         .args(["attempt", "cancel", "released-pending-refusal", "attempt-1"])
-        .output().unwrap();
+        .output()
+        .unwrap();
     assert!(!result.status.success());
     let root = project.join(".fluent/work");
-    assert!(root.join("transactions/released-pending-refusal.json").exists());
+    assert!(
+        root.join("transactions/released-pending-refusal.json")
+            .exists()
+    );
     let before = snapshot_tree(&root);
-    let result = released_command(&release, &project,
-        &["work-item", "abandon", "released-pending-refusal", "--reason", "old reader"]);
-    assert!(!result.status.success(), "old release replayed current publication");
+    let result = released_command(
+        &release,
+        &project,
+        &[
+            "work-item",
+            "abandon",
+            "released-pending-refusal",
+            "--reason",
+            "old reader",
+        ],
+    );
+    assert!(
+        !result.status.success(),
+        "old release replayed current publication"
+    );
     let after = snapshot_tree(&root);
     assert_eq!(after, before);
     record_release_refusal("pending-publication", &release, &before, &after, &result);
-    fluent_cmd().current_dir(&project)
+    fluent_cmd()
+        .current_dir(&project)
         .args(["attempt", "cancel", "released-pending-refusal", "attempt-1"])
-        .assert().success();
-    assert!(!root.join("transactions/released-pending-refusal.json").exists());
+        .assert()
+        .success();
+    assert!(
+        !root
+            .join("transactions/released-pending-refusal.json")
+            .exists()
+    );
 }
 
 fn fluent_cmd() -> LoggedCommand {
