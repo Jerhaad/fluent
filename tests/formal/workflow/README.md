@@ -7,12 +7,16 @@ isolated projects. Its Work tests exercise planned, queued, paused, running
 before cancellation, interrupted, and landed records. The strict host service
 test registers two projects, holds owned workers while each legacy coordinator
 drains, stops the supervised legacy service, then starts the replacement.
+The interrupted Work case terminates a running v0.5.0 Attempt and continues it
+through the current public cancellation command.
 
 `project_release.py` checks protected-state equality for both predecessor
 refusals and binds the service transition to the observed legacy coordinator
 identities, replacement service identity, builds, execution receipts, stop
 results, and queues. Mutating the protected state or the observed identities
-fails its negative controls. The suite
+fails its negative controls. The trace retains digest-bound protected-state
+snapshots, initial and final execution receipts, and service logs under the
+suite output; the projector checks retained bytes against the event facts. The suite
 also checks `service-competition.cfg` and `negative-guardversion.cfg` through
 TLC. A joint production trace across all workflow boundaries remains for the
 later integrated assurance work.

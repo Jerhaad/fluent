@@ -22,9 +22,18 @@ def project(path: Path, candidate: Path, commit: str):
     assert trace["collection-complete"] is True
     assert trace["fluent-commit"] == commit
     assert trace["fluent-binary-sha256"] == hashlib.sha256(candidate.read_bytes()).hexdigest()
-    assert trace["artifacts"] == []
+    artifacts = {}
+    for entry in trace["artifacts"]:
+        assert set(entry) == {"path", "sha256"}
+        name = entry["path"]
+        assert isinstance(name, str) and name not in artifacts
+        assert not Path(name).is_absolute() and ".." not in Path(name).parts
+        data = (path.parent / name).read_bytes()
+        assert hashlib.sha256(data).hexdigest() == entry["sha256"]
+        artifacts[name] = data
+    assert artifacts
     if trace["scenario"] == "released-shared-service-transition":
-        return project_service(trace)
+        return project_service(trace, artifacts)
     before, refused = trace["events"]
     assert before["sequence"] == 1 and refused["sequence"] == 2
     assert before["boundary"] == "before-refusal" and refused["boundary"] == "refused"
@@ -39,23 +48,37 @@ def project(path: Path, candidate: Path, commit: str):
     assert isinstance(facts["stdout"], str)
     protected = before["raw-facts"]["protected"]
     assert isinstance(protected, list) and protected
-    assert facts["protected"] == protected
+    assert len(facts["protected"]) == len(protected)
+    assert [(entry["path"], entry["kind"], entry["sha256"])
+            for entry in facts["protected"]] == [
+            (entry["path"], entry["kind"], entry["sha256"])
+            for entry in protected]
     names = set()
     for entry in protected:
-        assert set(entry) == {"path", "kind", "sha256"}
+        assert set(entry) == {"path", "kind", "sha256", "artifact"}
         name = entry["path"]
         assert isinstance(name, str) and name and name not in names
         assert not Path(name).is_absolute() and ".." not in Path(name).parts
         names.add(name)
         assert entry["kind"] in ("file", "directory", "symlink")
         assert re.fullmatch("[0-9a-f]{64}", entry["sha256"])
+        assert hashlib.sha256(artifacts[entry["artifact"]]).hexdigest() == entry["sha256"]
+    for entry in facts["protected"]:
+        assert set(entry) == {"path", "kind", "sha256", "artifact"}
+        assert hashlib.sha256(artifacts[entry["artifact"]]).hexdigest() == entry["sha256"]
+    assert {entry["artifact"] for entry in protected + facts["protected"]} == set(artifacts)
     assert any(name.startswith("items/") for name in names)
     if trace["scenario"] == "pending-publication":
         assert any(name.startswith("transactions/") for name in names)
     return {"scenario": trace["scenario"], "protected-entries": len(protected)}
 
 
-def project_service(trace):
+def project_service(trace, artifacts):
+    expected = {f"service-ownership/{work}-{stage}-receipt.json"
+                for work in ("first", "second") for stage in ("initial", "final")}
+    expected |= {"service-ownership/released-service.stdout",
+                 "service-ownership/released-service.stderr"}
+    assert set(artifacts) == expected
     old, stopped, new = trace["events"]
     for index, (event, boundary, operation) in enumerate(zip(
             (old, stopped, new),
@@ -80,6 +103,16 @@ def project_service(trace):
     assert settled["owned-worker-started"] is True
     owned = settled["owned-workers"]
     assert len(owned) > 0
+    for worker in owned:
+        work = worker["work_item_id"]
+        assert work in {"first", "second"}
+        for stage in ("initial", "final"):
+            name = f"service-ownership/{work}-{stage}-receipt.json"
+            assert worker[f"{stage}-receipt-artifact"] == name
+            assert json.loads(artifacts[name]) == worker[f"{stage}-receipt"]
+        for key in ("project", "workspace", "receipt"):
+            value = Path(worker[key])
+            assert not value.is_absolute() and ".." not in value.parts
     assert all(worker["work_item_id"] in {"first", "second"}
                and worker["attempt_id"] == "attempt-1"
                and worker["dispatch_id"]

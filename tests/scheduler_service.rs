@@ -685,6 +685,10 @@ fn scheduler_released_upgrade_preserves_shared_ownership() {
     use std::process::Command;
 
     let dirs = released_service_fixture_dirs();
+    let output = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target/formal/workflow/release-transition");
+    fs::create_dir_all(output.join("service-ownership")).unwrap();
+    let mut artifacts = Vec::new();
     let home = &dirs.home;
     let first = &dirs.first;
     let second = &dirs.second;
@@ -932,8 +936,9 @@ fn scheduler_released_upgrade_preserves_shared_ownership() {
             if let Some((task_id, workspace, receipt, pid)) = worker
                 .filter(|_| matches!(dispatch["status"].as_str(), Some("claimed" | "running")))
             {
+                let initial_bytes = fs::read(&receipt).unwrap();
                 let initial: fluent::execution::ExecutionRecord =
-                    serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
+                    serde_json::from_slice(&initial_bytes).unwrap();
                 if initial.state != fluent::execution::ExecutionState::Running
                     || initial.process_group_id != pid as u32
                 {
@@ -946,6 +951,10 @@ fn scheduler_released_upgrade_preserves_shared_ownership() {
                         .as_str()
                         .is_some_and(|id| !id.is_empty())
                 );
+                let name = format!("service-ownership/{work}-initial-receipt.json");
+                fs::write(output.join(&name), &initial_bytes).unwrap();
+                artifacts.push(serde_json::json!({"path":name,
+                    "sha256":format!("{:x}", Sha256::digest(&initial_bytes))}));
                 owned_before_stop.push((
                     project.to_path_buf(),
                     task_id,
@@ -1050,8 +1059,15 @@ fn scheduler_released_upgrade_preserves_shared_ownership() {
                     after["status"].as_str(),
                     Some("candidate-ready" | "failed" | "needs-user" | "canceled" | "blocked")
                 ));
+                let final_bytes = fs::read(receipt).unwrap();
                 let execution: fluent::execution::ExecutionRecord =
-                    serde_json::from_slice(&fs::read(receipt).unwrap()).unwrap();
+                    serde_json::from_slice(&final_bytes).unwrap();
+                let work = before["work_item_id"].as_str().unwrap();
+                let final_name = format!("service-ownership/{work}-final-receipt.json");
+                fs::write(output.join(&final_name), &final_bytes).unwrap();
+                artifacts.push(serde_json::json!({"path":final_name,
+                    "sha256":format!("{:x}", Sha256::digest(&final_bytes))}));
+                let initial_name = format!("service-ownership/{work}-initial-receipt.json");
                 assert!(matches!(
                     execution.state,
                     fluent::execution::ExecutionState::Settled
@@ -1094,9 +1110,11 @@ fn scheduler_released_upgrade_preserves_shared_ownership() {
                         | fluent::work_model::TaskStatus::NeedsUser
                         | fluent::work_model::TaskStatus::Superseded
                 ));
-                serde_json::json!({"project":project,"pid":pid,
-            "task_id":task_id,"workspace":workspace,"receipt":receipt,
+                serde_json::json!({"project":project.strip_prefix(dirs.root.path()).unwrap(),"pid":pid,
+            "task_id":task_id,"workspace":workspace.strip_prefix(dirs.root.path()).unwrap(),
+            "receipt":receipt.strip_prefix(dirs.root.path()).unwrap(),
             "initial-receipt":initial,"final-receipt":execution,
+            "initial-receipt-artifact":initial_name,"final-receipt-artifact":final_name,
             "launches":launches,"task-status":task.status,
             "execution-state":execution.state,"process-group-absent":true,
             "work_item_id":before["work_item_id"], "dispatch_id":before["dispatch_id"],
@@ -1198,12 +1216,19 @@ fn scheduler_released_upgrade_preserves_shared_ownership() {
         .output()
         .unwrap();
     assert!(head.status.success());
+    for name in ["released-service.stdout", "released-service.stderr"] {
+        let bytes = fs::read(home.path().join(name)).unwrap();
+        let retained = format!("service-ownership/{name}");
+        fs::write(output.join(&retained), &bytes).unwrap();
+        artifacts.push(serde_json::json!({"path":retained,
+            "sha256":format!("{:x}", Sha256::digest(&bytes))}));
+    }
     let trace = serde_json::json!({
         "schema-version":1,"scenario":"released-shared-service-transition",
         "fluent-commit":String::from_utf8_lossy(&head.stdout).trim(),
         "fluent-binary-sha256":format!("{:x}", Sha256::digest(current_binary)),
         "model-profile":"release-transition","collection-complete":true,
-        "artifacts":[],"events":[
+        "artifacts":artifacts,"events":[
             {"sequence":1,"actor":"released-service","operation-id":"scheduler-run",
              "generation":old_health.generation,"boundary":"old-owner",
              "causal-predecessors":[],"raw-facts":{"health":{
@@ -1225,15 +1250,12 @@ fn scheduler_released_upgrade_preserves_shared_ownership() {
                 "instance_id":new_health.instance_id,"state":new_health.state},
                 "registered-projects":scheduler_service::read_registry(home.path()).unwrap().len(),
                 "queues":queues_after_replacement,"stale-stop":{
-                    "requested-coordinator":stale_instance,"request-path":first.path().join(".fluent/work/scheduler/stop-request.json"),
+                    "requested-coordinator":stale_instance,"request-path":first.path().join(".fluent/work/scheduler/stop-request.json").strip_prefix(dirs.root.path()).unwrap(),
                     "health-after":{"instance_id":health_after_stale.instance_id,
                         "build":health_after_stale.build,"generation":health_after_stale.generation,
                         "state":health_after_stale.state}}}}
         ]
     });
-    let output = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("target/formal/workflow/release-transition");
-    fs::create_dir_all(&output).unwrap();
     fs::write(
         output.join("service-ownership.json"),
         serde_json::to_vec_pretty(&trace).unwrap(),

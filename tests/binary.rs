@@ -56,17 +56,27 @@ fn record_release_refusal(
     let root =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("target/formal/workflow/release-transition");
     fs::create_dir_all(&root).unwrap();
-    let facts = |snapshot: &[SnapshotEntry]| -> Vec<_> {
+    let mut artifacts = Vec::new();
+    let mut facts = |stage: &str, snapshot: &[SnapshotEntry]| -> Vec<_> {
         snapshot
             .iter()
-            .map(|entry| {
+            .enumerate()
+            .map(|(index, entry)| {
+                let name = format!("{scenario}/{stage}/{index:05}.bin");
+                let target = root.join(&name);
+                fs::create_dir_all(target.parent().unwrap()).unwrap();
+                fs::write(target, &entry.bytes).unwrap();
+                let digest = format!("{:x}", Sha256::digest(&entry.bytes));
+                artifacts.push(serde_json::json!({"path":name,"sha256":digest}));
                 serde_json::json!({
                     "path":entry.path.to_string_lossy(), "kind":entry.kind,
-                    "sha256":format!("{:x}", Sha256::digest(&entry.bytes))
+                    "sha256":digest,"artifact":name
                 })
             })
             .collect()
     };
+    let before_facts = facts("before", before);
+    let after_facts = facts("after", after);
     let release_bytes = fs::read(release).unwrap();
     let candidate_bytes = fs::read(assert_cmd::cargo::cargo_bin("fluent")).unwrap();
     let trace = serde_json::json!({
@@ -74,17 +84,17 @@ fn record_release_refusal(
         "fluent-commit":git_head(Path::new(env!("CARGO_MANIFEST_DIR"))),
         "fluent-binary-sha256":format!("{:x}", Sha256::digest(candidate_bytes)),
         "model-profile":"release-transition","collection-complete":true,
-        "artifacts":[],"events":[
+        "artifacts":artifacts,"events":[
             {"sequence":1,"actor":"current-reader","operation-id":"snapshot",
              "generation":null,"boundary":"before-refusal","causal-predecessors":[],
-             "raw-facts":{"protected":facts(before),"predecessor-sha256":
+             "raw-facts":{"protected":before_facts,"predecessor-sha256":
                  format!("{:x}", Sha256::digest(&release_bytes))}},
             {"sequence":2,"actor":"released-reader","operation-id":"work-item-abandon",
              "generation":null,"boundary":"refused","causal-predecessors":[1],
              "raw-facts":{"exit-code":refusal.status.code(),
                  "stdout":String::from_utf8_lossy(&refusal.stdout),
                  "stderr":String::from_utf8_lossy(&refusal.stderr),
-                 "protected":facts(after)}}
+                 "protected":after_facts}}
         ]
     });
     fs::write(
@@ -246,6 +256,75 @@ fn released_upgrade_recovers_interrupted_publication() {
             .join(".fluent/work/transactions/released-pending.json")
             .exists()
     );
+}
+
+#[test]
+fn released_upgrade_recovers_predecessor_interrupted_work() {
+    let tmp = TempDir::new().unwrap();
+    let release = released_050_binary(&tmp);
+    let project = released_work_fixture(&tmp, &release, "released-interrupted");
+    let bin = tmp.path().join("blocking-provider");
+    write_mock_claude(
+        &bin,
+        "#!/bin/sh\nset -eu\nprintf 'started\\n' > \"$RELEASE_STARTED\"\nwhile :; do sleep 0.05; done\n",
+    );
+    let started = tmp.path().join("writer-started");
+    let mut running = OwnedFixtureProcess::spawn(
+        Command::new(&release)
+            .current_dir(&project)
+            .env("HOME", tmp.path())
+            .env("PATH", mock_path(&bin))
+            .env("RELEASE_STARTED", &started)
+            .env("FLUENT_NO_UPDATE_CHECK", "1")
+            .args([
+                "attempt",
+                "run",
+                "released-interrupted",
+                "attempt-1",
+                "--no-sandbox",
+            ]),
+    );
+    assert!(poll_until(std::time::Duration::from_secs(10), || started.exists()));
+    let before = released_command(
+        &release,
+        &project,
+        &["work-item", "show", "released-interrupted"],
+    );
+    assert!(before.status.success());
+    let before: serde_json::Value = serde_json::from_slice(&before.stdout).unwrap();
+    assert_eq!(before["attempts"][0]["status"], "executing");
+    running.terminate_and_wait();
+    let interrupted = released_command(
+        &release,
+        &project,
+        &["work-item", "show", "released-interrupted"],
+    );
+    assert!(interrupted.status.success());
+    let interrupted: serde_json::Value = serde_json::from_slice(&interrupted.stdout).unwrap();
+    assert_eq!(
+        interrupted["attempts"][0]["id"],
+        before["attempts"][0]["id"]
+    );
+    assert_eq!(interrupted["attempts"][0]["status"], "executing");
+    fluent_cmd()
+        .current_dir(&project)
+        .args(["attempt", "cancel", "released-interrupted", "attempt-1"])
+        .assert()
+        .success();
+    let after = fluent_cmd()
+        .current_dir(&project)
+        .args(["work-item", "show", "released-interrupted"])
+        .output()
+        .unwrap();
+    assert!(after.status.success());
+    let after: serde_json::Value = serde_json::from_slice(&after.stdout).unwrap();
+    assert_eq!(after["id"], interrupted["id"]);
+    assert_eq!(after["attempts"][0]["id"], interrupted["attempts"][0]["id"]);
+    assert_eq!(
+        after["attempts"][0]["tasks"][0]["id"],
+        interrupted["attempts"][0]["tasks"][0]["id"]
+    );
+    assert_eq!(after["attempts"][0]["status"], "needs-user");
 }
 
 #[test]

@@ -684,6 +684,7 @@ def release_transition_suite(source, root, output, jar, java):
     cases = (
         ("binary", ("released_upgrade_preserves_workflow_state",
                     "released_upgrade_recovers_interrupted_publication",
+                    "released_upgrade_recovers_predecessor_interrupted_work",
                     "released_upgrade_preserves_running_before_stop",
                     "released_upgrade_preserves_landed_work")),
         ("binary", ("released_predecessor_refuses_current_authority",
@@ -726,6 +727,17 @@ def release_transition_suite(source, root, output, jar, java):
                 negative.stdout + negative.stderr)
             results.append({"case": f"{scenario}-negative", "pass": negative.returncode != 0,
                             "log": f"{scenario}-negative.log"})
+            corrupted = json.loads(path.read_text())
+            corrupted["artifacts"][0]["sha256"] = "0" * 64
+            negative_path = output / f"{scenario}-artifact-negative.json"
+            negative_path.write_text(json.dumps(corrupted))
+            negative = subprocess.run([*command[:2], str(negative_path), *command[3:]],
+                                      cwd=root, capture_output=True, text=True)
+            (output / f"{scenario}-artifact-negative.log").write_text(
+                negative.stdout + negative.stderr)
+            results.append({"case": f"{scenario}-artifact-negative",
+                            "pass": negative.returncode != 0,
+                            "log": f"{scenario}-artifact-negative.log"})
     service_trace = output / "service-ownership.json"
     service_command = ["python3", str(source / "project_release.py"), str(service_trace),
                        str(candidate), commit]
@@ -743,6 +755,10 @@ def release_transition_suite(source, root, output, jar, java):
                     dispatch_id="unobserved-dispatch")),
                 ("service-launch-negative", lambda trace: trace["events"][1]["raw-facts"]["owned-workers"][0]["launches"][0].update(
                     {"process-group-absent": False})),
+                ("service-receipt-negative", lambda trace: trace["events"][1]["raw-facts"]["owned-workers"][0]["initial-receipt"].update(
+                    {"state": "settled"})),
+                ("service-artifact-negative", lambda trace: trace["artifacts"][0].update(
+                    {"sha256": "0" * 64})),
                 ("service-stale-stop-negative", lambda trace: trace["events"][2]["raw-facts"]["stale-stop"].update(
                     {"requested-coordinator": "unobserved-coordinator"}))):
             corrupted = json.loads(service_trace.read_text())
