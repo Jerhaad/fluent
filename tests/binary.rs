@@ -41757,6 +41757,323 @@ exit 0
 }
 
 #[test]
+fn classified_writer_receives_current_authorized_instructions() {
+    classified_writer_delivery_probe(false);
+}
+
+fn classified_writer_delivery_probe(check_history: bool) {
+    let tmp = TempDir::new_in("target").unwrap();
+    let suffix = tmp.path().file_name().unwrap().to_string_lossy();
+    let work_id = format!("classified-writer-inputs-{suffix}");
+    let (project, candidate, _, review, digest, _) =
+        setup_paused_code_change_classification_fixture(&tmp, &work_id);
+    let workspace = bind_candidate_to_managed_sibling(&project, &work_id, &candidate);
+    let instruction = "Repair the runner and its result parser: sentinel-7841.";
+    fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "attempt",
+            "evidence",
+            "classify",
+            &work_id,
+            "attempt-1",
+            "--candidate",
+            &candidate,
+            "--review-artifact",
+            &review,
+            "--evidence-digest",
+            &digest,
+            "--resolution",
+            instruction,
+        ])
+        .assert()
+        .success();
+    let classified = work_item_value(&project, &work_id);
+    let classification =
+        &classified["attempts"][0]["evidence_recoveries"][0]["code_change_classification"];
+    let writer_id = classification["writer_task_id"].as_str().unwrap();
+    let audit = project.join(classification["audit_artifact"]["path"].as_str().unwrap());
+    let writer = classified["attempts"][0]["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["id"] == writer_id)
+        .unwrap();
+    let area = project.join(writer["artifact_area"]["path"].as_str().unwrap());
+    let marker = area.join("writer-read-confirmed");
+    let require_host = std::env::var("FLUENT_WORKFLOW_REQUIRE_HOST").as_deref() == Ok("1");
+    let bin = if require_host {
+        workspace.workspace.join(".fluent/provider-double")
+    } else {
+        tmp.path().join("bin")
+    };
+    let sibling = audit.parent().unwrap().join("private.json");
+    fs::write(&sibling, "unrelated sibling\n").unwrap();
+    if require_host {
+        let resolver = fluent::content::ContentResolver::new(None);
+        let profile = fluent::os::render_profile_for_access_for_coder(
+            &resolver,
+            "/Users/test",
+            std::slice::from_ref(&workspace.workspace),
+            std::slice::from_ref(&audit),
+            fluent::coder::CoderKind::Claude,
+        )
+        .unwrap();
+        fluent::os::preflight_profile_with(&profile, |path| {
+            Command::new("/usr/bin/sandbox-exec")
+                .arg("-f")
+                .arg(path)
+                .arg("/usr/bin/true")
+                .output()
+        })
+        .expect("required real confinement must be available");
+    }
+    write_mock_claude(
+        &bin,
+        r##"#!/bin/bash
+set -euo pipefail
+prompt=""
+next=0
+for arg in "$@"; do
+  if [ "$next" = 1 ]; then prompt="$arg"; break; fi
+  if [ "$arg" = "-p" ]; then next=1; fi
+done
+printf 'prompt=%s\naudit=%s\n' "$prompt" "${CLASSIFICATION_AUDIT:-missing}" > "$WRITER_MARKER"
+printf '%s' "$prompt" | grep -F 'Current assigned action: source correction' >/dev/null
+printf '%s' "$prompt" | grep -F "$CLASSIFICATION_AUDIT" >/dev/null
+if [ "$CHECK_HISTORY" = 1 ]; then
+  printf '%s' "$prompt" | grep -F "$HISTORY_REVIEW" >/dev/null
+  grep -F 'Additional-Proof: Attach a rerun' "$HISTORY_REVIEW" >/dev/null
+fi
+grep -F 'sentinel-7841' "$CLASSIFICATION_AUDIT" >/dev/null
+if [ "$REQUIRE_HOST" = 1 ]; then
+  if cat "$CLASSIFICATION_SIBLING" >/dev/null 2>&1; then exit 91; fi
+fi
+printf '\nread\n' >> "$WRITER_MARKER"
+printf 'Apply classified input\n' >> README.md
+git add README.md
+git commit -m 'Apply classified input' >/dev/null
+"##,
+    );
+    if require_host {
+        write_mock_executable(
+            &bin,
+            "sandbox-exec",
+            "#!/bin/bash\nexec /usr/bin/sandbox-exec \"$@\"\n",
+        );
+    }
+    let mut command = fluent_cmd();
+    command
+        .current_dir(&project)
+        .args(["task", "run", &work_id, "attempt-1", writer_id]);
+    if !require_host {
+        command.arg("--no-sandbox");
+    }
+    if require_host {
+        command.env_remove("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT");
+    }
+    let output = command
+        .env("PATH", mock_path(&bin))
+        .env("CLASSIFICATION_AUDIT", &audit)
+        .env("CLASSIFICATION_SIBLING", &sibling)
+        .env("REQUIRE_HOST", if require_host { "1" } else { "0" })
+        .env("CHECK_HISTORY", if check_history { "1" } else { "0" })
+        .env("HISTORY_REVIEW", project.join(&review))
+        .env("WRITER_MARKER", &marker)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "writer failed: {}\nmarker: {}",
+        String::from_utf8_lossy(&output.stderr),
+        fs::read_to_string(&marker).unwrap_or_default()
+    );
+    assert!(fs::read_to_string(&marker).unwrap().ends_with("\nread\n"));
+    if !check_history {
+        record_classified_writer_trace(&project, &work_id, &classified, &audit, &marker);
+    }
+}
+
+fn record_classified_writer_trace(
+    project: &Path,
+    work_id: &str,
+    classified: &serde_json::Value,
+    audit: &Path,
+    observation: &Path,
+) {
+    let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/formal/workflow/writer-inputs");
+    fs::create_dir_all(&target).unwrap();
+    let completed = work_item_value(project, work_id);
+    let files = [
+        (
+            "classified-work.json",
+            serde_json::to_vec_pretty(classified).unwrap(),
+        ),
+        (
+            "writer-work.json",
+            serde_json::to_vec_pretty(&completed).unwrap(),
+        ),
+        ("classification.json", fs::read(audit).unwrap()),
+        ("provider-observation.txt", fs::read(observation).unwrap()),
+    ];
+    let artifacts = files
+        .iter()
+        .map(|(name, bytes)| {
+            fs::write(target.join(name), bytes).unwrap();
+            serde_json::json!({"path":name,"sha256":format!("{:x}", Sha256::digest(bytes))})
+        })
+        .collect::<Vec<_>>();
+    let classification =
+        &classified["attempts"][0]["evidence_recoveries"][0]["code_change_classification"];
+    let binary = fs::read(env!("CARGO_BIN_EXE_fluent")).unwrap();
+    let head = git::run_stdout(
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+        &["rev-parse", "HEAD"],
+        "bind writer trace to Fluent source",
+    )
+    .unwrap();
+    let trace = serde_json::json!({
+        "schema-version":1,
+        "scenario":"writer-inputs-classified-source-correction",
+        "fluent-commit":head.trim(),
+        "fluent-binary-sha256":format!("{:x}", Sha256::digest(&binary)),
+        "model-profile":"writer-inputs",
+        "collection-complete":true,
+        "artifacts":artifacts,
+        "events":[
+            {"sequence":1,"actor":"operator","operation-id":classification["operation_id"],
+             "generation":null,"boundary":"classify-source-correction","causal-predecessors":[],
+             "raw-facts":{"exit-code":0,"work":classified}},
+            {"sequence":2,"actor":"worker","operation-id":classification["writer_task_id"],
+             "generation":null,"boundary":"writer-launch","causal-predecessors":[1],
+             "raw-facts":{"exit-code":0,"work":completed}}
+        ]
+    });
+    fs::write(
+        target.join("production-trace.json"),
+        serde_json::to_vec_pretty(&trace).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn classified_writer_rejects_invalid_required_inputs_before_launch() {
+    for invalid in ["changed-authority", "missing-audit", "oversized"] {
+        let tmp = TempDir::new().unwrap();
+        let suffix = tmp.path().file_name().unwrap().to_string_lossy();
+        let work_id = format!("classified-invalid-{invalid}-{suffix}");
+        let (project, candidate, _, review, digest, _) =
+            setup_paused_code_change_classification_fixture(&tmp, &work_id);
+        let _workspace = bind_candidate_to_managed_sibling(&project, &work_id, &candidate);
+        let resolution = if invalid == "oversized" {
+            "correct source ".repeat(3000)
+        } else {
+            "Correct the runner and parser.".to_string()
+        };
+        let tasks_before = work_item_value(&project, &work_id)["attempts"][0]["tasks"]
+            .as_array()
+            .unwrap()
+            .len();
+        let classify = fluent_cmd()
+            .current_dir(&project)
+            .args([
+                "attempt",
+                "evidence",
+                "classify",
+                &work_id,
+                "attempt-1",
+                "--candidate",
+                &candidate,
+                "--review-artifact",
+                &review,
+                "--evidence-digest",
+                &digest,
+                "--resolution",
+                &resolution,
+            ])
+            .output()
+            .unwrap();
+        if invalid == "oversized" {
+            assert!(!classify.status.success());
+            assert!(String::from_utf8_lossy(&classify.stderr).contains("up to 4096 bytes"));
+            assert_eq!(
+                work_item_value(&project, &work_id)["attempts"][0]["tasks"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                tasks_before
+            );
+            continue;
+        }
+        assert!(
+            classify.status.success(),
+            "{}",
+            String::from_utf8_lossy(&classify.stderr)
+        );
+        let classified = work_item_value(&project, &work_id);
+        let classification =
+            &classified["attempts"][0]["evidence_recoveries"][0]["code_change_classification"];
+        let writer_id = classification["writer_task_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let audit = project.join(classification["audit_artifact"]["path"].as_str().unwrap());
+        match invalid {
+            "changed-authority" => {
+                let store = WorkModelStore::new(&project);
+                store
+                    .mutate_work_item(&work_id, |item| {
+                        item.attempts[0].evidence_recoveries[0]
+                            .code_change_classification
+                            .as_mut()
+                            .unwrap()
+                            .authorization
+                            .push_str(" altered");
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            "missing-audit" => fs::remove_file(audit).unwrap(),
+            _ => unreachable!(),
+        }
+        let invoked = tmp.path().join("invoked");
+        let bin = tmp.path().join("bin");
+        write_mock_claude(
+            &bin,
+            "#!/bin/bash\nprintf invoked > \"$WRITER_MARKER\"\nexit 0\n",
+        );
+        let output = fluent_cmd()
+            .current_dir(&project)
+            .args([
+                "task",
+                "run",
+                &work_id,
+                "attempt-1",
+                &writer_id,
+                "--no-sandbox",
+            ])
+            .env("PATH", mock_path(&bin))
+            .env("WRITER_MARKER", &invoked)
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{invalid} launched a Writer");
+        assert!(!invoked.exists(), "{invalid} reached the provider");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let expected = match invalid {
+            "changed-authority" => "classification authorization digest changed",
+            "missing-audit" => "does not exist or is not a file",
+            _ => unreachable!(),
+        };
+        assert!(stderr.contains(expected), "{invalid}: {stderr}");
+    }
+}
+
+#[test]
+fn classified_writer_context_identifies_current_assignment() {
+    classified_writer_delivery_probe(true);
+}
+
+#[test]
 fn classified_host_evidence_scheduler_claim_dispatches_one_writer() {
     let tmp = TempDir::new().unwrap();
     let run_suffix = tmp

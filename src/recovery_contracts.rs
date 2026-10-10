@@ -3567,6 +3567,59 @@ pub(crate) fn findings_from_inputs(
     Ok(findings.into_values().collect())
 }
 
+/// Return the current source-correction assignment after launch admission has
+/// validated the complete recovery. Recheck its exact audit bytes because the
+/// prompt is built after the Task reservation.
+pub(crate) fn classified_writer_delivery(
+    project_root: &Path,
+    item: &work_model::WorkItem,
+    task_id: &str,
+) -> Result<Option<(String, PathBuf)>> {
+    let Some((recovery, classification)) = item
+        .attempts
+        .iter()
+        .flat_map(|attempt| &attempt.evidence_recoveries)
+        .filter_map(|recovery| {
+            recovery
+                .code_change_classification
+                .as_ref()
+                .map(|c| (recovery, c))
+        })
+        .find(|(_, classification)| classification.writer_task_id == task_id)
+    else {
+        return Ok(None);
+    };
+    let actual_digest = format!(
+        "sha256:{:x}",
+        Sha256::digest(classification.authorization.as_bytes())
+    );
+    anyhow::ensure!(
+        actual_digest == classification.authorization_digest,
+        "classification authorization digest changed"
+    );
+    let attempt_id = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.tasks.iter().any(|task| task.id == task_id))
+        .map(|attempt| attempt.id.as_str())
+        .context("classified Writer Attempt is missing")?;
+    let expected = classification_audit_bytes(
+        &item.id,
+        attempt_id,
+        recovery,
+        classification,
+        !classification_uses_legacy_identity(classification, attempt_id, recovery),
+    )?;
+    let audit = validate_managed_file_path(project_root, &classification.audit_artifact.path)?;
+    anyhow::ensure!(
+        fs::read(&audit)
+            .with_context(|| format!("cannot read classification audit {}", audit.display()))?
+            == expected,
+        "classification audit bytes changed"
+    );
+    Ok(Some((classification.authorization.clone(), audit)))
+}
+
 /// Revalidate a classified source-correction Writer immediately before it is
 /// reserved for execution. Ordinary Writers do not carry a matching
 /// classification and pass through unchanged.

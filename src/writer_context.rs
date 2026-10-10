@@ -26,6 +26,13 @@ pub(crate) fn is_correction_artifact(path: &Path) -> bool {
             || name == "tester-results.json"
             || name == crate::candidate_gate::CANDIDATE_GATE_FILE
             || name == "check-pre-merge.log"
+            || (name == "classification.json"
+                && path.components().any(|component| {
+                    component
+                        .as_os_str()
+                        .to_string_lossy()
+                        .starts_with("host-evidence-classification-")
+                }))
     }) || crate::tester::is_command_log_path(path)
         || (path.file_name().is_some_and(|name| name == "repair.json")
             && path

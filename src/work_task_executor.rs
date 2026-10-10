@@ -4935,6 +4935,25 @@ fn run_task_coder_with_coder_with_feedback(
         );
     }
 
+    if let Some((instructions, audit)) =
+        crate::recovery_contracts::classified_writer_delivery(project_root, item, task_id)?
+    {
+        anyhow::ensure!(
+            prior_reviews.contains(&audit),
+            "classification audit is missing from declared Writer inputs"
+        );
+        prompt.push_str(&format!(
+            "\n\n## Current host-evidence assignment\n\nCurrent assigned action: source correction. The prior request for more host evidence remains historical context. Read the complete authorized instructions and candidate-bound evidence in {} before changing the candidate.\n\nAuthorized instructions:\n{}\n",
+            audit.display(), instructions,
+        ));
+        anyhow::ensure!(
+            prompt.len() <= crate::writer_context::REVIEWED_CORRECTION_PROMPT_MAX_BYTES,
+            "classified Writer prompt is {} bytes; limit is {} bytes",
+            prompt.len(),
+            crate::writer_context::REVIEWED_CORRECTION_PROMPT_MAX_BYTES
+        );
+    }
+
     let transcript_path = task
         .artifact_area
         .as_ref()
