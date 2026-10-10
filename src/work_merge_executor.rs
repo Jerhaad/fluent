@@ -96,28 +96,45 @@ fn ensure_review_bindings_current(
         .iter()
         .find(|attempt| attempt.id == candidate.attempt_id)
         .context("landing Attempt is missing")?;
-    let reviews =
-        crate::recovery_contracts::review_coverage::ordinary_review_tasks(project_root, attempt);
-    for role in crate::review::REVIEWERS {
-        let Some((review, verdict)) = reviews.iter().find(|(task, _)| task.role == *role) else {
-            bail!("ordinary {role} review binding changed before landing");
-        };
-        anyhow::ensure!(
-            *verdict == crate::review::Verdict::Pass,
-            "ordinary {role} review binding changed before landing"
-        );
-        let Some(context) = review.review_context.as_ref() else {
-            bail!("ordinary {role} review context is missing before landing");
-        };
-        anyhow::ensure!(
+    // A passed Attempt can reuse older ordinary reviews after a later Writer
+    // changes an unrelated file. Check each recorded review's identity without
+    // requiring its commit to equal the final Merge Candidate commit.
+    let source = resolve_managed_candidate_workspace_path(
+        project_root,
+        &candidate.source_workspace.path,
+        &item.id,
+        &candidate.attempt_id,
+    )?;
+    for task in &attempt.tasks {
+        if task.kind != TaskKind::Review
+            || task.status != TaskStatus::Complete
+            || task.evidence_review_context.is_some()
+            || !crate::review::REVIEWERS.contains(&task.role.as_str())
+        {
+            continue;
+        }
+        let valid = task.review_context.as_ref().is_some_and(|context| {
             context.candidate_workspace_id == candidate.source_workspace.id
                 && context.candidate_workspace_path == candidate.source_workspace.path
                 && context.source_branch == candidate.source_branch
-                && review
+                && task
                     .workspace_access
                     .reads
-                    .contains(&candidate.source_workspace),
-            "ordinary {role} review binding changed before landing"
+                    .contains(&candidate.source_workspace)
+                && crate::git::run_raw(
+                    &source,
+                    &[
+                        "cat-file",
+                        "-e",
+                        &format!("{}^{{commit}}", context.candidate_commit),
+                    ],
+                )
+                .is_ok_and(|output| output.status.success())
+        });
+        anyhow::ensure!(
+            valid,
+            "ordinary {} review binding changed before landing",
+            task.role
         );
     }
     Ok(())
@@ -284,6 +301,7 @@ fn recognized_landing_intent(
         "target moved before the authorized landing effect"
     );
     item.ensure_execution_ready()?;
+    ensure_review_bindings_current(config.project_root, &item, &candidate)?;
     anyhow::ensure!(
         intent.authorization_digest == landing_authorization_digest(item)?,
         "landing authorization changed before Git effect"
@@ -584,7 +602,6 @@ pub fn merge_candidate(config: WorkMergeConfig<'_>) -> Result<WorkMergeOutcome> 
     }
 
     item.ensure_execution_ready()?;
-    ensure_review_bindings_current(config.project_root, &item, &candidate)?;
 
     // A fresh, unmerged no-expertise candidate whose Learning succeeded lands its
     // frozen reviewed SHA exactly: an identity-preserving preflight runs BEFORE any
@@ -618,8 +635,23 @@ pub fn merge_candidate(config: WorkMergeConfig<'_>) -> Result<WorkMergeOutcome> 
         &candidate.attempt_id,
     )?;
     let live_tip = head_commit(&source_workspace)?;
+    // A failed capture landing can leave a completed rebase at a new source
+    // HEAD while provenance regeneration has not updated the candidate yet.
+    let retrying_settled_rebase = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == candidate.attempt_id)
+        .is_some_and(|attempt| {
+            attempt.tasks.iter().any(|task| {
+                task.kind == TaskKind::Rebase
+                    && matches!(
+                        task.status,
+                        TaskStatus::Complete | TaskStatus::Failed | TaskStatus::NeedsUser
+                    )
+            })
+        });
     anyhow::ensure!(
-        live_tip == candidate.candidate_commit,
+        live_tip == candidate.candidate_commit || retrying_settled_rebase,
         "candidate HEAD {live_tip} differs from reviewed Merge Candidate {}; rerun the Attempt before landing",
         candidate.candidate_commit
     );
