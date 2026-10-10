@@ -66794,6 +66794,73 @@ fn workflow_recovery_requires_current_resume_authority() {
 }
 
 #[test]
+fn workflow_observation_preserves_state() {
+    let tmp = TempDir::new().unwrap();
+    let project = landed_status_fixture(&tmp);
+    let before = recorded_work_bytes(&project);
+    fluent_cmd()
+        .current_dir(&project)
+        .arg("status")
+        .assert()
+        .success();
+    let shown = read_work_show_json(&project, "work-1");
+    assert_eq!(
+        shown["evidence-history"]["merged-commit"],
+        git_head(&project)
+    );
+    let status = fluent::work_status::load_work_status(&project).unwrap();
+    assert_eq!(status.rows[0].action, "merged");
+    let lines = fluent::work_status::format_work_dashboard_lines(&status);
+    assert!(lines.iter().any(|line| line.contains("merged")));
+    assert_eq!(recorded_work_bytes(&project), before);
+}
+
+#[test]
+fn workflow_observation_reports_consistent_recovery() {
+    let tmp = TempDir::new().unwrap();
+    let (fixture, malformed) = committed_matrix_recovery_fixture(&tmp);
+    let before = recorded_work_bytes(&fixture.project);
+    let shown = read_work_show_json(&fixture.project, &fixture.work);
+    let action = shown["next-action"].as_str().unwrap();
+    assert!(action.contains("repair-writer-completion"), "{action}");
+    fluent_cmd()
+        .current_dir(&fixture.project)
+        .arg("status")
+        .assert()
+        .success();
+    assert_eq!(recorded_work_bytes(&fixture.project), before);
+    fluent_cmd()
+        .current_dir(&fixture.project)
+        .args([
+            "attempt",
+            "repair-writer-completion",
+            &fixture.work,
+            "attempt-1",
+            "--resolution",
+            &fixture.resolution,
+        ])
+        .assert()
+        .success();
+    let next = read_work_show_json(&fixture.project, &fixture.work);
+    assert_ne!(next["next-action"], shown["next-action"]);
+    let source = WorkModelStore::new(&fixture.project)
+        .read_work_item(&fixture.work)
+        .unwrap();
+    let source_matrix = fixture
+        .project
+        .join(
+            &source.attempts[0].tasks[0]
+                .artifact_area
+                .as_ref()
+                .unwrap()
+                .path,
+        )
+        .join("writer-completion.json");
+    assert_eq!(fs::read(source_matrix).unwrap(), malformed);
+    landed_status_observation_preserves_recorded_bytes_with_pending_publication();
+}
+
+#[test]
 fn landed_status_observation_preserves_recorded_bytes() {
     let tmp = TempDir::new().unwrap();
     let project = landed_status_fixture(&tmp);
