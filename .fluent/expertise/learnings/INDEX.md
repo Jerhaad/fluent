@@ -25,6 +25,7 @@
 - [capture-landing-owns-exact-tester-evidence](capture-landing-owns-exact-tester-evidence.md) — Capture landing owns final-candidate verification against the exact current target and promotes that evidence only after fast-forward
 - [capture-pump-terminate-descendants-before-eof](capture-pump-terminate-descendants-before-eof.md) — When a thread drains a child's piped stdout to EOF, terminate the whole process group before waiting for EOF; a backgrounded descendant can hold the pipe open forever
 - [checkout-selection-revalidates-identity](checkout-selection-revalidates-identity.md) — Revalidate a discovered checkout's canonical Git identity and current authority before every setup, commit, and publication effect
+- [classified-writer-inputs-revalidate-at-delivery](classified-writer-inputs-revalidate-at-delivery.md) — Deliver a classified Writer's current authorization and exact audit through its actual launch context, including resumed provider sessions
 - [commit-body-bullet-point-convention](commit-body-bullet-point-convention.md) — Commit bodies should use "- prefix" bullets for multiple changes when practical
 - [commit-subject-line-fifty-char-limit](commit-subject-line-fifty-char-limit.md) — Commit subject lines should stay within 50 characters when practical
 - [committed-writer-matrix-recovery-authority](committed-writer-matrix-recovery-authority.md) — Distinguish committed-matrix recovery authority from older Writer-completion audits by its source matrix digest and operation Task binding
