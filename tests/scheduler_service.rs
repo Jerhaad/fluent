@@ -134,6 +134,32 @@ fn released_service_fixture_dirs() -> ReleasedServiceFixtureDirs {
     }
 }
 
+fn released_fixture_relative_path(
+    root: &std::path::Path,
+    path: &std::path::Path,
+) -> anyhow::Result<PathBuf> {
+    let root = fs::canonicalize(root)?;
+    let path = fs::canonicalize(path)?;
+    Ok(path.strip_prefix(root)?.to_path_buf())
+}
+
+#[test]
+fn released_service_fixture_paths_resolve_aliases_and_reject_outside_files() {
+    let root = TempDir::new().unwrap();
+    let alias = TempDir::new().unwrap();
+    let actual = root.path().join("project");
+    fs::create_dir(&actual).unwrap();
+    let link = alias.path().join("project-link");
+    std::os::unix::fs::symlink(&actual, &link).unwrap();
+    let file = actual.join("receipt.json");
+    fs::write(&file, "receipt").unwrap();
+    assert_eq!(
+        released_fixture_relative_path(root.path(), &link.join("receipt.json")).unwrap(),
+        std::path::Path::new("project/receipt.json")
+    );
+    assert!(released_fixture_relative_path(root.path(), alias.path()).is_err());
+}
+
 #[test]
 fn released_service_fixture_cleans_managed_worktrees_between_allocations() {
     let previous_workspace = {
@@ -1110,9 +1136,9 @@ fn scheduler_released_upgrade_preserves_shared_ownership() {
                         | fluent::work_model::TaskStatus::NeedsUser
                         | fluent::work_model::TaskStatus::Superseded
                 ));
-                serde_json::json!({"project":project.strip_prefix(dirs.root.path()).unwrap(),"pid":pid,
-            "task_id":task_id,"workspace":workspace.strip_prefix(dirs.root.path()).unwrap(),
-            "receipt":receipt.strip_prefix(dirs.root.path()).unwrap(),
+                serde_json::json!({"project":released_fixture_relative_path(dirs.root.path(), project).unwrap(),"pid":pid,
+            "task_id":task_id,"workspace":released_fixture_relative_path(dirs.root.path(), workspace).unwrap(),
+            "receipt":released_fixture_relative_path(dirs.root.path(), receipt).unwrap(),
             "initial-receipt":initial,"final-receipt":execution,
             "initial-receipt-artifact":initial_name,"final-receipt-artifact":final_name,
             "launches":launches,"task-status":task.status,
@@ -1192,7 +1218,70 @@ fn scheduler_released_upgrade_preserves_shared_ownership() {
         .unwrap(),
     )
     .unwrap();
-    std::thread::sleep(Duration::from_millis(200));
+    let stop_path = first
+        .path()
+        .join(".fluent/work/scheduler/stop-request.json");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while stop_path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "replacement did not process stale stop: {}",
+            release_failure_diagnostics(
+                &[(first.path(), "first"), (second.path(), "second")],
+                home.path()
+            )
+        );
+        assert!(
+            replacement.try_wait().unwrap().is_none(),
+            "replacement exited before processing stale stop"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let coordinator_after_stale = match fluent::scheduler::status(first.path()).unwrap() {
+        fluent::scheduler::SchedulerStatus::Running(metadata) => metadata,
+        fluent::scheduler::SchedulerStatus::Stopped => {
+            panic!("replacement project coordinator stopped")
+        }
+    };
+    assert_ne!(coordinator_after_stale.instance_id, *stale_instance);
+    assert_eq!(
+        coordinator_after_stale.state,
+        fluent::scheduler::CoordinatorState::Running
+    );
+    for args in [
+        vec![
+            "work-item",
+            "create",
+            "first-after-stale",
+            "--title",
+            "Work after stale stop",
+        ],
+        vec!["attempt", "create", "first-after-stale", "attempt-1"],
+        vec!["queue", "add", "first-after-stale"],
+    ] {
+        let admitted = fixture(
+            std::path::Path::new(env!("CARGO_BIN_EXE_fluent")),
+            first.path(),
+            &args,
+        );
+        assert!(
+            admitted.status.success(),
+            "{}",
+            String::from_utf8_lossy(&admitted.stderr)
+        );
+    }
+    let admitted = fixture(
+        std::path::Path::new(env!("CARGO_BIN_EXE_fluent")),
+        first.path(),
+        &["queue", "show", "first-after-stale"],
+    );
+    assert!(admitted.status.success());
+    let admitted_work: serde_json::Value = serde_json::from_slice(&admitted.stdout).unwrap();
+    assert_eq!(admitted_work["work_item_id"], "first-after-stale");
+    assert!(matches!(
+        admitted_work["status"].as_str(),
+        Some("queued" | "claimed" | "running")
+    ));
     let health_after_stale = scheduler_service::send_health_request(&socket).unwrap();
     assert_eq!(health_after_stale.instance_id, new_health.instance_id);
     let mut queues_after_replacement = Vec::new();
@@ -1250,7 +1339,11 @@ fn scheduler_released_upgrade_preserves_shared_ownership() {
                 "instance_id":new_health.instance_id,"state":new_health.state},
                 "registered-projects":scheduler_service::read_registry(home.path()).unwrap().len(),
                 "queues":queues_after_replacement,"stale-stop":{
-                    "requested-coordinator":stale_instance,"request-path":first.path().join(".fluent/work/scheduler/stop-request.json").strip_prefix(dirs.root.path()).unwrap(),
+                    "requested-coordinator":stale_instance,"request-path":released_fixture_relative_path(dirs.root.path(), &stop_path.parent().unwrap()).unwrap().join("stop-request.json"),
+                    "request-processed":!stop_path.exists(),
+                    "coordinator-after":{"instance_id":coordinator_after_stale.instance_id,
+                        "state":coordinator_after_stale.state,"build":coordinator_after_stale.build},
+                    "admitted-work":admitted_work,
                     "health-after":{"instance_id":health_after_stale.instance_id,
                         "build":health_after_stale.build,"generation":health_after_stale.generation,
                         "state":health_after_stale.state}}}}
@@ -1579,6 +1672,56 @@ fn scheduler_drain_rejects_stale_instance() {
         "kind":"health", "generation": scheduler_service::PROTOCOL_GENERATION}),
     );
     assert_eq!(health["state"], "running");
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn replacement_project_coordinator_processes_stale_stop_and_admits_work() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let mut service = registered_service(
+        home.path(),
+        project.path(),
+        Arc::new(NeedsUserRunner::default()),
+    );
+    service.poll_once().unwrap();
+    let coordinator = match fluent::scheduler::status(project.path()).unwrap() {
+        fluent::scheduler::SchedulerStatus::Running(metadata) => metadata,
+        fluent::scheduler::SchedulerStatus::Stopped => panic!("project coordinator did not start"),
+    };
+    let stop_path = project
+        .path()
+        .join(".fluent/work/scheduler/stop-request.json");
+    fs::write(
+        &stop_path,
+        serde_json::to_vec(&serde_json::json!({
+            "schema": 1,
+            "instance_id": "departed-project-coordinator",
+            "requested_at": chrono::Utc::now().to_rfc3339(),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    service.poll_once().unwrap();
+    assert!(
+        !stop_path.exists(),
+        "replacement did not process stale stop"
+    );
+    let after = match fluent::scheduler::status(project.path()).unwrap() {
+        fluent::scheduler::SchedulerStatus::Running(metadata) => metadata,
+        fluent::scheduler::SchedulerStatus::Stopped => {
+            panic!("replacement project coordinator stopped")
+        }
+    };
+    assert_eq!(after.instance_id, coordinator.instance_id);
+    create_execution_ready_work(project.path(), "work-after-stale-stop");
+    fluent::queue::add(project.path(), "work-after-stale-stop", Some(0)).unwrap();
+    assert_eq!(
+        fluent::queue::show(project.path(), "work-after-stale-stop")
+            .unwrap()
+            .status,
+        fluent::queue::DispatchStatus::Queued
+    );
 }
 
 #[test]

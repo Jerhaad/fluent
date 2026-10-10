@@ -149,6 +149,12 @@ def project_service(trace, artifacts):
     assert len(first["coordinators"]) == 2
     assert stale["requested-coordinator"] == first["coordinators"][0]
     assert stale["request-path"].endswith("/.fluent/work/scheduler/stop-request.json")
+    assert stale["request-processed"] is True
+    assert stale["coordinator-after"]["instance_id"] != stale["requested-coordinator"]
+    assert stale["coordinator-after"]["state"] == "running"
+    assert stale["coordinator-after"]["build"] == new_health["build"]
+    assert stale["admitted-work"]["work_item_id"] == "first-after-stale"
+    assert stale["admitted-work"]["status"] in {"queued", "claimed", "running"}
     assert stale["health-after"] == new_health
     assert len(settled["queues"]) == len(replacement["queues"]) == 2
     assert all(queue["status"] == "queued" for queue in settled["queues"])
