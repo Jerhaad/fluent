@@ -725,7 +725,8 @@ def release_transition_suite(source, root, output, jar, java):
                                       cwd=root, capture_output=True, text=True)
             (output / f"{scenario}-negative.log").write_text(
                 negative.stdout + negative.stderr)
-            results.append({"case": f"{scenario}-negative", "pass": negative.returncode != 0,
+            results.append({"case": f"{scenario}-negative", "pass": negative.returncode != 0 and
+                            "protected snapshot changed" in negative.stderr,
                             "log": f"{scenario}-negative.log"})
             corrupted = json.loads(path.read_text())
             corrupted["artifacts"][0]["sha256"] = "0" * 64
@@ -736,8 +737,28 @@ def release_transition_suite(source, root, output, jar, java):
             (output / f"{scenario}-artifact-negative.log").write_text(
                 negative.stdout + negative.stderr)
             results.append({"case": f"{scenario}-artifact-negative",
-                            "pass": negative.returncode != 0,
+                            "pass": negative.returncode != 0 and
+                            "artifact digest mismatch" in negative.stderr,
                             "log": f"{scenario}-artifact-negative.log"})
+            for label, mutate, diagnostic in (
+                    ("actor-negative", lambda trace: trace["events"][1].update(actor="current-reader"),
+                     "refusal actor mismatch"),
+                    ("operation-negative", lambda trace: trace["events"][1].update({"operation-id": "queue-add"}),
+                     "refusal operation mismatch"),
+                    ("diagnostic-negative", lambda trace: trace["events"][1]["raw-facts"].update(
+                        stderr="unrelated file permission error"), "compatibility diagnostic mismatch")):
+                corrupted = json.loads(path.read_text())
+                mutate(corrupted)
+                negative_path = output / f"{scenario}-{label}.json"
+                negative_path.write_text(json.dumps(corrupted))
+                negative = subprocess.run([*command[:2], str(negative_path), *command[3:]],
+                                          cwd=root, capture_output=True, text=True)
+                (output / f"{scenario}-{label}.log").write_text(
+                    negative.stdout + negative.stderr)
+                results.append({"case": f"{scenario}-{label}",
+                                "pass": negative.returncode != 0 and
+                                diagnostic in negative.stderr,
+                                "log": f"{scenario}-{label}.log"})
     service_trace = output / "service-ownership.json"
     service_command = ["python3", str(source / "project_release.py"), str(service_trace),
                        str(candidate), commit]
@@ -769,7 +790,16 @@ def release_transition_suite(source, root, output, jar, java):
                                        *service_command[3:]], cwd=root,
                                       capture_output=True, text=True)
             (output / f"{name}.log").write_text(negative.stdout + negative.stderr)
-            results.append({"case": name, "pass": negative.returncode != 0,
+            diagnostic = {
+                "service-identity-negative": "service identity mismatch",
+                "service-worker-negative": "owned dispatch mismatch",
+                "service-launch-negative": "worker process group remains",
+                "service-receipt-negative": "worker receipt mismatch",
+                "service-artifact-negative": "artifact digest mismatch",
+                "service-stale-stop-negative": "stale stop authority mismatch",
+            }[name]
+            results.append({"case": name, "pass": negative.returncode != 0 and
+                            diagnostic in negative.stderr,
                             "log": f"{name}.log"})
     results.append(run_case(source, output, jar, java, "service-competition.cfg", None))
     results.append(run_case(source, output, jar, java, "negative-guardversion.cfg",

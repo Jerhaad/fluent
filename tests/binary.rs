@@ -180,6 +180,12 @@ fn released_upgrade_preserves_workflow_state() {
     let queued_before = released_command(&release, &queued, &["queue", "show", "released-queued"]);
     assert!(queued_before.status.success());
     assert!(String::from_utf8_lossy(&queued_before.stdout).contains("queued"));
+    let queued_before: serde_json::Value = serde_json::from_slice(&queued_before.stdout).unwrap();
+    let queued_work_before =
+        released_command(&release, &queued, &["work-item", "show", "released-queued"]);
+    assert!(queued_work_before.status.success());
+    let queued_work_before: serde_json::Value =
+        serde_json::from_slice(&queued_work_before.stdout).unwrap();
     fluent_cmd()
         .current_dir(&queued)
         .args(["work-item", "upgrade", "released-queued"])
@@ -192,6 +198,42 @@ fn released_upgrade_preserves_workflow_state() {
         .unwrap();
     assert!(queued_after.status.success());
     assert!(String::from_utf8_lossy(&queued_after.stdout).contains("queued"));
+    let queued_after: serde_json::Value = serde_json::from_slice(&queued_after.stdout).unwrap();
+    assert_eq!(queued_after["dispatch_id"], queued_before["dispatch_id"]);
+    assert_eq!(
+        queued_after["bound_attempt_id"],
+        queued_before["bound_attempt_id"]
+    );
+    let queued_work_after = fluent_cmd()
+        .current_dir(&queued)
+        .args(["work-item", "show", "released-queued"])
+        .output()
+        .unwrap();
+    assert!(queued_work_after.status.success());
+    let queued_work_after: serde_json::Value =
+        serde_json::from_slice(&queued_work_after.stdout).unwrap();
+    assert_eq!(
+        queued_work_after["attempts"][0]["id"],
+        queued_work_before["attempts"][0]["id"]
+    );
+    assert_eq!(
+        queued_work_after["attempts"][0]["tasks"],
+        queued_work_before["attempts"][0]["tasks"]
+    );
+    fluent_cmd()
+        .current_dir(&queued)
+        .args(["queue", "remove", "released-queued"])
+        .assert()
+        .success();
+    let removed = fluent_cmd()
+        .current_dir(&queued)
+        .args(["queue", "show", "released-queued"])
+        .output()
+        .unwrap();
+    assert!(removed.status.success());
+    let removed: serde_json::Value = serde_json::from_slice(&removed.stdout).unwrap();
+    assert_eq!(removed["dispatch_id"], queued_before["dispatch_id"]);
+    assert_ne!(removed["status"], "queued");
 
     let paused_tmp = TempDir::new().unwrap();
     let paused = released_work_fixture(&paused_tmp, &release, "released-paused");
@@ -468,10 +510,28 @@ fn released_upgrade_preserves_landed_work() {
             .as_array()
             .unwrap()
             .iter()
-            .map(|task| (task["id"].clone(), task["status"].clone()))
+            .map(|task| {
+                (
+                    task["id"].clone(),
+                    task["status"].clone(),
+                    task["output"].clone(),
+                    task["artifact_area"].clone(),
+                )
+            })
             .collect()
     };
     assert_eq!(historical_tasks(&after), historical_tasks(&released_landed));
+    assert!(
+        released_landed["attempts"][0]["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| !task["output"].is_null() && !task["artifact_area"].is_null())
+    );
+    assert_eq!(
+        after["merge_candidates"][0]["merge_state"],
+        released_landed["merge_candidates"][0]["merge_state"]
+    );
 }
 
 #[test]
@@ -522,6 +582,13 @@ fn released_upgrade_preserves_running_before_stop() {
         String::from_utf8_lossy(&stopped.stdout),
         String::from_utf8_lossy(&stopped.stderr)
     );
+    let settled = released_command(
+        &release,
+        &project,
+        &["work-item", "show", "released-running"],
+    );
+    assert!(settled.status.success());
+    let settled: serde_json::Value = serde_json::from_slice(&settled.stdout).unwrap();
     fs::write(&finish, "finish").unwrap();
     let _ = running.wait();
     fluent_cmd()
@@ -542,6 +609,41 @@ fn released_upgrade_preserves_running_before_stop() {
         before["attempts"][0]["tasks"][0]["id"]
     );
     assert_eq!(after["attempts"][0]["status"], "needs-user");
+    assert_eq!(
+        after["attempts"][0]["cancellation"],
+        settled["attempts"][0]["cancellation"]
+    );
+    assert_eq!(
+        after["attempts"][0]["tasks"],
+        settled["attempts"][0]["tasks"]
+    );
+    assert_eq!(
+        after["next-action"],
+        "fluent queue resume released-running --attempt attempt-1"
+    );
+    fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "queue",
+            "resume",
+            "released-running",
+            "--attempt",
+            "attempt-1",
+        ])
+        .assert()
+        .success();
+    let resumed = fluent_cmd()
+        .current_dir(&project)
+        .args(["queue", "show", "released-running"])
+        .output()
+        .unwrap();
+    assert!(resumed.status.success());
+    let resumed: serde_json::Value = serde_json::from_slice(&resumed.stdout).unwrap();
+    assert_eq!(resumed["bound_attempt_id"], after["attempts"][0]["id"]);
+    assert_eq!(
+        resumed["resume_cancellation_requested_at"],
+        after["attempts"][0]["cancellation"]["requested_at"]
+    );
 }
 
 #[test]
@@ -577,9 +679,11 @@ fn released_predecessor_refuses_current_authority() {
         !result.status.success(),
         "old release changed current authority"
     );
+    let diagnostic = String::from_utf8_lossy(&result.stderr);
     assert!(
-        !result.stderr.is_empty(),
-        "refusal must explain the incompatible record"
+        diagnostic.contains("unsupported Work Item writer envelope format/schema")
+            && diagnostic.contains("items/released-refusal.json"),
+        "refusal must identify the incompatible Work Item: {diagnostic}"
     );
     let after = snapshot_tree(&root);
     assert_eq!(after, before);
@@ -622,6 +726,11 @@ fn released_predecessor_refuses_pending_current_publication() {
         !result.status.success(),
         "old release replayed current publication"
     );
+    let diagnostic = String::from_utf8_lossy(&result.stderr);
+    assert!(diagnostic.contains("invalid work model")
+            && diagnostic.contains("transactions/released-pending-refusal.json")
+            && diagnostic.contains("work item transaction id \"released-pending-refusal\" cannot be used as a file name"),
+            "refusal must identify the incompatible transaction: {diagnostic}");
     let after = snapshot_tree(&root);
     assert_eq!(after, before);
     record_release_refusal("pending-publication", &release, &before, &after, &result);

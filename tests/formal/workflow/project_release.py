@@ -10,6 +10,11 @@ from pathlib import Path
 RELEASE_SHA = "8bb76717be942e4a0c97c297c318c0a1331e92105180edb386354dddbae12974"
 
 
+def require(condition, property_name):
+    if not condition:
+        raise ValueError(property_name)
+
+
 def project(path: Path, candidate: Path, commit: str):
     trace = json.loads(path.read_text())
     assert set(trace) == {"schema-version", "scenario", "fluent-commit",
@@ -29,7 +34,8 @@ def project(path: Path, candidate: Path, commit: str):
         assert isinstance(name, str) and name not in artifacts
         assert not Path(name).is_absolute() and ".." not in Path(name).parts
         data = (path.parent / name).read_bytes()
-        assert hashlib.sha256(data).hexdigest() == entry["sha256"]
+        require(hashlib.sha256(data).hexdigest() == entry["sha256"],
+                "artifact digest mismatch")
         artifacts[name] = data
     assert artifacts
     if trace["scenario"] == "released-shared-service-transition":
@@ -40,19 +46,43 @@ def project(path: Path, candidate: Path, commit: str):
     assert before["causal-predecessors"] == []
     assert refused["causal-predecessors"] == [1]
     assert before["operation-id"] == "snapshot"
-    assert refused["operation-id"] == "work-item-abandon"
+    require(before["actor"] == "current-reader" and refused["actor"] == "released-reader",
+            "refusal actor mismatch")
+    require(refused["operation-id"] == "work-item-abandon", "refusal operation mismatch")
     assert before["raw-facts"]["predecessor-sha256"] == RELEASE_SHA
     facts = refused["raw-facts"]
     assert type(facts["exit-code"]) is int and facts["exit-code"] != 0
     assert isinstance(facts["stderr"], str) and facts["stderr"]
     assert isinstance(facts["stdout"], str)
+    item_id = ("released-refusal" if trace["scenario"] == "current-authority"
+               else "released-pending-refusal")
+    if trace["scenario"] == "current-authority":
+        item = json.loads(artifacts[next(entry["artifact"] for entry in
+                                         before["raw-facts"]["protected"] if
+                                         entry["path"] == f"items/{item_id}.json")])
+        require(item["model_writer_version"]["format"] == "fluent-work-item-writer"
+                and item["model_writer_version"]["schema_version"] == 10,
+                "current writer envelope mismatch")
+        require("unsupported Work Item writer envelope format/schema" in facts["stderr"]
+                and f"items/{item_id}.json" in facts["stderr"],
+                "compatibility diagnostic mismatch")
+    else:
+        transaction = json.loads(artifacts[next(entry["artifact"] for entry in
+                                                before["raw-facts"]["protected"] if
+                                                entry["path"] == f"transactions/{item_id}.json")])
+        require(transaction["schema_version"] == 12 and transaction["id"] == item_id,
+                "pending transaction format mismatch")
+        require("invalid work model" in facts["stderr"]
+                and f"transactions/{item_id}.json" in facts["stderr"]
+                and f'work item transaction id "{item_id}" cannot be used as a file name'
+                in facts["stderr"], "compatibility diagnostic mismatch")
     protected = before["raw-facts"]["protected"]
     assert isinstance(protected, list) and protected
-    assert len(facts["protected"]) == len(protected)
-    assert [(entry["path"], entry["kind"], entry["sha256"])
+    require(len(facts["protected"]) == len(protected), "protected snapshot changed")
+    require([(entry["path"], entry["kind"], entry["sha256"])
             for entry in facts["protected"]] == [
             (entry["path"], entry["kind"], entry["sha256"])
-            for entry in protected]
+            for entry in protected], "protected snapshot changed")
     names = set()
     for entry in protected:
         assert set(entry) == {"path", "kind", "sha256", "artifact"}
@@ -94,7 +124,8 @@ def project_service(trace, artifacts):
     assert first["registered-projects"] == replacement["registered-projects"] == 2
     old_health, new_health = first["health"], replacement["health"]
     assert old_health["instance_id"] is None and old_health["state"] is None
-    assert isinstance(new_health["instance_id"], str) and new_health["instance_id"]
+    require(isinstance(new_health["instance_id"], str) and new_health["instance_id"],
+            "service identity mismatch")
     assert old_health["build"] != new_health["build"]
     assert old_health["generation"] == new_health["generation"]
     assert settled["stop-exit-codes"] == [0, 0]
@@ -103,9 +134,17 @@ def project_service(trace, artifacts):
     assert settled["owned-worker-started"] is True
     owned = settled["owned-workers"]
     assert len(owned) > 0
+    require(all(any(work["work_item_id"] == worker["work_item_id"]
+                    and work["dispatch_id"] == worker["dispatch_id"]
+                    for work in settled["active-work"]) for worker in owned),
+            "owned dispatch mismatch")
     for worker in owned:
         work = worker["work_item_id"]
         assert work in {"first", "second"}
+        require(worker["initial-receipt"]["state"] == "running",
+                "worker receipt mismatch")
+        require(all(launch["process-group-absent"] is True
+                    for launch in worker["launches"]), "worker process group remains")
         for stage in ("initial", "final"):
             name = f"service-ownership/{work}-{stage}-receipt.json"
             assert worker[f"{stage}-receipt-artifact"] == name
@@ -147,7 +186,8 @@ def project_service(trace, artifacts):
                    for work in active) for worker in owned)
     stale = replacement["stale-stop"]
     assert len(first["coordinators"]) == 2
-    assert stale["requested-coordinator"] == first["coordinators"][0]
+    require(stale["requested-coordinator"] == first["coordinators"][0],
+            "stale stop authority mismatch")
     assert stale["request-path"].endswith("/.fluent/work/scheduler/stop-request.json")
     assert stale["request-processed"] is True
     assert stale["coordinator-after"]["instance_id"] != stale["requested-coordinator"]
