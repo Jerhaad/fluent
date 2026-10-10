@@ -73,6 +73,8 @@ repeat as a no-op. Unknown future formats are rejected rather than guessed.
 
 See the [v0.5.0 release notes](documentation/releases/v0.5.0.md) for behavior
 changes and recovery commands.
+For a transition from v0.5.0 with a shared scheduler, follow the
+[next-release transition procedure](documentation/releases/next.md).
 
 ## How Fluent works
 
