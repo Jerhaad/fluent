@@ -99,6 +99,57 @@ struct ReleaseWorkers {
     projects: Vec<PathBuf>,
 }
 
+struct ReleasedServiceFixtureDirs {
+    home: TempDir,
+    first: TempDir,
+    second: TempDir,
+    // Drop the private parent after its children and their managed worktrees.
+    root: TempDir,
+}
+
+fn released_service_fixture_dirs() -> ReleasedServiceFixtureDirs {
+    let root = TempDir::new().unwrap();
+    let home = TempDir::new_in(root.path()).unwrap();
+    let first = TempDir::new_in(root.path()).unwrap();
+    let second = TempDir::new_in(root.path()).unwrap();
+    ReleasedServiceFixtureDirs {
+        home,
+        first,
+        second,
+        root,
+    }
+}
+
+#[test]
+fn released_service_fixture_cleans_managed_worktrees_between_allocations() {
+    let previous_workspace = {
+        let dirs = released_service_fixture_dirs();
+        for project in [&dirs.home, &dirs.first, &dirs.second] {
+            assert!(project.path().starts_with(dirs.root.path()));
+        }
+        let workspace = dirs
+            .first
+            .path()
+            .parent()
+            .unwrap()
+            .join("work-5-first-attempt-1");
+        fs::create_dir(&workspace).unwrap();
+        fs::write(workspace.join(".git"), "stale worktree").unwrap();
+        workspace
+    };
+    assert!(!previous_workspace.exists());
+
+    let dirs = released_service_fixture_dirs();
+    let next_workspace = dirs
+        .first
+        .path()
+        .parent()
+        .unwrap()
+        .join("work-5-first-attempt-1");
+    assert_ne!(next_workspace, previous_workspace);
+    assert!(!next_workspace.exists());
+}
+
 fn release_group_exists(group: i32) -> bool {
     let result = unsafe { libc::kill(-group, 0) };
     result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
@@ -560,9 +611,10 @@ fn scheduler_released_upgrade_preserves_shared_ownership() {
     use sha2::{Digest, Sha256};
     use std::process::Command;
 
-    let home = TempDir::new().unwrap();
-    let first = TempDir::new().unwrap();
-    let second = TempDir::new().unwrap();
+    let dirs = released_service_fixture_dirs();
+    let home = &dirs.home;
+    let first = &dirs.first;
+    let second = &dirs.second;
     let source =
         fs::read("/Users/mrinal/.local/bin/fluent").expect("actual v0.5.0 executable is required");
     assert_eq!(
