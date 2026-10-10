@@ -6256,7 +6256,9 @@ fi
     let mut run = fluent_cmd();
     run.current_dir(&fixture.project)
         .args(["attempt", "run", &fixture.work, "attempt-1"]);
-    if !require_host {
+    // The legacy first recovery predates source-input bindings. Exercise its
+    // historical no-change result, then confine the later corrective Writer.
+    if !require_host || legacy_source {
         run.arg("--no-sandbox");
     }
     let result = run
@@ -6281,6 +6283,16 @@ fi
         )
         .env("RECOVERY_OLD_AUDIT", &fixture.audit)
         .env("RECOVERY_CURRENT_AUDIT", &fixture.audit)
+        .env(
+            "FLUENT_WORKFLOW_REQUIRE_HOST",
+            if legacy_source {
+                "0"
+            } else if require_host {
+                "1"
+            } else {
+                "0"
+            },
+        )
         .assert();
     if legacy_source {
         result
@@ -6289,7 +6301,7 @@ fi
     } else {
         result.success();
     }
-    if require_host {
+    if require_host && !legacy_source {
         assert_eq!(
             fs::read(area.join("confinement-observed")).unwrap(),
             b"denied\n"

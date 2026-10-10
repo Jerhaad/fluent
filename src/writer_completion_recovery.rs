@@ -90,9 +90,18 @@ pub fn recovery_action(project_root: &Path, attempt: &Attempt) -> Option<String>
     ))
 }
 
-/// Report a repair only while its malformed source is the latest completed Writer.
+/// Report a repair for the latest malformed Writer or unresolved no-change findings.
 pub(crate) fn status_recovery_action(project_root: &Path, attempt: &Attempt) -> Option<String> {
     let eligible = inspect_eligible(project_root, attempt).ok()?;
+    if eligible.existing_no_change {
+        let source = attempt
+            .tasks
+            .iter()
+            .find(|task| task.id == eligible.source_writer_task_id)?;
+        if !writer_matrix_has_pending_finding(project_root, source).ok()? {
+            return None;
+        }
+    }
     let latest = attempt
         .tasks
         .iter()
