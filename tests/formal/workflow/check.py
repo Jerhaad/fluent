@@ -411,6 +411,16 @@ def evidence_status_suite(source, root, output, jar, java):
                 candidate_commit="0" * 40), "candidate binding differs"),
             ("wrong-command", "landing-results.json", lambda value: value["commands"][0]
              .update(command="forged command"), "differs from its occurrence"),
+            ("attempt-tester-error", "attempt-results.json", lambda value: value.update(
+                error="harness failed"), "Attempt Tester has a harness error"),
+            ("attempt-tester-command", "attempt-results.json", lambda value: value["commands"][0]
+             .update(command="forged command"), "Attempt Tester command 0 differs"),
+            ("attempt-tester-failure", "attempt-results.json", lambda value: value["commands"][0]
+             .update(exit_code=1), "Attempt Tester command 0 has an unexplained failure"),
+            ("attempt-tester-new-failure", "attempt-results.json", lambda value: (
+                value["tests"][0].update(status="fail"),
+                value["summary"].update(**{"pass": 1, "fail": 1})),
+             "Attempt Tester has a new failing test"),
             ("old-display", "shown-work.json", lambda value: value["evidence-history"]
              .update(**{"tester-results": None, "diagnostic": "old Attempt only"}),
              "display did not retain"),
@@ -441,6 +451,27 @@ def evidence_status_suite(source, root, output, jar, java):
             (output / f"{label}.log").write_text(negative.stdout + negative.stderr)
             results.append({"case": label, "pass": negative.returncode != 0 and
                             diagnostic in negative.stderr, "log": f"{label}.log"})
+        paired_dir = output / "paired-wrong-landing-command"
+        paired_dir.mkdir(exist_ok=True)
+        paired = json.loads(json.dumps(trace))
+        for entry in trace["artifacts"]:
+            (paired_dir / entry["path"]).write_bytes((output / entry["path"]).read_bytes())
+        for name in ("landing-results.json", "landing-manifest.json"):
+            value = json.loads((paired_dir / name).read_text())
+            value["commands"][0]["command"] = "forged command"
+            data = json.dumps(value).encode()
+            (paired_dir / name).write_bytes(data)
+            next(entry for entry in paired["artifacts"] if entry["path"] == name)["sha256"] = \
+                hashlib.sha256(data).hexdigest()
+        paired_path = paired_dir / "trace.json"
+        paired_path.write_text(json.dumps(paired))
+        rejected = subprocess.run(["python3", str(source / "project_evidence.py"),
+                                   str(paired_path)], capture_output=True, text=True)
+        (output / "paired-wrong-landing-command.log").write_text(rejected.stdout + rejected.stderr)
+        results.append({"case": "paired-wrong-landing-command",
+                        "pass": rejected.returncode != 0 and
+                        "landing command 0 differs from declared Tester configuration" in rejected.stderr,
+                        "log": "paired-wrong-landing-command.log"})
         for label, paths, expected_pass in (
             ("carried-review-valid", [".fluent/expertise/learned.md"], True),
             ("carried-review-stale", ["tests/corrected.rs"], False),

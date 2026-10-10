@@ -60,6 +60,91 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def declared_commands(data):
+    """Read the command fields in the retained Tester's YAML configuration."""
+    lines = data.splitlines()
+    require(lines and lines[0] == "commands:", "invalid Tester configuration")
+    commands = []
+    index = 1
+    while index < len(lines):
+        match = re.fullmatch(r"  - command: (.*)", lines[index])
+        require(match is not None, "invalid Tester configuration command")
+        scalar = match.group(1)
+        index += 1
+        if scalar == "|":
+            body = []
+            while index < len(lines) and (lines[index].startswith("      ") or
+                                           not lines[index].strip()):
+                body.append(lines[index][6:] if lines[index].startswith("      ") else "")
+                index += 1
+            command = "\n".join(body) + "\n"
+        elif scalar.startswith("'") and scalar.endswith("'"):
+            command = scalar[1:-1].replace("''", "'")
+        elif scalar.startswith('"') and scalar.endswith('"'):
+            command = json.loads(scalar)
+        else:
+            command = scalar
+        fields = {"command": command, "reject_process_leaks": False}
+        explicit = set()
+        while index < len(lines) and lines[index].startswith("    "):
+            field = re.fullmatch(r"    (test_harness|reject_process_leaks): (.*)", lines[index])
+            require(field is not None and field.group(1) not in explicit,
+                    "invalid Tester configuration field")
+            explicit.add(field.group(1))
+            if field.group(1) == "reject_process_leaks":
+                require(field.group(2) in ("true", "false"),
+                        "invalid Tester process-leak policy")
+            fields[field.group(1)] = (field.group(2) == "true" if
+                                      field.group(1) == "reject_process_leaks" else field.group(2))
+            index += 1
+        require(command and fields.get("test_harness"), "incomplete Tester configuration command")
+        commands.append(fields)
+    require(commands, "empty Tester configuration")
+    return commands
+
+
+def validate_accepted_results(results, commands, label, baseline=None):
+    require(results["error"] is None, f"{label} has a harness error")
+    require(len(results["commands"]) == len(commands), f"{label} command coverage differs")
+    for index, (result, declared) in enumerate(zip(results["commands"], commands)):
+        require(result["command"] == declared["command"] and
+                result["test_harness"] == declared["test_harness"],
+                f"{label} command {index} differs from declared Tester configuration")
+        require(not (result.get("process_settlement") or {}).get("leaks"),
+                f"{label} command {index} leaked a process")
+    tests = results["tests"]
+    summary = results["summary"]
+    require(summary["total"] == len(tests) and
+            summary["fail"] == sum(test["status"] == "fail" for test in tests) and
+            summary["pass"] == sum(test["status"] == "pass" for test in tests) and
+            summary["skipped"] == sum(test["status"] == "skipped" for test in tests),
+            f"{label} summary differs")
+    known = ({test["id"] for test in baseline["tests"] if test["status"] == "fail"}
+             if baseline is not None else set())
+    require({test["id"] for test in tests if test["status"] == "fail"} <= known,
+            f"{label} has a new failing test")
+    for index, result in enumerate(results["commands"]):
+        if result["exit_code"] == 0:
+            continue
+        if baseline is None:
+            require(False, f"{label} command {index} has an unexplained failure")
+        prior = baseline["commands"][index]
+        harness = result["test_harness"]
+        current_failures = {test["id"] for test in tests if
+                            test["status"] == "fail" and test["test_harness"] == harness}
+        prior_failures = {test["id"] for test in baseline["tests"] if
+                          test["status"] == "fail" and test["test_harness"] == harness}
+        require(result["command"] == prior["command"] and
+                result["test_harness"] == prior["test_harness"] and
+                result["exit_code"] == prior["exit_code"] and
+                len([entry for entry in results["commands"] if entry["exit_code"] != 0 and
+                     entry["test_harness"] == harness]) == 1 and
+                len([entry for entry in baseline["commands"] if entry["exit_code"] != 0 and
+                     entry["test_harness"] == harness]) == 1 and
+                current_failures and current_failures <= prior_failures,
+                f"{label} command {index} has an unexplained failure")
+
+
 def artifact(work, producer):
     matches = [ref["path"] for ref in work["merge_candidates"][0]["merge_state"]
                ["check_artifacts"] if ref["producer_id"] == producer]
@@ -100,6 +185,7 @@ def project(trace, root):
     manifest = load_json((root / "landing-manifest.json").read_text())
     baseline = load_json((root / "target-baseline.json").read_text())
     attempt_results = load_json((root / "attempt-results.json").read_text())
+    config = declared_commands((root / "tester-config.yaml").read_text())
     events = trace["events"]
     require(type(events) is list and len(events) == 4, "missing evidence events")
     boundaries = ("ready", "target-advanced", "landed", "observed")
@@ -199,6 +285,7 @@ def project(trace, root):
     require(attempt_results["candidate_commit"] ==
             tester[0]["review_context"]["candidate_commit"] and
             attempt_results["candidate_commit"] != merged, "Attempt Tester identity is wrong")
+    validate_accepted_results(attempt_results, config, "Attempt Tester")
     candidate = landed["merge_candidates"][0]
     require(candidate["merge_state"]["status"] == "merged" and
             candidate["merge_state"]["merged_commit"] == merged and
@@ -218,7 +305,12 @@ def project(trace, root):
     require(results["error"] is None and baseline["error"] is None and
             len(results["commands"]) == len(manifest["commands"]) > 0,
             "landing Tester is incomplete")
+    require(len(manifest["commands"]) == len(config),
+            "landing command coverage differs from declared Tester configuration")
     for index, (command, declared) in enumerate(zip(results["commands"], manifest["commands"])):
+        require(all(declared.get(key, False) == config[index][key] for key in
+                    ("command", "test_harness", "reject_process_leaks")),
+                f"landing command {index} differs from declared Tester configuration")
         require(command["command"] == declared["command"] and
                 command["test_harness"] == declared["test_harness"],
                 f"landing command {index} differs from its occurrence")
@@ -228,30 +320,7 @@ def project(trace, root):
                     f"landing command {index} log is missing")
         require(not (command.get("process_settlement") or {}).get("leaks"),
                 f"landing command {index} leaked a process")
-    require(results["summary"]["total"] == len(results["tests"]) and
-            results["summary"]["fail"] == sum(test["status"] == "fail" for test in results["tests"]),
-            "landing summary differs")
-    known = {test["id"] for test in baseline["tests"] if test["status"] == "fail"}
-    require({test["id"] for test in results["tests"] if test["status"] == "fail"} <= known,
-            "landing has a new failing test")
-    for index, command in enumerate(results["commands"]):
-        if command["exit_code"] == 0:
-            continue
-        prior = baseline["commands"][index]
-        harness = command["test_harness"]
-        current_failures = {test["id"] for test in results["tests"] if
-                            test["status"] == "fail" and test["test_harness"] == harness}
-        prior_failures = {test["id"] for test in baseline["tests"] if
-                          test["status"] == "fail" and test["test_harness"] == harness}
-        require(command["command"] == prior["command"] and
-                command["test_harness"] == prior["test_harness"] and
-                command["exit_code"] == prior["exit_code"] and
-                len([entry for entry in results["commands"] if entry["exit_code"] != 0 and
-                     entry["test_harness"] == harness]) == 1 and
-                len([entry for entry in baseline["commands"] if entry["exit_code"] != 0 and
-                     entry["test_harness"] == harness]) == 1 and
-                current_failures and current_failures <= prior_failures,
-                f"landing command {index} has an unexplained failure")
+    validate_accepted_results(results, config, "landing", baseline)
     require(shown["evidence-history"]["merged-commit"] == merged and
             shown["evidence-history"]["tester-results"] == final_path and
             shown["evidence-history"]["diagnostic"] is None and
