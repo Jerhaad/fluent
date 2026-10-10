@@ -70,11 +70,13 @@ def project_service(trace):
     assert first["predecessor-sha256"] == RELEASE_SHA
     assert first["registered-projects"] == replacement["registered-projects"] == 2
     old_health, new_health = first["health"], replacement["health"]
-    assert old_health["instance_id"] != new_health["instance_id"]
+    assert old_health["instance_id"] is None and old_health["state"] is None
+    assert isinstance(new_health["instance_id"], str) and new_health["instance_id"]
     assert old_health["build"] != new_health["build"]
     assert old_health["generation"] == new_health["generation"]
-    assert settled["stop-exit-code"] == 0
-    assert isinstance(settled["stop-stdout"], str)
+    assert settled["stop-exit-codes"] == [0, 0]
+    assert len(settled["stop-stdout"]) == 2
+    assert all(isinstance(output, str) for output in settled["stop-stdout"])
     assert settled["owned-worker-started"] is True
     owned = settled["owned-workers"]
     assert len(owned) > 0
@@ -83,6 +85,9 @@ def project_service(trace):
                and worker["dispatch_id"]
                and isinstance(worker["project"], str) and worker["project"]
                and type(worker["pid"]) is int and worker["pid"] > 0
+               and worker["task_id"] and worker["workspace"] and worker["receipt"]
+               and worker["execution-state"] in {"settled", "canceled"}
+               and worker["process-group-absent"] is True
                and worker["status-before-stop"] in {"claimed", "running"}
                and worker["status-after-stop"] in {"candidate-ready", "failed", "needs-user", "canceled", "blocked"}
                for worker in owned)
@@ -98,8 +103,9 @@ def project_service(trace):
                    and work["status"] == worker["status-after-stop"]
                    for work in active) for worker in owned)
     stale = replacement["stale-stop"]
-    assert stale["requested-instance"] == old_health["instance_id"]
-    assert f"stale drain request for {stale['requested-instance']} rejected" in stale["error"]
+    assert len(first["coordinators"]) == 2
+    assert stale["requested-coordinator"] == first["coordinators"][0]
+    assert stale["request-path"].endswith("/.fluent/work/scheduler/stop-request.json")
     assert stale["health-after"] == new_health
     assert len(settled["queues"]) == len(replacement["queues"]) == 2
     assert all(queue["status"] == "queued" for queue in settled["queues"])

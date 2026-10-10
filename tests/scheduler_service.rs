@@ -41,35 +41,144 @@ impl ReleaseServiceChild {
     }
 
     fn output_bounded(&mut self) -> std::process::Output {
-        self.wait_bounded();
-        self.child.take().unwrap().wait_with_output().unwrap()
+        use std::os::fd::AsRawFd;
+        let status = self.wait_bounded();
+        // A command can exit while one of its children still owns a pipe.
+        // Close that process group before collecting bounded output.
+        unsafe { libc::kill(-self.group, libc::SIGKILL) };
+        let child = self.child.as_mut().unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let stdout_pipe = child.stdout.take();
+        let stderr_pipe = child.stderr.take();
+        for pipe in [
+            stdout_pipe.as_ref().map(AsRawFd::as_raw_fd),
+            stderr_pipe.as_ref().map(AsRawFd::as_raw_fd),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let flags = unsafe { libc::fcntl(pipe, libc::F_GETFL) };
+            assert!(flags >= 0);
+            assert_eq!(
+                unsafe { libc::fcntl(pipe, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+                0
+            );
+        }
+        let mut pipes: [Option<Box<dyn Read>>; 2] = [
+            stdout_pipe.map(|pipe| Box::new(pipe) as Box<dyn Read>),
+            stderr_pipe.map(|pipe| Box::new(pipe) as Box<dyn Read>),
+        ];
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while pipes.iter().any(Option::is_some) {
+            for (pipe, output) in pipes.iter_mut().zip([&mut stdout, &mut stderr]) {
+                if let Some(reader) = pipe {
+                    let mut chunk = [0; 8192];
+                    match reader.read(&mut chunk) {
+                        Ok(0) => *pipe = None,
+                        Ok(count) => output.extend_from_slice(&chunk[..count]),
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(error) => panic!("fixture output read failed: {error}"),
+                    }
+                }
+            }
+            assert!(Instant::now() < deadline, "fixture output pipe stayed open");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::process::Output {
+            status,
+            stdout,
+            stderr,
+        }
     }
 }
 
 struct ReleaseWorkers {
     release: PathBuf,
     started: PathBuf,
+    projects: Vec<PathBuf>,
 }
 
-impl Drop for ReleaseWorkers {
-    fn drop(&mut self) {
-        let _ = fs::write(&self.release, "settle");
-        if let Ok(log) = fs::read_to_string(&self.started) {
-            for line in log.lines() {
-                if let Some(pid) = line
-                    .split('\t')
-                    .next()
-                    .and_then(|pid| pid.parse::<i32>().ok())
+fn release_group_exists(group: i32) -> bool {
+    let result = unsafe { libc::kill(-group, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+fn release_execution_groups(root: &std::path::Path, groups: &mut Vec<i32>) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            release_execution_groups(&path, groups);
+        } else if path
+            .file_name()
+            .is_some_and(|name| name == "execution.json")
+        {
+            if let Ok(bytes) = fs::read(&path) {
+                if let Ok(record) =
+                    serde_json::from_slice::<fluent::execution::ExecutionRecord>(&bytes)
                 {
-                    // Provider commands run in their own process groups. Check
-                    // the group before signaling so a stale PID cannot target
-                    // an unrelated process.
-                    if unsafe { libc::getpgid(pid) } == pid {
-                        unsafe { libc::kill(-pid, libc::SIGKILL) };
+                    if let Ok(group) = i32::try_from(record.process_group_id) {
+                        if group > 0 {
+                            groups.push(group);
+                        }
                     }
                 }
             }
         }
+    }
+}
+
+impl ReleaseWorkers {
+    fn groups(&self) -> Vec<i32> {
+        let mut groups = Vec::new();
+        if let Ok(log) = fs::read_to_string(&self.started) {
+            for line in log.lines() {
+                if let Some(pid) = line.split('\t').next().and_then(|pid| pid.parse().ok()) {
+                    groups.push(pid);
+                }
+            }
+        }
+        for project in &self.projects {
+            release_execution_groups(&project.join(".fluent/work/artifacts"), &mut groups);
+        }
+        groups.sort_unstable();
+        groups.dedup();
+        groups
+    }
+
+    fn reap(&self) {
+        let _ = fs::write(&self.release, "settle");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut quiet_since = None;
+        loop {
+            let groups = self.groups();
+            for group in &groups {
+                if release_group_exists(*group) {
+                    unsafe { libc::kill(-*group, libc::SIGKILL) };
+                }
+            }
+            if groups.iter().all(|group| !release_group_exists(*group)) {
+                let since = quiet_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= Duration::from_millis(200) {
+                    break;
+                }
+            } else {
+                quiet_since = None;
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+impl Drop for ReleaseWorkers {
+    fn drop(&mut self) {
+        self.reap();
     }
 }
 
@@ -89,6 +198,11 @@ impl Drop for ReleaseServiceChild {
         if let Some(child) = self.child.as_mut() {
             let _ = child.wait();
         }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while release_group_exists(self.group) && Instant::now() < deadline {
+            unsafe { libc::kill(-self.group, libc::SIGKILL) };
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 }
 
@@ -107,6 +221,22 @@ fn released_service_fixture_reaps_a_stalled_child() {
 }
 
 #[test]
+fn released_service_fixture_bounds_inherited_pipe_after_leader_exit() {
+    let mut command = std::process::Command::new("/bin/sh");
+    command.args(["-c", "sleep 30 & echo ready"]);
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::piped());
+    let mut child = ReleaseServiceChild::spawn(&mut command);
+    let group = child.group;
+    let started = Instant::now();
+    let output = child.output_bounded();
+    assert!(output.status.success());
+    assert!(output.stdout.starts_with(b"ready"));
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(!release_group_exists(group));
+}
+
+#[test]
 fn released_service_fixture_reaps_provider_group() {
     let home = TempDir::new().unwrap();
     let started = home.path().join("started");
@@ -119,8 +249,124 @@ fn released_service_fixture_reaps_provider_group() {
         format!("{}\t{}\n", provider.group, home.path().display()),
     )
     .unwrap();
-    drop(ReleaseWorkers { release, started });
+    drop(ReleaseWorkers {
+        release,
+        started,
+        projects: vec![],
+    });
     assert!(!provider.wait_bounded().success());
+}
+
+#[test]
+fn released_service_fixture_reaps_unmarked_execution_group() {
+    let project = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    let mut command = std::process::Command::new("/bin/sh");
+    command.args(["-c", "sleep 30 & wait"]);
+    let mut provider = ReleaseServiceChild::spawn(&mut command);
+    let receipt_dir = project
+        .path()
+        .join(".fluent/work/artifacts/work/attempt/task");
+    fs::create_dir_all(&receipt_dir).unwrap();
+    fs::write(
+        receipt_dir.join("execution.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version":1,"state":"running","owner_pid":1,
+            "leader_pid":provider.group,"process_group_id":provider.group,
+            "started_at":"now","heartbeat_at":"now"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    drop(ReleaseWorkers {
+        release: home.path().join("release"),
+        started: home.path().join("absent-marker"),
+        projects: vec![project.path().to_path_buf()],
+    });
+    assert!(!provider.wait_bounded().success());
+    assert!(!release_group_exists(provider.group));
+}
+
+#[test]
+fn released_service_fixture_reaps_descendant_after_leader_exit() {
+    let home = TempDir::new().unwrap();
+    let mut command = std::process::Command::new("/bin/sh");
+    command.args(["-c", "sleep 30 & exit 0"]);
+    let mut provider = ReleaseServiceChild::spawn(&mut command);
+    let group = provider.group;
+    assert!(provider.wait_bounded().success());
+    assert!(release_group_exists(group));
+    let started = home.path().join("started");
+    fs::write(&started, format!("{group}\t{}\n", home.path().display())).unwrap();
+    drop(ReleaseWorkers {
+        release: home.path().join("release"),
+        started,
+        projects: vec![],
+    });
+    assert!(!release_group_exists(group));
+}
+
+fn observed_release_worker(
+    project: &std::path::Path,
+    work: &str,
+    started: &std::path::Path,
+) -> Option<(String, PathBuf, PathBuf, i32)> {
+    let item = fluent::work_model::WorkModelStore::new(project)
+        .read_work_item_snapshot(work)
+        .ok()?;
+    let attempt = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == "attempt-1")?;
+    let log = fs::read_to_string(started).ok()?;
+    for task in &attempt.tasks {
+        let Some(area) = task.artifact_area.as_ref() else {
+            continue;
+        };
+        let receipt = project.join(&area.path).join("execution.json");
+        let Ok(bytes) = fs::read(&receipt) else {
+            continue;
+        };
+        let Ok(record) = serde_json::from_slice::<fluent::execution::ExecutionRecord>(&bytes)
+        else {
+            continue;
+        };
+        let Some(owner) = record.attempt_owner.as_ref() else {
+            continue;
+        };
+        if record.state != fluent::execution::ExecutionState::Running {
+            continue;
+        }
+        if owner.project_root != project
+            || owner.work_item_id != work
+            || owner.attempt_id != "attempt-1"
+        {
+            continue;
+        }
+        let Some(write) = task.workspace_access.writes.first() else {
+            continue;
+        };
+        let Ok(workspace) = fs::canonicalize(project.join(&write.path)) else {
+            continue;
+        };
+        let pid = i32::try_from(record.leader_pid).ok()?;
+        let group = i32::try_from(record.process_group_id).ok()?;
+        if pid <= 0 || pid != group || unsafe { libc::getpgid(pid) } != group {
+            continue;
+        }
+        if !log.lines().any(|line| {
+            line.split_once('\t').is_some_and(|(marked_pid, path)| {
+                marked_pid.parse::<i32>() == Ok(pid)
+                    && fs::canonicalize(path)
+                        .ok()
+                        .is_some_and(|path| path == workspace || path == project)
+            })
+        }) {
+            continue;
+        }
+        return Some((task.id.clone(), workspace, receipt, group));
+    }
+    None
 }
 
 #[test]
@@ -270,9 +516,10 @@ fn scheduler_released_upgrade_preserves_shared_ownership() {
         }
         return;
     }
-    let _release_guard = ReleaseWorkers {
+    let release_guard = ReleaseWorkers {
         release: release_workers.clone(),
         started: started.clone(),
+        projects: vec![first.path().to_path_buf(), second.path().to_path_buf()],
     };
     let mut old_command = Command::new(&predecessor);
     old_command
@@ -329,26 +576,19 @@ fn scheduler_released_upgrade_preserves_shared_ownership() {
     }
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut owned_before_stop = Vec::new();
-    while owned_before_stop.is_empty() {
+    while owned_before_stop.len() < 2 {
         for (project, work) in [(first.path(), "first"), (second.path(), "second")] {
+            if owned_before_stop
+                .iter()
+                .any(|(seen, _, _, _, _, _)| seen == project)
+            {
+                continue;
+            }
             let result = fixture(&predecessor, project, &["queue", "show", work]);
             assert!(result.status.success());
             let dispatch: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
-            let workspace = project
-                .parent()
-                .unwrap()
-                .join(format!("work-{}-{work}-attempt-1", work.len()));
-            let provider_pid = fs::read_to_string(&started)
-                .unwrap_or_default()
-                .lines()
-                .find_map(|line| {
-                    let (pid, path) = line.split_once('\t')?;
-                    let pid = pid.parse::<i32>().ok()?;
-                    ((path == project.to_string_lossy() || path == workspace.to_string_lossy())
-                        && unsafe { libc::getpgid(pid) } == pid)
-                        .then_some(pid)
-                });
-            if let Some(pid) = provider_pid
+            let worker = observed_release_worker(project, work, &started);
+            if let Some((task_id, workspace, receipt, pid)) = worker
                 .filter(|_| matches!(dispatch["status"].as_str(), Some("claimed" | "running")))
             {
                 assert_eq!(dispatch["work_item_id"], work);
@@ -358,7 +598,14 @@ fn scheduler_released_upgrade_preserves_shared_ownership() {
                         .as_str()
                         .is_some_and(|id| !id.is_empty())
                 );
-                owned_before_stop.push((project.to_path_buf(), pid, dispatch));
+                owned_before_stop.push((
+                    project.to_path_buf(),
+                    task_id,
+                    workspace,
+                    receipt,
+                    pid,
+                    dispatch,
+                ));
             }
         }
         assert!(
@@ -378,24 +625,47 @@ fn scheduler_released_upgrade_preserves_shared_ownership() {
             String::from_utf8_lossy(&queued.stderr)
         );
     }
-    let mut stop_command = Command::new(&predecessor);
-    stop_command
-        .current_dir(first.path())
-        .env("HOME", home.path())
-        .env("FLUENT_NO_UPDATE_CHECK", "1")
-        .args(["scheduler", "stop"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    let mut stopping = ReleaseServiceChild::spawn(&mut stop_command);
+    let legacy_coordinators: Vec<_> = [first.path(), second.path()]
+        .iter()
+        .map(|project| {
+            let bytes = fs::read(project.join(".fluent/work/scheduler/coordinator.json")).unwrap();
+            let metadata: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            metadata["instance_id"].as_str().unwrap().to_owned()
+        })
+        .collect();
+    let mut stopping: Vec<_> = [first.path(), second.path()]
+        .iter()
+        .map(|project| {
+            let mut command = Command::new(&predecessor);
+            command
+                .current_dir(project)
+                .env("HOME", home.path())
+                .env("FLUENT_NO_UPDATE_CHECK", "1")
+                .args(["scheduler", "stop"])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            ReleaseServiceChild::spawn(&mut command)
+        })
+        .collect();
     std::thread::sleep(Duration::from_millis(200));
     fs::write(&release_workers, "settle").unwrap();
-    let stopped = stopping.output_bounded();
-    assert!(
-        stopped.status.success(),
-        "{}",
-        String::from_utf8_lossy(&stopped.stderr)
-    );
+    let stopped: Vec<_> = stopping
+        .iter_mut()
+        .map(ReleaseServiceChild::output_bounded)
+        .collect();
+    for output in &stopped {
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    unsafe { libc::kill(-old_service.group, libc::SIGTERM) };
     assert!(old_service.wait_bounded().success());
+    assert!(scheduler_service::send_health_request(&socket).is_err());
+    let old_group = old_service.group;
+    drop(old_service);
+    assert!(!release_group_exists(old_group));
     let mut active_after_stop = Vec::new();
     for (project, work) in [(first.path(), "first"), (second.path(), "second")] {
         let result = fixture(&predecessor, project, &["queue", "show", work]);
@@ -413,7 +683,7 @@ fn scheduler_released_upgrade_preserves_shared_ownership() {
     )));
     let owned_workers: Vec<_> = owned_before_stop
         .iter()
-        .map(|(project, pid, before)| {
+        .map(|(project, task_id, workspace, receipt, pid, before)| {
             let after = active_after_stop
                 .iter()
                 .find(|after| {
@@ -426,12 +696,33 @@ fn scheduler_released_upgrade_preserves_shared_ownership() {
                 after["status"].as_str(),
                 Some("candidate-ready" | "failed" | "needs-user" | "canceled" | "blocked")
             ));
+            let execution: fluent::execution::ExecutionRecord =
+                serde_json::from_slice(&fs::read(receipt).unwrap()).unwrap();
+            assert!(matches!(
+                execution.state,
+                fluent::execution::ExecutionState::Settled
+                    | fluent::execution::ExecutionState::Canceled
+            ));
+            assert_eq!(execution.process_group_id, *pid as u32);
+            assert!(
+                !release_group_exists(*pid),
+                "owned provider group remains live"
+            );
             serde_json::json!({"project":project,"pid":pid,
+            "task_id":task_id,"workspace":workspace,"receipt":receipt,
+            "execution-state":execution.state,"process-group-absent":true,
             "work_item_id":before["work_item_id"], "dispatch_id":before["dispatch_id"],
             "attempt_id":before["bound_attempt_id"],
             "status-before-stop":before["status"],"status-after-stop":after["status"]})
         })
         .collect();
+    release_guard.reap();
+    assert!(
+        release_guard
+            .groups()
+            .iter()
+            .all(|group| !release_group_exists(*group))
+    );
     let mut queues_after_stop = Vec::new();
     for (project, work) in [
         (first.path(), "first-queued"),
@@ -463,15 +754,23 @@ fn scheduler_released_upgrade_preserves_shared_ownership() {
         std::thread::sleep(Duration::from_millis(20));
     }
     let new_health = scheduler_service::send_health_request(&socket).unwrap();
-    assert_ne!(old_health.instance_id, new_health.instance_id);
     assert_ne!(old_health.build, new_health.build);
     assert_eq!(
         scheduler_service::read_registry(home.path()).unwrap().len(),
         2
     );
-    let stale_instance = old_health.instance_id.as_deref().unwrap();
-    let stale = scheduler_service::stop_service_instance(home.path(), stale_instance).unwrap_err();
-    assert!(format!("{stale:#}").contains("stale drain request"));
+    assert!(old_health.instance_id.is_none());
+    let stale_instance = &legacy_coordinators[0];
+    fs::write(
+        first
+            .path()
+            .join(".fluent/work/scheduler/stop-request.json"),
+        serde_json::to_vec(&serde_json::json!({"schema":1,"instance_id":stale_instance,
+            "requested_at":chrono::Utc::now().to_rfc3339()}))
+        .unwrap(),
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(200));
     let health_after_stale = scheduler_service::send_health_request(&socket).unwrap();
     assert_eq!(health_after_stale.instance_id, new_health.instance_id);
     let mut queues_after_replacement = Vec::new();
@@ -507,11 +806,12 @@ fn scheduler_released_upgrade_preserves_shared_ownership() {
                 "generation":old_health.generation,"build":old_health.build,
                 "instance_id":old_health.instance_id,"state":old_health.state},
                 "registered-projects":registry.len(),
+                "coordinators":legacy_coordinators,
                 "predecessor-sha256":"8bb76717be942e4a0c97c297c318c0a1331e92105180edb386354dddbae12974"}},
             {"sequence":2,"actor":"operator","operation-id":"scheduler-stop",
              "generation":null,"boundary":"old-owner-settled",
-             "causal-predecessors":[1],"raw-facts":{"stop-exit-code":stopped.status.code(),
-                "stop-stdout":String::from_utf8_lossy(&stopped.stdout),
+             "causal-predecessors":[1],"raw-facts":{"stop-exit-codes":stopped.iter().map(|output| output.status.code()).collect::<Vec<_>>(),
+                "stop-stdout":stopped.iter().map(|output| String::from_utf8_lossy(&output.stdout).to_string()).collect::<Vec<_>>(),
                 "queues":queues_after_stop,"active-work":active_after_stop,
                 "owned-worker-started":!owned_workers.is_empty(),"owned-workers":owned_workers}},
             {"sequence":3,"actor":"current-service","operation-id":"scheduler-run",
@@ -521,7 +821,7 @@ fn scheduler_released_upgrade_preserves_shared_ownership() {
                 "instance_id":new_health.instance_id,"state":new_health.state},
                 "registered-projects":scheduler_service::read_registry(home.path()).unwrap().len(),
                 "queues":queues_after_replacement,"stale-stop":{
-                    "requested-instance":stale_instance,"error":format!("{stale:#}"),
+                    "requested-coordinator":stale_instance,"request-path":first.path().join(".fluent/work/scheduler/stop-request.json"),
                     "health-after":{"instance_id":health_after_stale.instance_id,
                         "build":health_after_stale.build,"generation":health_after_stale.generation,
                         "state":health_after_stale.state}}}}
