@@ -315,6 +315,69 @@ def evidence_status_suite(source, root, output, jar, java):
     fixture_ok = fixture.returncode == 0 and trace_path.is_file()
     results.append({"case": "fresh-evidence-fixture", "pass": fixture_ok,
                     "log": "production-fixture.log"})
+    carried_command = command[:-1] + ["review_coverage_preserves_valid_ordinary_carry_forward"]
+    carried_path = output / "carried-production/production-trace.json"
+    carried_path.unlink(missing_ok=True)
+    carried_fixture = subprocess.run(carried_command, cwd=root, capture_output=True, text=True)
+    (output / "carried-production-fixture.log").write_text(
+        "$ " + " ".join(carried_command) + "\n" +
+        carried_fixture.stdout + carried_fixture.stderr)
+    carried_ok = carried_fixture.returncode == 0 and carried_path.is_file()
+    results.append({"case": "public-carried-review-fixture", "pass": carried_ok,
+                    "log": "carried-production-fixture.log"})
+    stale_command = command[:-1] + ["workflow_landing_rejects_stale_carried_review"]
+    stale_fixture = subprocess.run(stale_command, cwd=root, capture_output=True, text=True)
+    (output / "stale-carried-review-fixture.log").write_text(
+        "$ " + " ".join(stale_command) + "\n" +
+        stale_fixture.stdout + stale_fixture.stderr)
+    results.append({"case": "public-stale-carried-review-landing",
+                    "pass": stale_fixture.returncode == 0,
+                    "log": "stale-carried-review-fixture.log"})
+    if carried_ok:
+        carried = json.loads(carried_path.read_text())
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root,
+                              capture_output=True, text=True, check=True).stdout.strip()
+        binary = root / "target/debug/fluent"
+        bound = carried["fluent-commit"] == head and binary.is_file() and \
+            carried["fluent-binary-sha256"] == hashlib.sha256(binary.read_bytes()).hexdigest()
+        projected = subprocess.run(["python3", str(source / "project_evidence.py"),
+                                    str(carried_path)], capture_output=True, text=True)
+        (output / "carried-production-projection.log").write_text(
+            projected.stdout + projected.stderr)
+        results.append({"case": "public-carried-review-projection",
+                        "pass": bound and projected.returncode == 0,
+                        "log": "carried-production-projection.log"})
+        future_dir = output / "real-review-binds-later-writer"
+        future_dir.mkdir(exist_ok=True)
+        changed = json.loads(json.dumps(carried))
+        for entry in carried["artifacts"]:
+            (future_dir / entry["path"]).write_bytes(
+                (carried_path.parent / entry["path"]).read_bytes())
+        work = json.loads((future_dir / "ready-work.json").read_text())
+        tasks = work["attempts"][0]["tasks"]
+        first_write = next(task for task in tasks if task["kind"] == "write")
+        later_write = next(task for task in tasks if task["kind"] == "write" and
+                           task["id"] != first_write["id"])
+        review = next(task for task in tasks if task["kind"] == "review" and
+                      task["role"] == "tests" and
+                      task["review_context"]["candidate_commit"] ==
+                      first_write["output"]["commit"])
+        review["review_context"]["candidate_commit"] = later_write["output"]["commit"]
+        data = json.dumps(work).encode()
+        (future_dir / "ready-work.json").write_bytes(data)
+        next(entry for entry in changed["artifacts"] if entry["path"] ==
+             "ready-work.json")["sha256"] = hashlib.sha256(data).hexdigest()
+        changed["events"][0]["raw-facts"]["work"] = work
+        future_path = future_dir / "trace.json"
+        future_path.write_text(json.dumps(changed))
+        rejected = subprocess.run(["python3", str(source / "project_evidence.py"),
+                                   str(future_path)], capture_output=True, text=True)
+        (output / "real-review-binds-later-writer.log").write_text(
+            rejected.stdout + rejected.stderr)
+        results.append({"case": "real-review-binds-later-writer",
+                        "pass": rejected.returncode != 0 and
+                        "ordinary review producing Writer differs" in rejected.stderr,
+                        "log": "real-review-binds-later-writer.log"})
     if fixture_ok:
         trace = json.loads(trace_path.read_text())
         head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root,
@@ -332,7 +395,7 @@ def evidence_status_suite(source, root, output, jar, java):
             ("wrong-review-candidate", "ready-work.json", lambda value: next(
                 task for task in value["attempts"][0]["tasks"] if task["kind"] == "review" and
                 task["role"] == "tests")["review_context"].update(candidate_commit="0" * 40),
-             "ordinary review binding differs"),
+             "ordinary review producing Writer differs"),
             ("wrong-review-context", "ready-work.json", lambda value: next(
                 task for task in value["attempts"][0]["tasks"] if task["kind"] == "review" and
                 task["role"] == "tests")["review_context"].update(source_branch="other"),
@@ -341,6 +404,9 @@ def evidence_status_suite(source, root, output, jar, java):
                 task for task in value["attempts"][0]["tasks"] if task["kind"] == "review" and
                 task["role"] == "tests")["workspace_access"]["reads"][0].update(path="../other"),
              "ordinary review authority differs"),
+            ("failed-review-verdict", "review-attempt-1-review-tests.md",
+             lambda value: value.replace("Verdict: pass", "Verdict: fail"),
+             "ordinary review verdict is missing or not passing"),
             ("wrong-candidate", "landing-results.json", lambda value: value.update(
                 candidate_commit="0" * 40), "candidate binding differs"),
             ("wrong-command", "landing-results.json", lambda value: value["commands"][0]
@@ -355,9 +421,11 @@ def evidence_status_suite(source, root, output, jar, java):
             changed = json.loads(json.dumps(trace))
             for entry in trace["artifacts"]:
                 (negative_dir / entry["path"]).write_bytes((output / entry["path"]).read_bytes())
-            value = json.loads((negative_dir / artifact).read_text())
-            mutate(value)
-            data = json.dumps(value).encode()
+            value = ((negative_dir / artifact).read_text() if label == "failed-review-verdict"
+                     else json.loads((negative_dir / artifact).read_text()))
+            changed_value = mutate(value)
+            data = (changed_value.encode() if label == "failed-review-verdict"
+                    else json.dumps(value).encode())
             (negative_dir / artifact).write_bytes(data)
             for entry in changed["artifacts"]:
                 if entry["path"] == artifact:
@@ -376,6 +444,7 @@ def evidence_status_suite(source, root, output, jar, java):
         for label, paths, expected_pass in (
             ("carried-review-valid", [".fluent/expertise/learned.md"], True),
             ("carried-review-stale", ["tests/corrected.rs"], False),
+            ("review-binds-later-writer", [".fluent/expertise/learned.md"], False),
         ):
             control_dir = output / label
             control_dir.mkdir(exist_ok=True)
@@ -393,11 +462,18 @@ def evidence_status_suite(source, root, output, jar, java):
             correction["id"] = "attempt-1-write-carried-control"
             correction["output"]["commit"] = work["merge_candidates"][0]["candidate_commit"]
             tasks.insert(next(i for i, task in enumerate(tasks) if task["kind"] == "tester"), correction)
+            if label == "review-binds-later-writer":
+                next(task for task in tasks if task["kind"] == "review" and
+                     task["role"] == "tests")["review_context"]["candidate_commit"] = correction["output"]["commit"]
             delta = [{"from": previous, "to": correction["output"]["commit"], "paths": paths}]
             for name, value in (("ready-work.json", work), ("writer-deltas.json", delta)):
                 data = json.dumps(value).encode()
                 (control_dir / name).write_bytes(data)
                 next(entry for entry in carried["artifacts"] if entry["path"] == name)["sha256"] = hashlib.sha256(data).hexdigest()
+            diff_bytes = ("\n".join(paths) + "\n").encode()
+            (control_dir / "writer-diff-1.txt").write_bytes(diff_bytes)
+            carried["artifacts"].append({"path": "writer-diff-1.txt",
+                                         "sha256": hashlib.sha256(diff_bytes).hexdigest()})
             carried["events"][0]["raw-facts"]["work"] = work
             control_path = control_dir / "trace.json"
             control_path.write_text(json.dumps(carried))
@@ -405,7 +481,9 @@ def evidence_status_suite(source, root, output, jar, java):
                                       str(control_path)], capture_output=True, text=True)
             (output / f"{label}.log").write_text(checked.stdout + checked.stderr)
             results.append({"case": label, "pass": (checked.returncode == 0) == expected_pass and
-                            (expected_pass or "ordinary review binding differs" in checked.stderr),
+                            (expected_pass or ("ordinary review producing Writer differs" if
+                             label == "review-binds-later-writer" else
+                             "ordinary review binding differs") in checked.stderr),
                             "log": f"{label}.log"})
         missing = json.loads(json.dumps(trace))
         missing["events"] = missing["events"][:-1]

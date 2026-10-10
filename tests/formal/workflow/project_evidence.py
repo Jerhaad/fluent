@@ -85,7 +85,9 @@ def project(trace, root):
         exact_keys(entry, ("path", "sha256"), "artifact")
         name = entry["path"]
         require(type(name) is str and name not in seen and
-                (name in NAMES or re.fullmatch(r"landing-\d+-(stdout|stderr)\.log", name)),
+                (name in NAMES or re.fullmatch(r"landing-\d+-(stdout|stderr)\.log", name)
+                 or re.fullmatch(r"review-[a-z0-9-]+\.md", name)
+                 or re.fullmatch(r"writer-diff-[1-9][0-9]*\.txt", name)),
                 "invalid artifact path")
         seen.add(name)
         require(digest((root / name).read_bytes()) == entry["sha256"],
@@ -146,6 +148,10 @@ def project(trace, root):
                 delta.get("to") == writes[index]["output"]["commit"] and
                 type(delta.get("paths")) is list,
                 "Writer delta binding differs")
+        diff_name = f"writer-diff-{index}.txt"
+        require(diff_name in seen and
+                (root / diff_name).read_text().splitlines() == delta["paths"],
+                "Writer delta differs from retained Git diff")
         invalidated[writes[index]["id"]] = affected_roles(delta["paths"])
     reviews = [task for task in ready_attempt["tasks"] if task["kind"] == "review" and
                task["status"] == "complete" and task.get("evidence_review_context") is None]
@@ -155,10 +161,20 @@ def project(trace, root):
         if review is None:
             continue
         context = review.get("review_context") or {}
+        review_index = ready_attempt["tasks"].index(review)
+        producing = next((write for write in reversed(writes) if
+                          ready_attempt["tasks"].index(write) < review_index), None)
+        require(producing is not None and
+                context.get("candidate_commit") == producing["output"]["commit"],
+                "ordinary review producing Writer differs")
+        verdict_name = f"review-{review['id']}.md"
+        require(verdict_name in seen and
+                re.match(r"\s*Verdict:\s*pass\s*(?:\r?\n|$)",
+                         (root / verdict_name).read_text(), re.IGNORECASE) is not None,
+                "ordinary review verdict is missing or not passing")
         bound = all(context.get(key) == value for key, value in expected_context.items())
         if not bound:
             # Each later Writer must leave this Review's domain unchanged.
-            review_index = ready_attempt["tasks"].index(review)
             later = [write for write in writes[1:] if
                      ready_attempt["tasks"].index(write) > review_index]
             carried = (context.get("candidate_commit") in

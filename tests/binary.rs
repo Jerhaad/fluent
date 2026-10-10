@@ -40947,8 +40947,7 @@ fn review_coverage_resume_keeps_targeted_and_ordinary_scope_separate() {
     }
 }
 
-#[test]
-fn review_coverage_preserves_valid_ordinary_carry_forward() {
+fn review_coverage_carry_forward_landing(stale: bool) {
     use fluent::work_model::*;
     let tmp = TempDir::new().unwrap();
     let work = format!(
@@ -40984,9 +40983,15 @@ fn review_coverage_preserves_valid_ordinary_carry_forward() {
     let ordinary = item.attempts[0].tasks[1..].to_vec();
     // Saved successive corrections: the second delta must not hide a domain
     // invalidated by the first correction but never reviewed again.
+    let later_path = if stale {
+        "tests/corrected.rs"
+    } else {
+        "README.md"
+    };
+    fs::create_dir_all(cleanup.workspace.join("tests")).unwrap();
     for (path, contents) in [
         ("skills/follow-up.md", "skill correction"),
-        ("README.md", "documentation correction"),
+        (later_path, "later correction"),
     ] {
         fs::write(cleanup.workspace.join(path), contents).unwrap();
         git::run(&cleanup.workspace, &["add", path], "stage saved correction").unwrap();
@@ -41045,7 +41050,11 @@ fn review_coverage_preserves_valid_ordinary_carry_forward() {
         .filter(|task| task.kind == TaskKind::Review)
         .map(|task| task.role.as_str())
         .collect::<Vec<_>>();
-    assert_eq!(roles, ["documentation", "skills"]);
+    if stale {
+        assert_eq!(roles, ["documentation", "skills", "tests"]);
+    } else {
+        assert_eq!(roles, ["documentation", "skills"]);
+    }
     assert_eq!(
         &attempt.tasks[..previous_tasks.len()],
         previous_tasks.as_slice()
@@ -41061,6 +41070,62 @@ fn review_coverage_preserves_valid_ordinary_carry_forward() {
         store.read_work_item(&work).unwrap().attempts[0].tasks,
         attempt.tasks
     );
+    if cleanup.workspace.join("review.md").exists() {
+        fs::remove_file(cleanup.workspace.join("review.md")).unwrap();
+    }
+    if stale {
+        store
+            .mutate_work_item(&work, |item| {
+                let tasks = &mut item.attempts[0].tasks;
+                let index = tasks
+                    .iter()
+                    .rposition(|task| task.kind == TaskKind::Review && task.role == "tests")
+                    .unwrap();
+                tasks.remove(index);
+                Ok(())
+            })
+            .unwrap();
+    }
+    write_mock_claude(&bin, "#!/bin/bash\ngit rebase main >/dev/null 2>&1\n");
+    let ready = work_item_value(&project, &work);
+    let before_land = advance_tester_target(&project);
+    let landing = fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "merge-candidate",
+            "land",
+            &work,
+            "--no-sandbox",
+            "--no-post-merge-review",
+        ])
+        .env("PATH", mock_path(&bin))
+        .assert();
+    if stale {
+        landing.failure().stderr(predicate::str::contains(
+            "ordinary tests review binding changed before landing",
+        ));
+        assert_eq!(git_head(&project), before_land);
+        return;
+    }
+    landing.success();
+    assert_ne!(git_head(&project), before_land);
+    assert_eq!(
+        work_item_value(&project, &work)["merge_candidates"][0]["merge_state"]["status"],
+        "merged"
+    );
+    let trace_output = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target/formal/workflow/evidence-status/carried-production");
+    record_evidence_status_trace(&project, &work, &ready, &before_land, &trace_output);
+}
+
+#[test]
+fn review_coverage_preserves_valid_ordinary_carry_forward() {
+    review_coverage_carry_forward_landing(false);
+}
+
+#[test]
+fn workflow_landing_rejects_stale_carried_review() {
+    review_coverage_carry_forward_landing(true);
 }
 
 #[test]
@@ -65715,7 +65780,9 @@ fn landed_status_uses_final_landing_tester_evidence() {
     let ready = work_item_value(&project, "work-1");
     let target = advance_tester_target(&project);
     land_work_1(&project, &bin, true);
-    record_evidence_status_trace(&project, &ready, &target);
+    let trace_output =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("target/formal/workflow/evidence-status");
+    record_evidence_status_trace(&project, "work-1", &ready, &target, &trace_output);
     let item = read_work_show_json(&project, "work-1");
     let attempt_tester = item["attempts"][0]["tasks"]
         .as_array()
@@ -65780,11 +65847,15 @@ fn landed_status_uses_final_landing_tester_evidence() {
     assert!(known["evidence-history"]["diagnostic"].is_null());
 }
 
-fn record_evidence_status_trace(project: &Path, ready: &serde_json::Value, target: &str) {
-    let output =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("target/formal/workflow/evidence-status");
-    fs::create_dir_all(&output).unwrap();
-    let landed = work_item_value(project, "work-1");
+fn record_evidence_status_trace(
+    project: &Path,
+    work: &str,
+    ready: &serde_json::Value,
+    target: &str,
+    output: &Path,
+) {
+    fs::create_dir_all(output).unwrap();
+    let landed = work_item_value(project, work);
     let status = fluent_cmd()
         .current_dir(project)
         .arg("status")
@@ -65793,7 +65864,7 @@ fn record_evidence_status_trace(project: &Path, ready: &serde_json::Value, targe
     assert!(status.status.success());
     let show = fluent_cmd()
         .current_dir(project)
-        .args(["work-item", "show", "work-1"])
+        .args(["work-item", "show", work])
         .output()
         .unwrap();
     assert!(show.status.success());
@@ -65850,7 +65921,6 @@ fn record_evidence_status_trace(project: &Path, ready: &serde_json::Value, targe
             "attempt-results.json".into(),
             fs::read(project.join(attempt_path).join("tester-results.json")).unwrap(),
         ),
-        ("writer-deltas.json".into(), b"[]".to_vec()),
         ("status.txt".into(), status.stdout.clone()),
         ("shown-work.json".into(), show.stdout.clone()),
         (
@@ -65862,6 +65932,47 @@ fn record_evidence_status_trace(project: &Path, ready: &serde_json::Value, targe
             fs::read(project.join(".fluent/extract-tester-results")).unwrap(),
         ),
     ];
+    let writes: Vec<_> = ready["attempts"][0]["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|task| task["kind"] == "write" && task["status"] == "complete")
+        .collect();
+    let mut deltas = Vec::new();
+    for (index, pair) in writes.windows(2).enumerate() {
+        let from = pair[0]["output"]["commit"].as_str().unwrap();
+        let to = pair[1]["output"]["commit"].as_str().unwrap();
+        let diff = std::process::Command::new("git")
+            .current_dir(project)
+            .args(["diff", "--name-only", from, to])
+            .output()
+            .unwrap();
+        assert!(diff.status.success());
+        let paths: Vec<_> = String::from_utf8(diff.stdout.clone())
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        files.push((format!("writer-diff-{}.txt", index + 1), diff.stdout));
+        deltas.push(serde_json::json!({"from":from,"to":to,"paths":paths}));
+    }
+    files.push((
+        "writer-deltas.json".into(),
+        serde_json::to_vec(&deltas).unwrap(),
+    ));
+    for review in ready["attempts"][0]["tasks"].as_array().unwrap() {
+        if review["kind"] == "review"
+            && review["status"] == "complete"
+            && review["evidence_review_context"].is_null()
+        {
+            let area = review["artifact_area"]["path"].as_str().unwrap();
+            let id = review["id"].as_str().unwrap();
+            files.push((
+                format!("review-{id}.md"),
+                fs::read(project.join(area).join("review.md")).unwrap(),
+            ));
+        }
+    }
     let results = read_json_path(&project.join(&final_path));
     for (index, command) in results["commands"].as_array().unwrap().iter().enumerate() {
         for (stream, key) in [("stdout", "stdout_log"), ("stderr", "stderr_log")] {
