@@ -46,6 +46,45 @@ fn released_command(binary: &Path, project: &Path, args: &[&str]) -> std::proces
         .unwrap()
 }
 
+fn record_release_refusal(
+    scenario: &str,
+    release: &Path,
+    before: &[SnapshotEntry],
+    after: &[SnapshotEntry],
+    refusal: &std::process::Output,
+) {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target/formal/workflow/release-transition");
+    fs::create_dir_all(&root).unwrap();
+    let facts = |snapshot: &[SnapshotEntry]| -> Vec<_> {
+        snapshot.iter().map(|entry| serde_json::json!({
+            "path":entry.path.to_string_lossy(), "kind":entry.kind,
+            "sha256":format!("{:x}", Sha256::digest(&entry.bytes))
+        })).collect()
+    };
+    let release_bytes = fs::read(release).unwrap();
+    let candidate_bytes = fs::read(assert_cmd::cargo::cargo_bin("fluent")).unwrap();
+    let trace = serde_json::json!({
+        "schema-version":1,"scenario":scenario,
+        "fluent-commit":git_head(Path::new(env!("CARGO_MANIFEST_DIR"))),
+        "fluent-binary-sha256":format!("{:x}", Sha256::digest(candidate_bytes)),
+        "model-profile":"release-transition","collection-complete":true,
+        "artifacts":[],"events":[
+            {"sequence":1,"actor":"current-reader","operation-id":"snapshot",
+             "generation":null,"boundary":"before-refusal","causal-predecessors":[],
+             "raw-facts":{"protected":facts(before),"predecessor-sha256":
+                 format!("{:x}", Sha256::digest(&release_bytes))}},
+            {"sequence":2,"actor":"released-reader","operation-id":"work-item-abandon",
+             "generation":null,"boundary":"refused","causal-predecessors":[1],
+             "raw-facts":{"exit-code":refusal.status.code(),
+                 "stdout":String::from_utf8_lossy(&refusal.stdout),
+                 "stderr":String::from_utf8_lossy(&refusal.stderr),
+                 "protected":facts(after)}}
+        ]
+    });
+    fs::write(root.join(format!("{scenario}.json")), serde_json::to_vec_pretty(&trace).unwrap()).unwrap();
+}
+
 fn released_work_fixture(tmp: &TempDir, binary: &Path, id: &str) -> PathBuf {
     let project = setup_git_project(tmp);
     for args in [
@@ -123,7 +162,9 @@ fn released_predecessor_refuses_current_authority() {
         &["work-item", "abandon", "released-refusal", "--reason", "old reader"]);
     assert!(!result.status.success(), "old release changed current authority");
     assert!(!result.stderr.is_empty(), "refusal must explain the incompatible record");
-    assert_eq!(snapshot_tree(&root), before);
+    let after = snapshot_tree(&root);
+    assert_eq!(after, before);
+    record_release_refusal("current-authority", &release, &before, &after, &result);
 }
 
 #[test]
@@ -142,7 +183,9 @@ fn released_predecessor_refuses_pending_current_publication() {
     let result = released_command(&release, &project,
         &["work-item", "abandon", "released-pending-refusal", "--reason", "old reader"]);
     assert!(!result.status.success(), "old release replayed current publication");
-    assert_eq!(snapshot_tree(&root), before);
+    let after = snapshot_tree(&root);
+    assert_eq!(after, before);
+    record_release_refusal("pending-publication", &release, &before, &after, &result);
     fluent_cmd().current_dir(&project)
         .args(["attempt", "cancel", "released-pending-refusal", "attempt-1"])
         .assert().success();

@@ -4,6 +4,7 @@
 import argparse
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -677,6 +678,61 @@ def recovery_observation_suite(source, root, output, jar, java):
     return 0 if result["pass"] else 1
 
 
+def release_transition_suite(source, root, output, jar, java):
+    """Recheck fresh release facts and the bounded version guard."""
+    results = []
+    cases = (
+        ("binary", ("released_upgrade_preserves_workflow_state",
+                    "released_upgrade_recovers_interrupted_publication")),
+        ("binary", ("released_predecessor_refuses_current_authority",
+                    "released_predecessor_refuses_pending_current_publication")),
+        ("scheduler_service", ("scheduler_released_upgrade_preserves_shared_ownership",)),
+    )
+    for index, (binary, names) in enumerate(cases, 1):
+        command = ["cargo", "nextest", "run", "--offline", "--features", "test-support",
+                   "--test", binary, "--no-tests", "fail", *names]
+        environment = dict(os.environ)
+        if binary == "scheduler_service":
+            environment["FLUENT_WORKFLOW_REQUIRE_HOST"] = "1"
+        result = subprocess.run(command, cwd=root, env=environment, capture_output=True,
+                                text=True)
+        name = f"released-fixture-{index}"
+        (output / f"{name}.log").write_text("$ " + " ".join(command) + "\n" +
+                                             result.stdout + result.stderr)
+        results.append({"case": name, "pass": result.returncode == 0,
+                        "log": f"{name}.log"})
+    commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, check=True,
+                            capture_output=True, text=True).stdout.strip()
+    candidate = root / "target/debug/fluent"
+    for scenario in ("current-authority", "pending-publication"):
+        path = output / f"{scenario}.json"
+        command = ["python3", str(source / "project_release.py"), str(path),
+                   str(candidate), commit]
+        projection = subprocess.run(command, cwd=root, capture_output=True, text=True)
+        (output / f"{scenario}-projection.log").write_text(
+            "$ " + " ".join(command) + "\n" + projection.stdout + projection.stderr)
+        results.append({"case": f"{scenario}-projection", "pass": projection.returncode == 0,
+                        "log": f"{scenario}-projection.log"})
+        if projection.returncode == 0:
+            corrupted = json.loads(path.read_text())
+            corrupted["events"][1]["raw-facts"]["protected"] = []
+            negative_path = output / f"{scenario}-negative.json"
+            negative_path.write_text(json.dumps(corrupted))
+            negative = subprocess.run([*command[:2], str(negative_path), *command[3:]],
+                                      cwd=root, capture_output=True, text=True)
+            (output / f"{scenario}-negative.log").write_text(
+                negative.stdout + negative.stderr)
+            results.append({"case": f"{scenario}-negative", "pass": negative.returncode != 0,
+                            "log": f"{scenario}-negative.log"})
+    results.append(run_case(source, output, jar, java, "service-competition.cfg", None))
+    results.append(run_case(source, output, jar, java, "negative-guardversion.cfg",
+                            CONTROLS["guardversion"]))
+    summary = {"schema-version": 1, "suite": "release-transition", "cases": results,
+               "pass": all(row["pass"] for row in results)}
+    (output / "result.json").write_text(json.dumps(summary, indent=2) + "\n")
+    return 0 if summary["pass"] else 1
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--suite", required=True)
@@ -684,7 +740,7 @@ def main():
     parser.add_argument("--focus", choices=("combined-one-failure", "guarded"))
     args = parser.parse_args()
     if args.suite not in ("foundation", "writer-inputs", "evidence-status",
-                          "recovery-observation"):
+                          "recovery-observation", "release-transition"):
         parser.error(f"unknown or incomplete suite: {args.suite}")
     jar = args.jar.resolve()
     if not jar.is_file() or hashlib.sha256(jar.read_bytes()).hexdigest() != JAR_SHA256:
@@ -694,6 +750,12 @@ def main():
     java = java_21(root)
     if java is None:
         parser.error("Java 21 is required")
+    if args.suite == "release-transition":
+        if args.focus:
+            parser.error("--focus is only supported for foundation")
+        output = root / "target/formal/workflow/release-transition"
+        output.mkdir(parents=True, exist_ok=True)
+        return release_transition_suite(source, root, output, jar, java)
     if args.suite == "writer-inputs":
         if args.focus:
             parser.error("--focus is only supported for foundation")
