@@ -66739,6 +66739,54 @@ fn landed_status_keeps_unmerged_checks_strict() {
 }
 
 #[test]
+fn workflow_recovery_preserves_settled_effects() {
+    let tmp = TempDir::new().unwrap();
+    let project = landed_status_fixture(&tmp);
+    let before = work_item_value(&project, "work-1");
+    let head = git_head(&project);
+    let bin = tmp.path().join("landed-status-bin");
+    land_work_1(&project, &bin, true);
+    assert_eq!(git_head(&project), head);
+    assert_eq!(work_item_value(&project, "work-1"), before);
+    assert_eq!(open_observation_files(&project).len(), 0);
+}
+
+#[test]
+fn workflow_recovery_preserves_intervening_changes() {
+    let tmp = TempDir::new().unwrap();
+    let project = landed_status_fixture(&tmp);
+    let before = work_item_value(&project, "work-1");
+    commit_file(
+        &project,
+        "independent.txt",
+        "later work\n",
+        "Add independent work",
+    );
+    fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "work-item",
+            "create",
+            "later-work",
+            "--title",
+            "Independent Work",
+        ])
+        .assert()
+        .success();
+    let independent = work_item_value(&project, "later-work");
+    let later_head = git_head(&project);
+    let bin = tmp.path().join("landed-status-bin");
+    land_work_1(&project, &bin, true);
+    assert_eq!(git_head(&project), later_head);
+    assert_eq!(
+        fs::read(project.join("independent.txt")).unwrap(),
+        b"later work\n"
+    );
+    assert_eq!(work_item_value(&project, "later-work"), independent);
+    assert_eq!(work_item_value(&project, "work-1"), before);
+}
+
+#[test]
 fn landed_status_observation_preserves_recorded_bytes() {
     let tmp = TempDir::new().unwrap();
     let project = landed_status_fixture(&tmp);
