@@ -14016,6 +14016,27 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_recheck_behavior_enters_completion_contract() {
+        let requirements =
+            parse_behavior_completion_requirements(include_str!("../documentation/behaviors.md"));
+        let recheck = requirements
+            .iter()
+            .find(|requirement| requirement.id == "behavior:cleanup:b11")
+            .expect("cleanup recheck behavior must enter the completion contract");
+        assert!(
+            recheck
+                .requirement
+                .contains("recheck its current eligibility")
+        );
+        assert_eq!(
+            recheck.verification_refs,
+            vec![
+                "tests/binary.rs (workflow_cleanup_rechecks_current_eligibility), tests/binary.rs (workflow_cleanup_holds_eligibility_through_removal)"
+            ]
+        );
+    }
+
+    #[test]
     fn plan_check_captures_approved_applicability() {
         for (policy, valid) in [
             (

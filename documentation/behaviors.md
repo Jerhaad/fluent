@@ -3897,13 +3897,6 @@ An optional future retry of terminal failed Work does not by itself require
 retention.
 Test: tests/binary.rs (cleanup_work_items_dry_run_and_apply_manage_state_worktree_and_branch), tests/binary.rs (cleanup_work_items_selects_failed_terminal_and_skips_pending_merge_candidate), tests/binary.rs (workflow_cleanup_retains_pending_recovery)
 
-### B6a
-
-WHEN Work cleanup selects a candidate for removal, THE SYSTEM SHALL recheck
-its current eligibility and keep that eligibility protected through removal
-of its managed worktrees, branches, artifacts, and state.
-Test: tests/binary.rs (workflow_cleanup_rechecks_current_eligibility), tests/binary.rs (workflow_cleanup_holds_eligibility_through_removal)
-
 ### B7
 
 WHEN Work cleanup sees failed terminal Work Items,
@@ -3934,6 +3927,13 @@ WHEN Work cleanup sees top-level entries under `.fluent/work/artifacts/`
 that are files or directories with matching stored Work Items,
 THE SYSTEM SHALL ignore them for orphan Work artifact cleanup.
 Test: tests/binary.rs (cleanup_work_items_reports_and_removes_orphan_artifact_roots), tests/behaviors/operations/test-cleanup.sh (cleanup removes orphan Work artifact roots)
+
+### B11
+
+WHEN Work cleanup selects a candidate for removal, THE SYSTEM SHALL recheck
+its current eligibility and keep that eligibility protected through removal
+of its managed worktrees, branches, artifacts, and state.
+Test: tests/binary.rs (workflow_cleanup_rechecks_current_eligibility), tests/binary.rs (workflow_cleanup_holds_eligibility_through_removal)
 
 ## Dashboard
 
