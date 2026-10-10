@@ -8,6 +8,17 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
+struct ReleaseServiceChild(std::process::Child);
+
+impl Drop for ReleaseServiceChild {
+    fn drop(&mut self) {
+        if self.0.try_wait().ok().flatten().is_none() {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
 #[test]
 fn scheduler_released_upgrade_preserves_shared_ownership() {
     use sha2::{Digest, Sha256};
@@ -57,15 +68,15 @@ fn scheduler_released_upgrade_preserves_shared_ownership() {
         }
         return;
     }
-    let mut old_service = Command::new(&predecessor).current_dir(first.path())
+    let mut old_service = ReleaseServiceChild(Command::new(&predecessor).current_dir(first.path())
         .env("HOME", home.path()).env("FLUENT_NO_UPDATE_CHECK", "1")
         .args(["scheduler", "run", "--poll-seconds", "30"])
-        .spawn().unwrap();
+        .spawn().unwrap());
     let socket = scheduler_service::socket_path(home.path());
     let deadline = Instant::now() + Duration::from_secs(10);
     while !socket.exists() {
         assert!(Instant::now() < deadline, "released service failed to start");
-        assert!(old_service.try_wait().unwrap().is_none(), "released service exited");
+        assert!(old_service.0.try_wait().unwrap().is_none(), "released service exited");
         std::thread::sleep(Duration::from_millis(20));
     }
     let reused = fixture(&predecessor, second.path(),
@@ -82,16 +93,16 @@ fn scheduler_released_upgrade_preserves_shared_ownership() {
     }
     let stopped = fixture(&predecessor, first.path(), &["scheduler", "stop", "--all"]);
     assert!(stopped.status.success(), "{}", String::from_utf8_lossy(&stopped.stderr));
-    assert!(old_service.wait().unwrap().success());
+    assert!(old_service.0.wait().unwrap().success());
     for (project, work) in [(first.path(), "first"), (second.path(), "second")] {
         let queued = fixture(&predecessor, project, &["queue", "show", work]);
         assert!(queued.status.success());
         assert!(String::from_utf8_lossy(&queued.stdout).contains("queued"));
     }
-    let mut replacement = Command::new(env!("CARGO_BIN_EXE_fluent"))
+    let mut replacement = ReleaseServiceChild(Command::new(env!("CARGO_BIN_EXE_fluent"))
         .current_dir(first.path()).env("HOME", home.path())
         .env_remove("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT")
-        .args(["scheduler", "run", "--poll-seconds", "1"]).spawn().unwrap();
+        .args(["scheduler", "run", "--poll-seconds", "1"]).spawn().unwrap());
     let deadline = Instant::now() + Duration::from_secs(10);
     while scheduler_service::send_health_request(&socket).is_err() {
         assert!(Instant::now() < deadline, "replacement did not acquire service");
@@ -104,7 +115,7 @@ fn scheduler_released_upgrade_preserves_shared_ownership() {
     let stopped = fixture(std::path::Path::new(env!("CARGO_BIN_EXE_fluent")), first.path(),
         &["scheduler", "stop", "--all"]);
     assert!(stopped.status.success(), "{}", String::from_utf8_lossy(&stopped.stderr));
-    assert!(replacement.wait().unwrap().success());
+    assert!(replacement.0.wait().unwrap().success());
 }
 
 // ─────────────────────────────────────────────────
