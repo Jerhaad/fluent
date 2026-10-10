@@ -14,6 +14,7 @@
 - [autonomous-claude-safe-mode-boundary](autonomous-claude-safe-mode-boundary.md) — Launch autonomous Claude work in safe mode while leaving explicitly interactive sessions customizable
 - [backward-compatible-serde-fields](backward-compatible-serde-fields.md) — Persisted Work model field additions and renames must preserve backward compatibility with existing on-disk JSON
 - [baseline-attribution-does-not-satisfy-references](baseline-attribution-does-not-satisfy-references.md) — Exclude proven pre-existing suite failures from Writer defects while still requiring passing evidence for every explicit reference
+- [behavior-ids-must-be-numeric](behavior-ids-must-be-numeric.md) — Use numeric B headings in behaviors.md because completion-contract extraction ignores suffixed IDs
 - [behaviors-test-citation-sync](behaviors-test-citation-sync.md) — Test renames must update all Test: citations in behaviors.md in the same commit
 - [bound-conversation-state-follows-project-authority](bound-conversation-state-follows-project-authority.md) — Keep bound conversation payloads and active state in the project runtime; the runner-owner root retains only routing, deduplication, and unbound ingress
 - [candidate-commits-should-use-separated-body](candidate-commits-should-use-separated-body.md) — Candidate commits should use a non-whitespace body separated from the subject by a blank line
@@ -26,6 +27,7 @@
 - [capture-pump-terminate-descendants-before-eof](capture-pump-terminate-descendants-before-eof.md) — When a thread drains a child's piped stdout to EOF, terminate the whole process group before waiting for EOF; a backgrounded descendant can hold the pipe open forever
 - [checkout-selection-revalidates-identity](checkout-selection-revalidates-identity.md) — Revalidate a discovered checkout's canonical Git identity and current authority before every setup, commit, and publication effect
 - [classified-writer-inputs-revalidate-at-delivery](classified-writer-inputs-revalidate-at-delivery.md) — Deliver a classified Writer's current authorization and exact audit through its actual launch context, including resumed provider sessions
+- [cleanup-protects-cross-record-eligibility](cleanup-protects-cross-record-eligibility.md) — Recheck cleanup eligibility under the locks for both the origin and its descendant recovery dependencies, then hold them through removal
 - [commit-body-bullet-point-convention](commit-body-bullet-point-convention.md) — Commit bodies should use "- prefix" bullets for multiple changes when practical
 - [commit-subject-line-fifty-char-limit](commit-subject-line-fifty-char-limit.md) — Commit subject lines should stay within 50 characters when practical
 - [committed-writer-matrix-recovery-authority](committed-writer-matrix-recovery-authority.md) — Distinguish committed-matrix recovery authority from older Writer-completion audits by its source matrix digest and operation Task binding
