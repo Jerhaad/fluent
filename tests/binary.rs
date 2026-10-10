@@ -41803,7 +41803,7 @@ fn classified_writer_delivery_probe(check_history: bool) {
     let marker = area.join("writer-read-confirmed");
     let require_host = std::env::var("FLUENT_WORKFLOW_REQUIRE_HOST").as_deref() == Ok("1");
     let bin = if require_host {
-        workspace.workspace.join(".fluent/provider-double")
+        area.join("provider-double")
     } else {
         tmp.path().join("bin")
     };
