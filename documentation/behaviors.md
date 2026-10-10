@@ -7305,6 +7305,7 @@ IF an in-scope failure leaves Work unfinished, THEN THE SYSTEM SHALL provide a
 supported public route to continue that Work from its retained state once
 required access, evidence, and authorization are supplied.
 Test: tests/binary.rs (writer_completion_recovery_committed_matrix_public_continuation)
+Test: tests/binary.rs (writer_completion_recovery_later_committed_matrix_public_continuation)
 
 For a completed Writer with a committed candidate and malformed completion
 matrix, the public repair command records explicit authorization and schedules
@@ -7312,6 +7313,13 @@ one corrective Writer. A separate resume executes it. The source Task, matrix,
 transcript, and candidate history remain intact; changed bindings and live
 owners reject stale recovery. Host checks, review, final Tester, and Learner
 retain their existing gates.
+
+When a later completed Writer in the same Attempt has a malformed matrix, the
+earlier completed recovery remains history. The public command requires a new
+decision for the later source and records a separate audit and corrective Task.
+Repeating the later decision reuses its identities; changed source evidence,
+candidate, assignment, ownership, or cancellation blocks it. Status names the
+current repair only while that repair is eligible.
 
 ### B20
 

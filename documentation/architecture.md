@@ -4744,6 +4744,16 @@ initial, reviewed-correction, or pre-review-continuation prompt. Invalid or
 oversized authority stops launch. Recovery inputs do not broaden the general
 JSON filter or grant access to their parent directories.
 
+Writer-completion repair selects the currently paused Writer before treating a
+retained recovery audit as a replay. If the current source is a later completed
+Writer, the recovery owner validates earlier attached audits and their completed
+replacement Tasks as history. It then requires a distinct resolution and writes
+a new audit, operation, and corrective Task for the later source. An approval
+for the earlier incident cannot bind the later candidate. The public status
+action uses the same eligibility and prior-history checks. Before a corrective
+Writer starts, the recovery contract rechecks its exact source matrix, contract,
+assignment, transcript, output, and operation binding.
+
 `recovery_contracts::pending_writer_completion_rows` reads the authoritative
 matrix through the existing completion and immutable-assignment validation.
 The generated `execution-context.json` preserves pending Writer rows and their
