@@ -4,11 +4,12 @@
 import argparse
 import hashlib
 import json
+import re
 import sys
 from pathlib import Path
 
 SUITES = ("foundation", "writer-inputs", "evidence-status",
-          "recovery-observation", "release-transition")
+          "recovery-observation", "release-transition", "integrated-production")
 REQUIRED_CASES = {
     "foundation": ("foundation.cfg", "combined-one-failure.cfg",
                    "repeated-recovery.cfg", "review-only.cfg", "service-competition.cfg",
@@ -32,6 +33,8 @@ REQUIRED_CASES = {
                            "released-fixture-3", "current-authority-projection",
                            "pending-publication-projection", "service-projection",
                            "service-competition.cfg", "negative-guardversion.cfg"),
+    "integrated-production": ("fresh-queue-cancel", "queue-cancel-projection",
+                              "cross-work-negative"),
 }
 BOUNDARIES = (
     "Intake and authorization scope", "Foreground execution", "Queued claim and lease",
@@ -62,7 +65,30 @@ def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def connections(source):
+def connection_credit(evidence, passing_cases):
+    """Credit only a named, checked model-to-production connection."""
+    if not evidence.startswith("Verified: "):
+        return False
+    parts = evidence.removeprefix("Verified: ").split("; ")
+    if len(parts) != 4:
+        return False
+    references = {}
+    for key, part in zip(("model", "assumption", "production", "control"), parts):
+        if not part.startswith(key + "="):
+            return False
+        match = re.fullmatch(r"([a-z][a-z-]*)/([A-Za-z0-9_.-]+)",
+                             part[len(key) + 1:])
+        if match is None:
+            return False
+        suite, case = match.groups()
+        if case not in passing_cases.get(suite, set()):
+            return False
+        references[key] = (suite, case)
+    return len({references["model"], references["production"],
+                references["control"]}) == 3
+
+
+def connections(source, passing_cases):
     rows = []
     for line in (source / "connections.md").read_text().splitlines():
         if not line.startswith("| ") or line.startswith("| ---"):
@@ -73,7 +99,7 @@ def connections(source):
         rows.append({"boundary": cells[0], "model-mapping": cells[1],
                      "assumption": cells[2], "scenario-control-owner": cells[3],
                      "evidence": cells[4],
-                     "pass": cells[4].startswith("Verified: ")})
+                     "pass": connection_credit(cells[4], passing_cases)})
     return rows
 
 
@@ -81,10 +107,11 @@ def report(results, candidate, binary, source, jar=None, java=None):
     suites = {}
     missing = []
     for name in SUITES:
-        directory = results / name
-        path = directory / "result.json"
+        directory = results / ("integrated" if name == "integrated-production" else name)
+        filename = "production-result.json" if name == "integrated-production" else "result.json"
+        path = directory / filename
         if not path.is_file():
-            missing.append(f"{name}: result.json")
+            missing.append(f"{name}: {filename}")
             suites[name] = {"pass": False, "reason": "missing result"}
             continue
         try:
@@ -117,7 +144,10 @@ def report(results, candidate, binary, source, jar=None, java=None):
         except (AssertionError, KeyError, TypeError, ValueError, OSError) as error:
             missing.append(f"{name}: malformed result or missing log")
             suites[name] = {"pass": False, "reason": str(error)}
-    mappings = connections(source)
+    passing_cases = {name: {case["case"] for case in value.get("cases", [])
+                            if case.get("pass") is True}
+                     for name, value in suites.items() if value.get("pass") is True}
+    mappings = connections(source, passing_cases)
     if [row["boundary"] for row in mappings] != list(BOUNDARIES):
         missing.append("connection inventory changed or incomplete")
     missing.extend(f"connection: {row['boundary']}" for row in mappings if not row["pass"])
@@ -138,7 +168,9 @@ def report(results, candidate, binary, source, jar=None, java=None):
                             if path is not None and path.is_file()},
             "suite-source-sha256": {"workflow": digest(source / "check.py"),
                                     "scheduler": digest(scheduler / "check.py"),
-                                    "report": digest(source / "report.py")},
+                                    "report": digest(source / "report.py"),
+                                    "integrated-projector": digest(source / "project_integrated.py")},
+            "connection-inventory-sha256": digest(source / "connections.md"),
             "suites": suites, "connections": mappings,
             "external-gates": {name: {"state": "pending", "command": command}
                                for name, command in EXTERNAL_GATES.items()},

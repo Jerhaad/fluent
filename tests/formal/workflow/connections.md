@@ -2,9 +2,10 @@
 
 The whole-workflow model is an abstraction. Each row names the concrete state
 that a check must relate to it. The integrated report credits a row only when
-its evidence starts with `Verified: ` and names a checked source mapping,
-discharged assumption, bounded model result, production scenario, and negative
-control. A passing component model alone does not complete a connection. The
+its evidence uses `Verified: model=SUITE/CASE; assumption=SUITE/CASE;
+production=SUITE/CASE; control=SUITE/CASE`. Each named case must pass in a
+candidate-bound suite; model, production, and control cases must be distinct.
+A passing component model alone does not complete a connection. The
 six scheduler models remain separate checks.
 
 | Boundary and property | Detailed model and state mapping | Assumption and required check | Production scenario, control, owner | Evidence |

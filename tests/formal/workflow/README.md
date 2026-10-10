@@ -4,14 +4,20 @@
 
 Run `python3 tests/formal/workflow/check.py --suite=integrated
 --jar=target/fluent-tools/tla2tools-1.7.4.jar` from the candidate checkout.
-The checker runs the five maintained workflow suites and the scheduler recovery,
-lifecycle, launch, and landing suites. It writes full command logs under
+The checker runs the five maintained workflow suites, a fresh public
+queue/cancellation sequence, and the scheduler recovery, lifecycle, launch,
+and landing suites. The queue/cancellation trace records two Work identities,
+the retained queue, the canceled foreground Attempt, read-only status, and a
+refused Task run. `project_integrated.py` checks the digest-bound raw facts and
+causal order independently of the command assertions. A rehashed trace that
+swaps the canceled Work identity must fail projection. The checker writes logs under
 `target/formal/workflow/integrated/` and a candidate-bound `report.json` with
 suite results, log digests, model hashes, and every connection row from
 `connections.md`. The integrated result fails if any required suite, log,
-binary binding, required case, or connection is missing. An inventory row needs `Verified: `
-evidence naming its checked mapping, assumptions, model result, production
-scenario, and control before the report may credit it. Existing descriptive
+binary binding, required case, or connection is missing. An inventory row needs
+the structured `Verified: model=SUITE/CASE; assumption=SUITE/CASE;
+production=SUITE/CASE; control=SUITE/CASE` evidence described in
+`connections.md` before the report may credit it. Existing descriptive
 evidence is retained as an explicit gap until those checks pass.
 
 The report is produced by `report.py` after the suite commands. Host results

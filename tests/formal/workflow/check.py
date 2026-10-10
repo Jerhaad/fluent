@@ -84,6 +84,70 @@ def candidate_binary_digest(root):
     return hashlib.sha256((root / "target/debug/fluent").read_bytes()).hexdigest()
 
 
+def integrated_production_suite(source, root, output):
+    """Refresh and independently check the public queue/cancellation trace."""
+    directory = output / "production"
+    directory.mkdir(parents=True, exist_ok=True)
+    for name in ("production-trace.json", "queued-work.json", "foreground-work.json",
+                 "queue.txt", "status.txt", "refused.txt"):
+        (directory / name).unlink(missing_ok=True)
+    command = ["cargo", "nextest", "run", "--offline", "--features", "test-support",
+               "--test", "workflow_assurance", "--no-tests", "fail",
+               "workflow_integrated_queue_survives_other_attempt_cancellation"]
+    fixture = subprocess.run(command, cwd=root, capture_output=True, text=True)
+    (output / "production-fixture.log").write_text(
+        "$ " + " ".join(command) + "\n" + fixture.stdout + fixture.stderr)
+    trace_path = directory / "production-trace.json"
+    produced = fixture.returncode == 0 and trace_path.is_file()
+    rows = [{"case": "fresh-queue-cancel", "pass": produced,
+             "log": "production-fixture.log"}]
+    if produced:
+        try:
+            trace = json.loads(trace_path.read_text())
+            bound = trace["fluent-commit"] == candidate_commit(root) and \
+                trace["fluent-binary-sha256"] == candidate_binary_digest(root)
+        except (ValueError, KeyError, OSError):
+            bound = False
+        command = ["python3", str(source / "project_integrated.py"), str(trace_path)]
+        projected = subprocess.run(command, cwd=root, capture_output=True, text=True)
+        (output / "production-projection.log").write_text(
+            "$ " + " ".join(command) + "\n" + projected.stdout + projected.stderr)
+        valid = bound and projected.returncode == 0
+        rows.append({"case": "queue-cancel-projection", "pass": valid,
+                     "log": "production-projection.log"})
+        if valid:
+            negative_dir = output / "cross-work-negative"
+            negative_dir.mkdir(exist_ok=True)
+            for entry in trace["artifacts"]:
+                shutil.copyfile(directory / entry["path"], negative_dir / entry["path"])
+            changed = json.loads(json.dumps(trace))
+            for index in (1, 3):
+                changed["events"][index]["raw-facts"]["work"]["id"] = "queued"
+            bytes_changed = json.dumps(
+                changed["events"][1]["raw-facts"]["work"]).encode()
+            (negative_dir / "foreground-work.json").write_bytes(bytes_changed)
+            for entry in changed["artifacts"]:
+                if entry["path"] == "foreground-work.json":
+                    entry["sha256"] = hashlib.sha256(bytes_changed).hexdigest()
+            negative_path = negative_dir / "production-trace.json"
+            negative_path.write_text(json.dumps(changed))
+            command = ["python3", str(source / "project_integrated.py"),
+                       str(negative_path)]
+            rejected = subprocess.run(command, cwd=root, capture_output=True, text=True)
+            (output / "cross-work-negative.log").write_text(
+                "$ " + " ".join(command) + "\n" + rejected.stdout + rejected.stderr)
+            rows.append({"case": "cross-work-negative",
+                         "pass": rejected.returncode != 0 and
+                         "Work identity changed" in rejected.stderr,
+                         "log": "cross-work-negative.log"})
+    result = {"schema-version": 1, "suite": "integrated-production",
+              "candidate-commit": candidate_commit(root),
+              "fluent-binary-sha256": candidate_binary_digest(root), "cases": rows,
+              "pass": all(row["pass"] for row in rows)}
+    (output / "production-result.json").write_text(json.dumps(result, indent=2) + "\n")
+    return result
+
+
 def integrated_suite(source, root, output, jar, java):
     """Run each maintained suite, then retain a fail-closed candidate report."""
     results = []
@@ -96,6 +160,9 @@ def integrated_suite(source, root, output, jar, java):
         log.write_text("$ " + " ".join(command) + "\n" + result.stdout + result.stderr)
         results.append({"case": name, "pass": result.returncode == 0,
                         "log": log.name})
+    production = integrated_production_suite(source, root, output)
+    results.append({"case": "integrated-production", "pass": production["pass"],
+                    "log": "production-fixture.log"})
     scheduler = source.parent / "scheduler/check.py"
     for name in ("recovery", "lifecycle", "launch", "landing"):
         command = ["python3", str(scheduler), "--suite=" + name,

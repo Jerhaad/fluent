@@ -360,6 +360,8 @@ fn workflow_assurance_report_rejects_missing_and_misbound_evidence() {
     assert!(!missing.status.success());
     let result: Value = serde_json::from_slice(&fs::read(&output).unwrap()).unwrap();
     assert_eq!(result["pass"], false);
+    assert!(result["suite-source-sha256"]["integrated-projector"].is_string());
+    assert!(result["connection-inventory-sha256"].is_string());
     assert!(result["missing"].as_array().unwrap().len() > 0);
     assert!(
         result["missing"]
@@ -368,6 +370,11 @@ fn workflow_assurance_report_rejects_missing_and_misbound_evidence() {
             .iter()
             .any(|item| item.as_str().unwrap().starts_with("connection: "))
     );
+    assert!(result["missing"].as_array().unwrap().iter().any(|item| {
+        item.as_str()
+            .unwrap()
+            .starts_with("integrated-production: ")
+    }));
     let suite = tmp.path().join("foundation");
     fs::create_dir(&suite).unwrap();
     fs::write(suite.join("case.log"), "Model checking completed\n").unwrap();
@@ -395,6 +402,33 @@ fn workflow_assurance_report_rejects_missing_and_misbound_evidence() {
     assert!(!incomplete.status.success());
     let result: Value = serde_json::from_slice(&fs::read(&output).unwrap()).unwrap();
     assert_eq!(result["suites"]["foundation"]["pass"], false);
+}
+
+#[test]
+fn workflow_assurance_report_rejects_unchecked_connection_claims() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script = r#"
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[1])))
+import report
+cases = {'foundation': {'foundation.cfg', 'production-projection',
+                        'negative-model-path', 'negative-deliverinputs.cfg'}}
+assert not report.connection_credit('Verified: manually reviewed', cases)
+assert not report.connection_credit(
+    'Verified: model=foundation/foundation.cfg; assumption=foundation/foundation.cfg; '
+    'production=foundation/production-projection; control=foundation/missing-control', cases)
+assert report.connection_credit(
+    'Verified: model=foundation/foundation.cfg; assumption=foundation/foundation.cfg; '
+    'production=foundation/production-projection; control=foundation/negative-model-path', cases)
+"#;
+    let source = root.join("tests/formal/workflow");
+    let result = run(root, "python3", &["-c", script, source.to_str().unwrap()]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
 }
 
 #[test]
@@ -503,4 +537,82 @@ fn workflow_integrated_queue_survives_other_attempt_cancellation() {
     let after_foreground = fluent(project, &["work-item", "show", "foreground"]);
     assert!(after_foreground.status.success());
     assert_eq!(foreground.stdout, after_foreground.stdout);
+
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let trace_dir = tmp.path().join("integrated-trace");
+    fs::create_dir(&trace_dir).unwrap();
+    let observed = [
+        ("queued-work.json", &before_queue.stdout),
+        ("foreground-work.json", &foreground.stdout),
+        ("queue.txt", &queue.stdout),
+        ("status.txt", &status.stdout),
+        ("refused.txt", &refused.stderr),
+    ];
+    let artifacts = observed
+        .iter()
+        .map(|(name, bytes)| {
+            fs::write(trace_dir.join(name), bytes).unwrap();
+            json!({"path":name,"sha256":digest(bytes)})
+        })
+        .collect::<Vec<_>>();
+    let trace = json!({"schema-version":1,"scenario":"integrated-queue-cancel",
+    "fluent-commit":String::from_utf8_lossy(&run(source,"git", &["rev-parse","HEAD"]).stdout).trim(),
+    "fluent-binary-sha256":digest(&fs::read(env!("CARGO_BIN_EXE_fluent")).unwrap()),
+    "model-profile":"service-competition","collection-complete":true,
+    "artifacts":artifacts,"events":[
+        event(1,"queue-admitted","queue-add",&[],json!({"exit-code":queued.status.code(),
+            "work":serde_json::from_slice::<Value>(&before_queue.stdout).unwrap()})),
+        event(2,"other-canceled","attempt-cancel",&[1],json!({"exit-code":cancel.status.code(),
+            "work":work})),
+        event(3,"observed","status",&[2],json!({"exit-code":status.status.code(),
+            "queue":String::from_utf8_lossy(&queue.stdout),
+            "status":String::from_utf8_lossy(&status.stdout),
+            "work":serde_json::from_slice::<Value>(&after_queue.stdout).unwrap()})),
+        event(4,"run-refused","task-run",&[3],json!({"exit-code":refused.status.code(),
+            "stderr":String::from_utf8_lossy(&refused.stderr),
+            "work":serde_json::from_slice::<Value>(&after_foreground.stdout).unwrap()}))
+    ]});
+    let trace_path = trace_dir.join("production-trace.json");
+    fs::write(&trace_path, serde_json::to_vec_pretty(&trace).unwrap()).unwrap();
+    let projector = source.join("tests/formal/workflow/project_integrated.py");
+    let projection = run(
+        source,
+        "python3",
+        &[projector.to_str().unwrap(), trace_path.to_str().unwrap()],
+    );
+    assert!(
+        projection.status.success(),
+        "{}",
+        String::from_utf8_lossy(&projection.stderr)
+    );
+    let target = source.join("target/formal/workflow/integrated/production");
+    fs::create_dir_all(&target).unwrap();
+    fs::copy(&trace_path, target.join("production-trace.json")).unwrap();
+    for (name, _) in observed {
+        fs::copy(trace_dir.join(name), target.join(name)).unwrap();
+    }
+    let negative_dir = tmp.path().join("negative-trace");
+    fs::create_dir(&negative_dir).unwrap();
+    for (name, _) in observed {
+        fs::copy(trace_dir.join(name), negative_dir.join(name)).unwrap();
+    }
+    let mut negative = trace;
+    negative["events"][1]["raw-facts"]["work"]["id"] = json!("queued");
+    negative["events"][3]["raw-facts"]["work"]["id"] = json!("queued");
+    let changed = serde_json::to_vec(&negative["events"][1]["raw-facts"]["work"]).unwrap();
+    fs::write(negative_dir.join("foreground-work.json"), &changed).unwrap();
+    negative["artifacts"][1]["sha256"] = json!(digest(&changed));
+    let negative_path = negative_dir.join("production-trace.json");
+    fs::write(
+        &negative_path,
+        serde_json::to_vec_pretty(&negative).unwrap(),
+    )
+    .unwrap();
+    let rejected = run(
+        source,
+        "python3",
+        &[projector.to_str().unwrap(), negative_path.to_str().unwrap()],
+    );
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("Work identity changed"));
 }
