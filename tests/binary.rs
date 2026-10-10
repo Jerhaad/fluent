@@ -65712,8 +65712,10 @@ fn landed_status_fixture(tmp: &TempDir) -> PathBuf {
 fn landed_status_uses_final_landing_tester_evidence() {
     let tmp = TempDir::new().unwrap();
     let (project, bin, _) = setup_rebased_tester_candidate(&tmp, ":");
-    advance_tester_target(&project);
+    let ready = work_item_value(&project, "work-1");
+    let target = advance_tester_target(&project);
     land_work_1(&project, &bin, true);
+    record_evidence_status_trace(&project, &ready, &target);
     let item = read_work_show_json(&project, "work-1");
     let attempt_tester = item["attempts"][0]["tasks"]
         .as_array()
@@ -65778,6 +65780,143 @@ fn landed_status_uses_final_landing_tester_evidence() {
     assert!(known["evidence-history"]["diagnostic"].is_null());
 }
 
+fn record_evidence_status_trace(project: &Path, ready: &serde_json::Value, target: &str) {
+    let output =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("target/formal/workflow/evidence-status");
+    fs::create_dir_all(&output).unwrap();
+    let landed = work_item_value(project, "work-1");
+    let status = fluent_cmd()
+        .current_dir(project)
+        .arg("status")
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    let show = fluent_cmd()
+        .current_dir(project)
+        .args(["work-item", "show", "work-1"])
+        .output()
+        .unwrap();
+    assert!(show.status.success());
+    let candidate = &landed["merge_candidates"][0];
+    let artifact = |producer: &str| {
+        candidate["merge_state"]["check_artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|artifact| artifact["producer_id"] == producer)
+            .unwrap()["path"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let final_path = artifact("merge-tester");
+    let baseline_path = artifact("merge-target-baseline");
+    let attempt_path = landed["attempts"][0]["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["kind"] == "tester" && task["status"] == "complete")
+        .unwrap()["artifact_area"]["path"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut files: Vec<(String, Vec<u8>)> = vec![
+        (
+            "ready-work.json".into(),
+            serde_json::to_vec_pretty(ready).unwrap(),
+        ),
+        (
+            "landed-work.json".into(),
+            serde_json::to_vec_pretty(&landed).unwrap(),
+        ),
+        (
+            "landing-results.json".into(),
+            fs::read(project.join(&final_path)).unwrap(),
+        ),
+        (
+            "landing-manifest.json".into(),
+            fs::read(
+                project
+                    .join(&final_path)
+                    .with_file_name("canonical-run.json"),
+            )
+            .unwrap(),
+        ),
+        (
+            "target-baseline.json".into(),
+            fs::read(project.join(&baseline_path)).unwrap(),
+        ),
+        (
+            "attempt-results.json".into(),
+            fs::read(project.join(attempt_path).join("tester-results.json")).unwrap(),
+        ),
+        ("status.txt".into(), status.stdout.clone()),
+        ("shown-work.json".into(), show.stdout.clone()),
+        (
+            "tester-config.yaml".into(),
+            fs::read(project.join(".fluent/tester.yaml")).unwrap(),
+        ),
+        (
+            "extractor".into(),
+            fs::read(project.join(".fluent/extract-tester-results")).unwrap(),
+        ),
+    ];
+    let results = read_json_path(&project.join(&final_path));
+    for (index, command) in results["commands"].as_array().unwrap().iter().enumerate() {
+        for (stream, key) in [("stdout", "stdout_log"), ("stderr", "stderr_log")] {
+            let name = format!("landing-{index}-{stream}.log");
+            files.push((
+                name,
+                fs::read(
+                    project
+                        .join(&final_path)
+                        .parent()
+                        .unwrap()
+                        .join(command[key].as_str().unwrap()),
+                )
+                .unwrap(),
+            ));
+        }
+    }
+    let artifacts = files
+        .iter()
+        .map(|(name, bytes)| {
+            fs::write(output.join(name), bytes).unwrap();
+            serde_json::json!({"path":name,"sha256":format!("{:x}", Sha256::digest(bytes))})
+        })
+        .collect::<Vec<_>>();
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let trace = serde_json::json!({
+        "schema-version":1,
+        "scenario":"evidence-status-rebased-landing",
+        "fluent-commit":git_head(source),
+        "fluent-binary-sha256":format!("{:x}", Sha256::digest(fs::read(env!("CARGO_BIN_EXE_fluent")).unwrap())),
+        "model-profile":"evidence-status",
+        "collection-complete":true,
+        "artifacts":artifacts,
+        "events":[
+            {"sequence":1,"actor":"operator","operation-id":"attempt-run",
+             "generation":null,"boundary":"ready","causal-predecessors":[],
+             "raw-facts":{"work":ready}},
+            {"sequence":2,"actor":"operator","operation-id":"advance-target",
+             "generation":null,"boundary":"target-advanced","causal-predecessors":[1],
+             "raw-facts":{"target-commit":target}},
+            {"sequence":3,"actor":"operator","operation-id":"land-candidate",
+             "generation":null,"boundary":"landed","causal-predecessors":[2],
+             "raw-facts":{"work":landed,"merged-commit":git_head(project)}},
+            {"sequence":4,"actor":"operator","operation-id":"inspect-landed",
+             "generation":null,"boundary":"observed","causal-predecessors":[3],
+             "raw-facts":{"status":String::from_utf8(status.stdout).unwrap(),
+                          "show":serde_json::from_slice::<serde_json::Value>(&show.stdout).unwrap()}}
+        ]
+    });
+    fs::write(
+        output.join("production-trace.json"),
+        serde_json::to_vec_pretty(&trace).unwrap(),
+    )
+    .unwrap();
+}
+
 #[test]
 fn landed_status_validates_retained_landing_evidence() {
     let tmp = TempDir::new().unwrap();
@@ -65826,6 +65965,36 @@ fn landed_status_validates_retained_landing_evidence() {
             .as_str()
             .unwrap()
             .contains("configuration")
+    );
+
+    let known_tmp = TempDir::new().unwrap();
+    let (known_project, known_bin, _) = setup_rebased_tester_candidate(
+        &known_tmp,
+        "printf 'not ok known-target-failure\\n'; exit 1",
+    );
+    advance_tester_target(&known_project);
+    land_work_1(&known_project, &known_bin, true);
+    let known = read_work_show_json(&known_project, "work-1");
+    let baseline = known["merge_candidates"][0]["merge_state"]["check_artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|artifact| artifact["producer_id"] == "merge-target-baseline")
+        .unwrap()["path"]
+        .as_str()
+        .unwrap();
+    let mut wrong_baseline = read_json_path(&known_project.join(baseline));
+    wrong_baseline["candidate_commit"] = serde_json::json!("wrong-target");
+    fs::write(
+        known_project.join(baseline),
+        serde_json::to_vec(&wrong_baseline).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        read_work_show_json(&known_project, "work-1")["evidence-history"]["diagnostic"]
+            .as_str()
+            .unwrap()
+            .contains("target baseline")
     );
 }
 

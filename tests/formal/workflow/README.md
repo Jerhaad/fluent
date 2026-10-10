@@ -1,5 +1,33 @@
 # Workflow foundation checks
 
+## Evidence status
+
+The `evidence-status` suite captures a public Attempt, advances the target,
+lands the rebased Merge Candidate, and reads `status` and `work-item show` after
+the source checkout is retired. `project_evidence.py` checks the raw Work
+snapshots, Tester result and manifest, target baseline, command logs, and public
+display. It derives `ready → target-advanced → landed → observed` from those
+artifacts. `EvidenceTrace.tla` checks the corresponding `Workflow` target
+baseline, landing result, verification, intent, Git effect, publication, and
+observation actions. A changed Tester candidate, command occurrence, or display
+result and a missing observation each fail projection after their artifact
+digests are updated. Model controls independently reject bad evidence credit,
+misbound or new landing results, and an untruthful observation; the known
+landing failure witness keeps accepted baseline treatment reachable.
+
+The Writer's focused trace check is:
+
+```sh
+python3 tests/formal/workflow/project_evidence.py target/formal/workflow/evidence-status/production-trace.json
+```
+
+The host runs the complete bounded suite against the committed candidate with
+`python3 tests/formal/workflow/check.py --suite=evidence-status
+--jar=target/fluent-tools/tla2tools-1.7.4.jar`. Its logs and `result.json` stay
+under `target/formal/workflow/evidence-status/`. The projector checks the
+observed final commit separately from Fluent's status decision; a success label
+cannot make a mismatched artifact pass.
+
 ## Classified Writer inputs
 
 The `writer-inputs` suite runs the exact classified Writer launch test, checks

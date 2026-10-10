@@ -290,13 +290,124 @@ def writer_inputs_suite(source, root, output, jar, java):
     return 0 if result["pass"] else 1
 
 
+def evidence_status_suite(source, root, output, jar, java):
+    results = []
+    for name in ("negative-checkevidence", "negative-landing-misbound",
+                 "negative-landing-new", "negative-truthfulobservation",
+                 "known-landing-accepted"):
+        expected = ("Invariant KnownLandingUnreachable is violated" if name ==
+                    "known-landing-accepted" else CONTROLS[name.removeprefix("negative-")])
+        results.append(run_case(source, output, jar, java, name + ".cfg", expected))
+    command = ["cargo", "nextest", "run", "--offline", "--features", "test-support",
+               "--test", "binary", "--no-tests", "fail",
+               "landed_status_uses_final_landing_tester_evidence"]
+    trace_path = output / "production-trace.json"
+    for path in output.glob("landing-*-*.log"):
+        path.unlink()
+    for name in ("production-trace.json", "ready-work.json", "landed-work.json",
+                 "landing-results.json", "landing-manifest.json", "target-baseline.json",
+                 "attempt-results.json", "status.txt", "shown-work.json",
+                 "tester-config.yaml", "extractor"):
+        (output / name).unlink(missing_ok=True)
+    fixture = subprocess.run(command, cwd=root, capture_output=True, text=True)
+    (output / "production-fixture.log").write_text("$ " + " ".join(command) + "\n"
+                                                     + fixture.stdout + fixture.stderr)
+    fixture_ok = fixture.returncode == 0 and trace_path.is_file()
+    results.append({"case": "fresh-evidence-fixture", "pass": fixture_ok,
+                    "log": "production-fixture.log"})
+    if fixture_ok:
+        trace = json.loads(trace_path.read_text())
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root,
+                              capture_output=True, text=True, check=True).stdout.strip()
+        binary = root / "target/debug/fluent"
+        bound = trace["fluent-commit"] == head and binary.is_file() and \
+            trace["fluent-binary-sha256"] == hashlib.sha256(binary.read_bytes()).hexdigest()
+        projection = subprocess.run(["python3", str(source / "project_evidence.py"),
+                                     str(trace_path)], capture_output=True, text=True)
+        (output / "projection.log").write_text(projection.stdout + projection.stderr)
+        valid = bound and projection.returncode == 0
+        results.append({"case": "evidence-production-projection", "pass": valid,
+                        "log": "projection.log"})
+        controls = (
+            ("wrong-candidate", "landing-results.json", lambda value: value.update(
+                candidate_commit="0" * 40), "candidate binding differs"),
+            ("wrong-command", "landing-results.json", lambda value: value["commands"][0]
+             .update(command="forged command"), "differs from its occurrence"),
+            ("old-display", "shown-work.json", lambda value: value["evidence-history"]
+             .update(**{"tester-results": None, "diagnostic": "old Attempt only"}),
+             "display did not retain"),
+        )
+        for label, artifact, mutate, diagnostic in controls:
+            negative_dir = output / label
+            negative_dir.mkdir(exist_ok=True)
+            changed = json.loads(json.dumps(trace))
+            for entry in trace["artifacts"]:
+                (negative_dir / entry["path"]).write_bytes((output / entry["path"]).read_bytes())
+            value = json.loads((negative_dir / artifact).read_text())
+            mutate(value)
+            data = json.dumps(value).encode()
+            (negative_dir / artifact).write_bytes(data)
+            for entry in changed["artifacts"]:
+                if entry["path"] == artifact:
+                    entry["sha256"] = hashlib.sha256(data).hexdigest()
+            if label == "old-display":
+                changed["events"][3]["raw-facts"]["show"] = value
+            control_path = negative_dir / "trace.json"
+            control_path.write_text(json.dumps(changed))
+            negative = subprocess.run(["python3", str(source / "project_evidence.py"),
+                                       str(control_path)], capture_output=True, text=True)
+            (output / f"{label}.log").write_text(negative.stdout + negative.stderr)
+            results.append({"case": label, "pass": negative.returncode != 0 and
+                            diagnostic in negative.stderr, "log": f"{label}.log"})
+        missing = json.loads(json.dumps(trace))
+        missing["events"] = missing["events"][:-1]
+        missing_path = output / "missing-observation.json"
+        missing_path.write_text(json.dumps(missing))
+        negative = subprocess.run(["python3", str(source / "project_evidence.py"),
+                                   str(missing_path)], capture_output=True, text=True)
+        (output / "missing-observation.log").write_text(negative.stdout + negative.stderr)
+        results.append({"case": "missing-observation", "pass": negative.returncode != 0 and
+                        "missing evidence events" in negative.stderr,
+                        "log": "missing-observation.log"})
+        if valid:
+            states = json.loads(projection.stdout)["states"]
+            config = output / "evidence-production-path.cfg"
+            config.write_text("SPECIFICATION EvidenceSpec\nCONSTANTS\n"
+                              "  Works = {w1}\n  EvidenceWork = w1\n  ReviewOnly = {}\n"
+                              "  MaxFailures = 0\n"
+                              + '  CanonicalKinds = {"pass"}\n'
+                              + '  LandingKinds = {"pass"}\n'
+                              + '  TargetKinds = {"unchanged"}\n'
+                              + '  CorruptPrewrite = FALSE\n'
+                              + "".join(f"  {control} = TRUE\n" for control in
+                                        ("DeliverInputs", "CheckEvidence", "FenceResume",
+                                         "GuardEffect", "TruthfulObservation", "GuardCleanup",
+                                         "GuardVersion", "GuardBaseline",
+                                         "GuardLandingBaseline", "GuardReviewRoute"))
+                              + "".join(f"  EvidenceState{i} = {json.dumps(state)}\n"
+                                        for i, state in enumerate(states, 1))
+                              + "INVARIANT EvidenceSafe\n"
+                              + "INVARIANT LandingAcceptanceSafe\n"
+                              + "INVARIANT PublicationSafe\n"
+                              + "INVARIANT ObservationSafe\n"
+                              + "PROPERTY EvidenceComplete\n")
+            results.append(run_case(source, output, jar, java, str(config), None,
+                                    module="EvidenceTrace"))
+    result = {"schema-version": 1, "suite": "evidence-status", "cases": results,
+              "pass": all(row["pass"] for row in results)}
+    (output / "result.json").write_text(json.dumps(result, indent=2) + "\n")
+    for row in results:
+        print(("PASS" if row["pass"] else "FAIL") + " " + row["case"])
+    return 0 if result["pass"] else 1
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--suite", required=True)
     parser.add_argument("--jar", type=Path, required=True)
     parser.add_argument("--focus", choices=("combined-one-failure", "guarded"))
     args = parser.parse_args()
-    if args.suite not in ("foundation", "writer-inputs"):
+    if args.suite not in ("foundation", "writer-inputs", "evidence-status"):
         parser.error(f"unknown or incomplete suite: {args.suite}")
     jar = args.jar.resolve()
     if not jar.is_file() or hashlib.sha256(jar.read_bytes()).hexdigest() != JAR_SHA256:
@@ -312,6 +423,12 @@ def main():
         output = root / "target/formal/workflow/writer-inputs"
         output.mkdir(parents=True, exist_ok=True)
         return writer_inputs_suite(source, root, output, jar, java)
+    if args.suite == "evidence-status":
+        if args.focus:
+            parser.error("--focus is only supported for foundation")
+        output = root / "target/formal/workflow/evidence-status"
+        output.mkdir(parents=True, exist_ok=True)
+        return evidence_status_suite(source, root, output, jar, java)
     output = root / "target/formal/workflow/foundation"
     output.mkdir(parents=True, exist_ok=True)
     if args.focus:

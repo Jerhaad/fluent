@@ -204,6 +204,15 @@ fn landed_evidence_history(
                 "retained target baseline has a harness error"
             );
             anyhow::ensure!(
+                baseline_results.candidate_commit.as_deref()
+                    == candidate
+                        .merge_state
+                        .landing_intent
+                        .as_ref()
+                        .map(|intent| intent.target_before.as_str()),
+                "retained target baseline does not match the landing target"
+            );
+            anyhow::ensure!(
                 crate::tester_evidence::introduced_tester_failures(
                     &root.join(&path),
                     Some(&root.join(baseline))
@@ -256,6 +265,21 @@ fn landed_evidence_history(
                     &format!("{area}/{expected}"),
                 )?;
             }
+        }
+        if let Some(intent) = candidate.merge_state.landing_intent.as_ref() {
+            anyhow::ensure!(
+                intent.verified_commit == history.merged_commit
+                    && intent.check_artifacts == candidate.merge_state.check_artifacts,
+                "retained landing intent differs from merged evidence"
+            );
+            anyhow::ensure!(
+                crate::work_merge_executor::landing_evidence_digest(
+                    root,
+                    &intent.check_artifacts,
+                    &intent.review_artifacts
+                )? == intent.evidence_digest,
+                "retained landing evidence changed after acceptance"
+            );
         }
         Ok(path)
     })();

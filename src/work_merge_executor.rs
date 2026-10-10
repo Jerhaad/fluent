@@ -64,7 +64,7 @@ fn landing_repository_identity(workspace: &Path) -> Result<String> {
     .into_owned())
 }
 
-fn landing_evidence_digest(
+pub(crate) fn landing_evidence_digest(
     project_root: &Path,
     checks: &[ArtifactRef],
     reviews: &[ArtifactRef],
