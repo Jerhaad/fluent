@@ -7002,6 +7002,174 @@ fn writer_completion_recovery_later_rejects_stale_source_at_start() {
 }
 
 #[test]
+fn workflow_reachable_failures_have_public_continuation() {
+    let tmp = TempDir::new().unwrap();
+    let (fixture, malformed) = committed_matrix_recovery_fixture(&tmp);
+    let store = WorkModelStore::new(&fixture.project);
+    let source = store.read_work_item(&fixture.work).unwrap();
+    let source_task = &source.attempts[0].tasks[0];
+    let source_matrix = fixture
+        .project
+        .join(&source_task.artifact_area.as_ref().unwrap().path)
+        .join("writer-completion.json");
+
+    let observe = fluent_cmd()
+        .current_dir(&fixture.project)
+        .args(["work-item", "show", &fixture.work])
+        .output()
+        .unwrap();
+    assert!(observe.status.success());
+    let shown: serde_json::Value = serde_json::from_slice(&observe.stdout).unwrap();
+    assert!(
+        shown["next-action"]
+            .as_str()
+            .unwrap()
+            .contains("repair-writer-completion")
+    );
+    let repair = fluent_cmd()
+        .current_dir(&fixture.project)
+        .args([
+            "attempt",
+            "repair-writer-completion",
+            &fixture.work,
+            "attempt-1",
+            "--resolution",
+            &fixture.resolution,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        repair.status.success(),
+        "{}",
+        String::from_utf8_lossy(&repair.stderr)
+    );
+    let authorized_shown = read_work_show_json(&fixture.project, &fixture.work);
+    let authorized = store.read_work_item(&fixture.work).unwrap();
+    assert_eq!(authorized.attempts[0].tasks[0], *source_task);
+    assert_eq!(fs::read(&source_matrix).unwrap(), malformed);
+    let correction = authorized.attempts[0].tasks.last().unwrap();
+    assert_eq!(correction.status, TaskStatus::Planned);
+    let correction_area = fixture
+        .project
+        .join(&correction.artifact_area.as_ref().unwrap().path);
+    let bin = tmp.path().join("workflow-recovery-provider");
+    write_mock_claude(
+        &bin,
+        r#"#!/bin/bash
+set -eu
+python3 - <<'PY'
+import json, os
+from pathlib import Path
+area = Path(os.environ['RECOVERY_AREA'])
+path = area / 'writer-completion.json'
+matrix = json.loads(path.read_text())
+for row in matrix['rows']:
+    if row.get('responsibility', 'writer') == 'writer':
+        row['state'] = 'complete'
+        row['implementation-evidence'] = ['candidate.txt: retained source candidate']
+        row['verification'] = [{'command': 'true', 'result': 'pass'}]
+path.write_text(json.dumps(matrix))
+(area / 'no-change.json').write_text(json.dumps({
+    'schema_version': 1,
+    'declaration_path': os.environ['RECOVERY_AREA_REL'] + '/no-change.json',
+    'reason': 'The retained candidate already contains the implementation.',
+    'verification': [{'command': 'true', 'result': 'pass'}]}))
+PY
+"#,
+    );
+    let require_host = std::env::var("FLUENT_WORKFLOW_REQUIRE_HOST").as_deref() == Ok("1");
+    let mut resume = fluent_cmd();
+    resume
+        .current_dir(&fixture.project)
+        .args(["attempt", "run", &fixture.work, "attempt-1"]);
+    if !require_host {
+        resume.arg("--no-sandbox");
+    }
+    let run = resume
+        .env("PATH", mock_path(&bin))
+        .env("RECOVERY_AREA", &correction_area)
+        .env(
+            "RECOVERY_AREA_REL",
+            &correction.artifact_area.as_ref().unwrap().path,
+        )
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let continued_shown = read_work_show_json(&fixture.project, &fixture.work);
+    let continued = store.read_work_item(&fixture.work).unwrap();
+    assert_eq!(continued.attempts[0].tasks[1].status, TaskStatus::Complete);
+    assert_eq!(continued.attempts[0].tasks[0], *source_task);
+    assert_eq!(fs::read(source_matrix).unwrap(), malformed);
+    assert_eq!(
+        continued.attempts[0]
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Write)
+            .count(),
+        2
+    );
+
+    let trace_dir =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("target/formal/workflow/recovery-observation");
+    fs::create_dir_all(&trace_dir).unwrap();
+    let snapshots = [
+        ("paused-work.json", &shown),
+        ("authorized-work.json", &authorized_shown),
+        ("continued-work.json", &continued_shown),
+    ];
+    let mut artifacts = Vec::new();
+    for (name, value) in snapshots {
+        let bytes = serde_json::to_vec_pretty(value).unwrap();
+        fs::write(trace_dir.join(name), &bytes).unwrap();
+        artifacts.push(
+            serde_json::json!({"path":name,"sha256":format!("{:x}", Sha256::digest(&bytes))}),
+        );
+    }
+    fs::write(trace_dir.join("source-matrix.json"), &malformed).unwrap();
+    artifacts.push(serde_json::json!({"path":"source-matrix.json",
+        "sha256":format!("{:x}", Sha256::digest(&malformed))}));
+    let event = |sequence: u64,
+                 boundary: &str,
+                 operation: &str,
+                 predecessors: Vec<u64>,
+                 work: serde_json::Value,
+                 exit_code: i32,
+                 stdout: String,
+                 stderr: String| {
+        serde_json::json!({"sequence":sequence,"actor":"operator",
+            "operation-id":operation,"generation":null,"boundary":boundary,
+            "causal-predecessors":predecessors,"raw-facts":{
+                "work":work,"exit-code":exit_code,"stdout":stdout,"stderr":stderr}})
+    };
+    let binary = fs::read(assert_cmd::cargo::cargo_bin("fluent")).unwrap();
+    let trace = serde_json::json!({
+    "schema-version":1,"scenario":"malformed-completion-public-recovery",
+    "fluent-commit":git_head(Path::new(env!("CARGO_MANIFEST_DIR"))),
+    "fluent-binary-sha256":format!("{:x}", Sha256::digest(binary)),
+    "model-profile":"recovery-observation","collection-complete":true,
+    "artifacts":artifacts,"events":[
+        event(1,"paused-observation","work-item-show",vec![],shown,
+              observe.status.code().unwrap(),String::from_utf8_lossy(&observe.stdout).into_owned(),
+              String::from_utf8_lossy(&observe.stderr).into_owned()),
+        event(2,"repair","repair-writer-completion",vec![1],authorized_shown,
+              repair.status.code().unwrap(),String::from_utf8_lossy(&repair.stdout).into_owned(),
+              String::from_utf8_lossy(&repair.stderr).into_owned()),
+        event(3,"resume","attempt-run",vec![2],continued_shown,
+              run.status.code().unwrap(),String::from_utf8_lossy(&run.stdout).into_owned(),
+              String::from_utf8_lossy(&run.stderr).into_owned()),
+    ]});
+    fs::write(
+        trace_dir.join("production-trace.json"),
+        serde_json::to_vec_pretty(&trace).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
 fn writer_completion_recovery_committed_matrix_public_continuation() {
     let tmp = TempDir::new().unwrap();
     let (fixture, malformed) = committed_matrix_recovery_fixture(&tmp);
