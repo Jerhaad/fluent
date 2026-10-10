@@ -8348,15 +8348,38 @@ fn writer_completion_plan_real_sandbox_inputs() {
     ));
     let source_bytes = fs::read(&source_matrix).unwrap();
     let audit_bytes = fs::read(&audit).unwrap();
-    let unrelated = tmp.path().join("unrelated.txt");
+    let outside_roots = tempfile::Builder::new()
+        .prefix("fluent-plan-sandbox-")
+        .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+        .unwrap();
+    let unrelated = outside_roots.path().join("unrelated.txt");
     fs::write(&unrelated, "outside fixture\n").unwrap();
     let bin = tmp.path().join("plan-sandbox-provider");
     write_mock_claude(
         &bin,
         r#"#!/bin/bash
 set -eu
-test -r "$RECOVERY_SOURCE_MATRIX"
-test -r "$RECOVERY_AUDIT"
+python3 - "$@" <<'PY'
+import hashlib, json, os, sys
+from pathlib import Path
+prompt = ' '.join(sys.argv[1:])
+source_path = Path(os.environ['RECOVERY_SOURCE_MATRIX'])
+audit_path = Path(os.environ['RECOVERY_AUDIT'])
+context_path = Path(os.environ['RECOVERY_AREA']) / 'execution-context.json'
+source = json.loads(source_path.read_text())
+audit = json.loads(audit_path.read_text())
+context = json.loads(context_path.read_text())
+assert audit['resolution'] == os.environ['RECOVERY_RESOLUTION']
+assert audit['candidate-commit'] == context['candidate-commit']
+assert audit['source-matrix-sha256'] == 'sha256:' + hashlib.sha256(source_path.read_bytes()).hexdigest()
+assert any(row['id'] == 'plan:step-1' and row['state'] == 'pending'
+           for row in source['rows'])
+assert any(row['id'] == 'plan:step-1'
+           for row in context['pending-writer-rows'])
+assert 'The completed source Writer has completion evidence that needs correction.' in prompt
+for delivered in (audit['resolution'], str(audit_path), str(context_path)):
+    assert delivered in prompt, delivered
+PY
 if printf tamper > "$RECOVERY_SOURCE_MATRIX" 2>/dev/null; then exit 91; fi
 if printf tamper > "$RECOVERY_AUDIT" 2>/dev/null; then exit 92; fi
 if printf tamper > "$RECOVERY_UNRELATED" 2>/dev/null; then exit 93; fi
@@ -8386,20 +8409,28 @@ PY
         "sandbox-exec",
         "#!/bin/bash\nexec /usr/bin/sandbox-exec \"$@\"\n",
     );
-    fluent_cmd()
+    let result = fluent_cmd()
         .current_dir(&fixture.project)
         .args(["attempt", "run", &fixture.work, "attempt-1"])
         .env("PATH", mock_path(&bin))
         .env("RECOVERY_SOURCE_MATRIX", &source_matrix)
         .env("RECOVERY_AUDIT", &audit)
+        .env("RECOVERY_RESOLUTION", &fixture.resolution)
         .env("RECOVERY_UNRELATED", &unrelated)
         .env("RECOVERY_AREA", &area)
         .env(
             "RECOVERY_AREA_REL",
             &successor.artifact_area.as_ref().unwrap().path,
         )
-        .assert()
-        .success();
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}\n{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr),
+        fs::read_to_string(area.join("provider-stderr.log")).unwrap_or_default()
+    );
     assert_eq!(fs::read(&source_matrix).unwrap(), source_bytes);
     assert_eq!(fs::read(&audit).unwrap(), audit_bytes);
     assert_eq!(fs::read(&unrelated).unwrap(), b"outside fixture\n");
