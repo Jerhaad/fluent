@@ -362,6 +362,7 @@ fn workflow_assurance_report_rejects_missing_and_misbound_evidence() {
     assert_eq!(result["pass"], false);
     assert!(result["suite-source-sha256"]["integrated-projector"].is_string());
     assert!(result["connection-inventory-sha256"].is_string());
+    assert_eq!(result["scheduler-suites"]["recovery"]["pass"], false);
     assert!(result["missing"].as_array().unwrap().len() > 0);
     assert!(
         result["missing"]
@@ -375,6 +376,13 @@ fn workflow_assurance_report_rejects_missing_and_misbound_evidence() {
             .unwrap()
             .starts_with("integrated-production: ")
     }));
+    assert!(
+        result["missing"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| { item.as_str().unwrap().starts_with("scheduler recovery: ") })
+    );
     let suite = tmp.path().join("foundation");
     fs::create_dir(&suite).unwrap();
     fs::write(suite.join("case.log"), "Model checking completed\n").unwrap();
@@ -413,7 +421,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(sys.argv[1])))
 import report
 cases = {'foundation': {'foundation.cfg', 'production-projection',
-                        'negative-model-path', 'negative-deliverinputs.cfg'}}
+                        'negative-model-path', 'negative-deliverinputs.cfg'},
+         'scheduler-recovery': {'queue-proposed.cfg'}}
 assert not report.connection_credit('Verified: manually reviewed', cases)
 assert not report.connection_credit(
     'Verified: model=foundation/foundation.cfg; assumption=foundation/foundation.cfg; '
@@ -421,6 +430,60 @@ assert not report.connection_credit(
 assert report.connection_credit(
     'Verified: model=foundation/foundation.cfg; assumption=foundation/foundation.cfg; '
     'production=foundation/production-projection; control=foundation/negative-model-path', cases)
+assert report.connection_credit(
+    'Verified: model=scheduler-recovery/queue-proposed.cfg; '
+    'assumption=foundation/foundation.cfg; production=foundation/production-projection; '
+    'control=foundation/negative-model-path', cases)
+"#;
+    let source = root.join("tests/formal/workflow");
+    let result = run(root, "python3", &["-c", script, source.to_str().unwrap()]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+#[test]
+fn workflow_assurance_report_binds_scheduler_results() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script = r#"
+import hashlib
+import json
+import runpy
+import sys
+import tempfile
+from pathlib import Path
+source = Path(sys.argv[1])
+sys.path.insert(0, str(source))
+import report
+with tempfile.TemporaryDirectory() as temporary:
+    target = Path(temporary)
+    (target / 'workflow').mkdir()
+    output = target / 'scheduler'
+    output.mkdir()
+    jar = target / 'tlc.jar'
+    jar.write_bytes(b'pinned-tool-fixture')
+    definitions = runpy.run_path(str(source.parent / 'scheduler/check.py'))
+    for suite, constant in {'recovery':'RECOVERY_CASES', 'lifecycle':'LIFECYCLE_CASES',
+                            'launch':'LAUNCH_CASES', 'landing':'LANDING_CASES'}.items():
+        cases = []
+        for module, config, violation in definitions[constant]:
+            log = output / (config + '.log')
+            log.write_text('checked\n')
+            cases.append({'case':config,'module':module,'expected':violation,
+                          'pass':True,'log':log.name,'log-sha256':report.digest(log)})
+        (output / (suite + '-result.json')).write_text(json.dumps({
+            'schema-version':1,'suite':suite,'candidate-commit':'candidate-a',
+            'tlc-jar-sha256':report.digest(jar),'pass':True,'cases':cases}))
+    suites, missing = report.scheduler_results(target / 'workflow', 'candidate-a',
+                                               jar, source.parent / 'scheduler')
+    assert not missing and all(value['pass'] for value in suites.values())
+    (output / 'queue-proposed.cfg.log').write_text('changed\n')
+    suites, missing = report.scheduler_results(target / 'workflow', 'candidate-a',
+                                               jar, source.parent / 'scheduler')
+    assert not suites['recovery']['pass'] and missing == [
+        'scheduler recovery: malformed result or log']
 "#;
     let source = root.join("tests/formal/workflow");
     let result = run(root, "python3", &["-c", script, source.to_str().unwrap()]);

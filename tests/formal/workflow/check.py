@@ -165,6 +165,7 @@ def integrated_suite(source, root, output, jar, java):
                     "log": "production-fixture.log"})
     scheduler = source.parent / "scheduler/check.py"
     for name in ("recovery", "lifecycle", "launch", "landing"):
+        (root / "target/formal/scheduler" / f"{name}-result.json").unlink(missing_ok=True)
         command = ["python3", str(scheduler), "--suite=" + name,
                    "--jar=" + str(jar)]
         environment = dict(os.environ)

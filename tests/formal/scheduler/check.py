@@ -3,6 +3,7 @@
 
 import argparse
 import hashlib
+import json
 import re
 import subprocess
 import sys
@@ -69,6 +70,7 @@ def main() -> int:
     logs = Path("target/formal/scheduler").resolve()
     logs.mkdir(parents=True, exist_ok=True)
     failed = False
+    results = []
     cases = {"recovery": RECOVERY_CASES, "lifecycle": LIFECYCLE_CASES,
              "launch": LAUNCH_CASES, "landing": LANDING_CASES}[args.suite]
     for module, config, expected_invariant in cases:
@@ -94,7 +96,16 @@ def main() -> int:
                       and expected_invariant in output)
         label = "PASS" if passed else "FAIL"
         print(f"{label} {module} {config} -> {log}")
+        results.append({"case": config, "module": module, "pass": passed,
+                        "expected": expected_invariant, "log": log.name,
+                        "log-sha256": hashlib.sha256(log.read_bytes()).hexdigest()})
         failed |= not passed
+    candidate = subprocess.run(["git", "rev-parse", "HEAD"], cwd=source,
+                               check=True, capture_output=True, text=True).stdout.strip()
+    summary = {"schema-version": 1, "suite": args.suite,
+               "candidate-commit": candidate, "tlc-jar-sha256": digest,
+               "cases": results, "pass": not failed}
+    (logs / f"{args.suite}-result.json").write_text(json.dumps(summary, indent=2) + "\n")
     return 1 if failed else 0
 
 

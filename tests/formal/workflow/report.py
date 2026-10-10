@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import json
 import re
+import runpy
 import sys
 from pathlib import Path
 
@@ -103,6 +104,48 @@ def connections(source, passing_cases):
     return rows
 
 
+def scheduler_results(results, candidate, jar, scheduler):
+    """Bind every scheduler model and defect control to its retained log."""
+    definitions = runpy.run_path(str(scheduler / "check.py"))
+    names = {"recovery": "RECOVERY_CASES", "lifecycle": "LIFECYCLE_CASES",
+             "launch": "LAUNCH_CASES", "landing": "LANDING_CASES"}
+    suites = {}
+    missing = []
+    for suite, constant in names.items():
+        path = results.parent / "scheduler" / f"{suite}-result.json"
+        if not path.is_file():
+            suites[suite] = {"pass": False, "reason": "missing result"}
+            missing.append(f"scheduler {suite}: missing result")
+            continue
+        try:
+            value = json.loads(path.read_text())
+            cases = value["cases"]
+            expected = definitions[constant]
+            assert type(value["schema-version"]) is int and value["schema-version"] == 1
+            assert value["suite"] == suite and type(value["pass"]) is bool
+            assert type(cases) is list and len(cases) == len(expected)
+            logs = {}
+            for row, (module, config, violation) in zip(cases, expected):
+                assert row["case"] == config and row["module"] == module
+                assert row["expected"] == violation and type(row["pass"]) is bool
+                assert row["log"] == f"{config}.log"
+                log = path.parent / row["log"]
+                assert log.is_file() and row["log-sha256"] == digest(log)
+                logs[row["log"]] = digest(log)
+            bound = value["candidate-commit"] == candidate and jar is not None and \
+                value["tlc-jar-sha256"] == digest(jar)
+            passed = value["pass"] and bound and all(row["pass"] for row in cases)
+            suites[suite] = {"pass": passed, "candidate-bound": bound,
+                             "result-sha256": digest(path), "log-sha256": logs,
+                             "cases": cases}
+            if not passed:
+                missing.append(f"scheduler {suite}: failed or unbound result")
+        except (AssertionError, KeyError, TypeError, ValueError, OSError) as error:
+            suites[suite] = {"pass": False, "reason": str(error)}
+            missing.append(f"scheduler {suite}: malformed result or log")
+    return suites, missing
+
+
 def report(results, candidate, binary, source, jar=None, java=None):
     suites = {}
     missing = []
@@ -144,15 +187,21 @@ def report(results, candidate, binary, source, jar=None, java=None):
         except (AssertionError, KeyError, TypeError, ValueError, OSError) as error:
             missing.append(f"{name}: malformed result or missing log")
             suites[name] = {"pass": False, "reason": str(error)}
+    scheduler = source.parent / "scheduler"
+    scheduler_suites, scheduler_missing = scheduler_results(results, candidate, jar,
+                                                            scheduler)
+    missing.extend(scheduler_missing)
     passing_cases = {name: {case["case"] for case in value.get("cases", [])
                             if case.get("pass") is True}
                      for name, value in suites.items() if value.get("pass") is True}
+    passing_cases.update({f"scheduler-{name}": {case["case"] for case in value["cases"]}
+                          for name, value in scheduler_suites.items()
+                          if value.get("pass") is True})
     mappings = connections(source, passing_cases)
     if [row["boundary"] for row in mappings] != list(BOUNDARIES):
         missing.append("connection inventory changed or incomplete")
     missing.extend(f"connection: {row['boundary']}" for row in mappings if not row["pass"])
     missing.extend(f"model: {name}" for name in MODELS if not (source / name).is_file())
-    scheduler = source.parent / "scheduler"
     missing.extend(f"scheduler model: {name}" for name in SCHEDULER_MODELS
                    if not (scheduler / name).is_file())
     tools = {"tlc-jar": jar, "java": java}
@@ -171,7 +220,8 @@ def report(results, candidate, binary, source, jar=None, java=None):
                                     "report": digest(source / "report.py"),
                                     "integrated-projector": digest(source / "project_integrated.py")},
             "connection-inventory-sha256": digest(source / "connections.md"),
-            "suites": suites, "connections": mappings,
+            "suites": suites, "scheduler-suites": scheduler_suites,
+            "connections": mappings,
             "external-gates": {name: {"state": "pending", "command": command}
                                for name, command in EXTERNAL_GATES.items()},
             "missing": missing,

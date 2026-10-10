@@ -13,7 +13,11 @@ causal order independently of the command assertions. A rehashed trace that
 swaps the canceled Work identity must fail projection. The checker writes logs under
 `target/formal/workflow/integrated/` and a candidate-bound `report.json` with
 suite results, log digests, model hashes, and every connection row from
-`connections.md`. The integrated result fails if any required suite, log,
+`connections.md`. The scheduler checker also writes candidate-bound results
+for its recovery, lifecycle, launch, and landing cases under
+`target/formal/scheduler/`. The report checks every named configuration and
+retained log digest before crediting a `scheduler-SUITE/CASE` connection reference.
+The integrated result fails if any required suite, log,
 binary binding, required case, or connection is missing. An inventory row needs
 the structured `Verified: model=SUITE/CASE; assumption=SUITE/CASE;
 production=SUITE/CASE; control=SUITE/CASE` evidence described in
