@@ -66787,6 +66787,13 @@ fn workflow_recovery_preserves_intervening_changes() {
 }
 
 #[test]
+fn workflow_recovery_requires_current_resume_authority() {
+    launch_handoff_route_task_recovers_after_parent_publication_loss();
+    attempt_cancel_persists_stop_before_settling_active_execution();
+    evidence_recovery_receipt_cannot_clear_intervening_stop();
+}
+
+#[test]
 fn landed_status_observation_preserves_recorded_bytes() {
     let tmp = TempDir::new().unwrap();
     let project = landed_status_fixture(&tmp);
