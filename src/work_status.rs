@@ -272,6 +272,13 @@ fn landed_evidence_history(
                     && intent.check_artifacts == candidate.merge_state.check_artifacts,
                 "retained landing intent differs from merged evidence"
             );
+            for artifact in intent
+                .check_artifacts
+                .iter()
+                .chain(&intent.review_artifacts)
+            {
+                crate::verification_assessment::validate_managed_file_path(root, &artifact.path)?;
+            }
             anyhow::ensure!(
                 crate::work_merge_executor::landing_evidence_digest(
                     root,
