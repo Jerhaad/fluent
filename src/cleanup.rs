@@ -94,14 +94,29 @@ pub fn cleanup_work_items(
     let mut results = Vec::new();
 
     for work_item in candidates {
+        // Verify post-land effects before holding the origin model lock.
+        // That verification takes the operation lock and reads Work Items;
+        // holding the model lock here would invert its lock order.
+        let checked = match store.read_work_item(&work_item.id) {
+            Ok(current)
+                if work_item_is_cleanable(&current)
+                    && !retains_for_follow_up_recovery(&source_root, &current) =>
+            {
+                current
+            }
+            _ => continue,
+        };
         // Landing takes the land lock before mutating the Work Item. Keep that
-        // order and hold both locks through every destructive action.
+        // order and hold both locks through every destructive action. Reject a
+        // changed snapshot rather than using an eligibility result from before
+        // the model lock was acquired.
         let _land_lock = crate::land_lock::acquire(&crate::land_lock::lock_path(&source_root))?;
         let _model_lock = store.lock_work_item_model(&work_item.id)?;
         let work_item = match store.read_work_item_under_model_lock(&work_item.id) {
             Ok(work_item)
-                if work_item_is_cleanable(&work_item)
-                    && !retains_for_follow_up_recovery(&source_root, &work_item) =>
+                if work_item == checked
+                    && work_item.storage_revision.get() == checked.storage_revision.get()
+                    && work_item_is_cleanable(&work_item) =>
             {
                 work_item
             }

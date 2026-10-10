@@ -229,7 +229,7 @@ impl StorageRevision {
         }
     }
 
-    fn get(&self) -> Option<u64> {
+    pub(crate) fn get(&self) -> Option<u64> {
         self.observed
             .load(Ordering::SeqCst)
             .then(|| self.value.load(Ordering::SeqCst))
