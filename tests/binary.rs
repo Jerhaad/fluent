@@ -21225,6 +21225,77 @@ fn workflow_cleanup_rechecks_current_eligibility() {
 }
 
 #[test]
+fn workflow_cleanup_holds_eligibility_through_removal() {
+    use fluent::work_model::{AttemptStatus, WorkItem};
+    let tmp = TempDir::new().unwrap();
+    let project = setup_git_project(&tmp);
+    let store = WorkModelStore::new(&project);
+    let mut item = WorkItem::planned("cleanup-locked", "Protect cleanup eligibility");
+    item.add_initial_attempt("attempt-1").unwrap();
+    item.attempts[0].status = AttemptStatus::Failed;
+    item.attempts[0].tasks[0].status = TaskStatus::Failed;
+    store.create_work_item(&item).unwrap();
+    let reached = tmp.path().join("cleanup-locked-reached");
+    let release = tmp.path().join("cleanup-locked-release");
+    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("fluent"));
+    command
+        .current_dir(&project)
+        .args(["cleanup", "--apply"])
+        .env("FLUENT_TEST_CLEANUP_LOCKED_ITEM", "cleanup-locked")
+        .env("FLUENT_TEST_CLEANUP_LOCKED_REACHED", &reached)
+        .env("FLUENT_TEST_CLEANUP_LOCKED_RELEASE", &release)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = OwnedFixtureProcess::spawn(&mut command);
+    for _ in 0..500 {
+        if reached.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        reached.exists(),
+        "cleanup did not reach the locked boundary"
+    );
+    let mutation_started = tmp.path().join("cleanup-mutation-started");
+    let mutation_finished = tmp.path().join("cleanup-mutation-finished");
+    let project_for_mutation = project.clone();
+    let mutation_finished_for_thread = mutation_finished.clone();
+    let mutation = std::thread::spawn(move || {
+        fs::write(&mutation_started, b"started").unwrap();
+        let result =
+            WorkModelStore::new(&project_for_mutation).mutate_work_item("cleanup-locked", |item| {
+                item.attempts[0].status = AttemptStatus::NeedsUser;
+                item.attempts[0].tasks[0].status = TaskStatus::NeedsUser;
+                Ok(())
+            });
+        fs::write(&mutation_finished_for_thread, b"finished").unwrap();
+        result
+    });
+    for _ in 0..500 {
+        if tmp.path().join("cleanup-mutation-started").exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(tmp.path().join("cleanup-mutation-started").exists());
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(
+        !mutation_finished.exists(),
+        "mutation bypassed cleanup's model lock"
+    );
+    fs::write(&release, b"continue").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(mutation.join().unwrap().is_err());
+    assert!(store.read_work_item("cleanup-locked").is_err());
+}
+
+#[test]
 fn cleanup_waits_for_recovery_then_rereads_the_completed_origin() {
     let tmp = TempDir::new().unwrap();
     let main_dir = setup_git_project(&tmp);

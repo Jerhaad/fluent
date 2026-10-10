@@ -4,6 +4,19 @@ Architectural and design decisions that are intentional and should not be flagge
 
 ---
 
+## Keep joint child settlement as a separate workflow model
+
+`tests/formal/workflow/JointSettlement.tla` models the crash boundary where
+service worker accounting reaches zero while an owned child receipt remains
+unsettled. Publication still requires child settlement, including after a
+second crash. This separate mapping is the accepted scope for the current
+workflow check. Integrated assurance must connect live `ServiceLifecycle`
+state and production child records in one trace; the separate model does not
+establish that production connection. See
+`tests/formal/workflow/connections.md` for the remaining scenario and control.
+
+---
+
 ## Keep compact execution contexts linked to complete verification
 
 New contexts with verification use schema 3. They keep unresolved reference and

@@ -70,15 +70,16 @@ pub fn cleanup_work_items(
     options: &CleanupOptions,
 ) -> Result<Vec<WorkCleanupResult>> {
     let source_root = cleanup_source_root(search_root)?;
-    let _land_lock = crate::land_lock::acquire(&crate::land_lock::lock_path(&source_root))?;
     let store = WorkModelStore::new(&source_root);
-    let work_items = store.list_work_items()?;
+    let work_items = {
+        let _land_lock = crate::land_lock::acquire(&crate::land_lock::lock_path(&source_root))?;
+        store.list_work_items()?
+    };
     let stored_work_item_ids = work_items
         .iter()
         .map(|work_item| work_item.id.clone())
         .collect::<HashSet<_>>();
     let candidates = cleanup_work_item_candidates(&source_root, work_items);
-    let registered = registered_worktrees(&source_root)?;
     #[cfg(feature = "test-support")]
     if let (Ok(reached), Ok(release)) = (
         std::env::var("FLUENT_TEST_CLEANUP_SELECTED"),
@@ -97,7 +98,11 @@ pub fn cleanup_work_items(
     let mut results = Vec::new();
 
     for work_item in candidates {
-        let work_item = match store.read_work_item(&work_item.id) {
+        // Landing takes the land lock before mutating the Work Item. Keep that
+        // order and hold both locks through every destructive action.
+        let _land_lock = crate::land_lock::acquire(&crate::land_lock::lock_path(&source_root))?;
+        let _model_lock = store.lock_work_item_model(&work_item.id)?;
+        let work_item = match store.read_work_item_under_model_lock(&work_item.id) {
             Ok(work_item)
                 if work_item_is_cleanable(&work_item)
                     && !retains_for_follow_up_recovery(&source_root, &work_item) =>
@@ -106,6 +111,29 @@ pub fn cleanup_work_items(
             }
             _ => continue,
         };
+        let registered = registered_worktrees(&source_root)?;
+        #[cfg(feature = "test-support")]
+        if options.apply
+            && std::env::var("FLUENT_TEST_CLEANUP_LOCKED_ITEM")
+                .ok()
+                .as_deref()
+                == Some(work_item.id.as_str())
+        {
+            if let (Ok(reached), Ok(release)) = (
+                std::env::var("FLUENT_TEST_CLEANUP_LOCKED_REACHED"),
+                std::env::var("FLUENT_TEST_CLEANUP_LOCKED_RELEASE"),
+            ) {
+                fs::write(&reached, b"locked")?;
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while !Path::new(&release).exists() {
+                    anyhow::ensure!(
+                        std::time::Instant::now() < deadline,
+                        "cleanup locked barrier timed out"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
         let plan = work_cleanup_plan(&source_root, &store, &work_item, &registered, options.apply)?;
         if options.apply {
             apply_work_item_cleanup(&plan)?;
@@ -113,6 +141,7 @@ pub fn cleanup_work_items(
         results.push(WorkCleanupResult::WorkItem(plan));
     }
 
+    let _land_lock = crate::land_lock::acquire(&crate::land_lock::lock_path(&source_root))?;
     for plan in
         orphan_work_artifact_cleanup_plans(&source_root, &stored_work_item_ids, options.apply)?
     {
