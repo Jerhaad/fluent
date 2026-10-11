@@ -13,7 +13,7 @@ ARTIFACTS = ("first-queued.json", "second-queued.json", "first-running.json",
              "second-running.json", "first-work.json", "second-work.json")
 
 
-def project(trace, root):
+def project(trace, root, recoveries=0):
     exact_keys(trace, ("schema-version", "scenario", "fluent-commit",
                        "fluent-binary-sha256", "model-profile", "collection-complete",
                        "events", "artifacts"), "trace")
@@ -81,7 +81,7 @@ def project(trace, root):
             second_work["id"] and first_work["id"] != second_work["id"],
             "Work or dispatch identity changed")
     require(type(first["generation"]) is int and
-            first["generation"] == queued["first"]["generation"] + 2 and
+            first["generation"] == queued["first"]["generation"] + 2 + 3 * recoveries and
             events[1]["generation"] == first["generation"] and
             second["generation"] == queued["second"]["generation"],
             "claim and running generations do not match")

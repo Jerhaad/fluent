@@ -303,9 +303,20 @@ fn configure_launch_identity(
     let publish = generation.is_some();
     #[cfg(feature = "test-support")]
     let child_barrier = std::env::var_os("FLUENT_TEST_LAUNCH_CHILD_BARRIER")
+        .filter(|_| {
+            std::env::var_os("FLUENT_TEST_LAUNCH_BARRIER_PROGRAM").is_none_or(|program| {
+                Path::new(command.get_program()).file_name() == Some(program.as_os_str())
+            })
+        })
         .map(|path| std::ffi::CString::new(Path::new(&path).as_os_str().as_bytes()))
         .transpose()
         .context("test launch barrier contains a NUL byte")?;
+    #[cfg(feature = "test-support")]
+    let receipt_ready = child_barrier.as_ref().map(|barrier| {
+        let mut bytes = barrier.as_bytes().to_vec();
+        bytes.extend_from_slice(b".ready");
+        std::ffi::CString::new(bytes).expect("barrier was checked for NUL bytes")
+    });
     #[cfg(feature = "test-support")]
     let start_marker = std::env::var_os("FLUENT_TEST_LAUNCH_START_MARKER")
         .map(|path| std::ffi::CString::new(Path::new(&path).as_os_str().as_bytes()))
@@ -359,7 +370,14 @@ fn configure_launch_identity(
                 }
             }
             #[cfg(feature = "test-support")]
-            if let Some(barrier) = &child_barrier {
+            if let (Some(barrier), Some(ready)) = (&child_barrier, &receipt_ready) {
+                let fd = libc::open(ready.as_ptr(), libc::O_CREAT | libc::O_WRONLY, 0o600);
+                if fd < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::close(fd) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
                 while libc::access(barrier.as_ptr(), libc::F_OK) != 0 {
                     libc::usleep(10_000);
                 }

@@ -29835,6 +29835,166 @@ fn launch_handoff_route_task_recovers_after_parent_publication_loss() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn workflow_integrated_child_receipt_survives_parent_crash() {
+    let tmp = TempDir::new().unwrap();
+    let main_dir = setup_git_project(&tmp);
+    let bin_dir = tmp.path().join("bin-launch-task");
+    let payload = tmp.path().join("payload-started");
+    write_mock_claude(
+        &bin_dir,
+        &format!(
+            "#!/bin/bash\nprintf '%s' \"$$\" > '{}'\nsleep 30\n",
+            payload.display()
+        ),
+    );
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args([
+            "work-item",
+            "create",
+            "work-1",
+            "--title",
+            "Recover task launch",
+        ])
+        .assert()
+        .success();
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["attempt", "create", "work-1", "attempt-1"])
+        .assert()
+        .success();
+    let item = WorkModelStore::new(&main_dir)
+        .read_work_item("work-1")
+        .unwrap();
+    let area = main_dir.join(
+        &item.attempts[0].tasks[0]
+            .artifact_area
+            .as_ref()
+            .unwrap()
+            .path,
+    );
+    let barrier = tmp.path().join("allow-child-exec");
+    let mut owner = fluent_cmd()
+        .current_dir(&main_dir)
+        .args([
+            "task",
+            "run",
+            "work-1",
+            "attempt-1",
+            "attempt-1-write-1",
+            "--no-sandbox",
+        ])
+        .env("PATH", mock_path(&bin_dir))
+        .env("FLUENT_TEST_LAUNCH_CHILD_BARRIER", &barrier)
+        .env("FLUENT_TEST_LAUNCH_BARRIER_PROGRAM", "claude")
+        .spawn()
+        .unwrap();
+    let receipt = area.join("execution-receipt");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let ready = barrier.with_file_name("allow-child-exec.ready");
+    while !ready.is_file() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        ready.is_file(),
+        "task route did not publish a child receipt"
+    );
+    let before_receipt = fs::read_to_string(&receipt).unwrap();
+    let before_record = read_json_path(&area.join("execution.json"));
+    let owner_pid = owner.id();
+    let child_pid = before_receipt
+        .split_whitespace()
+        .last()
+        .unwrap()
+        .parse::<i32>()
+        .unwrap();
+    let _execution_cleanup = CancellationFixtureExecution {
+        record_path: area.join("execution.json"),
+        group: child_pid,
+    };
+    owner.kill().unwrap();
+    owner.wait().unwrap();
+    assert_launch_receipt(&area);
+    let record = area.join("execution.json");
+    assert!(
+        fluent::execution::execution_is_live(&record).unwrap(),
+        "Task child lost ownership after parent crash: {}",
+        fs::read_to_string(&record).unwrap()
+    );
+    let retained_record = read_json_path(&record);
+    let retained_receipt = fs::read_to_string(&receipt).unwrap();
+    fs::write(&barrier, b"go").unwrap();
+    assert!(poll_until(std::time::Duration::from_secs(5), || payload.exists()));
+    let payload_pid: i32 = fs::read_to_string(&payload)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(payload_pid, child_pid);
+    let launched_work = work_item_value(&main_dir, "work-1");
+    let launched_record = read_json_path(&record);
+    let live_before_cancel = fluent::execution::execution_is_live(&record).unwrap();
+    let canceled = fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["attempt", "cancel", "work-1", "attempt-1"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let settled_work = work_item_value(&main_dir, "work-1");
+    let settled_record = read_json_path(&record);
+    assert!(!fluent::execution::execution_is_live(&record).unwrap());
+    assert!(!cancellation_fixture_owns_execution(&record));
+    let process_gone = poll_until(std::time::Duration::from_secs(3), || {
+        (unsafe { libc::kill(child_pid, 0) }) == -1
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    });
+    assert!(process_gone, "canceled provider remains alive");
+    let directory = std::env::var_os("FLUENT_INTEGRATED_CHILD_TRACE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| tmp.path().join("child-trace"));
+    fs::create_dir_all(&directory).unwrap();
+    let facts = [
+        serde_json::json!({"record":before_record,"receipt":before_receipt,"owner-pid":owner_pid}),
+        serde_json::json!({"record":retained_record,"receipt":retained_receipt,"parent-reaped":true}),
+        serde_json::json!({"record":launched_record,"work":launched_work,"payload-pid":payload_pid,"lease-live":live_before_cancel}),
+        serde_json::json!({"record":settled_record,"work":settled_work,"lease-live":false,"process-gone":process_gone,"exit":canceled.status.code()}),
+    ];
+    let mut artifacts = Vec::new();
+    let mut events = Vec::new();
+    for (index, fact) in facts.iter().enumerate() {
+        let name = format!("child-{index}.json");
+        let raw = serde_json::to_vec_pretty(fact).unwrap();
+        fs::write(directory.join(&name), &raw).unwrap();
+        artifacts
+            .push(serde_json::json!({"path":name,"sha256":format!("{:x}",Sha256::digest(raw))}));
+        events.push(
+            serde_json::json!({"sequence":index+1,"actor":"operator","generation":null,
+            "operation-id":(["task-run","kill-parent","release-exec","attempt-cancel"][index]),
+            "boundary":(["receipt","parent-crash","execution","settled"][index]),
+            "causal-predecessors":if index == 0 {vec![]} else {vec![index]},"raw-facts":fact}),
+        );
+    }
+    let trace = serde_json::json!({"schema-version":1,"scenario":"child-launch-stop","model-profile":"child-connection",
+        "fluent-commit":git_head(Path::new(env!("CARGO_MANIFEST_DIR"))),
+        "fluent-binary-sha256":format!("{:x}",Sha256::digest(fs::read(env!("CARGO_BIN_EXE_fluent")).unwrap())),
+        "collection-complete":true,"events":events,"artifacts":artifacts});
+    let path = directory.join("production-trace.json");
+    fs::write(&path, serde_json::to_vec_pretty(&trace).unwrap()).unwrap();
+    let projected = Command::new("python3")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/formal/workflow/project_child.py"))
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(
+        projected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&projected.stderr)
+    );
+}
+
 #[test]
 fn work_task_run_write_auth_rejection_pauses_attempt_after_one_retry() {
     let tmp = TempDir::new().unwrap();
@@ -68925,7 +69085,7 @@ fn workflow_recovery_requires_current_resume_authority() {
             .resumed_at
             .is_none()
     );
-    fluent_cmd()
+    let stale_run = fluent_cmd()
         .current_dir(&fixture.main_dir)
         .args([
             "attempt",
@@ -68938,8 +69098,11 @@ fn workflow_recovery_requires_current_resume_authority() {
         ])
         .env("PATH", mock_path(&bin))
         .assert()
-        .failure();
-    assert_eq!(fixture.store.read_work_item("work-1").unwrap(), second);
+        .failure()
+        .get_output()
+        .clone();
+    let after_stale = fixture.store.read_work_item("work-1").unwrap();
+    assert_eq!(after_stale, second);
     fluent_cmd()
         .current_dir(&fixture.main_dir)
         .args(["queue", "resume", "work-1", "--attempt", "attempt-1"])
@@ -68971,6 +69134,53 @@ fn workflow_recovery_requires_current_resume_authority() {
             .resumed_at
             .is_some()
     );
+    {
+        let directory = std::env::var_os("FLUENT_INTEGRATED_GENERATION_TRACE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| fixture._tmp.path().join("generation-trace"));
+        fs::create_dir_all(&directory).unwrap();
+        let facts = [
+            serde_json::json!({"work":first,"dispatch":first_dispatch}),
+            serde_json::json!({"work":resumed}),
+            serde_json::json!({"work":second}),
+            serde_json::json!({"work":after_stale,"exit":stale_run.status.code(),
+                "stderr":String::from_utf8_lossy(&stale_run.stderr)}),
+            serde_json::json!({"work":continued,"dispatch":latest}),
+        ];
+        let mut artifacts = Vec::new();
+        let mut events = Vec::new();
+        for (index, fact) in facts.iter().enumerate() {
+            let name = format!("generation-{index}.json");
+            let raw = serde_json::to_vec_pretty(fact).unwrap();
+            fs::write(directory.join(&name), &raw).unwrap();
+            artifacts.push(
+                serde_json::json!({"path":name,"sha256":format!("{:x}",Sha256::digest(raw))}),
+            );
+            events.push(serde_json::json!({"sequence":index+1,"actor":"operator",
+                "operation-id":(["queue-resume","scheduler-run","attempt-cancel","stale-attempt-run","queue-resume-and-run"][index]),
+                "generation":null,"boundary":(["first-authority","first-resumed","later-stop","stale-refused","current-resumed"][index]),
+                "causal-predecessors":if index == 0 {vec![]} else {vec![index]},"raw-facts":fact}));
+        }
+        let path = directory.join("production-trace.json");
+        fs::write(&path, serde_json::to_vec_pretty(&serde_json::json!({
+            "schema-version":1,"scenario":"generation-authority","model-profile":"generation-connection",
+            "fluent-commit":git_head(Path::new(env!("CARGO_MANIFEST_DIR"))),
+            "fluent-binary-sha256":format!("{:x}",Sha256::digest(fs::read(env!("CARGO_BIN_EXE_fluent")).unwrap())),
+            "collection-complete":true,"events":events,"artifacts":artifacts})).unwrap()).unwrap();
+        let projected = Command::new("python3")
+            .arg(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/formal/workflow/project_generation.py"),
+            )
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(
+            projected.status.success(),
+            "{}",
+            String::from_utf8_lossy(&projected.stderr)
+        );
+    }
 }
 
 #[test]

@@ -596,6 +596,15 @@ fn workflow_integrated_rejects_missing_model_tool() {
 
 #[test]
 fn workflow_integrated_review_only_orders_tester_before_reviews() {
+    review_only_trace(false);
+}
+
+#[test]
+fn workflow_integrated_review_only_resumes_after_interruption() {
+    review_only_trace(true);
+}
+
+fn review_only_trace(restart: bool) {
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("main");
     fs::create_dir(&project).unwrap();
@@ -683,6 +692,10 @@ for arg in "$@"; do
   case "$arg" in *'"candidate-commit"'*) prompt="$arg" ;; esac
 done
 if [ -z "$prompt" ]; then exit 0; fi
+if [ -n "$FLUENT_REVIEW_ONLY_WAIT" ]; then
+  touch "$FLUENT_REVIEW_ONLY_WAIT.started"
+  while [ -f "$FLUENT_REVIEW_ONLY_WAIT" ]; do sleep 0.1; done
+fi
 candidate="$(printf '%s\n' "$prompt" | sed -n 's/^- Workspace: //p' | head -1)"
 if [ -z "$candidate" ]; then
   candidate="$(printf '%s\n' "$prompt" | sed -n 's/^Review the codebase at \(.*\)\.$/\1/p' | head -1)"
@@ -702,7 +715,9 @@ jq -cn '{type:"user",message:{content:[{type:"tool_result",tool_use_id:"review-r
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&mock, fs::Permissions::from_mode(0o755)).unwrap();
     }
-    let completed = Command::new(env!("CARGO_BIN_EXE_fluent"))
+    let wait = tmp.path().join("wait-review");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_fluent"));
+    command
         .current_dir(project)
         .env("FLUENT_NO_UPDATE_CHECK", "1")
         .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "pass")
@@ -715,9 +730,41 @@ jq -cn '{type:"user",message:{content:[{type:"tool_result",tool_use_id:"review-r
                 std::env::var("PATH").unwrap_or_default()
             ),
         )
-        .args(["attempt", "run", "review", "attempt-review", "--no-sandbox"])
-        .output()
-        .unwrap();
+        .args(["attempt", "run", "review", "attempt-review", "--no-sandbox"]);
+    let mut interrupted = None;
+    if restart {
+        fs::write(&wait, b"wait").unwrap();
+        let mut child = command
+            .env("FLUENT_REVIEW_ONLY_WAIT", &wait)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let started = tmp.path().join("wait-review.started");
+        while !started.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let reached = started.exists();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let crashed = fluent(project, &["work-item", "show", "review"]);
+        let cancel = fluent(project, &["attempt", "cancel", "review", "attempt-review"]);
+        assert!(
+            cancel.status.success(),
+            "{}",
+            String::from_utf8_lossy(&cancel.stderr)
+        );
+        let paused = fluent(project, &["work-item", "show", "review"]);
+        assert!(reached && crashed.status.success() && paused.status.success());
+        interrupted = Some((crashed.stdout, paused.stdout));
+        fs::remove_file(&wait).unwrap();
+        command
+            .env_remove("FLUENT_REVIEW_ONLY_WAIT")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+    }
+    let completed = command.output().unwrap();
     assert!(
         completed.status.success(),
         "{}",
@@ -731,7 +778,13 @@ jq -cn '{type:"user",message:{content:[{type:"tool_result",tool_use_id:"review-r
     assert!(final_head.status.success());
 
     let source = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target = source.join("target/formal/workflow/integrated/production/review-only");
+    let target = source
+        .join("target/formal/workflow/integrated/production")
+        .join(if restart {
+            "review-restart"
+        } else {
+            "review-only"
+        });
     fs::create_dir_all(&target).unwrap();
     let observed = [
         ("planned.json", &before.stdout),
@@ -772,6 +825,73 @@ jq -cn '{type:"user",message:{content:[{type:"tool_result",tool_use_id:"review-r
         "{}",
         String::from_utf8_lossy(&projected.stderr)
     );
+    if let Some((crashed, paused)) = interrupted {
+        let crashed: Value = serde_json::from_slice(&crashed).unwrap();
+        let paused: Value = serde_json::from_slice(&paused).unwrap();
+        let finished: Value = serde_json::from_slice(&after.stdout).unwrap();
+        assert_eq!(
+            crashed["attempts"][0]["tasks"][0], finished["attempts"][0]["tasks"][0],
+            "review-only restart replaced completed Tester history"
+        );
+        assert!(paused["attempts"][0]["cancellation"]["requested_at"].is_string());
+        assert!(finished["attempts"][0]["cancellation"]["resumed_at"].is_string());
+        fs::write(
+            target.join("crashed.json"),
+            serde_json::to_vec_pretty(&crashed).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            target.join("paused.json"),
+            serde_json::to_vec_pretty(&paused).unwrap(),
+        )
+        .unwrap();
+        let facts = [
+            json!({"work":crashed}),
+            json!({"work":paused}),
+            json!({"continued":trace}),
+        ];
+        let mut artifacts = Vec::new();
+        let mut events = Vec::new();
+        for (index, fact) in facts.iter().enumerate() {
+            let name = format!("review-restart-{index}.json");
+            let bytes = serde_json::to_vec_pretty(fact).unwrap();
+            fs::write(target.join(&name), &bytes).unwrap();
+            artifacts.push(json!({"path":name,"sha256":digest(&bytes)}));
+            events.push(event(
+                index as u64 + 1,
+                ["crashed", "canceled", "continued"][index],
+                ["kill-parent", "attempt-cancel", "attempt-run"][index],
+                &if index == 0 {
+                    vec![]
+                } else {
+                    vec![index as u64]
+                },
+                fact.clone(),
+            ));
+        }
+        let restart_trace = json!({"schema-version":1,"scenario":"review-restart",
+            "fluent-commit":trace["fluent-commit"],"fluent-binary-sha256":trace["fluent-binary-sha256"],
+            "model-profile":"review-restart","collection-complete":true,"events":events,"artifacts":artifacts});
+        let restart_path = target.join("restart-trace.json");
+        fs::write(
+            &restart_path,
+            serde_json::to_vec_pretty(&restart_trace).unwrap(),
+        )
+        .unwrap();
+        let projected = run(
+            source,
+            "python3",
+            &[
+                "tests/formal/workflow/project_review_restart.py",
+                restart_path.to_str().unwrap(),
+            ],
+        );
+        assert!(
+            projected.status.success(),
+            "{}",
+            String::from_utf8_lossy(&projected.stderr)
+        );
+    }
     let negative = tmp.path().join("review-order-negative");
     fs::create_dir(&negative).unwrap();
     for (name, _) in observed {
@@ -1086,6 +1206,15 @@ fn workflow_integrated_queue_survives_other_attempt_cancellation() {
 
 #[test]
 fn workflow_integrated_queue_claim_holds_bound_attempt_lease() {
+    queue_dispatch_trace(false);
+}
+
+#[test]
+fn workflow_integrated_queue_recovery_fences_old_generation() {
+    queue_dispatch_trace(true);
+}
+
+fn queue_dispatch_trace(recover: bool) {
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("project");
     fs::create_dir(&project).unwrap();
@@ -1168,6 +1297,49 @@ exit 0
     assert!(queued_first.status.success() && queued_second.status.success());
     let started = project.join("writer-started");
     let release = project.join("writer-release");
+    let mut recovery_snapshots = Vec::new();
+    if recover {
+        for round in 0..2 {
+            let barrier = tmp.path().join(format!("dispatch-barrier-{round}"));
+            let mut child = Command::new(env!("CARGO_BIN_EXE_fluent"))
+                .current_dir(&project)
+                .env("FLUENT_NO_UPDATE_CHECK", "1")
+                .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "pass")
+                .env("FLUENT_TEST_DISPATCH_RUNNING_BARRIER", &barrier)
+                .args(["scheduler", "run", "--poll-seconds", "1"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !barrier.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            // Kill and reap even when the barrier is missing; failure must not
+            // leave a coordinator running in the fixture.
+            let reached = barrier.exists();
+            let snapshot = fluent(&project, &["queue", "show", &first]);
+            let work = fluent(&project, &["work-item", "show", &first]);
+            let held =
+                fluent::lease::is_leased(&fluent::queue::dispatch_lease_path(&project, &first));
+            child.kill().unwrap();
+            child.wait().unwrap();
+            assert!(
+                reached,
+                "scheduler did not reach the running dispatch barrier"
+            );
+            assert!(snapshot.status.success() && work.status.success() && held);
+            assert!(!fluent::lease::is_leased(
+                &fluent::queue::dispatch_lease_path(&project, &first)
+            ));
+            assert!(!fluent::scheduler::coordinator_is_live(&project));
+            recovery_snapshots.push(json!({
+                "dispatch":serde_json::from_slice::<Value>(&snapshot.stdout).unwrap(),
+                "work":serde_json::from_slice::<Value>(&work.stdout).unwrap(),
+                "lease-before-crash":held,"lease-after-crash":false
+            }));
+        }
+    }
     let mut scheduler = Command::new(env!("CARGO_BIN_EXE_fluent"))
         .current_dir(&project)
         .env("FLUENT_NO_UPDATE_CHECK", "1")
@@ -1185,7 +1357,9 @@ exit 0
         )
         .args(["scheduler", "run", "--poll-seconds", "1"])
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(
+            fs::File::create(tmp.path().join("scheduler.log")).unwrap(),
+        ))
         .spawn()
         .unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -1208,6 +1382,34 @@ exit 0
         &project.join(format!(".fluent/work/scheduler/leases/{first}.lock")),
     );
     let coordinator_live = fluent::scheduler::coordinator_is_live(&project);
+    let mut stale_results = Vec::new();
+    if recover {
+        for snapshot in &recovery_snapshots {
+            let dispatch: fluent::queue::Dispatch =
+                serde_json::from_value(snapshot["dispatch"].clone()).unwrap();
+            let token = fluent::queue::DispatchToken {
+                work_item_id: dispatch.work_item_id,
+                dispatch_id: dispatch.dispatch_id,
+                generation: dispatch.generation,
+                priority: dispatch.priority,
+                bound_attempt_id: dispatch.bound_attempt_id.unwrap(),
+                tester_no_sandbox: dispatch.tester_no_sandbox,
+            };
+            let before = fluent(&project, &["queue", "show", &first]);
+            let rejected =
+                fluent::queue::reconcile(&project, &token, fluent::queue::DispatchStatus::Failed)
+                    .unwrap_err();
+            let after = fluent(&project, &["queue", "show", &first]);
+            assert_eq!(
+                before.stdout, after.stdout,
+                "stale settlement changed the queue"
+            );
+            stale_results.push(json!({"generation": token.generation,
+                "error":format!("{rejected:#}"),
+                "before":serde_json::from_slice::<Value>(&before.stdout).unwrap(),
+                "after":serde_json::from_slice::<Value>(&after.stdout).unwrap()}));
+        }
+    }
     fs::write(&release, b"release").unwrap();
     let stopped = fluent(&project, &["scheduler", "stop"]);
     let _ = scheduler.wait();
@@ -1216,7 +1418,12 @@ exit 0
         "{}",
         String::from_utf8_lossy(&stopped.stderr)
     );
-    let running_first = running_first.expect("public scheduler did not run queued Work");
+    let running_first = running_first.unwrap_or_else(|| {
+        panic!(
+            "public scheduler did not run queued Work: {}",
+            fs::read_to_string(tmp.path().join("scheduler.log")).unwrap()
+        )
+    });
     assert!(
         running_second.status.success()
             && running_work.status.success()
@@ -1229,7 +1436,12 @@ exit 0
     );
 
     let target = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("target/formal/workflow/integrated/production/queue-dispatch");
+        .join("target/formal/workflow/integrated/production")
+        .join(if recover {
+            "queue-recovery"
+        } else {
+            "queue-dispatch"
+        });
     fs::create_dir_all(&target).unwrap();
     let observed = [
         ("first-queued.json", &queued_first.stdout),
@@ -1277,9 +1489,62 @@ exit 0
             trace_path.to_str().unwrap(),
         ],
     );
-    assert!(
-        projection.status.success(),
-        "{}",
-        String::from_utf8_lossy(&projection.stderr)
-    );
+    if !recover {
+        assert!(
+            projection.status.success(),
+            "{}",
+            String::from_utf8_lossy(&projection.stderr)
+        );
+    }
+    if recover {
+        let mut facts = recovery_snapshots;
+        facts.push(json!({"continued":trace,"stale-settlements":stale_results}));
+        let mut artifacts = Vec::new();
+        let mut events = Vec::new();
+        for (index, fact) in facts.iter().enumerate() {
+            let name = format!("recovery-{index}.json");
+            let bytes = serde_json::to_vec_pretty(fact).unwrap();
+            fs::write(target.join(&name), &bytes).unwrap();
+            artifacts.push(json!({"path":name,"sha256":digest(&bytes)}));
+            events.push(event(
+                index as u64 + 1,
+                if index < 2 {
+                    "process-crash"
+                } else {
+                    "continued-and-fenced"
+                },
+                if index < 2 {
+                    "kill-scheduler"
+                } else {
+                    "scheduler-run"
+                },
+                &if index == 0 {
+                    vec![]
+                } else {
+                    vec![index as u64]
+                },
+                fact.clone(),
+            ));
+        }
+        let recovery = json!({"schema-version":1,"scenario":"queue-recovery",
+            "fluent-commit":trace["fluent-commit"],
+            "fluent-binary-sha256":trace["fluent-binary-sha256"],
+            "model-profile":"queue-recovery","collection-complete":true,
+            "events":events,"artifacts":artifacts});
+        let path = target.join("recovery-trace.json");
+        fs::write(&path, serde_json::to_vec_pretty(&recovery).unwrap()).unwrap();
+        let projected = run(
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+            "python3",
+            &[
+                "tests/formal/workflow/project_queue_recovery.py",
+                path.to_str().unwrap(),
+            ],
+        );
+        assert!(
+            projected.status.success(),
+            "{}",
+            String::from_utf8_lossy(&projected.stderr)
+        );
+    }
 }

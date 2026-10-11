@@ -27,3 +27,10 @@ path for the child PID. The stop commits without waiting for a payload action.
 The test then verifies the payload ran and cancellation settled. Inspecting the
 executable at lock acquisition detects a stop that overtakes exec even if a
 later payload action succeeds.
+
+For a public Task route, setup commands share the Task execution record. Set
+`FLUENT_TEST_LAUNCH_BARRIER_PROGRAM` to the provider executable basename when
+the observation must interrupt that provider rather than an earlier setup
+child. Wait for `<barrier>.ready` before reading the complete receipt. Match a
+PID written by the payload with the receipt PID, then verify cancellation and
+lock release before dropping any failure-cleanup guard.

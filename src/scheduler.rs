@@ -789,6 +789,21 @@ pub fn run_claimed_dispatch(
     let token = queue::mark_running(project_root, &token)?;
     eprintln!("[scheduler] starting {work_item_id}");
 
+    // Pause at an observable running boundary before any child can inherit
+    // the lease. Tests kill this process to exercise actual OS lease release.
+    #[cfg(feature = "test-support")]
+    if let Some(barrier) = std::env::var_os("FLUENT_TEST_DISPATCH_RUNNING_BARRIER") {
+        let barrier = std::path::PathBuf::from(barrier);
+        std::fs::write(&barrier, token.generation.to_string())?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !barrier.with_extension("release").exists() {
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!("test dispatch barrier timed out");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     let outcome = runner.run(
         project_root,
         &work_item_id,

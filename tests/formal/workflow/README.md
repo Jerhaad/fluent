@@ -40,6 +40,41 @@ production=SUITE/CASE; control=SUITE/CASE` evidence described in
 `connections.md` before the report may credit it. Existing descriptive
 evidence is retained as an explicit gap until those checks pass.
 
+The queue recovery connection checks two Work Items, one elected coordinator,
+up to two process crashes, and queue revisions through ten. Its positive
+connection and assumption searches each reach 2,933 distinct states. Enabled
+claim, lease, binding, dispatch, delivery, completion, settlement, restart and
+recovery steps receive weak fairness; finite crash bounds let recovered Work
+reach Writer completion. `Workflow.Recover` restores queued eligibility when
+recovering interrupted queued execution. Production observations kill and reap
+the scheduler twice at the running boundary before child launch, observe lease
+release, restart through `scheduler run`, and retain the same bound Attempt.
+Stale settlement calls must fail without changing the current dispatch.
+Duplicate-Attempt and live-lease recovery controls fail named invariants;
+rehashed identity, generation, lease and stale-write observations fail projection.
+
+`GenerationConnection.tla` instantiates both `Workflow` and `GenerationFence`
+and checks 15 distinct states through old-authority reads, replacement, and
+current or refused resume. Queue revisions and cancellation epochs have
+separate persisted representations: a queue token includes dispatch identity
+and revision; resume authority includes the cancellation timestamp. The public
+fixture proves a later stop survives a stale dispatch and that a newly authorized
+dispatch continues the same Attempt. This connection checks safety, without a
+progress claim for authorization that an operator has not supplied.
+
+`ChildConnection.tla` instantiates `Workflow` and `ChildLaunchIdentity`, with
+one Work/Task, two launch generations, and two bounded failures. Its positive
+search reaches 281 distinct states. It explores receipt publication, parent
+loss, execution, cancellation, wrong receipt owner, settlement and replacement.
+The public fixture interrupts the provider launch after receipt publication,
+reaps the parent, checks the provider PID against the receipt, then invokes
+`attempt cancel` and checks both process exit and inherited-lock release.
+Missing receipts and wrong generation/owner signaling have separate named model
+controls. The finite safety check does not assume arbitrary providers terminate;
+production cancellation and observed settlement establish this fixture's outcome.
+These test-support barriers are excluded from ordinary release binaries; they
+pause execution and do not alter production admission or acceptance policy.
+
 The canonical no-change sequence runs the production Attempt, evidence
 attachment, and queue dispatch owners after a failing Tester check. It records
 the retained Work and Merge Candidate at four ordered boundaries, and
@@ -237,8 +272,14 @@ review started, each review depends on the same Tester Task, no Writer Task or
 Merge Candidate appeared, and the source commit stayed fixed. A control changes
 one review start time and rehashes the completed snapshot; projection must reject
 it. This observed route supplements the bounded `review-only.cfg` search.
-Restart and a checked detailed-model connection remain open in the connection
-inventory.
+`ReviewConnection.tla` couples the workflow to `ReviewTasks.tla`, checking
+one Tester, five review roles, and two interruptions across 2,005 distinct
+states. The public restart fixture kills the Attempt owner during review,
+settles cancellation, then resumes through `attempt run`. Its digest-bound
+projector retains the exact completed Tester record and Task identities.
+Early review and repeated Tester execution have named model controls;
+rehashed history and authority controls must fail projection. This is a bounded
+safety connection, with no liveness claim for a provider that never responds.
 
 `Workflow.tla` stores Work, Attempt, Task, Workspace, Merge Candidate, dispatch, service, worker-generation, and recovery-operation identities as typed tuples. Its state distinguishes required and delivered input bindings, raw review evidence and credited evidence bound to generation, candidate, requirement, context, and review scope, cancellation and resume authority, pending and published result records, Git effect and result publication, stored stage and displayed observation, and cleanup eligibility. Actions cover authorized intake, foreground selection or queue admission and shared service dispatch, Writer, ordinary and targeted review, same-candidate review carry-forward with its own recorded review kind, a changed candidate with new requirement and context, Tester acceptance of the current candidate, capture and no-expertise Learning with distinct expertise effects, final landing verification, landing, follow-up, review-only Work, observation, cleanup, crash/recovery, write failure/retry, and version transition. Stale generation, candidate, requirement, context, scope, and unrelated evidence remain uncredited; replacement generations return credited Work to review. After a generation replacement, a separate authority grant enables a fenced resume. Paused unfinished Work permits a version transition. The review-only route tests before reviewing, can fail, cancel, resume, observe, and transition version, and completes without Writer, Learner, Merge Candidate, or Git effects.
 

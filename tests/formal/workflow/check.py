@@ -42,6 +42,15 @@ CONTROLS = {
     "target-misbound": "Invariant LandingAcceptanceSafe is violated",
 }
 PROFILE_ACTIONS = {
+    "review-connection.cfg": ("Test", "StartReview", "FinishReview", "Credit", "Ready", "Crash", "Cancel", "Recover", "Resume"),
+    "review-assumptions.cfg": ("Test", "StartReview", "Crash", "Resume"),
+    "child-connection.cfg": ("Reserve", "Receipt", "Execute", "Crash", "Stop",
+                             "Signal", "RecoverChild", "Replace", "Resume"),
+    "child-assumptions.cfg": ("Reserve", "Receipt", "Execute", "Crash", "Stop", "Signal"),
+    "generation-connection.cfg": ("Stop", "Read", "Replace", "Resume"),
+    "generation-assumptions.cfg": ("Stop", "Read", "Replace", "Resume"),
+    "queue-recovery-connection.cfg": ("Crash", "Restart", "Recover", "Dispatch"),
+    "queue-recovery-assumptions.cfg": ("Crash", "Restart", "Recover", "Dispatch"),
     "queue-dispatch-connection.cfg": ("Elect", "Claim", "Acquire", "Bind",
                                       "Dispatch", "Finish", "Settle"),
     "queue-dispatch-assumptions.cfg": ("Elect", "Claim", "Acquire", "Bind",
@@ -243,6 +252,10 @@ def integrated_production_suite(source, root, output, jar, java):
                 rows.append({"case": name,
                              "pass": rejected.returncode != 0 and
                              diagnostic in rejected.stderr, "log": log.name})
+    rows.extend(queue_recovery_suite(source, root, output, jar, java))
+    rows.extend(generation_connection_suite(source, root, output, jar, java))
+    rows.extend(child_connection_suite(source, root, output, jar, java))
+    rows.extend(review_connection_suite(source, root, output, jar, java))
     if produced:
         try:
             trace = json.loads(trace_path.read_text())
@@ -596,6 +609,184 @@ def integrated_suite(source, root, output, jar, java):
                "pass": all(row["pass"] for row in results)}
     (output / "result.json").write_text(json.dumps(summary, indent=2) + "\n")
     return 0 if summary["pass"] else 1
+
+
+def review_connection_suite(source, root, output, jar, java):
+    return observed_connection_suite(
+        source, root, output, jar, java, "review-restart", "ReviewConnection",
+        (("review-connection.cfg", None), ("review-assumptions.cfg", None),
+         ("review-early.cfg", "Invariant TesterFirst is violated"),
+         ("review-retest.cfg", "Invariant TesterRetained is violated")),
+        "workflow_integrated_review_only_resumes_after_interruption", None,
+        (("replaced-tester", 0, lambda f: f["work"]["attempts"][0]["tasks"][0].update(
+            {"completed_at": "2000-01-01T00:00:00Z"}), "restart replaced completed Tester history"),
+         ("stale-resume", 1, lambda f: f["work"]["attempts"][0]["cancellation"].update(
+            {"resumed_at": "unauthorized"}), "restart lacks current resume authority")),
+        binary="workflow_assurance", trace_file="restart-trace.json")
+
+
+def child_connection_suite(source, root, output, jar, java):
+    return observed_connection_suite(
+        source, root, output, jar, java, "child", "ChildConnection",
+        (("child-connection.cfg", None), ("child-assumptions.cfg", None),
+         ("child-no-receipt.cfg", "Invariant NoUnrecordedExecution is violated"),
+         ("child-wrong-generation.cfg", "Invariant NoWrongSignal is violated"),
+         ("child-wrong-owner.cfg", "Invariant NoWrongOwnerSignal is violated")),
+        "workflow_integrated_child_receipt_survives_parent_crash", "FLUENT_INTEGRATED_CHILD_TRACE",
+        (("missing-receipt", 0, lambda f: f.update({"receipt": ""}),
+          "missing or malformed child receipt"),
+         ("wrong-generation", 3, lambda f: f["record"].update({"launch_generation": "0" * 32}),
+          "receipt generation does not bind execution"),
+         ("wrong-owner", 3, lambda f: f["record"]["attempt_owner"].update({"work_item_id": "other"}),
+          "execution owner changed"),
+         ("unsettled", 3, lambda f: f.update({"process-gone": False}),
+          "cancellation did not settle owned execution")))
+
+
+def generation_connection_suite(source, root, output, jar, java):
+    return observed_connection_suite(
+        source, root, output, jar, java, "generation", "GenerationConnection",
+        (("generation-connection.cfg", None), ("generation-assumptions.cfg", None),
+         ("generation-stale.cfg", "Invariant NoStaleResume is violated")),
+        "workflow_recovery_requires_current_resume_authority", "FLUENT_INTEGRATED_GENERATION_TRACE",
+        (("stale-stop", 3, lambda f: f["work"]["attempts"][0]["cancellation"].update(
+            {"resumed_at": "unauthorized"}), "stale authority cleared the later stop"),
+         ("wrong-authority", 4, lambda f: f["dispatch"].update(
+            {"resume_cancellation_requested_at": "old-stop"}),
+          "resume dispatch lacks current cancellation authority"),
+         ("wrong-refusal", 3, lambda f: f.update({"stderr": "unrelated failure"}),
+          "stale dispatch changed Work or lacked the expected refusal")))
+
+
+def observed_connection_suite(source, root, output, jar, java, name, module,
+                              configs, test, variable, controls,
+                              binary="binary", trace_file="production-trace.json"):
+    """Run a public fixture, bind its observations, and rehash defect controls."""
+    rows = [run_case(source, output, jar, java, config, expected, module)
+            for config, expected in configs]
+    directory = output / "production" / name
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / trace_file
+    path.unlink(missing_ok=True)
+    command = ["cargo", "nextest", "run", "--offline", "--features", "test-support",
+               "--test", binary, "--no-tests", "fail", "-E", f"test(={test})"]
+    environment = dict(os.environ)
+    if variable is not None:
+        environment[variable] = str(directory)
+    fixture = subprocess.run(command, cwd=root, env=environment, capture_output=True, text=True)
+    log = output / f"{name}-fixture.log"
+    log.write_text("$ " + " ".join(command) + "\n" + fixture.stdout + fixture.stderr)
+    produced = fixture.returncode == 0 and path.is_file()
+    rows.append({"case": f"fresh-{name}", "pass": produced, "log": log.name})
+    if not produced:
+        return rows
+    try:
+        trace = json.loads(path.read_text())
+        bound = trace["fluent-commit"] == candidate_commit(root) and \
+            trace["fluent-binary-sha256"] == candidate_binary_digest(root)
+    except (ValueError, KeyError, OSError):
+        bound = False
+    command = ["python3", str(source / ("project_" + name.replace("-", "_") + ".py")), str(path)]
+    projected = subprocess.run(command, cwd=root, capture_output=True, text=True)
+    log = output / f"{name}-projection.log"
+    log.write_text("$ " + " ".join(command) + "\n" + projected.stdout + projected.stderr)
+    rows.append({"case": f"{name}-projection",
+                 "pass": bound and projected.returncode == 0, "log": log.name})
+    if not bound or projected.returncode != 0:
+        return rows
+    for label, index, mutate, diagnostic in controls:
+        changed = json.loads(json.dumps(trace))
+        mutate(changed["events"][index]["raw-facts"])
+        control_dir = directory / label
+        control_dir.mkdir(exist_ok=True)
+        for artifact in (*trace["artifacts"], *trace["events"][-1]["raw-facts"].get("continued", {}).get("artifacts", [])):
+            shutil.copyfile(directory / artifact["path"], control_dir / artifact["path"])
+        artifact = changed["artifacts"][index]
+        raw = json.dumps(changed["events"][index]["raw-facts"]).encode()
+        (control_dir / artifact["path"]).write_bytes(raw)
+        artifact["sha256"] = hashlib.sha256(raw).hexdigest()
+        control = control_dir / "production-trace.json"
+        control.write_text(json.dumps(changed))
+        command = ["python3", str(source / ("project_" + name.replace("-", "_") + ".py")), str(control)]
+        rejected = subprocess.run(command, cwd=root, capture_output=True, text=True)
+        log = output / f"{name}-{label}-negative.log"
+        log.write_text("$ " + " ".join(command) + "\n" + rejected.stdout + rejected.stderr)
+        rows.append({"case": f"{name}-{label}-negative", "pass": rejected.returncode != 0 and
+                     diagnostic in rejected.stderr, "log": log.name})
+    return rows
+
+
+def queue_recovery_suite(source, root, output, jar, java):
+    """Check retained identity and fences across repeated scheduler crashes."""
+    rows = []
+    for config, expected in (
+            ("queue-recovery-connection.cfg", None),
+            ("queue-recovery-assumptions.cfg", None),
+            ("queue-recovery-duplicate.cfg", "Invariant SameAttempt is violated"),
+            ("queue-recovery-live-lease.cfg", "Invariant CurrentLease is violated")):
+        rows.append(run_case(source, output, jar, java, config, expected,
+                             "QueueDispatchConnection"))
+    directory = output / "production/queue-recovery"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "recovery-trace.json"
+    path.unlink(missing_ok=True)
+    command = ["cargo", "nextest", "run", "--offline", "--features", "test-support",
+               "--test", "workflow_assurance", "--no-tests", "fail",
+               "workflow_integrated_queue_recovery_fences_old_generation"]
+    fixture = subprocess.run(command, cwd=root, capture_output=True, text=True)
+    log = output / "queue-recovery-fixture.log"
+    log.write_text("$ " + " ".join(command) + "\n" + fixture.stdout + fixture.stderr)
+    produced = fixture.returncode == 0 and path.is_file()
+    rows.append({"case": "fresh-queue-recovery", "pass": produced, "log": log.name})
+    if not produced:
+        return rows
+    try:
+        trace = json.loads(path.read_text())
+        bound = trace["fluent-commit"] == candidate_commit(root) and \
+            trace["fluent-binary-sha256"] == candidate_binary_digest(root)
+    except (ValueError, KeyError, OSError):
+        bound = False
+    command = ["python3", str(source / "project_queue_recovery.py"), str(path)]
+    projected = subprocess.run(command, cwd=root, capture_output=True, text=True)
+    log = output / "queue-recovery-projection.log"
+    log.write_text("$ " + " ".join(command) + "\n" + projected.stdout + projected.stderr)
+    rows.append({"case": "queue-recovery-projection",
+                 "pass": bound and projected.returncode == 0, "log": log.name})
+    if not bound or projected.returncode != 0:
+        return rows
+    for name, index, mutate, diagnostic in (
+            ("queue-recovery-attempt-negative", 1,
+             lambda f: f["work"]["attempts"][0].update({"id": "duplicate-attempt"}),
+             "recovery changed bound Attempt"),
+            ("queue-recovery-lease-negative", 0,
+             lambda f: f.update({"lease-after-crash": True}),
+             "crash did not release the Attempt lease"),
+            ("queue-recovery-generation-negative", 1,
+             lambda f: f["dispatch"].update({"generation": 2}),
+             "recovery did not fence the previous generation"),
+            ("queue-recovery-stale-negative", 2,
+             lambda f: f["stale-settlements"][0]["after"].update({"status": "failed"}),
+             "stale settlement changed the current dispatch")):
+        changed = json.loads(json.dumps(trace))
+        mutate(changed["events"][index]["raw-facts"])
+        control_dir = directory / name
+        control_dir.mkdir(exist_ok=True)
+        for artifact in (*trace["artifacts"],
+                         *trace["events"][2]["raw-facts"]["continued"]["artifacts"]):
+            shutil.copyfile(directory / artifact["path"], control_dir / artifact["path"])
+        artifact = changed["artifacts"][index]
+        raw = json.dumps(changed["events"][index]["raw-facts"]).encode()
+        (control_dir / artifact["path"]).write_bytes(raw)
+        artifact["sha256"] = hashlib.sha256(raw).hexdigest()
+        control = control_dir / "recovery-trace.json"
+        control.write_text(json.dumps(changed))
+        command = ["python3", str(source / "project_queue_recovery.py"), str(control)]
+        rejected = subprocess.run(command, cwd=root, capture_output=True, text=True)
+        log = output / f"{name}.log"
+        log.write_text("$ " + " ".join(command) + "\n" + rejected.stdout + rejected.stderr)
+        rows.append({"case": name, "pass": rejected.returncode != 0 and
+                     diagnostic in rejected.stderr, "log": log.name})
+    return rows
 
 
 def run_case(source, output_dir, jar, java, config, expected, module="Workflow"):

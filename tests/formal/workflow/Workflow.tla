@@ -396,6 +396,9 @@ Recover(w) == /\ s[w].failed
                                     ![w].phase = IF s[w].phase \in
                                         {"dispatched", "delivered"}
                                         THEN "authorized" ELSE @,
+                                    ![w].queued = IF s[w].routeMode = "queued"
+                                        /\ s[w].phase \in {"dispatched", "delivered"}
+                                        THEN TRUE ELSE @,
                                     ![w].serviceOwner = Unowned]
 ReviewOnlyFailure(w) == /\ w \in ReviewOnly /\ ~s[w].failed
                         /\ FaultBudgetAvailable(w)
