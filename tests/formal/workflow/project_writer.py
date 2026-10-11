@@ -59,6 +59,13 @@ def project(trace, root):
             audit["attempt_id"] == "attempt-1", "writer identity differs")
     writer = next(task for task in completed["attempts"][0]["tasks"]
                   if task["id"] == authority["writer_task_id"])
+    reserved = next(task for task in classified["attempts"][0]["tasks"]
+                    if task["id"] == authority["writer_task_id"])
+    require(writer["work_item_id"] == reserved["work_item_id"] == classified["id"] and
+            writer["attempt_id"] == reserved["attempt_id"] == audit["attempt_id"] and
+            writer["workspace_access"] == reserved["workspace_access"] and
+            writer["kind"] == reserved["kind"] == "write" and writer["role"] == reserved["role"] == "author",
+            "foreground Task identity or workspace differs")
     require(writer["status"] == "complete" and writer["output"] is not None,
             "writer did not launch and complete")
     require(any(ref["path"] == authority["audit_artifact"]["path"] and

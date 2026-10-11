@@ -441,6 +441,13 @@ cases = {'foundation': {'foundation.cfg', 'production-projection',
                         'negative-model-path', 'negative-deliverinputs.cfg'},
          'scheduler-recovery': {'queue-proposed.cfg'}}
 assert not report.connection_credit('Verified: manually reviewed', cases)
+assert report.connection_credit(
+    'Check: model=foundation/foundation.cfg; assumption=foundation/foundation.cfg; '
+    'production=foundation/production-projection; control=foundation/negative-model-path', cases)
+assert not report.connection_credit(
+    'Check: model=foundation/foundation.cfg; assumption=foundation/foundation.cfg; '
+    'production=release-transition/service-projection; control=foundation/negative-model-path', cases)
+
 assert not report.connection_credit(
     'Verified: model=foundation/foundation.cfg; assumption=foundation/foundation.cfg; '
     'production=foundation/production-projection; control=foundation/missing-control', cases)

@@ -1,6 +1,6 @@
 ------------------------ MODULE LandingConnection ------------------------
 EXTENDS Naturals, Sequences
-CONSTANTS BindCurrentIntent, ReconcileFirst, PreserveIndependent
+CONSTANTS BindCurrentIntent, ReconcileFirst, PreserveIndependent, RetainPending, ReportTruthfully
 VARIABLES wf, owner, crashes, failures, intent, target, result, provenance, cleaned,
           stopped, ioFailed, effects, independent, badUnbound, badReplay
 lvars == <<owner, crashes, failures, intent, target, result, provenance, cleaned,
@@ -8,8 +8,8 @@ lvars == <<owner, crashes, failures, intent, target, result, provenance, cleaned
 vars == <<wf, lvars>>
 W == INSTANCE Workflow WITH Works <- {"work"}, ReviewOnly <- {},
      MaxFailures <- 2, DeliverInputs <- TRUE, CheckEvidence <- TRUE,
-     FenceResume <- TRUE, GuardEffect <- ReconcileFirst, TruthfulObservation <- TRUE,
-     GuardCleanup <- TRUE, GuardVersion <- TRUE, GuardBaseline <- TRUE,
+     FenceResume <- TRUE, GuardEffect <- ReconcileFirst, TruthfulObservation <- ReportTruthfully,
+     GuardCleanup <- RetainPending, GuardVersion <- TRUE, GuardBaseline <- TRUE,
      GuardLandingBaseline <- TRUE, CanonicalKinds <- {"pass"},
      CorruptPrewrite <- FALSE, TargetKinds <- {"unchanged"},
      GuardReviewRoute <- TRUE, LandingKinds <- {"pass"}, s <- wf
@@ -40,7 +40,8 @@ IndependentWrite == /\ L!IndependentWrite /\ UNCHANGED wf
 \* level. The detailed invariant must independently forbid another effect.
 Replay == /\ ~wf["work"].failed /\ L!Retry /\ UNCHANGED wf
 Cleanup == /\ W!Cleanup("work") /\ L!Cleanup
-Next == Intent \/ Effect \/ Publish \/ Crash \/ Recover \/ FailWrite \/ RecoverIO
+Observe == /\ W!Observe("work") /\ UNCHANGED lvars
+Next == Observe \/ Intent \/ Effect \/ Publish \/ Crash \/ Recover \/ FailWrite \/ RecoverIO
         \/ StartFollowUp \/ FollowUp \/ Advance \/ IndependentWrite \/ Replay \/ Cleanup
 Spec == Init /\ [][Next]_vars
 NoUnboundEffect == L!NoUnboundEffect
@@ -51,4 +52,5 @@ MappedPublication == /\ (result = "candidate") = wf["work"].published
                      /\ ioFailed = wf["work"].ioFailed
                      /\ cleaned = wf["work"].cleaned
 CleanupSafe == W!CleanupSafe
+ObservationSafe == W!ObservationSafe
 =============================================================================

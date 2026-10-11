@@ -336,7 +336,7 @@ instance: a settled replacement must not claim it settled a previous owner's
 child. Clearing worker accounting without child settlement violates publication
 safety. Separate controls remove the build and stop-instance guards. These are
 joint model checks; the released-service production projection and its host
-execution remain separate evidence, and the inventory retains that gap.
+execution remain separate evidence, and the inventory declares those required host cases.
 
 `IsolationConnection` couples `ServiceIsolation.PollProject` with actual
 `Workflow.Dispatch` transitions for two projects. It disables repair and restart
@@ -346,3 +346,81 @@ real registered-project poller for configuration, corrupt-Work and coordinator
 lock failures, recording raw registry, queue, Work and diagnostic snapshots. Its
 external Attempt runner returns a scripted needs-user result; the projection
 credits dispatch isolation, not provider execution or shared socket ownership.
+
+### Check authorization, scoped evidence, learning, and cleanup
+
+`AuthorizationConnection` checks proposed Work admission against human authority.
+Its fixture lands a proposed corrective follow-up, observes queue refusal before
+authorization, then checks scope, origin and enqueue identity through repeated
+public authorization. `WriterTrace` now executes authorization, foreground route
+selection and dispatch before its observed input delivery and Writer completion.
+A swapped Attempt in the completed Writer observation must be rejected.
+
+`EvidenceConnection` bounds one or two failed command occurrences. A targeted
+review grants credit only to its attached occurrence and current candidate; all
+required occurrences must be accepted before the workflow Tester transition.
+The fixture retains the original canonical result, ordinary reviews and Tester,
+attaches a scripted external proof through the public API, runs the real targeted
+review route, and reaches readiness without rerunning the passing command. This
+exercises evidence handling; the scripted proof is not release host evidence.
+
+`LearningConnection` checks both Learner modes, one failure and one retry, with
+and without an available confinement boundary. Capture can advance the candidate
+through expertise. No-expertise must preserve the reviewed commit, and an
+unavailable boundary must leave Learning failed and readiness uncredited. Raw
+Work snapshots bind the retained reviews, Tester and handoff digest. Successful
+confined no-expertise execution is a separate required case; a fail-closed retry
+never substitutes for that host result.
+
+The cleanup fixture records complete retained Work bytes, public detailed status
+and dashboard output while observation publication is blocked. Cleanup preserves
+that state; after retry the observation names the original merged commit. The
+projector distinguishes Git merge completion from follow-up completion and
+checks both against stored facts. Early-cleanup, false-status, lost-artifact and
+missing-observation controls must fail. These models establish safety under the
+listed finite bounds, not unbounded progress or an obligation to repair a host
+filesystem or confinement configuration.
+
+
+### Check publication, approval, and released ownership
+
+`CompletionConnection` bounds five durable publication parts, one interruption
+and one retry. It permits Workflow recovery only after publication completes and
+checks replay without allocating another Writer. The actual fixture interrupts
+each prefix independently, retains raw Work and artifact bytes, reuses the failed
+output-free Writer and supersedes the already planned competing reservation.
+`RecoveryTrace`, `NoChangeTrace` and `PendingPlanTrace` also instantiate Workflow;
+their public fixtures independently check repaired context and canonical or Plan
+proof attachment before continuation.
+
+`RequirementConnection` delivers fourteen original Tester requirements and the
+new section's B20 as distinct section-qualified identities. The provider fixture
+reads the actual generated completion matrix; it uses those exact source sections
+to stay within the bounded input size. The existing full-document extraction test
+checks that the rest of the source does not change their identities.
+
+`ApprovalConnection` bounds one ready candidate, current or stale approval, and a
+cancellation before Git. Its real fixture retains a landing intent, cancels the
+Attempt and verifies that retry refuses without moving HEAD. This checks current
+approval scope and cancellation; it does not simulate a human accepting a release.
+
+`ReleaseOwnershipConnection` bounds two independent project Workflows and two
+legacy children, followed by one current service owner. Its legacy state begins
+at observed running receipts; it does not attribute current receipt-before-exec
+guarantees to v0.5.0. `ReleaseOwnershipTrace` takes receipt ownership, settlement,
+Task outcomes, replacement identity and stale-stop refusal from the independent
+release projector. Its finite replay uses weak fairness only for the next
+observed transition. The static trace configurations test that adapter; only the
+host-owned actual-release fixture supplies production evidence. The current
+`ServiceConnection` separately checks crash, drain and child settlement.
+
+`VersionConnection` checks unsupported-reader refusal in two bounded states:
+current execution authority and pending landing publication. The actual old
+executable's diagnostic and protected before/after digests parameterize the model.
+This is a compatibility refusal check, not a general migration proof.
+
+The connection inventory uses `Check:` to declare required case identities.
+Declarations are not passing evidence: the report requires candidate-bound,
+successful cases and preserves missing host results. TLC logs retain exact state
+counts, coverage, tool identity and bounds; no development run substitutes for
+the assigned Java 21 host check or the final canonical Tester.

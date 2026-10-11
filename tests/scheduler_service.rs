@@ -937,6 +937,9 @@ fn scheduler_released_upgrade_preserves_shared_ownership() {
         !incompatible.status.success(),
         "current build replaced live release"
     );
+    let health_after_incompatible = scheduler_service::send_health_request(&socket).unwrap();
+    assert_eq!(health_after_incompatible.build, old_health.build);
+    assert!(old_service.try_wait().unwrap().is_none());
     for (project, work) in [(first.path(), "first"), (second.path(), "second")] {
         let queued = fixture(&predecessor, project, &["queue", "add", work]);
         assert!(
@@ -1324,6 +1327,9 @@ fn scheduler_released_upgrade_preserves_shared_ownership() {
                 "generation":old_health.generation,"build":old_health.build,
                 "instance_id":old_health.instance_id,"state":old_health.state},
                 "registered-projects":registry.len(),
+                "incompatible-start":{"exit":incompatible.status.code(),"stderr":String::from_utf8_lossy(&incompatible.stderr),
+                    "health-after":{"generation":health_after_incompatible.generation,"build":health_after_incompatible.build,
+                        "instance_id":health_after_incompatible.instance_id,"state":health_after_incompatible.state}},
                 "coordinators":legacy_coordinators,
                 "predecessor-sha256":"8bb76717be942e4a0c97c297c318c0a1331e92105180edb386354dddbae12974"}},
             {"sequence":2,"actor":"operator","operation-id":"scheduler-stop",

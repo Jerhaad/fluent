@@ -100,7 +100,11 @@ def project(path: Path, candidate: Path, commit: str):
     assert any(name.startswith("items/") for name in names)
     if trace["scenario"] == "pending-publication":
         assert any(name.startswith("transactions/") for name in names)
-    return {"scenario": trace["scenario"], "protected-entries": len(protected)}
+    return {"scenario": trace["scenario"], "protected-entries": len(protected),
+            "mapping": {"refused": facts["exit-code"] != 0,
+                        "pending-publication": trace["scenario"] == "pending-publication",
+                        "before-digest": hashlib.sha256(json.dumps([(e["path"],e["kind"],e["sha256"]) for e in protected]).encode()).hexdigest(),
+                        "after-digest": hashlib.sha256(json.dumps([(e["path"],e["kind"],e["sha256"]) for e in facts["protected"]]).encode()).hexdigest()}}
 
 
 def project_service(trace, artifacts):
@@ -128,12 +132,17 @@ def project_service(trace, artifacts):
             "service identity mismatch")
     assert old_health["build"] != new_health["build"]
     assert old_health["generation"] == new_health["generation"]
+    incompatible = first["incompatible-start"]
+    require(type(incompatible["exit"]) is int and incompatible["exit"] != 0 and
+            "lacks verifiable drain control" in incompatible["stderr"] and
+            incompatible["health-after"] == old_health, "incompatible start replaced legacy ownership")
     assert settled["stop-exit-codes"] == [0, 0]
     assert len(settled["stop-stdout"]) == 2
     assert all(isinstance(output, str) for output in settled["stop-stdout"])
     assert settled["owned-worker-started"] is True
     owned = settled["owned-workers"]
-    assert len(owned) > 0
+    require(len(owned) == 2 and {w["work_item_id"] for w in owned} == {"first", "second"},
+            "legacy settlement requires both registered workers")
     require(all(any(work["work_item_id"] == worker["work_item_id"]
                     and work["dispatch_id"] == worker["dispatch_id"]
                     for work in settled["active-work"]) for worker in owned),
@@ -200,7 +209,12 @@ def project_service(trace, artifacts):
     assert all(queue["status"] == "queued" for queue in settled["queues"])
     assert all(queue["work_item_id"] == prior["work_item_id"]
                for queue, prior in zip(replacement["queues"], settled["queues"]))
-    return {"scenario": trace["scenario"], "service-transfer": "settled"}
+    return {"scenario": trace["scenario"], "service-transfer": "settled",
+            "mapping": {"legacy-children": len(owned), "legacy-owned-before": True,
+                        "children-held-before": [w["initial-receipt"]["state"] == "running" for w in owned],
+                        "children-held-after": [not w["process-group-absent"] for w in owned],
+                        "children-completed": [w["task-status"] == "complete" for w in owned],
+                        "current-owner": new_health["instance_id"], "stale-stop-refused": stale["health-after"] == new_health}}
 
 
 if __name__ == "__main__":

@@ -42,9 +42,25 @@ CONTROLS = {
     "target-misbound": "Invariant LandingAcceptanceSafe is violated",
 }
 PROFILE_ACTIONS = {
+    "approval-connection.cfg": ("Intent", "Cancel", "Effect"),
+    "approval-assumptions.cfg": ("Intent", "Cancel", "Effect"),
+    "version-connection.cfg": ("Refuse",),
+    "version-assumptions.cfg": ("Refuse",),
+    "release-ownership-connection.cfg": ("RequestLegacyStop", "SettleA", "SettleB", "ReleaseLegacy", "StartCurrent", "ReuseCurrent", "StaleStop"),
+    "release-ownership-assumptions.cfg": ("SettleA", "SettleB", "ReleaseLegacy", "StartCurrent"),
+    "completion-connection.cfg": ("WritePart", "Crash", "Retry", "Publish", "Replay"),
+    "completion-assumptions.cfg": ("WritePart", "Crash", "Retry", "Publish"),
+    "requirements-connection.cfg": ("Deliver",),
+    "requirements-assumptions.cfg": ("Deliver",),
+    "authorization-connection.cfg": ("Intake", "Authorize", "Enqueue", "Repeat"),
+    "authorization-assumptions.cfg": ("Intake", "Authorize", "Enqueue"),
+    "evidence-connection.cfg": ("Attach", "Review", "Credit", "Result", "Tester"),
+    "evidence-assumptions.cfg": ("Attach", "Review", "Credit", "Tester"),
+    "learning-connection.cfg": ("Retry", "Refuse", "Capture", "NoExpertise", "Ready"),
+    "learning-assumptions.cfg": ("Retry", "Refuse", "Capture", "NoExpertise"),
     "isolation-connection.cfg": ("Poll", "NextPoll"),
     "isolation-assumptions.cfg": ("Poll", "NextPoll"),
-    "landing-connection.cfg": ("Intent", "Effect", "Publish", "Crash", "Recover", "FailWrite", "RecoverIO", "Replay", "FollowUp", "Cleanup"),
+    "landing-connection.cfg": ("Intent", "Effect", "Publish", "Crash", "Recover", "FailWrite", "RecoverIO", "Replay", "FollowUp", "Cleanup", "Observe"),
     "landing-assumptions.cfg": ("Intent", "Effect", "Publish", "Advance", "IndependentWrite", "Replay"),
     "service-connection.cfg": ("Start", "Reuse", "Claim", "Receipt", "Execute", "Drain", "Settle", "Publish", "Release", "Crash", "Replay"),
     "service-assumptions.cfg": ("Start", "Claim", "Receipt", "Execute", "Publish", "Crash"),
@@ -264,7 +280,16 @@ def integrated_production_suite(source, root, output, jar, java):
     rows.extend(review_connection_suite(source, root, output, jar, java))
     rows.extend(landing_connection_suite(source, root, output, jar, java))
     rows.extend(service_connection_suite(source, output, jar, java))
+    rows.extend(release_ownership_connection_suite(source, output, jar, java))
+    rows.extend(version_connection_suite(source, output, jar, java))
     rows.extend(isolation_connection_suite(source, root, output, jar, java))
+    rows.extend(cleanup_connection_suite(source, root, output, jar, java))
+    rows.extend(learning_connection_suite(source, root, output, jar, java))
+    rows.extend(targeted_connection_suite(source, root, output, jar, java))
+    rows.extend(authorization_connection_suite(source, root, output, jar, java))
+    rows.extend(requirements_connection_suite(source, root, output, jar, java))
+    rows.extend(completion_connection_suite(source, root, output, jar, java))
+    rows.extend(approval_connection_suite(source, root, output, jar, java))
     if produced:
         try:
             trace = json.loads(trace_path.read_text())
@@ -667,6 +692,112 @@ def generation_connection_suite(source, root, output, jar, java):
           "stale dispatch changed Work or lacked the expected refusal")))
 
 
+def approval_connection_suite(source, root, output, jar, java):
+    return observed_connection_suite(
+        source, root, output, jar, java, "approval", "ApprovalConnection",
+        (("approval-connection.cfg", None), ("approval-assumptions.cfg", None),
+         ("approval-candidate.cfg", "Invariant CurrentApproval is violated"),
+         ("approval-stop.cfg", "Invariant CurrentStop is violated")),
+        "workflow_integrated_landing_rechecks_current_approval", "FLUENT_INTEGRATED_APPROVAL_TRACE",
+        (("scope", 1, lambda f: f["work"]["merge_candidates"][0]["merge_state"]["landing_intent"].update(
+            {"merge_candidate_id": "other"}), "approval intent scope differs"),
+         ("effect", 3, lambda f: f.update({"head": "0" * 40}), "canceled landing applied an effect"),
+         ("authority", 3, lambda f: f["work"]["attempts"][0]["cancellation"].update({"resumed_at": "old-authority"}),
+          "landing retry ignored current cancellation")))
+
+
+def completion_connection_suite(source, root, output, jar, java):
+    return observed_connection_suite(
+        source, root, output, jar, java, "completion", "CompletionConnection",
+        (("completion-connection.cfg", None), ("completion-assumptions.cfg", None),
+         ("completion-early.cfg", "Invariant NoEarlyAuthority is violated"),
+         ("completion-history.cfg", "Invariant RetainedHistory is violated"),
+         ("completion-replay.cfg", "Invariant OneReservation is violated")),
+        "writer_completion_context_repaired_retry_replays_publication", "FLUENT_INTEGRATED_COMPLETION_TRACE",
+        (("identity", 0, lambda f: f["repeated"].update({"id": "other"}), "publication replay changed retained identity"),
+         ("history", 1, lambda f: f["original"]["attempts"][0]["tasks"][0].update({"instructions": "changed"}),
+          "publication rewrote completed history")))
+
+
+def requirements_connection_suite(source, root, output, jar, java):
+    def collide(fact):
+        matrix = json.loads(fact["matrix"])
+        matrix["rows"][0]["id"] = "behavior:public-workflow-continuation:b20"
+        fact["matrix"] = fact["observed"] = json.dumps(matrix)
+    return observed_connection_suite(
+        source, root, output, jar, java, "requirements", "RequirementConnection",
+        (("requirements-connection.cfg", None), ("requirements-assumptions.cfg", None),
+         ("requirements-collision.cfg", "Invariant AllIdentities is violated")),
+        "workflow_integrated_continuation_requirements_reach_writer", "FLUENT_INTEGRATED_REQUIREMENTS_TRACE",
+        (("collision", 0, collide, "section-qualified identities were lost"),
+         ("delivery", 0, lambda f: f.update({"observed": "{}"}), "Writer did not read the current matrix")))
+
+
+def authorization_connection_suite(source, root, output, jar, java):
+    return observed_connection_suite(
+        source, root, output, jar, java, "authorization", "AuthorizationConnection",
+        (("authorization-connection.cfg", None), ("authorization-assumptions.cfg", None),
+         ("authorization-forged.cfg", "Invariant AuthorizedAdmission is violated")),
+        "human_authorization_transitions_same_work_item", "FLUENT_INTEGRATED_AUTHORIZATION_TRACE",
+        (("forged", 2, lambda f: f["work"]["authorization"].update({"authority": "automatic"}),
+          "queue admission lacks current human authority"),
+         ("scope", 2, lambda f: f["work"]["corrective_context"].update({"included_scope": "other"}),
+          "authorization changed proposed scope or origin")))
+
+
+def targeted_connection_suite(source, root, output, jar, java):
+    return observed_connection_suite(
+        source, root, output, jar, java, "targeted", "EvidenceConnection",
+        (("evidence-connection.cfg", None), ("evidence-assumptions.cfg", None),
+         ("evidence-scope.cfg", "Invariant ScopedCredit is violated"),
+         ("evidence-stale.cfg", "Invariant CurrentCredit is violated")),
+        "canonical_tester_recovery_reuses_other_passing_results", "FLUENT_INTEGRATED_TARGETED_TRACE",
+        (("scope", 1, lambda f: f["work"]["attempts"][0]["evidence_recoveries"][0]["required_check"]["source"].update(
+            {"command_index": 0}), "targeted credit escaped exact command or candidate"),
+         ("stale", 2, lambda f: f["work"]["merge_candidates"][0].update({"candidate_commit": "0" * 40}),
+          "ready candidate differs from reviewed check"),
+         ("verdict", 2, lambda f: f.update({"review": "Verdict: fail\n"}), "targeted review lacks scoped verdict")))
+
+
+def learning_connection_suite(source, root, output, jar, java):
+    rows = observed_connection_suite(
+        source, root, output, jar, java, "learning_capture", "LearningConnection",
+        (("learning-connection.cfg", None), ("learning-assumptions.cfg", None),
+         ("learning-candidate.cfg", "Invariant CandidateSafe is violated"),
+         ("learning-confinement.cfg", "Invariant ConfinementSafe is violated"),
+         ("learning-mode.cfg", "Action property ModeStable is violated")),
+        "learner_retry_completes_existing_record_idempotently", "FLUENT_INTEGRATED_LEARNING_CAPTURE_TRACE",
+        (("mode", 1, lambda f: f["work"].update({"learner_mode": "no-expertise"}), "retry changed learner mode or Work identity"),
+         ("handoff", 1, lambda f: f["handoff"].update({"source_attempt_id": "other"}), "handoff differs from retained learning")))
+    rows.extend(observed_connection_suite(
+        source, root, output, jar, java, "learning_no_expertise", "LearningConnection", (),
+        "pre_land_no_expertise_retry_runs_only_learner_and_preserves_mode", "FLUENT_INTEGRATED_LEARNING_NO_EXPERTISE_TRACE",
+        (("mutation", 1, lambda f: f.update({"changed": "src/unauthorized.rs"}), "no-expertise retry changed reviewed candidate"),)))
+    path = output / "production/learning_no_expertise/production-trace.json"
+    try:
+        final = json.loads(path.read_text())["events"][-1]["raw-facts"]
+        confined = final["confinement"] == "available" and final["work"]["attempts"][0]["learning"]["status"] == "succeeded"
+    except (OSError, ValueError, KeyError, IndexError, TypeError):
+        confined = False
+    log = output / "learning-confined-success.log"
+    log.write_text("Confined no-expertise retry succeeded.\n" if confined else
+                   "Required successful no-expertise retry unavailable; fail-closed observations do not replace this host check.\n")
+    rows.append({"case": "learning-no-expertise-confined-success", "pass": confined, "log": log.name})
+    return rows
+
+
+def cleanup_connection_suite(source, root, output, jar, java):
+    return observed_connection_suite(
+        source, root, output, jar, java, "cleanup", "LandingConnection",
+        (("landing-cleanup.cfg", "Invariant CleanupSafe is violated"),
+         ("landing-observation.cfg", "Invariant ObservationSafe is violated")),
+        "workflow_cleanup_retains_pending_recovery", "FLUENT_INTEGRATED_CLEANUP_TRACE",
+        (("lost-evidence", 1, lambda f: f.update({"artifacts-present": False}), "cleanup removed pending recovery state"),
+         ("status", 0, lambda f: f["shown"]["merge_candidates"][0]["merge_state"].pop("follow_up_failure"),
+          "status differs from retained state"),
+         ("publication", 2, lambda f: f.update({"observations": []}), "cleanup recovery did not publish retained origin")))
+
+
 def isolation_connection_suite(source, root, output, jar, java):
     return observed_connection_suite(
         source, root, output, jar, java, "isolation", "IsolationConnection",
@@ -677,6 +808,59 @@ def isolation_connection_suite(source, root, output, jar, java):
          ("corrupt", 1, lambda f: f.update({"bad-work": "rewritten"}), "corrupt project was rewritten or dropped"),
          ("identity", 2, lambda f: f["good"].update({"bound_attempt_id": "other"}), "healthy Attempt binding differs")),
         binary="scheduler_service")
+
+
+def version_connection_suite(source, output, jar, java):
+    return [run_case(source, output, jar, java, config, expected, "VersionConnection")
+            for config, expected in (
+                ("version-connection.cfg", None), ("version-assumptions.cfg", None),
+                ("version-write.cfg", "Invariant NoUnsupportedMutation is violated"),
+                ("version-state.cfg", "Invariant RetainedState is violated"))]
+
+
+def version_trace_case(source, output, jar, java, scenario, projection):
+    mapping = projection["mapping"]
+    config = output / f"{scenario}-connection.cfg"
+    config.write_text('SPECIFICATION Spec\nCONSTANTS\n  CheckVersion = TRUE\n' +
+                      '  Refused = ' + ('TRUE' if mapping["refused"] else 'FALSE') + '\n' +
+                      '  BeforeDigest = ' + json.dumps(mapping["before-digest"]) + '\n' +
+                      '  AfterDigest = ' + json.dumps(mapping["after-digest"]) + '\n' +
+                      '  PendingPublication = ' + ('TRUE' if mapping["pending-publication"] else 'FALSE') + '\n' +
+                      'INVARIANTS NoUnsupportedMutation RetainedState\nPROPERTY ObservedRefusal\nCHECK_DEADLOCK FALSE\n')
+    return run_case(source, output, jar, java, str(config), None, "VersionConnection")
+
+
+def release_ownership_trace_case(source, output, jar, java, projection):
+    mapping = projection["mapping"]
+    def booleans(name, values):
+        assert len(values) == 2, "release mapping requires both projects"
+        return "".join("  " + name + suffix + " = " + ("TRUE" if value else "FALSE") + "\n"
+                       for suffix, value in zip(("A", "B"), values))
+    config = output / "service-ownership-production.cfg"
+    config.write_text("SPECIFICATION TraceSpec\nCONSTANTS\n" +
+                      "  SettleLegacyChildren = TRUE\n  CheckNewBuild = TRUE\n  CheckNewStop = TRUE\n" +
+                      booleans("BeforeHeld", mapping["children-held-before"]) +
+                      booleans("AfterHeld", mapping["children-held-after"]) +
+                      booleans("Completed", mapping["children-completed"]) +
+                      "  NewOwner = " + ("TRUE" if mapping["current-owner"] else "FALSE") + "\n" +
+                      "  StaleRefused = " + ("TRUE" if mapping["stale-stop-refused"] else "FALSE") + "\n" +
+                      "INVARIANTS Observed NoOverlap CurrentIdentity SettledBeforeStart\n" +
+                      "PROPERTY TraceComplete\nCHECK_DEADLOCK FALSE\n")
+    return run_case(source, output, jar, java, str(config), None, "ReleaseOwnershipTrace")
+
+
+def release_ownership_connection_suite(source, output, jar, java):
+    rows = [run_case(source, output, jar, java, config, expected, "ReleaseOwnershipConnection")
+            for config, expected in (
+                ("release-ownership-connection.cfg", None), ("release-ownership-assumptions.cfg", None),
+                ("release-ownership-unsettled.cfg", "Invariant NoOverlap is violated"),
+                ("release-ownership-build.cfg", "Invariant CurrentIdentity is violated"),
+                ("release-ownership-stop.cfg", "Invariant CurrentIdentity is violated"))]
+    # These exercise the adapter, not the physical released-service fixture.
+    rows.extend(run_case(source, output, jar, java, config, expected, "ReleaseOwnershipTrace")
+                for config, expected in (("release-ownership-trace.cfg", None),
+                    ("release-ownership-trace-held.cfg", "Invariant Observed is violated")))
+    return rows
 
 
 def service_connection_suite(source, output, jar, java):
@@ -992,6 +1176,26 @@ def writer_inputs_suite(source, root, output, jar, java):
         valid = bound and projection.returncode == 0
         results.append({"case": "writer-production-projection", "pass": valid,
                         "log": "projection.log"})
+        changed = json.loads(json.dumps(trace))
+        directory = output / "wrong-task"
+        directory.mkdir(exist_ok=True)
+        for artifact in trace["artifacts"]:
+            shutil.copyfile(output / artifact["path"], directory / artifact["path"])
+        work = json.loads((directory / "writer-work.json").read_text())
+        identity = changed["events"][-1]["operation-id"]
+        task = next(task for task in work["attempts"][0]["tasks"] if task["id"] == identity)
+        task["attempt_id"] = "wrong-attempt"
+        raw = json.dumps(work).encode()
+        (directory / "writer-work.json").write_bytes(raw)
+        changed["events"][-1]["raw-facts"]["work"] = work
+        next(a for a in changed["artifacts"] if a["path"] == "writer-work.json")["sha256"] = hashlib.sha256(raw).hexdigest()
+        path = directory / "production-trace.json"
+        path.write_text(json.dumps(changed))
+        rejected = subprocess.run(["python3", str(source / "project_writer.py"), str(path)], capture_output=True, text=True)
+        (output / "wrong-task.log").write_text(rejected.stdout + rejected.stderr)
+        results.append({"case": "wrong-task-control", "pass": rejected.returncode != 0 and
+                        "foreground Task identity or workspace differs" in rejected.stderr,
+                        "log": "wrong-task.log"})
         omitted = json.loads(json.dumps(trace))
         negative_dir = output / "omitted-instruction"
         negative_dir.mkdir(exist_ok=True)
@@ -1486,6 +1690,7 @@ def release_transition_suite(source, root, output, jar, java):
         results.append({"case": f"{scenario}-projection", "pass": projection.returncode == 0,
                         "log": f"{scenario}-projection.log"})
         if projection.returncode == 0:
+            results.append(version_trace_case(source, output, jar, java, scenario, json.loads(projection.stdout)))
             corrupted = json.loads(path.read_text())
             corrupted["events"][1]["raw-facts"]["protected"] = []
             negative_path = output / f"{scenario}-negative.json"
@@ -1538,7 +1743,10 @@ def release_transition_suite(source, root, output, jar, java):
     results.append({"case": "service-projection", "pass": service_projection.returncode == 0,
                     "log": "service-projection.log"})
     if service_projection.returncode == 0:
+        results.append(release_ownership_trace_case(source, output, jar, java, json.loads(service_projection.stdout)))
         for name, mutate in (
+                ("service-incompatible-negative", lambda trace: trace["events"][0]["raw-facts"]["incompatible-start"].update(exit=0)),
+                ("service-project-negative", lambda trace: trace["events"][1]["raw-facts"]["owned-workers"][1].update(work_item_id="first")),
                 ("service-identity-negative", lambda trace: trace["events"][2]["raw-facts"]["health"].update(
                     instance_id=trace["events"][0]["raw-facts"]["health"]["instance_id"])),
                 ("service-worker-negative", lambda trace: trace["events"][1]["raw-facts"]["owned-workers"][0].update(
@@ -1560,6 +1768,8 @@ def release_transition_suite(source, root, output, jar, java):
                                       capture_output=True, text=True)
             (output / f"{name}.log").write_text(negative.stdout + negative.stderr)
             diagnostic = {
+                "service-incompatible-negative": "incompatible start replaced legacy ownership",
+                "service-project-negative": "legacy settlement requires both registered workers",
                 "service-identity-negative": "service identity mismatch",
                 "service-worker-negative": "owned dispatch mismatch",
                 "service-launch-negative": "worker process group remains",

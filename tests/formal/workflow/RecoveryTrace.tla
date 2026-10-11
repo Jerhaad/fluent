@@ -10,8 +10,17 @@ CONSTANTS Trace1attemptStatus, Trace1work, Trace1attempt, Trace1source,
           Trace3attemptStatus, Trace3work, Trace3attempt, Trace3source,
           Trace3candidate, Trace3correction, Trace3correctionStatus,
           Trace3operation, Trace3authority, Trace3outputCommit, Trace3published
-VARIABLE state
-vars == <<state>>
+VARIABLES state, wf
+vars == <<state, wf>>
+
+W == INSTANCE Workflow WITH Works <- {"work"}, ReviewOnly <- {},
+     MaxFailures <- 0, DeliverInputs <- TRUE, CheckEvidence <- TRUE,
+     FenceResume <- TRUE, GuardEffect <- TRUE, TruthfulObservation <- TRUE,
+     GuardCleanup <- TRUE, GuardVersion <- TRUE, GuardBaseline <- TRUE,
+     GuardLandingBaseline <- TRUE, CanonicalKinds <- {"pass"},
+     CorruptPrewrite <- FALSE, TargetKinds <- {"unchanged"},
+     GuardReviewRoute <- TRUE, LandingKinds <- {"pass"}, s <- wf
+
 
 TraceState1 == [attemptStatus |-> Trace1attemptStatus, work |-> Trace1work,
                 attempt |-> Trace1attempt, source |-> Trace1source,
@@ -42,18 +51,23 @@ Identity(s) == /\ s.work = TraceState1.work
 Authority(s) == /\ s.operation # "absent"
                 /\ s.authority # "absent"
                 /\ s.correction # "absent"
-Init == state = TraceState1 /\ state.attemptStatus = "needs-user"
+Init == /\ wf = [w \in {"work"} |-> LET base == W!InitialWork(w) IN
+             [base EXCEPT !.phase = "delivered", !.delivered = base.required,
+                          !.serviceOwner = W!ServiceId(1), !.routeMode = "foreground"]]
+        /\ state = TraceState1 /\ state.attemptStatus = "needs-user"
         /\ state.correctionStatus = "absent"
         /\ state.operation = "absent" /\ state.outputCommit = "absent"
         /\ ~state.published
-Repair == /\ state.correctionStatus = "absent"
+Repair == /\ UNCHANGED wf
+          /\ state.correctionStatus = "absent"
           /\ state' = TraceState2
           /\ state'.attemptStatus = "planned"
           /\ Identity(state') /\ Authority(state')
           /\ state'.correctionStatus = "planned"
           /\ state'.outputCommit = "absent"
           /\ ~state'.published
-Run == /\ state.correctionStatus = "planned"
+Run == /\ W!Writer("work")
+       /\ state.correctionStatus = "planned"
        /\ Authority(state)
        /\ state' = TraceState3
        /\ state'.attemptStatus = "needs-user"
@@ -66,7 +80,8 @@ Run == /\ state.correctionStatus = "planned"
 Next == Repair \/ Run
 Spec == Init /\ [][Next]_vars /\ WF_vars(Repair) /\ WF_vars(Run)
 TraceComplete == <> (state.correctionStatus = "complete")
-TraceSafe == /\ Identity(state)
+TraceSafe == /\ (state.published = (wf["work"].phase = "written"))
+             /\ Identity(state)
              /\ (state.correctionStatus # "absent" => Authority(state))
              /\ (state.published => state.correctionStatus = "complete"
                                     /\ state.outputCommit = state.candidate)

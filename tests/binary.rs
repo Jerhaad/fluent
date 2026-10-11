@@ -1943,14 +1943,20 @@ fn writer_completion_context_repaired_retry_rejects_stale_authority() {
 
 #[test]
 fn writer_completion_context_repaired_retry_replays_publication() {
+    let output_root = TempDir::new().unwrap();
+    let mut observations = Vec::new();
     for phase in ["audit", "journal", "children", "attempt", "task"] {
         let tmp = TempDir::new().unwrap();
         let fixture = output_free_context_fixture(&tmp);
         output_free_context_command(&fixture).assert().success();
-        output_free_retry_command(&fixture)
+        let original = WorkModelStore::new(&fixture.carried.project)
+            .read_work_item_snapshot(&fixture.carried.work)
+            .unwrap();
+        let interrupted = output_free_retry_command(&fixture)
             .env("FLUENT_TEST_CONTEXT_RETRY_INTERRUPT", phase)
-            .assert()
-            .code(86);
+            .output()
+            .unwrap();
+        assert_eq!(interrupted.status.code(), Some(86));
         let before = snapshot_tree(&fixture.carried.project.join(".fluent/work"));
         let mut changed = fluent_cmd();
         changed
@@ -1970,13 +1976,36 @@ fn writer_completion_context_repaired_retry_replays_publication() {
             before
         );
         output_free_retry_command(&fixture).assert().success();
+        let recovered = WorkModelStore::new(&fixture.carried.project)
+            .read_work_item_snapshot(&fixture.carried.work)
+            .unwrap();
         let published = snapshot_tree(&fixture.carried.project.join(".fluent/work"));
         output_free_retry_command(&fixture).assert().success();
         assert_eq!(
             snapshot_tree(&fixture.carried.project.join(".fluent/work")),
             published
         );
+        let repeated = WorkModelStore::new(&fixture.carried.project)
+            .read_work_item_snapshot(&fixture.carried.work)
+            .unwrap();
+        let snapshot = |entries: &[SnapshotEntry]| {
+            entries
+                .iter()
+                .map(|entry| {
+                    serde_json::json!({
+            "path":entry.path,"kind":entry.kind,"bytes":entry.bytes})
+                })
+                .collect::<Vec<_>>()
+        };
+        observations.push((phase,"repair-writer-completion",serde_json::json!({"original":original,"interrupted-exit":interrupted.status.code(),
+            "interrupted":snapshot(&before),"published":snapshot(&published),"recovered":recovered,"repeated":repeated})));
     }
+    record_integrated_facts(
+        "completion",
+        "FLUENT_INTEGRATED_COMPLETION_TRACE",
+        &output_root,
+        &observations,
+    );
 }
 
 #[test]
@@ -19219,7 +19248,7 @@ fn learner_retry_completes_existing_record_idempotently() {
         &bin_dir,
         &learner_mock_script(
             r#"{"learning_summary":"learned","follow_ups":[{"id":"fu-1","summary":"Follow up","corrective":false}]}"#,
-        ),
+        ).replacen("  DRAFT=", "  mkdir -p .fluent/expertise\n  printf 'Retain learned context\\n' > .fluent/expertise/retry.md\n  DRAFT=",1),
     );
     fluent_cmd()
         .current_dir(&main_dir)
@@ -19242,6 +19271,35 @@ fn learner_retry_completes_existing_record_idempotently() {
         "one accepted follow-up, not duplicated"
     );
     assert_eq!(follow_ups[0]["id"], "fu-1");
+    let candidate = main_dir.join("../work-6-work-1-attempt-1");
+    let changed = git::run_stdout(
+        &candidate,
+        &[
+            "diff",
+            "--name-only",
+            failed["merge_candidates"][0]["candidate_commit"]
+                .as_str()
+                .unwrap(),
+            value["merge_candidates"][0]["candidate_commit"]
+                .as_str()
+                .unwrap(),
+        ],
+        "learner delta",
+    )
+    .unwrap();
+    record_integrated_facts(
+        "learning_capture",
+        "FLUENT_INTEGRATED_LEARNING_CAPTURE_TRACE",
+        &tmp,
+        &[
+            ("failed", "attempt-run", serde_json::json!({"work":failed})),
+            (
+                "retried",
+                "attempt-run",
+                serde_json::json!({"work":value,"handoff":handoff,"handoff-bytes":fs::read_to_string(main_dir.join(".fluent/work/artifacts/work-1/attempt-1/learner/handoff.json")).unwrap(),"head":git_head(&candidate),"changed":changed,"confinement":"not-required"}),
+            ),
+        ],
+    );
 }
 
 #[test]
@@ -19532,6 +19590,25 @@ fn pre_land_no_expertise_retry_runs_only_learner_and_preserves_mode() {
             "an unsupported host keeps the Learner relaunchable without downgrading"
         );
     }
+    let candidate = main_dir.join("../work-6-work-1-attempt-1");
+    let handoff = main_dir.join(".fluent/work/artifacts/work-1/attempt-1/learner/handoff.json");
+    record_integrated_facts(
+        "learning_no_expertise",
+        "FLUENT_INTEGRATED_LEARNING_NO_EXPERTISE_TRACE",
+        &tmp,
+        &[
+            ("failed", "attempt-run", serde_json::json!({"work":before})),
+            (
+                "retried",
+                "attempt-run",
+                serde_json::json!({"work":after,
+            "handoff":if handoff.is_file() {read_json_path(&handoff)} else {serde_json::Value::Null},
+            "handoff-bytes":if handoff.is_file() {Some(fs::read_to_string(&handoff).unwrap())} else {None},
+            "head":git_head(&candidate),"changed":git::run_stdout(&candidate,&["diff","--name-only",commit_before.as_str().unwrap(),"HEAD"],"learner delta").unwrap(),
+            "confinement":if real_sandbox_exec_is_usable() {"available"} else {"unavailable"}}),
+            ),
+        ],
+    );
 }
 
 /// A mock coder that drives write and review rounds like `loop_mock_script`, and
@@ -21885,6 +21962,15 @@ fn human_authorization_transitions_same_work_item() {
         "proposed"
     );
 
+    let proposed = work_item_value(&main_dir, DERIVED_FU1);
+    let refused = fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["queue", "add", DERIVED_FU1])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    let after_refusal = work_item_value(&main_dir, DERIVED_FU1);
+    assert_eq!(after_refusal, proposed);
     authorize_work_item(&main_dir, DERIVED_FU1);
 
     let derived = work_item_value(&main_dir, DERIVED_FU1);
@@ -21896,6 +21982,31 @@ fn human_authorization_transitions_same_work_item() {
     assert_eq!(
         derived["authorization"]["authority"], "human",
         "the human authority is recorded"
+    );
+    let queued = read_json_path(&queue_ledger_path(&main_dir, DERIVED_FU1));
+    authorize_work_item(&main_dir, DERIVED_FU1);
+    record_integrated_facts(
+        "authorization",
+        "FLUENT_INTEGRATED_AUTHORIZATION_TRACE",
+        &tmp,
+        &[
+            ("proposed", "land", serde_json::json!({"work":proposed})),
+            (
+                "refused",
+                "queue-add",
+                serde_json::json!({"work":after_refusal,"exit":refused.status.code(),"stderr":String::from_utf8_lossy(&refused.stderr)}),
+            ),
+            (
+                "authorized",
+                "work-item-authorize",
+                serde_json::json!({"work":derived,"queue":queued}),
+            ),
+            (
+                "repeated",
+                "work-item-authorize",
+                serde_json::json!({"work":work_item_value(&main_dir,DERIVED_FU1),"queue":read_json_path(&queue_ledger_path(&main_dir,DERIVED_FU1))}),
+            ),
+        ],
     );
 }
 
@@ -22725,6 +22836,151 @@ fn concurrent_learner_retry_and_land_never_mutate_after_merge() {
 }
 
 #[test]
+fn workflow_integrated_continuation_requirements_reach_writer() {
+    let tmp = TempDir::new().unwrap();
+    let project = setup_git_project(&tmp).canonicalize().unwrap();
+    let source = include_str!("../documentation/behaviors.md");
+    let tester = source
+        .split("## Tester Task\n")
+        .nth(1)
+        .unwrap()
+        .split("### B20\n")
+        .nth(1)
+        .unwrap()
+        .split("### B34\n")
+        .next()
+        .unwrap();
+    let continuation = source
+        .split("## Public workflow continuation\n")
+        .nth(1)
+        .unwrap()
+        .split("### B20\n")
+        .nth(1)
+        .unwrap()
+        .split("### B21\n")
+        .next()
+        .unwrap();
+    let document = format!(
+        "## Tester Task\n\n### B20\n{tester}## Public workflow continuation\n\n### B20\n{continuation}"
+    );
+    let planning = project.join(".fluent/work/items/work-1");
+    fs::create_dir_all(&planning).unwrap();
+    fs::write(planning.join("behaviors.md"), &document).unwrap();
+    fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "work-item",
+            "create",
+            "work-1",
+            "--title",
+            "Requirement identities",
+            "--authorize-large-scope",
+            "--behaviors-file",
+            planning.join("behaviors.md").to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    fluent_cmd()
+        .current_dir(&project)
+        .args(["attempt", "create", "work-1", "attempt-1"])
+        .assert()
+        .success();
+    let matrix = project
+        .join(".fluent/work/artifacts/work-1/attempt-1/attempt-1-write-1/writer-completion.json");
+    let observed = tmp.path().join("observed-matrix.json");
+    let bin = tmp.path().join("requirements-provider");
+    write_mock_claude(
+        &bin,
+        r##"#!/bin/bash
+PROMPT=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-p" ]; then shift; PROMPT="${1:-}"; break; fi
+  shift
+done
+if [ -z "$PROMPT" ]; then exit 0; fi
+case "$PROMPT" in *"$MATRIX_PATH"*) cp "$MATRIX_PATH" "$OBSERVED_MATRIX";; *) exit 9;; esac
+exit 1
+"##,
+    );
+    let output = fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "task",
+            "run",
+            "work-1",
+            "attempt-1",
+            "attempt-1-write-1",
+            "--no-sandbox",
+        ])
+        .env("PATH", mock_path(&bin))
+        .env("MATRIX_PATH", &matrix)
+        .env("OBSERVED_MATRIX", &observed)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        observed.is_file(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    record_integrated_facts(
+        "requirements",
+        "FLUENT_INTEGRATED_REQUIREMENTS_TRACE",
+        &tmp,
+        &[(
+            "delivered",
+            "task-run",
+            serde_json::json!({"document":document,
+            "observed":fs::read_to_string(observed).unwrap(),"matrix":fs::read_to_string(matrix).unwrap(),
+            "work":work_item_value(&project,"work-1")}),
+        )],
+    );
+}
+
+/// Retain raw observations and require the independent projector to accept them.
+fn record_integrated_facts(
+    name: &str,
+    variable: &str,
+    tmp: &TempDir,
+    facts: &[(&str, &str, serde_json::Value)],
+) {
+    let directory = std::env::var_os(variable)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| tmp.path().join(format!("{name}-trace")));
+    fs::create_dir_all(&directory).unwrap();
+    let mut artifacts = Vec::new();
+    let mut events = Vec::new();
+    for (index, (boundary, operation, fact)) in facts.iter().enumerate() {
+        let path = format!("{name}-{index}.json");
+        let raw = serde_json::to_vec_pretty(fact).unwrap();
+        fs::write(directory.join(&path), &raw).unwrap();
+        artifacts
+            .push(serde_json::json!({"path":path,"sha256":format!("{:x}",Sha256::digest(raw))}));
+        events.push(serde_json::json!({"sequence":index+1,"actor":"operator","generation":null,
+            "operation-id":operation,"boundary":boundary,"causal-predecessors":if index==0 {vec![]} else {vec![index]},"raw-facts":fact}));
+    }
+    let path = directory.join("production-trace.json");
+    fs::write(&path,serde_json::to_vec_pretty(&serde_json::json!({"schema-version":1,
+        "scenario":name,"model-profile":format!("{name}-connection"),"collection-complete":true,
+        "fluent-commit":git_head(Path::new(env!("CARGO_MANIFEST_DIR"))),
+        "fluent-binary-sha256":format!("{:x}",Sha256::digest(fs::read(env!("CARGO_BIN_EXE_fluent")).unwrap())),
+        "artifacts":artifacts,"events":events})).unwrap()).unwrap();
+    let result = Command::new("python3")
+        .arg(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("tests/formal/workflow/project_{name}.py")),
+        )
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+#[test]
 fn workflow_cleanup_retains_pending_recovery() {
     let tmp = TempDir::new().unwrap();
     let project = setup_git_project(&tmp);
@@ -22742,6 +22998,12 @@ fn workflow_cleanup_retains_pending_recovery() {
     );
     let artifact_root = project.join(".fluent/work/artifacts/work-1");
     assert!(artifact_root.is_dir());
+    let retained = recorded_work_bytes(&project);
+    let before_show = read_work_show_json(&project, "work-1");
+    let before_status = fluent::work_status::format_work_dashboard_lines(
+        &fluent::work_status::load_work_status(&project).unwrap(),
+    );
+    assert_eq!(recorded_work_bytes(&project), retained);
     fluent_cmd()
         .current_dir(&project)
         .args(["cleanup", "--apply"])
@@ -22749,10 +23011,44 @@ fn workflow_cleanup_retains_pending_recovery() {
         .success();
     assert_eq!(work_item_value(&project, "work-1"), before);
     assert!(artifact_root.is_dir());
+    let after_cleanup = work_item_value(&project, "work-1");
+    let retained_after = recorded_work_bytes(&project);
+    assert_eq!(retained, retained_after);
     fs::remove_file(project.join(".fluent/observations")).unwrap();
     land_work_1(&project, &bin, true);
     assert_eq!(follow_up_failure_stage(&project), "");
     assert_eq!(open_observation_files(&project).len(), 1);
+    let settled = work_item_value(&project, "work-1");
+    let settled_show = read_work_show_json(&project, "work-1");
+    let settled_status = fluent::work_status::format_work_dashboard_lines(
+        &fluent::work_status::load_work_status(&project).unwrap(),
+    );
+    let observations: Vec<_> = open_observation_files(&project)
+        .into_iter()
+        .map(|name| fs::read_to_string(project.join(".fluent/observations").join(name)).unwrap())
+        .collect();
+    record_integrated_facts(
+        "cleanup",
+        "FLUENT_INTEGRATED_CLEANUP_TRACE",
+        &tmp,
+        &[
+            (
+                "pending",
+                "observe",
+                serde_json::json!({"work":before,"shown":before_show,"status":before_status,"retained":retained}),
+            ),
+            (
+                "cleanup-refused",
+                "cleanup",
+                serde_json::json!({"work":after_cleanup,"retained":retained_after,"artifacts-present":artifact_root.is_dir()}),
+            ),
+            (
+                "settled",
+                "land-retry",
+                serde_json::json!({"work":settled,"shown":settled_show,"status":settled_status,"observations":observations}),
+            ),
+        ],
+    );
 }
 
 #[test]
@@ -55813,7 +56109,9 @@ fn canonical_tester_replacement_reaches_ready(extractor: Option<&str>) {
         extractor,
     );
     let original = fs::read(&results).unwrap();
-    attach_canonical_fixture_result(&tmp, &project, work, &candidate, 1, "false");
+    let before = work_item_value(&project, work);
+    let selector = attach_canonical_fixture_result(&tmp, &project, work, &candidate, 1, "false");
+    let planned = work_item_value(&project, work);
     let bin = tmp.path().join("bin");
     write_mock_claude(
         &bin,
@@ -55841,8 +56139,39 @@ fn canonical_tester_replacement_reaches_ready(extractor: Option<&str>) {
         tasks.iter().filter(|task| task["kind"] == "tester").count(),
         1
     );
-    assert_eq!(fs::read_to_string(marker).unwrap(), "pass\n");
-    assert_eq!(fs::read(results).unwrap(), original);
+    assert_eq!(fs::read_to_string(&marker).unwrap(), "pass\n");
+    assert_eq!(fs::read(&results).unwrap(), original);
+    if extractor.is_none() {
+        let recovery = &item["attempts"][0]["evidence_recoveries"][0];
+        let review = tasks
+            .iter()
+            .find(|t| t["evidence_review_context"].is_object())
+            .unwrap();
+        record_integrated_facts(
+            "targeted",
+            "FLUENT_INTEGRATED_TARGETED_TRACE",
+            &tmp,
+            &[
+                (
+                    "failed-check",
+                    "task-run",
+                    serde_json::json!({"work":before,"results":String::from_utf8(original.clone()).unwrap(),"config":fs::read_to_string(project.join(".fluent/tester.yaml")).unwrap()}),
+                ),
+                (
+                    "attached",
+                    "evidence-attach",
+                    serde_json::json!({"work":planned,"selector":selector,
+                "proof":fs::read_to_string(project.join(recovery["attachment"]["snapshot_path"].as_str().unwrap())).unwrap()}),
+                ),
+                (
+                    "ready",
+                    "attempt-run",
+                    serde_json::json!({"work":item,"results":fs::read_to_string(&results).unwrap(),"head":git_head(&project),
+                "passing-runs":fs::read_to_string(&marker).unwrap(),"review":fs::read_to_string(project.join(review["artifact_area"]["path"].as_str().unwrap()).join("review.md")).unwrap()}),
+                ),
+            ],
+        );
+    }
 }
 
 #[test]
@@ -68919,6 +69248,80 @@ fn landed_status_keeps_unmerged_checks_strict() {
     let shown = read_work_show_json(&project, "work-1");
     assert!(shown["evidence-recovery"].is_object());
     assert!(shown["verification-diagnostic"].is_string());
+}
+
+#[test]
+fn workflow_integrated_landing_rechecks_current_approval() {
+    let tmp = TempDir::new().unwrap();
+    let project = setup_git_project(&tmp);
+    let bin = run_plain_attempt(&project, &tmp, "approval-provider");
+    let ready = work_item_value(&project, "work-1");
+    let head = git_head(&project);
+    let interrupted = fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "merge-candidate",
+            "land",
+            "work-1",
+            "attempt-1-merge-candidate",
+            "--no-sandbox",
+            "--no-post-merge-review",
+        ])
+        .env("PATH", mock_path(&bin))
+        .env("FLUENT_TEST_INTERRUPT_BEFORE_LANDING_GIT", "1")
+        .output()
+        .unwrap();
+    assert!(!interrupted.status.success());
+    assert_eq!(git_head(&project), head);
+    let intent = work_item_value(&project, "work-1");
+    fluent_cmd()
+        .current_dir(&project)
+        .args(["attempt", "cancel", "work-1", "attempt-1"])
+        .assert()
+        .success();
+    let canceled = work_item_value(&project, "work-1");
+    let refused = fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "merge-candidate",
+            "land",
+            "work-1",
+            "attempt-1-merge-candidate",
+            "--no-sandbox",
+            "--no-post-merge-review",
+        ])
+        .env("PATH", mock_path(&bin))
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert_eq!(git_head(&project), head);
+    record_integrated_facts(
+        "approval",
+        "FLUENT_INTEGRATED_APPROVAL_TRACE",
+        &tmp,
+        &[
+            (
+                "ready",
+                "attempt-run",
+                serde_json::json!({"work":ready,"head":head}),
+            ),
+            (
+                "intent",
+                "land-interrupted",
+                serde_json::json!({"work":intent,"head":head,"stderr":String::from_utf8_lossy(&interrupted.stderr)}),
+            ),
+            (
+                "canceled",
+                "attempt-cancel",
+                serde_json::json!({"work":canceled,"head":head}),
+            ),
+            (
+                "refused",
+                "land-retry",
+                serde_json::json!({"work":work_item_value(&project,"work-1"),"head":git_head(&project),"exit":refused.status.code(),"stderr":String::from_utf8_lossy(&refused.stderr)}),
+            ),
+        ],
+    );
 }
 
 #[test]

@@ -14,8 +14,17 @@ CONSTANTS Trace1work, Trace1attempt, Trace1candidate, Trace1writer,
           Trace4outputCommit, Trace4noChange, Trace4proofCount, Trace4tester,
           Trace4ready
 
-VARIABLE state
-vars == <<state>>
+VARIABLES state, wf
+vars == <<state, wf>>
+
+W == INSTANCE Workflow WITH Works <- {"work"}, ReviewOnly <- {},
+     MaxFailures <- 0, DeliverInputs <- TRUE, CheckEvidence <- TRUE,
+     FenceResume <- TRUE, GuardEffect <- TRUE, TruthfulObservation <- TRUE,
+     GuardCleanup <- TRUE, GuardVersion <- TRUE, GuardBaseline <- TRUE,
+     GuardLandingBaseline <- TRUE, CanonicalKinds <- {"pass"},
+     CorruptPrewrite <- FALSE, TargetKinds <- {"unchanged"},
+     GuardReviewRoute <- TRUE, LandingKinds <- {"pass"}, s <- wf
+
 
 TraceState1 == [work |-> Trace1work, attempt |-> Trace1attempt,
                 candidate |-> Trace1candidate, writer |-> Trace1writer,
@@ -38,17 +47,25 @@ TraceState4 == [work |-> Trace4work, attempt |-> Trace4attempt,
                 noChange |-> Trace4noChange, proofCount |-> Trace4proofCount,
                 tester |-> Trace4tester, ready |-> Trace4ready]
 
-Init == state = TraceState1 /\ ~state.noChange /\ ~state.ready
-NoChange == /\ ~state.noChange /\ state' = TraceState2
+Init == /\ state = TraceState1 /\ ~state.noChange /\ ~state.ready
+        /\ wf = [w \in {"work"} |-> LET base == W!InitialWork(w) IN
+             [base EXCEPT !.phase = "reviewed", !.delivered = base.required]]
+NoChange == /\ ~state.noChange /\ state' = TraceState2 /\ UNCHANGED wf
 Attach == /\ state.noChange /\ state.proofCount = TraceState2.proofCount
-          /\ state' = TraceState3
+          /\ state' = TraceState3 /\ UNCHANGED wf
 Resume == /\ state.proofCount = TraceState3.proofCount
-          /\ ~state.ready /\ state' = TraceState4
+          /\ ~state.ready
+          /\ CASE wf["work"].credit = {} -> /\ W!TargetedReview("work") /\ UNCHANGED state
+                [] wf["work"].canonicalOutcome = "unset" -> /\ W!CanonicalResult("work", "pass") /\ UNCHANGED state
+                [] wf["work"].phase = "reviewed" -> /\ W!Tester("work") /\ UNCHANGED state
+                [] wf["work"].phase = "tested" -> /\ W!LearnCapture("work") /\ UNCHANGED state
+                [] OTHER -> /\ W!Ready("work") /\ state' = TraceState4
 Next == NoChange \/ Attach \/ Resume
 Spec == Init /\ [][Next]_vars /\ WF_vars(NoChange) /\ WF_vars(Attach)
         /\ WF_vars(Resume)
 
-TraceSafe == /\ state.work = TraceState1.work
+TraceSafe == /\ (state.ready = (wf["work"].phase = "ready"))
+             /\ state.work = TraceState1.work
              /\ state.attempt = TraceState1.attempt
              /\ state.candidate = TraceState1.candidate
              /\ state.tester = TraceState1.tester

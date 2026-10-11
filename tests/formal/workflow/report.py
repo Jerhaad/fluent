@@ -20,7 +20,7 @@ REQUIRED_CASES = {
                    "production-model-path", "negative-trace-projection",
                    "negative-model-path"),
     "writer-inputs": ("negative-deliverinputs.cfg", "fresh-writer-fixture",
-                      "writer-production-projection", "omitted-instruction-control",
+                      "writer-production-projection", "wrong-task-control", "omitted-instruction-control",
                       "missing-delivery-boundary-control", "writer-production-path.cfg"),
     "evidence-status": ("negative-checkevidence.cfg", "negative-landing-new.cfg",
                         "fresh-evidence-fixture", "public-carried-review-fixture",
@@ -32,7 +32,8 @@ REQUIRED_CASES = {
                              "recovery-projection", "recovery-production.cfg"),
     "release-transition": ("released-fixture-1", "released-fixture-2",
                            "released-fixture-3", "current-authority-projection",
-                           "pending-publication-projection", "service-projection",
+                           "pending-publication-projection", "current-authority-connection.cfg", "pending-publication-connection.cfg", "service-projection", "service-ownership-production.cfg",
+                           "service-incompatible-negative", "service-project-negative",
                            "service-competition.cfg", "negative-guardversion.cfg"),
     "integrated-production": ("fresh-queue-cancel", "queue-cancel-projection",
                               "cross-work-negative", "ambiguous-order-negative",
@@ -46,6 +47,27 @@ REQUIRED_CASES = {
                               "isolation-connection.cfg", "isolation-assumptions.cfg", "isolation-dropped.cfg",
                               "fresh-isolation", "isolation-projection", "isolation-dropped-negative",
                               "isolation-corrupt-negative", "isolation-identity-negative",
+                              "approval-connection.cfg", "approval-assumptions.cfg", "approval-candidate.cfg", "approval-stop.cfg",
+                              "fresh-approval", "approval-projection", "approval-scope-negative", "approval-effect-negative", "approval-authority-negative",
+                              "version-connection.cfg", "version-assumptions.cfg", "version-write.cfg", "version-state.cfg",
+                              "release-ownership-connection.cfg", "release-ownership-assumptions.cfg",
+                              "release-ownership-trace.cfg", "release-ownership-trace-held.cfg", "release-ownership-unsettled.cfg", "release-ownership-build.cfg", "release-ownership-stop.cfg",
+                              "completion-connection.cfg", "completion-assumptions.cfg", "completion-early.cfg", "completion-history.cfg",
+                              "completion-replay.cfg", "fresh-completion", "completion-projection", "completion-identity-negative", "completion-history-negative",
+                              "requirements-connection.cfg", "requirements-assumptions.cfg", "requirements-collision.cfg",
+                              "fresh-requirements", "requirements-projection", "requirements-collision-negative", "requirements-delivery-negative",
+                              "authorization-connection.cfg", "authorization-assumptions.cfg", "authorization-forged.cfg",
+                              "fresh-authorization", "authorization-projection", "authorization-forged-negative", "authorization-scope-negative",
+                              "evidence-connection.cfg", "evidence-assumptions.cfg", "evidence-scope.cfg", "evidence-stale.cfg",
+                              "fresh-targeted", "targeted-projection", "targeted-scope-negative",
+                              "targeted-stale-negative", "targeted-verdict-negative",
+                              "learning-connection.cfg", "learning-assumptions.cfg", "learning-candidate.cfg",
+                              "learning-confinement.cfg", "learning-mode.cfg", "fresh-learning_capture",
+                              "learning_capture-projection", "learning_capture-mode-negative", "learning_capture-handoff-negative",
+                              "learning-no-expertise-confined-success", "fresh-learning_no_expertise", "learning_no_expertise-projection", "learning_no_expertise-mutation-negative",
+                              "landing-cleanup.cfg", "landing-observation.cfg", "fresh-cleanup",
+                              "cleanup-projection", "cleanup-lost-evidence-negative",
+                              "cleanup-status-negative", "cleanup-publication-negative",
                               "landing-connection.cfg", "landing-assumptions.cfg", "landing-unbound.cfg",
                               "landing-replay.cfg", "landing-independent.cfg", "fresh-landing", "landing-projection",
                               "landing-unbound-negative", "landing-replay-negative", "landing-independent-negative",
@@ -94,7 +116,7 @@ BOUNDARIES = (
 MODELS = ("Workflow.tla", "Trace.tla", "WriterTrace.tla", "EvidenceTrace.tla",
           "RecoveryTrace.tla", "JointSettlement.tla", "NoChangeTrace.tla",
           "PendingPlanTrace.tla", "QueueDispatchConnection.tla", "GenerationConnection.tla", "ChildConnection.tla",
-          "ReviewTasks.tla", "ReviewConnection.tla", "ServiceConnection.tla", "LandingConnection.tla", "IsolationConnection.tla")
+          "ReviewTasks.tla", "ReviewConnection.tla", "ServiceConnection.tla", "LandingConnection.tla", "IsolationConnection.tla", "LearningConnection.tla", "EvidenceConnection.tla", "AuthorizationConnection.tla", "RequirementConnection.tla", "CompletionConnection.tla", "ReleaseOwnershipConnection.tla", "ReleaseOwnershipTrace.tla", "VersionConnection.tla", "ApprovalConnection.tla")
 SCHEDULER_MODELS = ("QueueHandoff.tla", "GenerationFence.tla", "ServiceIsolation.tla",
                     "ChildLaunchIdentity.tla", "ServiceLifecycle.tla",
                     "LandingPublication.tla")
@@ -180,9 +202,9 @@ def approved_contracts(source, results, candidate, binary):
 
 def connection_credit(evidence, passing_cases):
     """Credit only a named, checked model-to-production connection."""
-    if not evidence.startswith("Verified: "):
+    if not evidence.startswith(("Check: ", "Verified: ")):
         return False
-    parts = evidence.removeprefix("Verified: ").split("; ")
+    parts = evidence.split(": ", 1)[1].split("; ")
     if len(parts) != 4:
         return False
     references = {}
