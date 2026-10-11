@@ -42,6 +42,12 @@ CONTROLS = {
     "target-misbound": "Invariant LandingAcceptanceSafe is violated",
 }
 PROFILE_ACTIONS = {
+    "isolation-connection.cfg": ("Poll", "NextPoll"),
+    "isolation-assumptions.cfg": ("Poll", "NextPoll"),
+    "landing-connection.cfg": ("Intent", "Effect", "Publish", "Crash", "Recover", "FailWrite", "RecoverIO", "Replay", "FollowUp", "Cleanup"),
+    "landing-assumptions.cfg": ("Intent", "Effect", "Publish", "Advance", "IndependentWrite", "Replay"),
+    "service-connection.cfg": ("Start", "Reuse", "Claim", "Receipt", "Execute", "Drain", "Settle", "Publish", "Release", "Crash", "Replay"),
+    "service-assumptions.cfg": ("Start", "Claim", "Receipt", "Execute", "Publish", "Crash"),
     "review-connection.cfg": ("Test", "StartReview", "FinishReview", "Credit", "Ready", "Crash", "Cancel", "Recover", "Resume"),
     "review-assumptions.cfg": ("Test", "StartReview", "Crash", "Resume"),
     "child-connection.cfg": ("Reserve", "Receipt", "Execute", "Crash", "Stop",
@@ -256,6 +262,9 @@ def integrated_production_suite(source, root, output, jar, java):
     rows.extend(generation_connection_suite(source, root, output, jar, java))
     rows.extend(child_connection_suite(source, root, output, jar, java))
     rows.extend(review_connection_suite(source, root, output, jar, java))
+    rows.extend(landing_connection_suite(source, root, output, jar, java))
+    rows.extend(service_connection_suite(source, output, jar, java))
+    rows.extend(isolation_connection_suite(source, root, output, jar, java))
     if produced:
         try:
             trace = json.loads(trace_path.read_text())
@@ -656,6 +665,44 @@ def generation_connection_suite(source, root, output, jar, java):
           "resume dispatch lacks current cancellation authority"),
          ("wrong-refusal", 3, lambda f: f.update({"stderr": "unrelated failure"}),
           "stale dispatch changed Work or lacked the expected refusal")))
+
+
+def isolation_connection_suite(source, root, output, jar, java):
+    return observed_connection_suite(
+        source, root, output, jar, java, "isolation", "IsolationConnection",
+        (("isolation-connection.cfg", None), ("isolation-assumptions.cfg", None),
+         ("isolation-dropped.cfg", "Temporal properties were violated")),
+        "scheduler_isolation_continues_healthy_projects", "FLUENT_INTEGRATED_ISOLATION_TRACE",
+        (("dropped", 0, lambda f: f.update({"calls": []}), "healthy project was not dispatched"),
+         ("corrupt", 1, lambda f: f.update({"bad-work": "rewritten"}), "corrupt project was rewritten or dropped"),
+         ("identity", 2, lambda f: f["good"].update({"bound_attempt_id": "other"}), "healthy Attempt binding differs")),
+        binary="scheduler_service")
+
+
+def service_connection_suite(source, output, jar, java):
+    # The released-service production evidence remains owned by the separate
+    # host release suite; this writer suite supplies only the joint mapping.
+    return [run_case(source, output, jar, java, config, expected, "ServiceConnection")
+            for config, expected in (
+                ("service-connection.cfg", None), ("service-assumptions.cfg", None),
+                ("service-unsettled.cfg", "Invariant ChildBeforePublication is violated"),
+                ("service-stale-stop.cfg", "Invariant OwnerBound is violated"),
+                ("service-wrong-build.cfg", "Invariant OwnerBound is violated"))]
+
+
+def landing_connection_suite(source, root, output, jar, java):
+    return observed_connection_suite(
+        source, root, output, jar, java, "landing", "LandingConnection",
+        (("landing-connection.cfg", None), ("landing-assumptions.cfg", None),
+         ("landing-unbound.cfg", "Invariant NoUnboundEffect is violated"),
+         ("landing-replay.cfg", "Invariant OneEffect is violated"),
+         ("landing-independent.cfg", "Invariant RetainIndependent is violated")),
+        "workflow_recovery_preserves_intervening_changes", "FLUENT_INTEGRATED_LANDING_TRACE",
+        (("unbound", 1, lambda f: f["work"]["merge_candidates"][0]["merge_state"]["landing_intent"].update(
+            {"verified_commit": "0" * 40}), "Git effect lacks exact retained intent"),
+         ("replay", 3, lambda f: f.update({"head": "0" * 40}), "replay applied another Git effect"),
+         ("independent", 5, lambda f: f.update({"file": "overwritten"}), "replay overwrote independent state"),
+         ("follow-up", 5, lambda f: f.update({"observations": []}), "follow-up publication lacks retained origin")))
 
 
 def observed_connection_suite(source, root, output, jar, java, name, module,

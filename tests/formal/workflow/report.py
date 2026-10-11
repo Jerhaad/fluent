@@ -43,6 +43,14 @@ REQUIRED_CASES = {
                               "queue-dispatch-early.cfg",
                               "queue-dispatch-no-coordinator.cfg",
                               "fresh-queue-dispatch", "queue-dispatch-projection",
+                              "isolation-connection.cfg", "isolation-assumptions.cfg", "isolation-dropped.cfg",
+                              "fresh-isolation", "isolation-projection", "isolation-dropped-negative",
+                              "isolation-corrupt-negative", "isolation-identity-negative",
+                              "landing-connection.cfg", "landing-assumptions.cfg", "landing-unbound.cfg",
+                              "landing-replay.cfg", "landing-independent.cfg", "fresh-landing", "landing-projection",
+                              "landing-unbound-negative", "landing-replay-negative", "landing-independent-negative",
+                              "landing-follow-up-negative", "service-connection.cfg", "service-assumptions.cfg",
+                              "service-unsettled.cfg", "service-stale-stop.cfg", "service-wrong-build.cfg",
                               "queue-recovery-connection.cfg", "queue-recovery-assumptions.cfg",
                               "queue-recovery-duplicate.cfg", "queue-recovery-live-lease.cfg",
                               "fresh-queue-recovery", "queue-recovery-projection",
@@ -86,7 +94,7 @@ BOUNDARIES = (
 MODELS = ("Workflow.tla", "Trace.tla", "WriterTrace.tla", "EvidenceTrace.tla",
           "RecoveryTrace.tla", "JointSettlement.tla", "NoChangeTrace.tla",
           "PendingPlanTrace.tla", "QueueDispatchConnection.tla", "GenerationConnection.tla", "ChildConnection.tla",
-          "ReviewTasks.tla", "ReviewConnection.tla")
+          "ReviewTasks.tla", "ReviewConnection.tla", "ServiceConnection.tla", "LandingConnection.tla", "IsolationConnection.tla")
 SCHEDULER_MODELS = ("QueueHandoff.tla", "GenerationFence.tla", "ServiceIsolation.tla",
                     "ChildLaunchIdentity.tla", "ServiceLifecycle.tla",
                     "LandingPublication.tla")

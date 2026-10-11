@@ -68966,6 +68966,9 @@ fn workflow_recovery_preserves_intervening_changes() {
     let tmp = TempDir::new().unwrap();
     let project = setup_git_project(&tmp);
     let bin = run_plain_attempt(&project, &tmp, "workflow-recovery-provider");
+    let mut facts = vec![
+        serde_json::json!({"work":work_item_value(&project,"work-1"),"head":git_head(&project)}),
+    ];
     fluent_cmd()
         .current_dir(&project)
         .args([
@@ -68981,10 +68984,15 @@ fn workflow_recovery_preserves_intervening_changes() {
         .assert()
         .failure();
     let after_effect = git_head(&project);
+    facts.push(serde_json::json!({"work":work_item_value(&project,"work-1"),"head":after_effect}));
     fs::write(project.join(".fluent/observations"), "block publication\n").unwrap();
     land_work_1(&project, &bin, true);
     assert_eq!(git_head(&project), after_effect);
     assert_eq!(follow_up_failure_stage(&project), "observation");
+    facts.push(serde_json::json!({"work":work_item_value(&project,"work-1"),"head":git_head(&project),"obstruction":fs::read_to_string(project.join(".fluent/observations")).unwrap()}));
+    land_work_1(&project, &bin, true);
+    facts.push(serde_json::json!({"work":work_item_value(&project,"work-1"),"head":git_head(&project),"obstruction":fs::read_to_string(project.join(".fluent/observations")).unwrap()}));
+    assert_eq!(facts[2], facts[3]);
     commit_file(
         &project,
         "independent.txt",
@@ -69004,6 +69012,8 @@ fn workflow_recovery_preserves_intervening_changes() {
         .success();
     let independent = work_item_value(&project, "later-work");
     let later_head = git_head(&project);
+    facts.push(serde_json::json!({"work":work_item_value(&project,"work-1"),"head":later_head,
+        "independent":independent,"file":fs::read_to_string(project.join("independent.txt")).unwrap()}));
     fs::remove_file(project.join(".fluent/observations")).unwrap();
     land_work_1(&project, &bin, true);
     assert_eq!(git_head(&project), later_head);
@@ -69014,6 +69024,50 @@ fn workflow_recovery_preserves_intervening_changes() {
     assert_eq!(work_item_value(&project, "later-work"), independent);
     assert_eq!(follow_up_failure_stage(&project), "");
     assert_eq!(open_observation_files(&project).len(), 1);
+    let observations: Vec<_> = open_observation_files(&project)
+        .into_iter()
+        .map(|name| {
+            let content =
+                fs::read_to_string(project.join(".fluent/observations").join(&name)).unwrap();
+            serde_json::json!({"path":name,"content":content})
+        })
+        .collect();
+    facts.push(serde_json::json!({"work":work_item_value(&project,"work-1"),"head":git_head(&project),
+        "independent":work_item_value(&project,"later-work"),"file":fs::read_to_string(project.join("independent.txt")).unwrap(),
+        "observations":observations}));
+    let directory = std::env::var_os("FLUENT_INTEGRATED_LANDING_TRACE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| tmp.path().join("landing-trace"));
+    fs::create_dir_all(&directory).unwrap();
+    let mut artifacts = Vec::new();
+    let mut events = Vec::new();
+    for (index, fact) in facts.iter().enumerate() {
+        let name = format!("landing-{index}.json");
+        let raw = serde_json::to_vec_pretty(fact).unwrap();
+        fs::write(directory.join(&name), &raw).unwrap();
+        artifacts
+            .push(serde_json::json!({"path":name,"sha256":format!("{:x}",Sha256::digest(raw))}));
+        events.push(serde_json::json!({"sequence":index+1,"actor":"operator","generation":null,
+            "operation-id":(["attempt-run","land-interrupted","land-obstructed","land-retry","independent-write","land-retry"][index]),
+            "boundary":(["ready","git-effect","follow-up-pending","replayed","independent","settled"][index]),
+            "causal-predecessors":if index == 0 {vec![]} else {vec![index]},"raw-facts":fact}));
+    }
+    let path = directory.join("production-trace.json");
+    fs::write(&path,serde_json::to_vec_pretty(&serde_json::json!({
+        "schema-version":1,"scenario":"landing-recovery","model-profile":"landing-connection",
+        "fluent-commit":git_head(Path::new(env!("CARGO_MANIFEST_DIR"))),
+        "fluent-binary-sha256":format!("{:x}",Sha256::digest(fs::read(env!("CARGO_BIN_EXE_fluent")).unwrap())),
+        "collection-complete":true,"events":events,"artifacts":artifacts})).unwrap()).unwrap();
+    let projected = Command::new("python3")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/formal/workflow/project_landing.py"))
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(
+        projected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&projected.stderr)
+    );
 }
 
 #[test]

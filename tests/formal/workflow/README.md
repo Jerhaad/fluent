@@ -309,3 +309,40 @@ The JSON envelope has exactly these fields:
 Each event has integer `sequence`, string `actor`, string `operation-id`, nullable `generation`, string `boundary`, integer-array `causal-predecessors`, and object `raw-facts`. The four boundaries are `intake`, `attempt-create`, `cancel`, and `run-refused`. Every boundary records integer `exit-code` and the full parsed `work` snapshot from `work-item show`; `run-refused` also records string `stdout` and `stderr`. The fixture uses controlled command order as its barrier. Missing, duplicate, unordered, or artifact-inconsistent facts fail projection. The checker compares the trace commit and binary digest with the candidate it just built, so a retained trace from another candidate cannot satisfy the host check.
 
 The checker stores model results, projection result, raw production trace, and corrupted-trace result separately. `Trace.tla` checks the projected sequence against the named intake, attempt creation, cancellation, and refusal actions in `Workflow.tla`. The checker also changes the refused snapshot to claim advancement, rebinds its artifact digest, projects that observation for model input, and requires TLC to violate `TraceComplete` at the refusal action. Ordinary projection still rejects that contradictory observation; the Rust test also checks it. [The connection inventory](connections.md) maps every workflow boundary to the six existing detailed protocol models, explicit mapping checks, production coverage owners, and pending evidence. Those older models are passing checks of their own protocols; they are not composed whole-workflow assurance. The foundation proves a narrow real trace and records the rest as obligations for the subsequent Work Items.
+
+### Check landing replay and service ownership together
+
+`LandingConnection` instantiates the unchanged `LandingPublication` protocol and
+`Workflow`. It starts at verified candidate metadata; readiness evidence is
+checked separately by the evidence suite. Intent, Git effect, result, crash and
+I/O failure advance both models. Once a result exists, retry stutters in the
+workflow while the detailed protocol still checks effect count and independent
+state. Bounds are one Work, one candidate, one crash and one I/O failure. Cleanup
+requires settled follow-up publication. These configurations check safety; they
+do not assert that an operator eventually removes a filesystem obstruction.
+
+`workflow_recovery_preserves_intervening_changes` records the real interrupted
+land command, retained intent and Git HEAD, retries through an observation-path
+obstruction, creates independent Git and Work state, and retries publication.
+`project_landing.py` reads these snapshots independently, verifies the exact
+operation and candidate tuple and unchanged independent state, and checks the
+observation's retained origin. Rehashed intent, effect, independent-file and
+missing-observation controls must be rejected.
+
+`ServiceConnection` instantiates `Workflow`, `ServiceLifecycle`, and
+`ChildLaunchIdentity`. It bounds two service instances, two registered projects,
+one active child and one service crash. Child ownership is bound to its service
+instance: a settled replacement must not claim it settled a previous owner's
+child. Clearing worker accounting without child settlement violates publication
+safety. Separate controls remove the build and stop-instance guards. These are
+joint model checks; the released-service production projection and its host
+execution remain separate evidence, and the inventory retains that gap.
+
+`IsolationConnection` couples `ServiceIsolation.PollProject` with actual
+`Workflow.Dispatch` transitions for two projects. It disables repair and restart
+in this profile: under weakly fair polling the healthy project must still be
+dispatched while the other stays unreadable. The production fixture invokes the
+real registered-project poller for configuration, corrupt-Work and coordinator
+lock failures, recording raw registry, queue, Work and diagnostic snapshots. Its
+external Attempt runner returns a scripted needs-user result; the projection
+credits dispatch isolation, not provider execution or shared socket ownership.

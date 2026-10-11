@@ -4267,6 +4267,8 @@ fn scheduler_recovery_uncreated_attempt() {
 
 #[test]
 fn scheduler_isolation_continues_healthy_projects() {
+    use sha2::{Digest, Sha256};
+    let mut facts = Vec::new();
     for fault in ["configuration", "corrupt-work", "coordinator"] {
         let root = TempDir::new().unwrap();
         let home = root.path().join("home");
@@ -4302,6 +4304,9 @@ fn scheduler_isolation_continues_healthy_projects() {
         }
         create_execution_ready_work(&good, "wi-good");
         fluent::queue::add(&good, "wi-good", Some(0)).unwrap();
+        let before = serde_json::json!({"bad":fluent::queue::show(&bad,"wi-bad").unwrap(),
+            "good":fluent::queue::show(&good,"wi-good").unwrap(),
+            "registry":scheduler_service::read_registry(&home).unwrap()});
         service.poll_once().unwrap();
         service.join_workers().unwrap();
         assert_eq!(
@@ -4331,7 +4336,55 @@ fn scheduler_isolation_continues_healthy_projects() {
                     .any(|error| error.contains(&bad.display().to_string()))
             );
         }
+        facts.push(serde_json::json!({"fault":fault,"before":before,
+            "bad":bad_dispatch,"good":fluent::queue::show(&good,"wi-good").unwrap(),
+            "registry":scheduler_service::read_registry(&home).unwrap(),
+            "calls":runner.calls.lock().unwrap().clone(),"diagnostics":service.last_poll_failures(),
+            "good-work":fluent::work_model::WorkModelStore::new(&good).read_work_item("wi-good").unwrap(),
+            "bad-work":fs::read_to_string(fluent::work_model::WorkModelStore::new(&bad).work_item_path("wi-bad").unwrap()).unwrap()}));
     }
+
+    let tmp = TempDir::new().unwrap();
+    let directory = std::env::var_os("FLUENT_INTEGRATED_ISOLATION_TRACE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| tmp.path().join("isolation"));
+    fs::create_dir_all(&directory).unwrap();
+    let mut artifacts = Vec::new();
+    let mut events = Vec::new();
+    for (index, fact) in facts.iter().enumerate() {
+        let name = format!("isolation-{index}.json");
+        let raw = serde_json::to_vec_pretty(fact).unwrap();
+        fs::write(directory.join(&name), &raw).unwrap();
+        artifacts
+            .push(serde_json::json!({"path":name,"sha256":format!("{:x}",Sha256::digest(raw))}));
+        events.push(serde_json::json!({"sequence":index+1,"actor":"service","generation":null,
+            "operation-id":"poll-projects","boundary":fact["fault"],"causal-predecessors":[],"raw-facts":fact}));
+    }
+    let head = std::process::Command::new("git")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(head.status.success());
+    let path = directory.join("production-trace.json");
+    fs::write(&path,serde_json::to_vec_pretty(&serde_json::json!({"schema-version":1,
+        "scenario":"project-isolation","model-profile":"isolation-connection","collection-complete":true,
+        "fluent-commit":String::from_utf8_lossy(&head.stdout).trim(),
+        "fluent-binary-sha256":format!("{:x}",Sha256::digest(fs::read(env!("CARGO_BIN_EXE_fluent")).unwrap())),
+        "artifacts":artifacts,"events":events})).unwrap()).unwrap();
+    let result = std::process::Command::new("python3")
+        .arg(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/formal/workflow/project_isolation.py"),
+        )
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
 }
 
 fn create_bound_attempt(
