@@ -42,6 +42,10 @@ CONTROLS = {
     "target-misbound": "Invariant LandingAcceptanceSafe is violated",
 }
 PROFILE_ACTIONS = {
+    "queue-dispatch-connection.cfg": ("Elect", "Claim", "Acquire", "Bind",
+                                      "Dispatch", "Finish", "Settle"),
+    "queue-dispatch-assumptions.cfg": ("Elect", "Claim", "Acquire", "Bind",
+                                       "Dispatch"),
     "no-change-production.cfg": ("NoChange", "Attach", "Resume"),
     "pending-plan-production.cfg": ("NoChange", "Attach", "Resume"),
     "joint-settlement.cfg": ("Launch", "RequestStop", "Crash", "Restart",
@@ -105,6 +109,84 @@ def integrated_production_suite(source, root, output, jar, java):
     produced = fixture.returncode == 0 and trace_path.is_file()
     rows = [{"case": "fresh-queue-cancel", "pass": produced,
              "log": "production-fixture.log"}]
+    for config, violation in (("queue-dispatch-connection.cfg", None),
+                              ("queue-dispatch-assumptions.cfg", None),
+                              ("queue-dispatch-early.cfg",
+                               "Invariant MappedDispatch is violated"),
+                              ("queue-dispatch-no-coordinator.cfg",
+                               "Invariant ClaimRequiresCoordinator is violated")):
+        rows.append(run_case(source, output, jar, java, config, violation,
+                             module="QueueDispatchConnection"))
+    queue_directory = directory / "queue-dispatch"
+    queue_directory.mkdir(exist_ok=True)
+    for name in ("production-trace.json", "first-queued.json", "second-queued.json",
+                 "first-running.json", "second-running.json", "first-work.json",
+                 "second-work.json"):
+        (queue_directory / name).unlink(missing_ok=True)
+    queue_command = ["cargo", "nextest", "run", "--offline", "--features",
+                     "test-support", "--test", "workflow_assurance", "--no-tests",
+                     "fail", "workflow_integrated_queue_claim_holds_bound_attempt_lease"]
+    queue_fixture = subprocess.run(queue_command, cwd=root, capture_output=True, text=True)
+    (output / "queue-dispatch-fixture.log").write_text(
+        "$ " + " ".join(queue_command) + "\n" + queue_fixture.stdout + queue_fixture.stderr)
+    queue_trace_path = queue_directory / "production-trace.json"
+    queue_produced = queue_fixture.returncode == 0 and queue_trace_path.is_file()
+    rows.append({"case": "fresh-queue-dispatch", "pass": queue_produced,
+                 "log": "queue-dispatch-fixture.log"})
+    if queue_produced:
+        try:
+            queue_trace = json.loads(queue_trace_path.read_text())
+            queue_bound = queue_trace["fluent-commit"] == candidate_commit(root) and \
+                queue_trace["fluent-binary-sha256"] == candidate_binary_digest(root)
+        except (ValueError, KeyError, OSError):
+            queue_bound = False
+        command = ["python3", str(source / "project_queue_dispatch.py"),
+                   str(queue_trace_path)]
+        projected = subprocess.run(command, cwd=root, capture_output=True, text=True)
+        (output / "queue-dispatch-projection.log").write_text(
+            "$ " + " ".join(command) + "\n" + projected.stdout + projected.stderr)
+        rows.append({"case": "queue-dispatch-projection",
+                     "pass": queue_bound and projected.returncode == 0,
+                     "log": "queue-dispatch-projection.log"})
+        if queue_bound and projected.returncode == 0:
+            for name, mutate, diagnostic in (
+                ("queue-dispatch-bound-negative",
+                 lambda value: value["events"][1]["raw-facts"]["first"].update(
+                     {"bound_attempt_id": "wrong-attempt"}),
+                 "bound Attempt identity or claim history differs"),
+                ("queue-dispatch-lease-negative",
+                 lambda value: value["events"][1]["raw-facts"].update(
+                     {"lease-live": False}),
+                 "running dispatch lacks a live Attempt lease"),
+                ("queue-dispatch-coordinator-negative",
+                 lambda value: value["events"][1]["raw-facts"].update(
+                     {"coordinator-live": False}),
+                 "claim lacks a live project coordinator")):
+                changed = json.loads(json.dumps(queue_trace))
+                mutate(changed)
+                control_dir = queue_directory / name
+                control_dir.mkdir(exist_ok=True)
+                for entry in changed["artifacts"]:
+                    shutil.copyfile(queue_directory / entry["path"],
+                                    control_dir / entry["path"])
+                if name == "queue-dispatch-bound-negative":
+                    raw = json.dumps(changed["events"][1]["raw-facts"]["first"]).encode()
+                    (control_dir / "first-running.json").write_bytes(raw)
+                    for entry in changed["artifacts"]:
+                        if entry["path"] == "first-running.json":
+                            entry["sha256"] = hashlib.sha256(raw).hexdigest()
+                control = control_dir / "production-trace.json"
+                control.write_text(json.dumps(changed))
+                command = ["python3", str(source / "project_queue_dispatch.py"),
+                           str(control)]
+                rejected = subprocess.run(command, cwd=root, capture_output=True,
+                                          text=True)
+                log = output / f"{name}.log"
+                log.write_text("$ " + " ".join(command) + "\n" +
+                               rejected.stdout + rejected.stderr)
+                rows.append({"case": name,
+                             "pass": rejected.returncode != 0 and
+                             diagnostic in rejected.stderr, "log": log.name})
     if produced:
         try:
             trace = json.loads(trace_path.read_text())
@@ -463,7 +545,8 @@ def integrated_suite(source, root, output, jar, java):
 def run_case(source, output_dir, jar, java, config, expected, module="Workflow"):
     name = Path(config).name
     with tempfile.TemporaryDirectory(prefix="tlc-", dir=output_dir) as metadir:
-        command = [java, "-XX:+UseParallelGC", "-Xmx512m", "-cp", str(jar),
+        command = [java, "-DTLA-Library=" + str(source.parent / "scheduler"),
+                   "-XX:+UseParallelGC", "-Xmx512m", "-cp", str(jar),
                    "tlc2.TLC", "-deadlock", "-coverage", "1", "-workers", "1", "-fp", "0",
                    "-seed", "1", "-metadir", metadir, "-config", config,
                    f"{module}.tla"]

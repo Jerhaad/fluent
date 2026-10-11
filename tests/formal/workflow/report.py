@@ -38,6 +38,14 @@ REQUIRED_CASES = {
                               "cross-work-negative", "ambiguous-order-negative",
                               "post-git-work-negative",
                               "post-git-queue-negative",
+                              "queue-dispatch-connection.cfg",
+                              "queue-dispatch-assumptions.cfg",
+                              "queue-dispatch-early.cfg",
+                              "queue-dispatch-no-coordinator.cfg",
+                              "fresh-queue-dispatch", "queue-dispatch-projection",
+                              "queue-dispatch-bound-negative",
+                              "queue-dispatch-lease-negative",
+                              "queue-dispatch-coordinator-negative",
                               "fresh-no-change-pending-canonical",
                               "no-change-projection", "no-change-production.cfg",
                               "no-change-wrong-candidate.cfg",
@@ -59,7 +67,7 @@ BOUNDARIES = (
 )
 MODELS = ("Workflow.tla", "Trace.tla", "WriterTrace.tla", "EvidenceTrace.tla",
           "RecoveryTrace.tla", "JointSettlement.tla", "NoChangeTrace.tla",
-          "PendingPlanTrace.tla")
+          "PendingPlanTrace.tla", "QueueDispatchConnection.tla")
 SCHEDULER_MODELS = ("QueueHandoff.tla", "GenerationFence.tla", "ServiceIsolation.tla",
                     "ChildLaunchIdentity.tla", "ServiceLifecycle.tla",
                     "LandingPublication.tla")
@@ -298,6 +306,7 @@ def report(results, candidate, binary, source, jar=None, java=None):
                                     "scheduler": digest(scheduler / "check.py"),
                                     "report": digest(source / "report.py"),
                                     "integrated-projector": digest(source / "project_integrated.py"),
+                                    "queue-dispatch-projector": digest(source / "project_queue_dispatch.py"),
                                     "no-change-projector": digest(source / "project_no_change.py"),
                                     "pending-plan-projector": digest(source / "project_pending_plan.py")},
             "connection-inventory-sha256": digest(source / "connections.md"),

@@ -9,6 +9,20 @@ queue/cancellation and no-change Writer sequences, and the scheduler recovery,
 lifecycle, launch, and landing suites. The queue/cancellation trace records two
 Work identities, the retained queue, the canceled foreground Attempt, read-only
 status, a refused Task run, and a later independent Git commit.
+The queued dispatch connection also runs two public queue admissions through
+`scheduler run` at project capacity one. While the first Writer is held open,
+it records both dispatches, both Work Items, the elected coordinator lease,
+and the first dispatch's whole-Attempt lease. `project_queue_dispatch.py`
+checks their digest-bound identities, bound Attempt, and generation increments.
+Rehashed changes to the bound Attempt or either live lease must fail. The
+`QueueDispatchConnection.tla` model composes the actual `Workflow` and
+`QueueHandoff` actions: claim, lease acquisition, and Attempt creation stutter
+in the workflow until `MarkRunning` and `Dispatch` occur together. Two Jobs,
+one actor, one coordinator, no crashes, and at most four queue generations
+bound its complete safety search. The early-dispatch and missing-coordinator
+controls must violate their named invariants. Progress across persistent
+provider failure or a process crash is outside this connection; the scheduler
+recovery suites check those paths separately.
 `project_integrated.py` checks the digest-bound raw facts and causal order
 independently of the command assertions. Rehashed traces that swap the canceled
 Work identity or change retained Work after the Git commit must fail projection.

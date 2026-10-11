@@ -877,3 +877,203 @@ fn workflow_integrated_queue_survives_other_attempt_cancellation() {
             .contains("independent Git change altered retained Work or queue")
     );
 }
+
+#[test]
+fn workflow_integrated_queue_claim_holds_bound_attempt_lease() {
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("project");
+    fs::create_dir(&project).unwrap();
+    assert!(
+        run(&project, "git", &["init", "-b", "main"])
+            .status
+            .success()
+    );
+    assert!(
+        run(&project, "git", &["config", "user.name", "Test"])
+            .status
+            .success()
+    );
+    assert!(
+        run(
+            &project,
+            "git",
+            &["config", "user.email", "test@example.com"]
+        )
+        .status
+        .success()
+    );
+    fs::create_dir_all(project.join(".fluent/work/items")).unwrap();
+    fs::create_dir_all(project.join("mock-bin")).unwrap();
+    fs::write(
+        project.join(".fluent/config.yaml"),
+        "scheduler:\n  local-concurrency: 1\n",
+    )
+    .unwrap();
+    let mock = project.join("mock-bin/claude");
+    fs::write(
+        &mock,
+        r##"#!/bin/bash
+if [ "$1 $2 $3" = "auth status --json" ]; then echo '{"loggedIn":true}'; exit 0; fi
+if [ "$1" = "--version" ]; then echo '2.1.211 (Claude Code)'; exit 0; fi
+touch "$FLUENT_QUEUE_WRITER_STARTED"
+while [ ! -f "$FLUENT_QUEUE_WRITER_RELEASE" ]; do sleep 0.1; done
+git commit --allow-empty -m 'Add fixture write' >/dev/null 2>&1
+exit 0
+"##,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&mock, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    fs::write(project.join("README.md"), "queue connection fixture\n").unwrap();
+    assert!(run(&project, "git", &["add", "."]).status.success());
+    assert!(
+        run(&project, "git", &["commit", "-m", "Add fixture"])
+            .status
+            .success()
+    );
+    let token = tmp
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect::<String>();
+    let first = format!("queue{token}a");
+    let second = format!("queue{token}b");
+    for id in [&first, &second] {
+        fs::write(
+            project.join(format!(".fluent/work/items/{id}.json")),
+            format!("{{\"id\":\"{id}\",\"title\":\"Queue fixture\"}}\n"),
+        )
+        .unwrap();
+        let admitted = fluent(&project, &["queue", "add", id]);
+        assert!(
+            admitted.status.success(),
+            "{}",
+            String::from_utf8_lossy(&admitted.stderr)
+        );
+    }
+    let queued_first = fluent(&project, &["queue", "show", &first]);
+    let queued_second = fluent(&project, &["queue", "show", &second]);
+    assert!(queued_first.status.success() && queued_second.status.success());
+    let started = project.join("writer-started");
+    let release = project.join("writer-release");
+    let mut scheduler = Command::new(env!("CARGO_BIN_EXE_fluent"))
+        .current_dir(&project)
+        .env("FLUENT_NO_UPDATE_CHECK", "1")
+        .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "pass")
+        .env("FLUENT_TEST_HERMETIC_PROVIDERS", "1")
+        .env("FLUENT_QUEUE_WRITER_STARTED", &started)
+        .env("FLUENT_QUEUE_WRITER_RELEASE", &release)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                project.join("mock-bin").display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .args(["scheduler", "run", "--poll-seconds", "1"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut running_first = None;
+    while std::time::Instant::now() < deadline {
+        let shown = fluent(&project, &["queue", "show", &first]);
+        if shown.status.success()
+            && serde_json::from_slice::<Value>(&shown.stdout).unwrap()["status"] == "running"
+            && started.exists()
+        {
+            running_first = Some(shown);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let running_second = fluent(&project, &["queue", "show", &second]);
+    let running_work = fluent(&project, &["work-item", "show", &first]);
+    let competing_work = fluent(&project, &["work-item", "show", &second]);
+    let lease_live = fluent::lease::is_leased(
+        &project.join(format!(".fluent/work/scheduler/leases/{first}.lock")),
+    );
+    let coordinator_live = fluent::scheduler::coordinator_is_live(&project);
+    fs::write(&release, b"release").unwrap();
+    let stopped = fluent(&project, &["scheduler", "stop"]);
+    let _ = scheduler.wait();
+    assert!(
+        stopped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    let running_first = running_first.expect("public scheduler did not run queued Work");
+    assert!(
+        running_second.status.success()
+            && running_work.status.success()
+            && competing_work.status.success()
+    );
+    assert!(lease_live, "running dispatch had no held Attempt lease");
+    assert!(
+        coordinator_live,
+        "queued claim had no elected project coordinator"
+    );
+
+    let target = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target/formal/workflow/integrated/production/queue-dispatch");
+    fs::create_dir_all(&target).unwrap();
+    let observed = [
+        ("first-queued.json", &queued_first.stdout),
+        ("second-queued.json", &queued_second.stdout),
+        ("first-running.json", &running_first.stdout),
+        ("second-running.json", &running_second.stdout),
+        ("first-work.json", &running_work.stdout),
+        ("second-work.json", &competing_work.stdout),
+    ];
+    let artifacts = observed
+        .iter()
+        .map(|(name, bytes)| {
+            fs::write(target.join(name), bytes).unwrap();
+            json!({"path":name,"sha256":digest(bytes)})
+        })
+        .collect::<Vec<_>>();
+    let first_running: Value = serde_json::from_slice(&running_first.stdout).unwrap();
+    let second_running: Value = serde_json::from_slice(&running_second.stdout).unwrap();
+    let first_work: Value = serde_json::from_slice(&running_work.stdout).unwrap();
+    let second_work: Value = serde_json::from_slice(&competing_work.stdout).unwrap();
+    let trace = json!({"schema-version":1,"scenario":"queue-dispatch-connection",
+    "fluent-commit":String::from_utf8_lossy(&run(Path::new(env!("CARGO_MANIFEST_DIR")),
+        "git", &["rev-parse","HEAD"]).stdout).trim(),
+    "fluent-binary-sha256":digest(&fs::read(env!("CARGO_BIN_EXE_fluent")).unwrap()),
+    "model-profile":"queue-dispatch-connection","collection-complete":true,
+    "artifacts":artifacts,"events":[
+        json!({"sequence":1,"actor":"operator","operation-id":"queue-add",
+            "generation":0,"boundary":"two-queued","causal-predecessors":[],
+            "raw-facts":{"first":serde_json::from_slice::<Value>(&queued_first.stdout).unwrap(),
+                         "second":serde_json::from_slice::<Value>(&queued_second.stdout).unwrap()}}),
+        json!({"sequence":2,"actor":"scheduler","operation-id":"scheduler-run",
+            "generation":first_running["generation"],"boundary":"claim-lease-run",
+            "causal-predecessors":[1],"raw-facts":{"first":first_running,
+                "second":second_running,"first-work":first_work,
+                    "second-work":second_work,"lease-live":lease_live,
+                    "coordinator-live":coordinator_live}})
+    ]});
+    let trace_path = target.join("production-trace.json");
+    fs::write(&trace_path, serde_json::to_vec_pretty(&trace).unwrap()).unwrap();
+    let projection = run(
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+        "python3",
+        &[
+            "tests/formal/workflow/project_queue_dispatch.py",
+            trace_path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        projection.status.success(),
+        "{}",
+        String::from_utf8_lossy(&projection.stderr)
+    );
+}

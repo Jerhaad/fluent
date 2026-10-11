@@ -77,6 +77,8 @@ must not launch host evidence work or disable worker sandboxing to obtain it.
 
 ## Patterns
 
+- [joint-tla-boundary-model](testing/patterns/joint-tla-boundary-model.md) — read when connecting a workflow action to an existing detailed TLA protocol.
+
 - [snapshot-split-work-state](testing/patterns/snapshot-split-work-state.md) — read when tracing Work Item readiness across the split Merge Candidate store.
 
 - [test-child-owned-launch-receipts](testing/patterns/test-child-owned-launch-receipts.md) — read when a worker must prove launch identity survives its parent and serializes cancellation through exec
