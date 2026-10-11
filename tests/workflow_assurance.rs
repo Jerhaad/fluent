@@ -378,6 +378,8 @@ fn workflow_assurance_report_rejects_missing_and_misbound_evidence() {
     }));
     assert!(result["approved-contracts-sha256"].is_string());
     assert!(result["suite-source-sha256"]["integrated-projector"].is_string());
+    assert!(result["suite-source-sha256"]["writer-plan-projector"].is_string());
+    assert!(result["model-sha256"]["WriterPlanTrace.tla"].is_string());
     assert!(result["connection-inventory-sha256"].is_string());
     assert_eq!(result["scheduler-suites"]["recovery"]["pass"], false);
     assert!(result["missing"].as_array().unwrap().len() > 0);
@@ -1585,6 +1587,18 @@ for stdout, stderr, code in (
     assert not check.named_test_passed(CompletedProcess([], code, stdout, stderr)), (stdout, stderr, code)
 assert not check.named_test_passed(None)
 "#;
-    let result = run(root, "python3", &["-c", script, root.join("tests/formal/workflow").to_str().unwrap()]);
-    assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    let result = run(
+        root,
+        "python3",
+        &[
+            "-c",
+            script,
+            root.join("tests/formal/workflow").to_str().unwrap(),
+        ],
+    );
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
 }

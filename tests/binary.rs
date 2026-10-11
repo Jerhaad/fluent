@@ -7873,9 +7873,12 @@ fn run_writer_completion_plan_successor(
         r#"#!/bin/bash
 set -eu
 python3 - <<'PY'
-import json, os
+import json, os, subprocess
 from pathlib import Path
 path = Path(os.environ['RECOVERY_AREA']) / 'writer-completion.json'
+context = path.parent / 'execution-context.json'
+(path.parent / 'provider-context.json').write_bytes(context.read_bytes())
+subprocess.run(['true'], check=True)
 matrix = json.loads(path.read_text())
 for row in matrix['rows']:
     if row.get('responsibility', 'writer') == 'writer':
@@ -7977,6 +7980,11 @@ fn writer_completion_plan_public_continuation() {
     let fixture = writer_completion_plan_fixture(&tmp);
     let store = WorkModelStore::new(&fixture.project);
     let before = store.read_work_item(&fixture.work).unwrap();
+    let source = &before.attempts[0].tasks[0];
+    let source_area = fixture
+        .project
+        .join(&source.artifact_area.as_ref().unwrap().path);
+    let source_matrix = fs::read(source_area.join("writer-completion.json")).unwrap();
     let action = read_work_show_json(&fixture.project, &fixture.work)["next-action"]
         .as_str()
         .unwrap()
@@ -8003,6 +8011,9 @@ fn writer_completion_plan_public_continuation() {
         .success();
     let approved = store.read_work_item(&fixture.work).unwrap();
     assert_eq!(approved.attempts[0].tasks[0], before.attempts[0].tasks[0]);
+    let audit_path = fixture.project.join(format!(
+        ".fluent/work/artifacts/{}/attempt-1/writer-completion-recoveries/attempt-1-write-2/recovery.json", fixture.work));
+    let audit = fs::read(&audit_path).unwrap();
     run_writer_completion_plan_successor(&fixture, &tmp, false);
     let completed = store.read_work_item(&fixture.work).unwrap();
     fluent_cmd()
@@ -8020,6 +8031,111 @@ fn writer_completion_plan_public_continuation() {
     assert_eq!(
         store.read_work_item(&fixture.work).unwrap().attempts[0].tasks,
         completed.attempts[0].tasks
+    );
+    let replayed = store.read_work_item(&fixture.work).unwrap();
+    assert_eq!(fs::read(&audit_path).unwrap(), audit);
+    assert_eq!(
+        fs::read(source_area.join("writer-completion.json")).unwrap(),
+        source_matrix
+    );
+    let trace_dir = std::env::var_os("FLUENT_INTEGRATED_WRITER_PLAN_TRACE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| tmp.path().join("writer-plan-trace"));
+    write_integrated_work_trace(
+        &trace_dir,
+        "integrated-no-change-writer-plan",
+        "writer-plan-recovery",
+        [
+            ("pending.json", &before),
+            ("authorized.json", &approved),
+            ("executed.json", &completed),
+            ("replayed.json", &replayed),
+        ],
+        [
+            "work-show",
+            "repair-writer-completion",
+            "attempt-run",
+            "repair-writer-completion",
+        ],
+        [
+            "observe-pending",
+            "authorize-successor",
+            "execute-successor",
+            "replay-authorization",
+        ],
+        ["pending", "authorized", "executed", "replayed"],
+    );
+    let successor = &completed.attempts[0].tasks[1];
+    let area = fixture
+        .project
+        .join(&successor.artifact_area.as_ref().unwrap().path);
+    let extra = [
+        ("source-matrix.json", source_matrix),
+        (
+            "contract.json",
+            serde_json::to_vec(
+                before.attempts[0]
+                    .writer_completion_contract
+                    .as_ref()
+                    .unwrap(),
+            )
+            .unwrap(),
+        ),
+        (
+            "source-output.json",
+            serde_json::to_vec(source.output.as_ref().unwrap()).unwrap(),
+        ),
+        (
+            "source-assignment.json",
+            serde_json::to_vec(&(
+                &source.workspace_access,
+                &source.writer_correction_assignment,
+            ))
+            .unwrap(),
+        ),
+        (
+            "source-transcript.jsonl",
+            fs::read(source_area.join("transcript.jsonl")).unwrap(),
+        ),
+        ("authority.json", audit),
+        (
+            "context.json",
+            fs::read(area.join("execution-context.json")).unwrap(),
+        ),
+        (
+            "provider-context.json",
+            fs::read(area.join("provider-context.json")).unwrap(),
+        ),
+        (
+            "successor-matrix.json",
+            fs::read(area.join("writer-completion.json")).unwrap(),
+        ),
+    ];
+    let trace_path = trace_dir.join("no-change-trace.json");
+    let mut trace: serde_json::Value =
+        serde_json::from_slice(&fs::read(&trace_path).unwrap()).unwrap();
+    for (name, bytes) in extra {
+        fs::write(trace_dir.join(name), &bytes).unwrap();
+        trace["artifacts"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+            "path":name, "sha256":format!("{:x}", Sha256::digest(&bytes))}));
+    }
+    fs::write(trace_path, serde_json::to_vec_pretty(&trace).unwrap()).unwrap();
+    let projection = std::process::Command::new("python3")
+        .arg(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/formal/workflow/project_writer_plan.py"),
+        )
+        .arg(trace_dir.join("no-change-trace.json"))
+        .arg("--check-controls")
+        .output()
+        .unwrap();
+    assert!(
+        projection.status.success(),
+        "{}",
+        String::from_utf8_lossy(&projection.stderr)
     );
 }
 
@@ -57429,8 +57545,27 @@ fn record_integrated_work_trace(
     let Some(directory) = std::env::var_os(variable) else {
         return;
     };
-    let directory = PathBuf::from(directory);
-    fs::create_dir_all(&directory).unwrap();
+    write_integrated_work_trace(
+        &PathBuf::from(directory),
+        scenario,
+        model_profile,
+        snapshots,
+        actors,
+        operations,
+        boundaries,
+    );
+}
+
+fn write_integrated_work_trace(
+    directory: &Path,
+    scenario: &str,
+    model_profile: &str,
+    snapshots: [(&str, &fluent::work_model::WorkItem); 4],
+    actors: [&str; 4],
+    operations: [&str; 4],
+    boundaries: [&str; 4],
+) {
+    fs::create_dir_all(directory).unwrap();
     let facts = snapshots
         .iter()
         .map(|(_, item)| {

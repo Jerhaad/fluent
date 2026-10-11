@@ -79,6 +79,7 @@ PROFILE_ACTIONS = {
                                        "Dispatch"),
     "no-change-production.cfg": ("NoChange", "Attach", "Resume"),
     "pending-plan-production.cfg": ("NoChange", "Attach", "Resume"),
+    "writer-plan-production.cfg": ("Authorize", "Run", "Replay"),
     "joint-settlement.cfg": ("Launch", "RequestStop", "Crash", "Restart",
                              "Settle", "Publish"),
     "recovery-production.cfg": ("Repair", "Run"),
@@ -539,12 +540,78 @@ def integrated_production_suite(source, root, output, jar, java):
                          "pass": rejected.returncode != 0 and
                          "pending Plan proof or recovery history disappeared" in rejected.stderr,
                          "log": "pending-plan-negative.log"})
+    rows.extend(writer_plan_production_cases(source, root, output, jar, java))
     result = {"schema-version": 1, "suite": "integrated-production",
               "candidate-commit": candidate_commit(root),
               "fluent-binary-sha256": candidate_binary_digest(root), "cases": rows,
               "pass": all(row["pass"] for row in rows)}
     (output / "production-result.json").write_text(json.dumps(result, indent=2) + "\n")
     return result
+
+
+def writer_plan_production_cases(source, root, output, jar, java):
+    """Check the pending Writer-owned Plan successor independently of host proof."""
+    from project_writer_plan import CONTROLS as writer_controls, negative_trace
+
+    directory = output / "production" / "writer-plan"
+    if directory.exists():
+        shutil.rmtree(directory)
+    directory.mkdir(parents=True)
+    command = ["cargo", "nextest", "run", "--offline", "--features", "test-support",
+               "--test", "binary", "--no-tests", "fail", "-E",
+               "test(=writer_completion_plan_public_continuation)"]
+    environment = dict(os.environ)
+    environment["FLUENT_INTEGRATED_WRITER_PLAN_TRACE"] = str(directory)
+    fixture = subprocess.run(command, cwd=root, env=environment, capture_output=True, text=True)
+    (output / "writer-plan-fixture.log").write_text(
+        "$ " + " ".join(command) + "\n" + fixture.stdout + fixture.stderr)
+    path = directory / "no-change-trace.json"
+    produced = named_test_passed(fixture) and path.is_file()
+    rows = [{"case": "fresh-no-change-writer-plan", "pass": produced,
+             "log": "writer-plan-fixture.log"}]
+    if not produced:
+        return rows
+    command = ["python3", str(source / "project_writer_plan.py"), str(path)]
+    projected = subprocess.run(command, cwd=root, capture_output=True, text=True)
+    (output / "writer-plan-projection.log").write_text(
+        "$ " + " ".join(command) + "\n" + projected.stdout + projected.stderr)
+    try:
+        trace = json.loads(path.read_text())
+        valid = projected.returncode == 0 and \
+            trace["fluent-commit"] == candidate_commit(root) and \
+            trace["fluent-binary-sha256"] == candidate_binary_digest(root)
+    except (ValueError, KeyError, OSError):
+        valid = False
+    rows.append({"case": "writer-plan-projection", "pass": valid,
+                 "log": "writer-plan-projection.log"})
+    if not valid:
+        return rows
+    states = json.loads(projected.stdout)["states"]
+    config = output / "writer-plan-production.cfg"
+    config.write_text("SPECIFICATION Spec\nCONSTANTS\n" +
+                      "".join(f"  Trace{i}{key} = " +
+                              ("TRUE" if value is True else "FALSE" if value is False
+                               else json.dumps(value)) + "\n"
+                              for i, state in enumerate(states, 1)
+                              for key, value in state.items()) +
+                      "INVARIANT TraceSafe\nPROPERTY TraceComplete\n")
+    rows.append(run_case(source, output, jar, java, str(config), None, "WriterPlanTrace"))
+    wrong = output / "writer-plan-wrong-authority.cfg"
+    assert config.read_text().count("Trace3authorized = TRUE") == 1
+    wrong.write_text(config.read_text().replace("Trace3authorized = TRUE", "Trace3authorized = FALSE"))
+    rows.append(run_case(source, output, jar, java, str(wrong),
+                         "Invariant TraceSafe is violated", "WriterPlanTrace"))
+    for defect in writer_controls:
+        negative_dir = directory / ("negative-" + defect)
+        _, expected = negative_trace(trace, directory, negative_dir, defect)
+        command = ["python3", str(source / "project_writer_plan.py"),
+                   str(negative_dir / "no-change-trace.json")]
+        rejected = subprocess.run(command, cwd=root, capture_output=True, text=True)
+        log = "writer-plan-" + defect + "-negative.log"
+        (output / log).write_text("$ " + " ".join(command) + "\n" + rejected.stdout + rejected.stderr)
+        rows.append({"case": "writer-plan-" + defect + "-negative",
+                     "pass": rejected.returncode != 0 and expected in rejected.stderr, "log": log})
+    return rows
 
 
 def named_test_passed(run):

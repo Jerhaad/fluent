@@ -100,7 +100,12 @@ REQUIRED_CASES = {
                               "no-change-missing-proof-negative",
                               "fresh-no-change-pending-plan", "pending-plan-projection",
                               "pending-plan-production.cfg", "pending-plan-wrong-proof.cfg",
-                              "pending-plan-missing-proof-negative"),
+                              "pending-plan-missing-proof-negative",
+                              "fresh-no-change-writer-plan", "writer-plan-projection",
+                              "writer-plan-production.cfg", "writer-plan-wrong-authority.cfg",
+                              "writer-plan-pending-negative", "writer-plan-authority-negative",
+                              "writer-plan-history-negative", "writer-plan-duplicate-negative",
+                              "writer-plan-execution-negative"),
 }
 BOUNDARIES = (
     "Intake and authorization scope", "Foreground execution", "Queued claim and lease",
@@ -115,7 +120,7 @@ BOUNDARIES = (
 )
 MODELS = ("Workflow.tla", "Trace.tla", "WriterTrace.tla", "EvidenceTrace.tla",
           "RecoveryTrace.tla", "JointSettlement.tla", "NoChangeTrace.tla",
-          "PendingPlanTrace.tla", "QueueDispatchConnection.tla", "GenerationConnection.tla", "ChildConnection.tla",
+          "PendingPlanTrace.tla", "WriterPlanTrace.tla", "QueueDispatchConnection.tla", "GenerationConnection.tla", "ChildConnection.tla",
           "ReviewTasks.tla", "ReviewConnection.tla", "ServiceConnection.tla", "LandingConnection.tla", "IsolationConnection.tla", "LearningConnection.tla", "EvidenceConnection.tla", "AuthorizationConnection.tla", "RequirementConnection.tla", "CompletionConnection.tla", "ReleaseOwnershipConnection.tla", "ReleaseOwnershipTrace.tla", "VersionConnection.tla", "ApprovalConnection.tla")
 SCHEDULER_MODELS = ("QueueHandoff.tla", "GenerationFence.tla", "ServiceIsolation.tla",
                     "ChildLaunchIdentity.tla", "ServiceLifecycle.tla",
@@ -357,7 +362,8 @@ def report(results, candidate, binary, source, jar=None, java=None):
                                     "integrated-projector": digest(source / "project_integrated.py"),
                                     "queue-dispatch-projector": digest(source / "project_queue_dispatch.py"),
                                     "no-change-projector": digest(source / "project_no_change.py"),
-                                    "pending-plan-projector": digest(source / "project_pending_plan.py")},
+                                    "pending-plan-projector": digest(source / "project_pending_plan.py"),
+                                    "writer-plan-projector": digest(source / "project_writer_plan.py")},
             "connection-inventory-sha256": digest(source / "connections.md"),
             "approved-contracts-sha256": digest(source / "approved-contracts.json"),
             "approved-behaviors": approved,

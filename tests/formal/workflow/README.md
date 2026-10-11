@@ -92,8 +92,28 @@ candidate, Writer, Plan row, Tester order, recovery history, and readiness
 against digest-bound Work snapshots. `PendingPlanTrace.tla` checks the joint
 Writer and host-proof transition under weak fairness. Rehashed missing proof
 and a model state with a false final proof are required negative controls.
-These sequences cover their observed paths; the other pending connection rows
-in `connections.md` remain obligations.
+The Writer-owned Plan sequence starts from a seeded retained no-change incident
+with one pending Writer Plan row and one pending host row. The existing
+`writer_completion_plan_public_continuation` fixture executes public repair,
+Attempt run, and repair replay. It retains four Work snapshots, the immutable
+source matrix, contract, output, assignment and transcript, the recovery audit,
+and the context read by the successor provider. `project_writer_plan.py` checks
+those bytes and their bindings independently, including one authorized successor,
+unchanged completed history, delivery of the pending Writer row, completed
+successor output, replay, and the still-pending host obligation. The provider is
+scripted; the seed does not claim production execution of the original no-change
+Task. Successor dispatch and execution use the production owners.
+
+`WriterPlanTrace.tla` bounds one Work, one Attempt, one pending Writer row,
+one successor and one authorization replay. It maps the unfinished logical
+Writer obligation to interrupted delivery, then checks `Workflow.Recover`,
+foreground dispatch, input delivery and Writer completion under weak fairness.
+Replay stutters and host readiness stays blocked. Rehashed missing input,
+wrong authority, changed completed history, duplicate successor and unexecuted
+successor controls must each fail their intended check. A model state that
+executes without authority must violate `TraceSafe`. The integrated report
+requires this connection while retaining both earlier proof traces. These
+bounded checks do not replace the required host execution or final Tester.
 
 `approved-contracts.json` records the approved parent statements by section,
 statement digest, and named test identity. The integrated checker discovers
@@ -389,7 +409,8 @@ and one retry. It permits Workflow recovery only after publication completes and
 checks replay without allocating another Writer. The actual fixture interrupts
 each prefix independently, retains raw Work and artifact bytes, reuses the failed
 output-free Writer and supersedes the already planned competing reservation.
-`RecoveryTrace`, `NoChangeTrace` and `PendingPlanTrace` also instantiate Workflow;
+`RecoveryTrace`, `NoChangeTrace`, `PendingPlanTrace` and `WriterPlanTrace` also
+instantiate Workflow;
 their public fixtures independently check repaired context and canonical or Plan
 proof attachment before continuation.
 
