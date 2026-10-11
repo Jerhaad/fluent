@@ -1555,3 +1555,36 @@ exit 0
         );
     }
 }
+
+#[test]
+fn workflow_assurance_report_accepts_single_nextest_result() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script = r#"
+import sys
+from pathlib import Path
+from subprocess import CompletedProcess
+sys.path.insert(0, str(Path(sys.argv[1])))
+import check
+singular = 'Summary [ 0.100s] 1 test run: 1 passed, 204 skipped\n'
+plural = 'Summary [ 0.100s] 1 tests run: 1 passed, 204 skipped\n'
+for summary in (singular, plural):
+    for stdout, stderr in ((summary, ''), ('', summary)):
+        assert check.named_test_passed(CompletedProcess([], 0, stdout, stderr)), summary
+for stdout, stderr, code in (
+    ('', '', 0),
+    ('PASS named_test\n', '', 0),
+    ('Summary [ 0.100s] 0 tests run: 0 passed\n', '', 0),
+    ('Summary [ 0.100s] 2 tests run: 2 passed\n', '', 0),
+    ('Summary [ 0.100s] 1 test run: 0 passed, 1 failed\n', '', 1),
+    ('Summary [ 0.100s] 1 test run: 0 passed, 1 failed\n', '', 0),
+    ('Summary [ 0.100s] 1 test run: 1 passed, 1 failed\n', '', 0),
+    (singular, '', 1),
+    (singular, singular, 0),
+    (singular + 'Summary [ 0.100s] 0 tests run: 0 passed\n', '', 0),
+):
+    assert not check.named_test_passed(CompletedProcess([], code, stdout, stderr)), (stdout, stderr, code)
+assert not check.named_test_passed(None)
+"#;
+    let result = run(root, "python3", &["-c", script, root.join("tests/formal/workflow").to_str().unwrap()]);
+    assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+}

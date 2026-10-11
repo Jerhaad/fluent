@@ -547,6 +547,22 @@ def integrated_production_suite(source, root, output, jar, java):
     return result
 
 
+def named_test_passed(run):
+    """Credit exactly one executed named test from its nextest result."""
+    if run is None or run.returncode != 0:
+        return False
+    summaries = re.findall(r"^\s*Summary[^\n]*", run.stdout + "\n" + run.stderr,
+                           re.MULTILINE)
+    if len(summaries) != 1:
+        return False
+    # Accept nextest's singular and legacy plural forms, but require one pass
+    # and no contradictory outcomes. A successful exit alone is insufficient.
+    return re.fullmatch(
+        r"\s*Summary\s+\[[^\]\n]+\]\s+1 tests? run: 1 passed(?:, \d+ skipped)?\s*",
+        summaries[0]) is not None
+
+
+
 def integrated_suite(source, root, output, jar, java):
     """Run each maintained suite, then retain a fail-closed candidate report."""
     results = []
@@ -610,10 +626,7 @@ def integrated_suite(source, root, output, jar, java):
             log = output / ("named-" + test["name"] + ".log")
             log.write_text("$ " + " ".join(command) + "\n" + run.stdout + run.stderr
                            if run is not None else "named test discovery incomplete\n")
-            summary = re.search(r"Summary[^\n]*?\b(\d+) tests run:", run.stdout + run.stderr) \
-                if run is not None else None
-            passed = run is not None and run.returncode == 0 and summary is not None and \
-                int(summary.group(1)) == 1
+            passed = named_test_passed(run)
             named_rows.append({"binary": test["binary"], "name": test["name"],
                                "pass": passed, "log": log.name,
                                "log-sha256": hashlib.sha256(log.read_bytes()).hexdigest()})
