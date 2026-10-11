@@ -181,6 +181,29 @@ def integrated_production_suite(source, root, output, jar, java):
                          "pass": rejected.returncode != 0 and
                          "independent Git change altered retained Work or queue" in rejected.stderr,
                          "log": "post-git-work-negative.log"})
+            changed_queue_dir = output / "post-git-queue-negative"
+            changed_queue_dir.mkdir(exist_ok=True)
+            for entry in trace["artifacts"]:
+                shutil.copyfile(directory / entry["path"],
+                                changed_queue_dir / entry["path"])
+            changed = json.loads(json.dumps(trace))
+            queue_bytes = b"0 changed queued changed\n"
+            (changed_queue_dir / "queue-after-git.txt").write_bytes(queue_bytes)
+            changed["events"][4]["raw-facts"]["queue"] = queue_bytes.decode()
+            for entry in changed["artifacts"]:
+                if entry["path"] == "queue-after-git.txt":
+                    entry["sha256"] = hashlib.sha256(queue_bytes).hexdigest()
+            changed_path = changed_queue_dir / "production-trace.json"
+            changed_path.write_text(json.dumps(changed))
+            command = ["python3", str(source / "project_integrated.py"),
+                       str(changed_path)]
+            rejected = subprocess.run(command, cwd=root, capture_output=True, text=True)
+            (output / "post-git-queue-negative.log").write_text(
+                "$ " + " ".join(command) + "\n" + rejected.stdout + rejected.stderr)
+            rows.append({"case": "post-git-queue-negative",
+                         "pass": rejected.returncode != 0 and
+                         "independent Git change altered retained Work or queue" in rejected.stderr,
+                         "log": "post-git-queue-negative.log"})
     no_change = directory / "no-change"
     no_change.mkdir(exist_ok=True)
     for path in no_change.iterdir():

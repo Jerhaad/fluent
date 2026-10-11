@@ -843,4 +843,37 @@ fn workflow_integrated_queue_survives_other_attempt_cancellation() {
         String::from_utf8_lossy(&rejected.stderr)
             .contains("independent Git change altered retained Work or queue")
     );
+    let mut changed_queue: Value = serde_json::from_slice(&fs::read(&trace_path).unwrap()).unwrap();
+    let changed_queue_dir = tmp.path().join("changed-queue-trace");
+    fs::create_dir(&changed_queue_dir).unwrap();
+    for (name, _) in observed {
+        fs::copy(trace_dir.join(name), changed_queue_dir.join(name)).unwrap();
+    }
+    let queue_bytes = b"0 changed queued changed\n";
+    fs::write(changed_queue_dir.join("queue-after-git.txt"), queue_bytes).unwrap();
+    changed_queue["events"][4]["raw-facts"]["queue"] = json!(String::from_utf8_lossy(queue_bytes));
+    for artifact in changed_queue["artifacts"].as_array_mut().unwrap() {
+        if artifact["path"] == "queue-after-git.txt" {
+            artifact["sha256"] = json!(digest(queue_bytes));
+        }
+    }
+    let changed_queue_path = changed_queue_dir.join("production-trace.json");
+    fs::write(
+        &changed_queue_path,
+        serde_json::to_vec(&changed_queue).unwrap(),
+    )
+    .unwrap();
+    let rejected = run(
+        source,
+        "python3",
+        &[
+            projector.to_str().unwrap(),
+            changed_queue_path.to_str().unwrap(),
+        ],
+    );
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr)
+            .contains("independent Git change altered retained Work or queue")
+    );
 }

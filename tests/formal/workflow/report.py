@@ -37,6 +37,7 @@ REQUIRED_CASES = {
     "integrated-production": ("fresh-queue-cancel", "queue-cancel-projection",
                               "cross-work-negative", "ambiguous-order-negative",
                               "post-git-work-negative",
+                              "post-git-queue-negative",
                               "fresh-no-change-pending-canonical",
                               "no-change-projection", "no-change-production.cfg",
                               "no-change-wrong-candidate.cfg",
