@@ -740,7 +740,7 @@ fn workflow_integrated_queue_survives_other_attempt_cancellation() {
     for (name, _) in observed {
         fs::copy(trace_dir.join(name), negative_dir.join(name)).unwrap();
     }
-    let mut negative = trace;
+    let mut negative = trace.clone();
     negative["events"][1]["raw-facts"]["work"]["id"] = json!("queued");
     negative["events"][3]["raw-facts"]["work"]["id"] = json!("queued");
     let changed = serde_json::to_vec(&negative["events"][1]["raw-facts"]["work"]).unwrap();
@@ -759,4 +759,25 @@ fn workflow_integrated_queue_survives_other_attempt_cancellation() {
     );
     assert!(!rejected.status.success());
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("Work identity changed"));
+    let mut ambiguous = trace;
+    ambiguous["events"][2]["causal-predecessors"] = json!([1]);
+    let ambiguous_path = trace_dir.join("ambiguous-order-trace.json");
+    fs::write(
+        &ambiguous_path,
+        serde_json::to_vec_pretty(&ambiguous).unwrap(),
+    )
+    .unwrap();
+    let rejected = run(
+        source,
+        "python3",
+        &[
+            projector.to_str().unwrap(),
+            ambiguous_path.to_str().unwrap(),
+        ],
+    );
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr)
+            .contains("missing or ambiguous causal predecessor")
+    );
 }

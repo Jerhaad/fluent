@@ -14037,6 +14037,25 @@ mod tests {
     }
 
     #[test]
+    fn public_continuation_heading_preserves_earlier_behavior_identities() {
+        let requirements =
+            parse_behavior_completion_requirements(include_str!("../documentation/behaviors.md"));
+        for number in 20..=33 {
+            let suffix = format!("b{number}");
+            let earlier = requirements
+                .iter()
+                .find(|requirement| requirement.id == format!("behavior:tester-task:{suffix}"))
+                .unwrap_or_else(|| panic!("Tester Task {suffix} must survive the new heading"));
+            assert!(!earlier.requirement.is_empty());
+            assert!(!earlier.verification_refs.is_empty());
+        }
+        assert!(requirements.iter().any(|requirement| {
+            requirement.id == "behavior:public-workflow-continuation:b20"
+                && requirement.requirement.contains("ordinary reviewer")
+        }));
+    }
+
+    #[test]
     fn plan_check_captures_approved_applicability() {
         for (policy, valid) in [
             (

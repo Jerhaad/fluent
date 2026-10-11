@@ -142,6 +142,19 @@ def integrated_production_suite(source, root, output, jar, java):
                          "pass": rejected.returncode != 0 and
                          "Work identity changed" in rejected.stderr,
                          "log": "cross-work-negative.log"})
+            ambiguous = json.loads(json.dumps(trace))
+            ambiguous["events"][2]["causal-predecessors"] = [1]
+            ambiguous_path = directory / "ambiguous-order-trace.json"
+            ambiguous_path.write_text(json.dumps(ambiguous))
+            command = ["python3", str(source / "project_integrated.py"),
+                       str(ambiguous_path)]
+            rejected = subprocess.run(command, cwd=root, capture_output=True, text=True)
+            (output / "ambiguous-order-negative.log").write_text(
+                "$ " + " ".join(command) + "\n" + rejected.stdout + rejected.stderr)
+            rows.append({"case": "ambiguous-order-negative",
+                         "pass": rejected.returncode != 0 and
+                         "missing or ambiguous causal predecessor" in rejected.stderr,
+                         "log": "ambiguous-order-negative.log"})
     no_change = directory / "no-change"
     no_change.mkdir(exist_ok=True)
     for path in no_change.iterdir():
