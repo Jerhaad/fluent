@@ -56928,6 +56928,211 @@ PY
         )
 }
 
+fn record_integrated_work_trace(
+    variable: &str,
+    scenario: &str,
+    model_profile: &str,
+    snapshots: [(&str, &fluent::work_model::WorkItem); 4],
+    actors: [&str; 4],
+    operations: [&str; 4],
+    boundaries: [&str; 4],
+) {
+    let Some(directory) = std::env::var_os(variable) else {
+        return;
+    };
+    let directory = PathBuf::from(directory);
+    fs::create_dir_all(&directory).unwrap();
+    let facts = snapshots
+        .iter()
+        .map(|(_, item)| {
+            let mut value = serde_json::to_value(item).unwrap();
+            value["merge_candidates"] = serde_json::to_value(&item.merge_candidates).unwrap();
+            value
+        })
+        .collect::<Vec<_>>();
+    let artifacts = snapshots
+        .iter()
+        .zip(&facts)
+        .map(|((name, _), value)| {
+            let bytes = serde_json::to_vec(value).unwrap();
+            fs::write(directory.join(name), &bytes).unwrap();
+            serde_json::json!({"path":name,"sha256":format!("{:x}", Sha256::digest(bytes))})
+        })
+        .collect::<Vec<_>>();
+    let events = facts
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            serde_json::json!({
+                "sequence":index+1,"actor":actors[index],"operation-id":operations[index],
+                "generation":null,"boundary":boundaries[index],
+                "causal-predecessors":if index == 0 {vec![]} else {vec![index]},
+                "raw-facts":{"work":value}
+            })
+        })
+        .collect::<Vec<_>>();
+    let trace = serde_json::json!({
+        "schema-version":1,"scenario":scenario,
+        "fluent-commit":git_head(Path::new(env!("CARGO_MANIFEST_DIR"))),
+        "fluent-binary-sha256":format!("{:x}", Sha256::digest(fs::read(env!("CARGO_BIN_EXE_fluent")).unwrap())),
+        "model-profile":model_profile,"collection-complete":true,
+        "events":events,"artifacts":artifacts,
+    });
+    fs::write(
+        directory.join("no-change-trace.json"),
+        serde_json::to_vec_pretty(&trace).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn integrated_no_change_writer_continues_pending_plan_proof() {
+    let tmp = TempDir::new().unwrap();
+    let project = setup_git_project(&tmp);
+    let work = "combined-current";
+    let plan = tmp.path().join("plan.md");
+    fs::write(&plan, "| # | State reached | Behaviors | Verification | Responsibility | Req? |\n| 1 | Inspect source. | | `true` | writer | Yes |\n| 2 | Verify host code. | | `bash tests/host.sh` | host | Yes |\n").unwrap();
+    let bin = tmp.path().join("bin");
+    let control = tmp.path().join("review-control");
+    write_mock_claude(&bin, &combined_evidence_provider(&project, &control));
+    fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "work-item",
+            "create",
+            work,
+            "--title",
+            "Resume pending Plan proof",
+            "--plan-file",
+            plan.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    fluent_cmd()
+        .current_dir(&project)
+        .args(["attempt", "create", work, "attempt-1"])
+        .assert()
+        .success();
+    let run = || {
+        let mut command = fluent_cmd();
+        command
+            .current_dir(&project)
+            .env("PATH", mock_path(&bin))
+            .args(["attempt", "run", work, "attempt-1", "--no-sandbox"]);
+        command
+    };
+    run().assert().success();
+    let store = WorkModelStore::new(&project);
+    let initial = store.read_work_item(work).unwrap();
+    let candidate = initial.attempts[0].tasks[0]
+        .output
+        .as_ref()
+        .unwrap()
+        .commit
+        .clone();
+    assert_eq!(
+        initial.attempts[0].status,
+        fluent::work_model::AttemptStatus::NeedsUser
+    );
+    let failed_proof = tmp.path().join("failed-plan-proof.json");
+    fs::write(
+        &failed_proof,
+        serde_json::to_vec(&serde_json::json!({"schema_version":1,
+        "producer":"isolated host","check":"bash tests/host.sh","working_directory":".",
+        "result":"fail","run_at":"2026-09-09T12:00:00Z","output":"host assertion failed"}))
+        .unwrap(),
+    )
+    .unwrap();
+    fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "attempt",
+            "evidence",
+            "attach",
+            work,
+            "attempt-1",
+            "--candidate",
+            &candidate,
+            "--plan-row",
+            "plan:step-2",
+            "--evidence-file",
+            failed_proof.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    fs::write(&control, "request-correction").unwrap();
+    let result = run().output().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let pending = store.read_work_item(work).unwrap();
+    let writers = pending.attempts[0]
+        .tasks
+        .iter()
+        .filter(|task| task.kind == TaskKind::Write)
+        .collect::<Vec<_>>();
+    assert_eq!(writers.len(), 2);
+    assert!(writers[1].output.as_ref().unwrap().no_change.is_some());
+    assert_eq!(writers[1].output.as_ref().unwrap().commit, candidate);
+    assert!(pending.merge_candidates.is_empty());
+    let passing_proof = tmp.path().join("passing-plan-proof.json");
+    fs::write(
+        &passing_proof,
+        serde_json::to_vec(&serde_json::json!({"schema_version":1,
+        "producer":"isolated host","check":"bash tests/host.sh","working_directory":".",
+        "result":"pass","run_at":"2026-09-09T12:01:00Z","output":"host assertion passed"}))
+        .unwrap(),
+    )
+    .unwrap();
+    fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "attempt",
+            "evidence",
+            "attach",
+            work,
+            "attempt-1",
+            "--candidate",
+            &candidate,
+            "--plan-row",
+            "plan:step-2",
+            "--evidence-file",
+            passing_proof.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    let attached = store.read_work_item(work).unwrap();
+    run().assert().success();
+    let ready = store.read_work_item(work).unwrap();
+    assert!(
+        ready
+            .merge_candidates
+            .iter()
+            .any(|merge| merge.ready_at.is_some())
+    );
+    record_integrated_work_trace(
+        "FLUENT_INTEGRATED_PENDING_PLAN_TRACE",
+        "integrated-no-change-pending-plan",
+        "pending-plan-recovery",
+        [
+            ("pending-plan.json", &initial),
+            ("after-no-change.json", &pending),
+            ("after-proof.json", &attached),
+            ("ready.json", &ready),
+        ],
+        [
+            "attempt-run",
+            "attempt-run",
+            "evidence-attach",
+            "attempt-run",
+        ],
+        ["initial-writer", "writer-no-change", "plan-proof", "resume"],
+        ["pending-plan", "writer-complete", "proof-attached", "ready"],
+    );
+}
+
 #[test]
 fn combined_evidence_recovery_resumes_to_ready_candidate() {
     use fluent::work_model::*;
@@ -57177,6 +57382,35 @@ fn combined_evidence_recovery_resumes_to_ready_candidate() {
             .unwrap()
         );
     }
+    record_integrated_work_trace(
+        "FLUENT_INTEGRATED_NO_CHANGE_TRACE",
+        "integrated-no-change-pending-canonical",
+        "no-change-recovery",
+        [
+            ("after-failed-check.json", &failed),
+            ("after-no-change.json", &unchanged),
+            ("after-plan-attachment.json", &attached),
+            ("ready.json", &final_item),
+        ],
+        [
+            "attempt-run",
+            "attempt-run",
+            "evidence-attach",
+            "scheduler-dispatch",
+        ],
+        [
+            "canonical-failure",
+            "writer-no-change",
+            "canonical-attachment",
+            "queue-resume",
+        ],
+        [
+            "pending-canonical",
+            "writer-complete",
+            "canonical-proof",
+            "ready",
+        ],
+    );
 }
 
 #[test]

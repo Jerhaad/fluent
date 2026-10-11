@@ -42,6 +42,8 @@ CONTROLS = {
     "target-misbound": "Invariant LandingAcceptanceSafe is violated",
 }
 PROFILE_ACTIONS = {
+    "no-change-production.cfg": ("NoChange", "Attach", "Resume"),
+    "pending-plan-production.cfg": ("NoChange", "Attach", "Resume"),
     "joint-settlement.cfg": ("Launch", "RequestStop", "Crash", "Restart",
                              "Settle", "Publish"),
     "recovery-production.cfg": ("Repair", "Run"),
@@ -84,8 +86,8 @@ def candidate_binary_digest(root):
     return hashlib.sha256((root / "target/debug/fluent").read_bytes()).hexdigest()
 
 
-def integrated_production_suite(source, root, output):
-    """Refresh and independently check the public queue/cancellation trace."""
+def integrated_production_suite(source, root, output, jar, java):
+    """Refresh and independently check combined public workflow traces."""
     directory = output / "production"
     directory.mkdir(parents=True, exist_ok=True)
     for name in ("production-trace.json", "queued-work.json", "foreground-work.json",
@@ -140,6 +142,156 @@ def integrated_production_suite(source, root, output):
                          "pass": rejected.returncode != 0 and
                          "Work identity changed" in rejected.stderr,
                          "log": "cross-work-negative.log"})
+    no_change = directory / "no-change"
+    no_change.mkdir(exist_ok=True)
+    for path in no_change.iterdir():
+        if path.is_file():
+            path.unlink()
+    command = ["cargo", "nextest", "run", "--offline", "--features", "test-support",
+               "--test", "binary", "--no-tests", "fail", "-E",
+               "test(=combined_evidence_recovery_resumes_to_ready_candidate)"]
+    environment = dict(os.environ)
+    environment["FLUENT_INTEGRATED_NO_CHANGE_TRACE"] = str(no_change)
+    fixture = subprocess.run(command, cwd=root, env=environment,
+                             capture_output=True, text=True)
+    (output / "no-change-fixture.log").write_text(
+        "$ " + " ".join(command) + "\n" + fixture.stdout + fixture.stderr)
+    path = no_change / "no-change-trace.json"
+    produced = fixture.returncode == 0 and path.is_file()
+    rows.append({"case": "fresh-no-change-pending-canonical", "pass": produced,
+                 "log": "no-change-fixture.log"})
+    if produced:
+        try:
+            trace = json.loads(path.read_text())
+            bound = trace["fluent-commit"] == candidate_commit(root) and \
+                trace["fluent-binary-sha256"] == candidate_binary_digest(root)
+        except (ValueError, KeyError, OSError):
+            bound = False
+        command = ["python3", str(source / "project_no_change.py"), str(path)]
+        projected = subprocess.run(command, cwd=root, capture_output=True, text=True)
+        (output / "no-change-projection.log").write_text(
+            "$ " + " ".join(command) + "\n" + projected.stdout + projected.stderr)
+        valid = bound and projected.returncode == 0
+        rows.append({"case": "no-change-projection", "pass": valid,
+                     "log": "no-change-projection.log"})
+        if valid:
+            states = json.loads(projected.stdout)["states"]
+            config = output / "no-change-production.cfg"
+            config.write_text("SPECIFICATION Spec\nCONSTANTS\n" +
+                              "".join(f"  Trace{i}{key} = " +
+                                      ("TRUE" if value is True else "FALSE" if value is False
+                                       else json.dumps(value)) + "\n"
+                                      for i, state in enumerate(states, 1)
+                                      for key, value in state.items()) +
+                              "INVARIANT TraceSafe\nPROPERTY TraceComplete\n")
+            rows.append(run_case(source, output, jar, java, str(config), None,
+                                 "NoChangeTrace"))
+            wrong_candidate = output / "no-change-wrong-candidate.cfg"
+            binding = f'Trace4candidate = "{states[3]["candidate"]}"'
+            assert config.read_text().count(binding) == 1
+            wrong_candidate.write_text(config.read_text().replace(
+                binding, 'Trace4candidate = "wrong"'))
+            rows.append(run_case(source, output, jar, java,
+                                 str(wrong_candidate),
+                                 "Invariant TraceSafe is violated",
+                                 "NoChangeTrace"))
+            negative_dir = directory / "no-change-negative"
+            negative_dir.mkdir(exist_ok=True)
+            for entry in trace["artifacts"]:
+                shutil.copyfile(no_change / entry["path"],
+                                negative_dir / entry["path"])
+            changed = json.loads(json.dumps(trace))
+            ready = changed["events"][-1]["raw-facts"]["work"]
+            ready["attempts"][0]["evidence_recoveries"] = []
+            artifact = negative_dir / "ready.json"
+            artifact.write_text(json.dumps(ready))
+            changed["artifacts"][-1]["sha256"] = hashlib.sha256(
+                artifact.read_bytes()).hexdigest()
+            negative_path = negative_dir / "no-change-trace.json"
+            negative_path.write_text(json.dumps(changed))
+            command = ["python3", str(source / "project_no_change.py"),
+                       str(negative_path)]
+            rejected = subprocess.run(command, cwd=root, capture_output=True, text=True)
+            (output / "no-change-negative.log").write_text(
+                "$ " + " ".join(command) + "\n" + rejected.stdout + rejected.stderr)
+            rows.append({"case": "no-change-missing-proof-negative",
+                         "pass": rejected.returncode != 0 and
+                         "canonical proof or completed recovery history disappeared" in rejected.stderr,
+                         "log": "no-change-negative.log"})
+    pending_plan = directory / "pending-plan"
+    pending_plan.mkdir(exist_ok=True)
+    for path in pending_plan.iterdir():
+        if path.is_file():
+            path.unlink()
+    command = ["cargo", "nextest", "run", "--offline", "--features", "test-support",
+               "--test", "binary", "--no-tests", "fail", "-E",
+               "test(=integrated_no_change_writer_continues_pending_plan_proof)"]
+    environment = dict(os.environ)
+    environment["FLUENT_INTEGRATED_PENDING_PLAN_TRACE"] = str(pending_plan)
+    fixture = subprocess.run(command, cwd=root, env=environment,
+                             capture_output=True, text=True)
+    (output / "pending-plan-fixture.log").write_text(
+        "$ " + " ".join(command) + "\n" + fixture.stdout + fixture.stderr)
+    path = pending_plan / "no-change-trace.json"
+    produced = fixture.returncode == 0 and path.is_file()
+    rows.append({"case": "fresh-no-change-pending-plan", "pass": produced,
+                 "log": "pending-plan-fixture.log"})
+    if produced:
+        try:
+            trace = json.loads(path.read_text())
+            bound = trace["fluent-commit"] == candidate_commit(root) and \
+                trace["fluent-binary-sha256"] == candidate_binary_digest(root)
+        except (ValueError, KeyError, OSError):
+            bound = False
+        command = ["python3", str(source / "project_pending_plan.py"), str(path)]
+        projected = subprocess.run(command, cwd=root, capture_output=True, text=True)
+        (output / "pending-plan-projection.log").write_text(
+            "$ " + " ".join(command) + "\n" + projected.stdout + projected.stderr)
+        valid = bound and projected.returncode == 0
+        rows.append({"case": "pending-plan-projection", "pass": valid,
+                     "log": "pending-plan-projection.log"})
+        if valid:
+            states = json.loads(projected.stdout)["states"]
+            config = output / "pending-plan-production.cfg"
+            config.write_text("SPECIFICATION Spec\nCONSTANTS\n" +
+                              "".join(f"  Trace{i}{key} = " +
+                                      ("TRUE" if value is True else "FALSE" if value is False
+                                       else json.dumps(value)) + "\n"
+                                      for i, state in enumerate(states, 1)
+                                      for key, value in state.items()) +
+                              "INVARIANT TraceSafe\nPROPERTY TraceComplete\n")
+            rows.append(run_case(source, output, jar, java, str(config), None,
+                                 "PendingPlanTrace"))
+            wrong_proof = output / "pending-plan-wrong-proof.cfg"
+            assert config.read_text().count("Trace4proofComplete = TRUE") == 1
+            wrong_proof.write_text(config.read_text().replace(
+                "Trace4proofComplete = TRUE", "Trace4proofComplete = FALSE"))
+            rows.append(run_case(source, output, jar, java, str(wrong_proof),
+                                 "Invariant TraceSafe is violated",
+                                 "PendingPlanTrace"))
+            negative_dir = directory / "pending-plan-negative"
+            negative_dir.mkdir(exist_ok=True)
+            for entry in trace["artifacts"]:
+                shutil.copyfile(pending_plan / entry["path"],
+                                negative_dir / entry["path"])
+            changed = json.loads(json.dumps(trace))
+            ready = changed["events"][-1]["raw-facts"]["work"]
+            ready["attempts"][0]["evidence_recoveries"] = []
+            artifact = negative_dir / "ready.json"
+            artifact.write_text(json.dumps(ready))
+            changed["artifacts"][-1]["sha256"] = hashlib.sha256(
+                artifact.read_bytes()).hexdigest()
+            negative_path = negative_dir / "no-change-trace.json"
+            negative_path.write_text(json.dumps(changed))
+            command = ["python3", str(source / "project_pending_plan.py"),
+                       str(negative_path)]
+            rejected = subprocess.run(command, cwd=root, capture_output=True, text=True)
+            (output / "pending-plan-negative.log").write_text(
+                "$ " + " ".join(command) + "\n" + rejected.stdout + rejected.stderr)
+            rows.append({"case": "pending-plan-missing-proof-negative",
+                         "pass": rejected.returncode != 0 and
+                         "pending Plan proof or recovery history disappeared" in rejected.stderr,
+                         "log": "pending-plan-negative.log"})
     result = {"schema-version": 1, "suite": "integrated-production",
               "candidate-commit": candidate_commit(root),
               "fluent-binary-sha256": candidate_binary_digest(root), "cases": rows,
@@ -160,7 +312,7 @@ def integrated_suite(source, root, output, jar, java):
         log.write_text("$ " + " ".join(command) + "\n" + result.stdout + result.stderr)
         results.append({"case": name, "pass": result.returncode == 0,
                         "log": log.name})
-    production = integrated_production_suite(source, root, output)
+    production = integrated_production_suite(source, root, output, jar, java)
     results.append({"case": "integrated-production", "pass": production["pass"],
                     "log": "production-fixture.log"})
     scheduler = source.parent / "scheduler/check.py"

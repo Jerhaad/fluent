@@ -4,9 +4,9 @@
 
 Run `python3 tests/formal/workflow/check.py --suite=integrated
 --jar=target/fluent-tools/tla2tools-1.7.4.jar` from the candidate checkout.
-The checker runs the five maintained workflow suites, a fresh public
-queue/cancellation sequence, and the scheduler recovery, lifecycle, launch,
-and landing suites. The queue/cancellation trace records two Work identities,
+The checker runs the five maintained workflow suites, fresh public
+queue/cancellation and no-change Writer sequences, and the scheduler recovery,
+lifecycle, launch, and landing suites. The queue/cancellation trace records two Work identities,
 the retained queue, the canceled foreground Attempt, read-only status, and a
 refused Task run. `project_integrated.py` checks the digest-bound raw facts and
 causal order independently of the command assertions. A rehashed trace that
@@ -23,6 +23,26 @@ the structured `Verified: model=SUITE/CASE; assumption=SUITE/CASE;
 production=SUITE/CASE; control=SUITE/CASE` evidence described in
 `connections.md` before the report may credit it. Existing descriptive
 evidence is retained as an explicit gap until those checks pass.
+
+The canonical no-change sequence runs the production Attempt, evidence
+attachment, and queue dispatch owners after a failing Tester check. It records
+the retained Work and Merge Candidate at four ordered boundaries, and
+`project_no_change.py` checks the snapshot digests, candidate binding,
+original Tester, retained recovery history, and absence of early readiness.
+`NoChangeTrace.tla` checks the projected states under weak fairness. A
+rehashed missing canonical proof must fail projection, and a wrong final
+candidate must violate the model invariant.
+
+The pending Plan sequence starts with a host Plan row awaiting evidence,
+attaches a failing result, executes a no-change Writer after a code-change
+review, attaches passing Plan evidence, and continues through the public
+Attempt owner to a ready candidate. `project_pending_plan.py` checks the
+candidate, Writer, Plan row, Tester order, recovery history, and readiness
+against digest-bound Work snapshots. `PendingPlanTrace.tla` checks the joint
+Writer and host-proof transition under weak fairness. Rehashed missing proof
+and a model state with a false final proof are required negative controls.
+These sequences cover their observed paths; the other pending connection rows
+in `connections.md` remain obligations.
 
 `approved-contracts.json` records the approved parent statements by section,
 statement digest, and named test identity. The integrated checker discovers

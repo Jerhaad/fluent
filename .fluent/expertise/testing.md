@@ -77,6 +77,8 @@ must not launch host evidence work or disable worker sandboxing to obtain it.
 
 ## Patterns
 
+- [snapshot-split-work-state](testing/patterns/snapshot-split-work-state.md) — read when tracing Work Item readiness across the split Merge Candidate store.
+
 - [test-child-owned-launch-receipts](testing/patterns/test-child-owned-launch-receipts.md) — read when a worker must prove launch identity survives its parent and serializes cancellation through exec
 
 - [diagnose-inherited-test-pipes](testing/patterns/diagnose-inherited-test-pipes.md) — read when concurrent nextest runs report LEAK despite settled application workers

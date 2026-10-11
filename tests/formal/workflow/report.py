@@ -35,7 +35,13 @@ REQUIRED_CASES = {
                            "pending-publication-projection", "service-projection",
                            "service-competition.cfg", "negative-guardversion.cfg"),
     "integrated-production": ("fresh-queue-cancel", "queue-cancel-projection",
-                              "cross-work-negative"),
+                              "cross-work-negative", "fresh-no-change-pending-canonical",
+                              "no-change-projection", "no-change-production.cfg",
+                              "no-change-wrong-candidate.cfg",
+                              "no-change-missing-proof-negative",
+                              "fresh-no-change-pending-plan", "pending-plan-projection",
+                              "pending-plan-production.cfg", "pending-plan-wrong-proof.cfg",
+                              "pending-plan-missing-proof-negative"),
 }
 BOUNDARIES = (
     "Intake and authorization scope", "Foreground execution", "Queued claim and lease",
@@ -49,7 +55,8 @@ BOUNDARIES = (
     "Public continuation requirement identity", "Cleanup eligibility", "Version transitions",
 )
 MODELS = ("Workflow.tla", "Trace.tla", "WriterTrace.tla", "EvidenceTrace.tla",
-          "RecoveryTrace.tla", "JointSettlement.tla")
+          "RecoveryTrace.tla", "JointSettlement.tla", "NoChangeTrace.tla",
+          "PendingPlanTrace.tla")
 SCHEDULER_MODELS = ("QueueHandoff.tla", "GenerationFence.tla", "ServiceIsolation.tla",
                     "ChildLaunchIdentity.tla", "ServiceLifecycle.tla",
                     "LandingPublication.tla")
@@ -287,7 +294,9 @@ def report(results, candidate, binary, source, jar=None, java=None):
             "suite-source-sha256": {"workflow": digest(source / "check.py"),
                                     "scheduler": digest(scheduler / "check.py"),
                                     "report": digest(source / "report.py"),
-                                    "integrated-projector": digest(source / "project_integrated.py")},
+                                    "integrated-projector": digest(source / "project_integrated.py"),
+                                    "no-change-projector": digest(source / "project_no_change.py"),
+                                    "pending-plan-projector": digest(source / "project_pending_plan.py")},
             "connection-inventory-sha256": digest(source / "connections.md"),
             "approved-contracts-sha256": digest(source / "approved-contracts.json"),
             "approved-behaviors": approved,
