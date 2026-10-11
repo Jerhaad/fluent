@@ -1,5 +1,7 @@
 #[path = "lib/log.rs"]
 mod log;
+#[path = "lib/release_trace.rs"]
+mod release_trace;
 
 use fluent::git;
 use fluent::review;
@@ -59,8 +61,9 @@ fn record_release_refusal(
     after: &[SnapshotEntry],
     refusal: &std::process::Output,
 ) {
-    let root =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("target/formal/workflow/release-transition");
+    let root = release_trace::output_directory(
+        std::env::var_os("FLUENT_RELEASE_TRACE_DIR").map(PathBuf::from),
+    );
     fs::create_dir_all(&root).unwrap();
     let mut artifacts = Vec::new();
     let mut facts = |stage: &str, snapshot: &[SnapshotEntry]| -> Vec<_> {

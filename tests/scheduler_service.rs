@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
+#[path = "lib/release_trace.rs"]
+mod release_trace;
 
 struct ReleaseServiceChild {
     child: Option<std::process::Child>,
@@ -711,8 +713,9 @@ fn scheduler_released_upgrade_preserves_shared_ownership() {
     use std::process::Command;
 
     let dirs = released_service_fixture_dirs();
-    let output = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("target/formal/workflow/release-transition");
+    let output = release_trace::output_directory(
+        std::env::var_os("FLUENT_RELEASE_TRACE_DIR").map(std::path::PathBuf::from),
+    );
     fs::create_dir_all(output.join("service-ownership")).unwrap();
     let mut artifacts = Vec::new();
     let home = &dirs.home;

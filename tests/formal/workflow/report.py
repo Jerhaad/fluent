@@ -9,6 +9,8 @@ import runpy
 import sys
 from pathlib import Path
 
+from release_evidence import verify_release_evidence
+
 SUITES = ("foundation", "writer-inputs", "evidence-status",
           "recovery-observation", "release-transition", "integrated-production")
 REQUIRED_CASES = {
@@ -303,6 +305,8 @@ def report(results, candidate, binary, source, jar=None, java=None):
             assert value["schema-version"] == 1 and value["suite"] == name
             cases = value["cases"]
             assert isinstance(cases, list) and cases
+            if name == "release-transition":
+                verify_release_evidence(directory, value)
             logs = {}
             for case in cases:
                 assert isinstance(case["case"], str) and isinstance(case["pass"], bool)
@@ -359,6 +363,7 @@ def report(results, candidate, binary, source, jar=None, java=None):
             "suite-source-sha256": {"workflow": digest(source / "check.py"),
                                     "scheduler": digest(scheduler / "check.py"),
                                     "report": digest(source / "report.py"),
+                                    "release-evidence": digest(source / "release_evidence.py"),
                                     "integrated-projector": digest(source / "project_integrated.py"),
                                     "queue-dispatch-projector": digest(source / "project_queue_dispatch.py"),
                                     "no-change-projector": digest(source / "project_no_change.py"),

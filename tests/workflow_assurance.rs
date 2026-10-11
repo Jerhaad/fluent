@@ -4,6 +4,40 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use tempfile::TempDir;
+#[path = "lib/release_trace.rs"]
+mod release_trace;
+
+#[test]
+fn workflow_assurance_report_isolates_release_collections() {
+    let tmp = TempDir::new().unwrap();
+    let formal = tmp.path().join("formal");
+    let root = release_trace::output_directory(Some(formal.clone()));
+    assert_eq!(root, formal);
+    fs::write(root.join("receipt.json"), "checked proof").unwrap();
+    let threads: Vec<_> = (0..4)
+        .map(|_| {
+            std::thread::spawn(|| {
+                let path = release_trace::output_directory(None);
+                fs::write(path.join("receipt.json"), "later test").unwrap();
+                path
+            })
+        })
+        .collect();
+    let later: Vec<_> = threads
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .collect();
+    assert_eq!(
+        fs::read(root.join("receipt.json")).unwrap(),
+        b"checked proof"
+    );
+    let unique: std::collections::HashSet<_> = later.iter().collect();
+    assert_eq!(unique.len(), later.len());
+    for path in later {
+        assert_ne!(path, formal);
+        fs::remove_dir_all(path).unwrap();
+    }
+}
 
 fn run(dir: &Path, program: &str, args: &[&str]) -> Output {
     Command::new(program)
@@ -1556,6 +1590,21 @@ exit 0
             String::from_utf8_lossy(&projected.stderr)
         );
     }
+}
+
+#[test]
+fn workflow_assurance_report_preserves_release_evidence() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let result = run(
+        root,
+        "python3",
+        &["tests/formal/workflow/test_release_evidence.py"],
+    );
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
 }
 
 #[test]

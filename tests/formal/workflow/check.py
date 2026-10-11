@@ -12,6 +12,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+from release_evidence import retain_release_evidence
+
 JAR_SHA256 = "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
 CONTROLS = {
     "deliverinputs": "Invariant InputSafe is violated",
@@ -685,6 +687,8 @@ def integrated_suite(source, root, output, jar, java):
         environment = dict(os.environ)
         environment["FLUENT_WORKFLOW_REQUIRE_HOST"] = "1"
         for test in selected:
+            environment["FLUENT_RELEASE_TRACE_DIR"] = tempfile.mkdtemp(
+                prefix="named-release-", dir=output.resolve())
             command = base + ["run", "--offline", "--features", "test-support", "--test",
                               binary_name, "--no-tests", "fail", "-E",
                               f'test(={test["name"]})']
@@ -1731,9 +1735,15 @@ def recovery_observation_suite(source, root, output, jar, java):
     return 0 if result["pass"] else 1
 
 
+def corrupt_service_project(trace):
+    workers = trace["events"][1]["raw-facts"]["owned-workers"]
+    workers[1]["work_item_id"] = workers[0]["work_item_id"]
+
+
 def release_transition_suite(source, root, output, jar, java):
     """Recheck fresh release facts and the bounded version guard."""
     results = []
+    collection = Path(tempfile.mkdtemp(prefix="collection-", dir=output)).resolve()
     cases = (
         ("binary", ("released_upgrade_preserves_workflow_state",
                     "released_upgrade_recovers_interrupted_publication",
@@ -1748,6 +1758,7 @@ def release_transition_suite(source, root, output, jar, java):
         command = ["cargo", "nextest", "run", "--offline", "--features", "test-support",
                    "--test", binary, "--no-tests", "fail", *names]
         environment = dict(os.environ)
+        environment["FLUENT_RELEASE_TRACE_DIR"] = str(collection)
         if binary == "scheduler_service":
             environment["FLUENT_WORKFLOW_REQUIRE_HOST"] = "1"
         result = subprocess.run(command, cwd=root, env=environment, capture_output=True,
@@ -1761,7 +1772,7 @@ def release_transition_suite(source, root, output, jar, java):
                             capture_output=True, text=True).stdout.strip()
     candidate = root / "target/debug/fluent"
     for scenario in ("current-authority", "pending-publication"):
-        path = output / f"{scenario}.json"
+        path = collection / f"{scenario}.json"
         command = ["python3", str(source / "project_release.py"), str(path),
                    str(candidate), commit]
         projection = subprocess.run(command, cwd=root, capture_output=True, text=True)
@@ -1773,7 +1784,7 @@ def release_transition_suite(source, root, output, jar, java):
             results.append(version_trace_case(source, output, jar, java, scenario, json.loads(projection.stdout)))
             corrupted = json.loads(path.read_text())
             corrupted["events"][1]["raw-facts"]["protected"] = []
-            negative_path = output / f"{scenario}-negative.json"
+            negative_path = collection / f"{scenario}-negative.json"
             negative_path.write_text(json.dumps(corrupted))
             negative = subprocess.run([*command[:2], str(negative_path), *command[3:]],
                                       cwd=root, capture_output=True, text=True)
@@ -1784,7 +1795,7 @@ def release_transition_suite(source, root, output, jar, java):
                             "log": f"{scenario}-negative.log"})
             corrupted = json.loads(path.read_text())
             corrupted["artifacts"][0]["sha256"] = "0" * 64
-            negative_path = output / f"{scenario}-artifact-negative.json"
+            negative_path = collection / f"{scenario}-artifact-negative.json"
             negative_path.write_text(json.dumps(corrupted))
             negative = subprocess.run([*command[:2], str(negative_path), *command[3:]],
                                       cwd=root, capture_output=True, text=True)
@@ -1803,7 +1814,7 @@ def release_transition_suite(source, root, output, jar, java):
                         stderr="unrelated file permission error"), "compatibility diagnostic mismatch")):
                 corrupted = json.loads(path.read_text())
                 mutate(corrupted)
-                negative_path = output / f"{scenario}-{label}.json"
+                negative_path = collection / f"{scenario}-{label}.json"
                 negative_path.write_text(json.dumps(corrupted))
                 negative = subprocess.run([*command[:2], str(negative_path), *command[3:]],
                                           cwd=root, capture_output=True, text=True)
@@ -1813,7 +1824,7 @@ def release_transition_suite(source, root, output, jar, java):
                                 "pass": negative.returncode != 0 and
                                 diagnostic in negative.stderr,
                                 "log": f"{scenario}-{label}.log"})
-    service_trace = output / "service-ownership.json"
+    service_trace = collection / "service-ownership.json"
     service_command = ["python3", str(source / "project_release.py"), str(service_trace),
                        str(candidate), commit]
     service_projection = subprocess.run(service_command, cwd=root, capture_output=True, text=True)
@@ -1826,7 +1837,7 @@ def release_transition_suite(source, root, output, jar, java):
         results.append(release_ownership_trace_case(source, output, jar, java, json.loads(service_projection.stdout)))
         for name, mutate in (
                 ("service-incompatible-negative", lambda trace: trace["events"][0]["raw-facts"]["incompatible-start"].update(exit=0)),
-                ("service-project-negative", lambda trace: trace["events"][1]["raw-facts"]["owned-workers"][1].update(work_item_id="first")),
+                ("service-project-negative", corrupt_service_project),
                 ("service-identity-negative", lambda trace: trace["events"][2]["raw-facts"]["health"].update(
                     instance_id=trace["events"][0]["raw-facts"]["health"]["instance_id"])),
                 ("service-worker-negative", lambda trace: trace["events"][1]["raw-facts"]["owned-workers"][0].update(
@@ -1841,7 +1852,7 @@ def release_transition_suite(source, root, output, jar, java):
                     {"requested-coordinator": "unobserved-coordinator"}))):
             corrupted = json.loads(service_trace.read_text())
             mutate(corrupted)
-            negative_path = output / f"{name}.json"
+            negative_path = collection / f"{name}.json"
             negative_path.write_text(json.dumps(corrupted))
             negative = subprocess.run([*service_command[:2], str(negative_path),
                                        *service_command[3:]], cwd=root,
@@ -1866,6 +1877,7 @@ def release_transition_suite(source, root, output, jar, java):
     summary = {"schema-version": 1, "suite": "release-transition",
                "candidate-commit": candidate_commit(root),
                "fluent-binary-sha256": candidate_binary_digest(root), "cases": results,
+               "retained-artifacts": retain_release_evidence(output, collection, results),
                "pass": all(row["pass"] for row in results)}
     (output / "result.json").write_text(json.dumps(summary, indent=2) + "\n")
     return 0 if summary["pass"] else 1

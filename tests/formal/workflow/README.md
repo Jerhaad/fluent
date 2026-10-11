@@ -159,6 +159,14 @@ The suite requires the pinned JAR, Java 21, and permission to bind an isolated
 Unix socket. It writes command logs, traces, projections, controls, and
 `result.json` under `target/formal/workflow/release-transition/`.
 
+Each formal collection retains raw traces and controls in a fresh `collection-*`
+subdirectory. The checker passes that location through `FLUENT_RELEASE_TRACE_DIR`;
+later named tests receive separate directories. Standalone release fixtures keep
+each invocation under `target/formal/release-traces/invocation-*`. The release
+result binds the collected traces, referenced artifacts, controls and logs to
+their hashes. Final reporting rejects changed, missing or unbound proof, so a
+later test cannot replace evidence already checked by the formal collection.
+
 ## Recovery observation
 
 The `recovery-observation` suite checks repeated failure and recovery profiles,
