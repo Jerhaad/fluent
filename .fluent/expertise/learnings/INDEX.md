@@ -131,6 +131,7 @@
 - [rejection-tests-snapshot-owned-trees](rejection-tests-snapshot-owned-trees.md) — A CLI rejection that promises no mutation must snapshot every project and home tree it can manage, byte-for-byte, including pre-existing files and empty directories
 - [release-fixture-process-group-ownership](release-fixture-process-group-ownership.md) — Own every process group a long-lived release fixture launches and verify cleanup during unwinding before fallback teardown
 - [release-fixture-roots-cover-managed-worktrees](release-fixture-roots-cover-managed-worktrees.md) — Isolate release fixture projects with their sibling managed worktrees while keeping the scheduler socket path short
+- [release-proof-survives-later-test-invocations](release-proof-survives-later-test-invocations.md) — Isolate release trace collections and revalidate their retained bytes when assembling the final assurance report
 - [release-suite-scoped-process-guard](release-suite-scoped-process-guard.md) — Declared release commands compare root-scoped process inventories before and after each suite to report surviving Fluent or provider processes
 - [reloaded-authority-config-validates-before-ingress](reloaded-authority-config-validates-before-ingress.md) — Validate every live authority configuration reload before persisting ingress or evaluating an approval
 - [required-checks-outlive-individual-results](required-checks-outlive-individual-results.md) — Retain independent check obligations after proof changes or finding acceptance, regardless of Task ordering
@@ -176,6 +177,7 @@
 - [tester-readiness-shares-production-boundary](tester-readiness-shares-production-boundary.md) — Tester readiness validates structure and executes through the production sandbox, extraction, and normalization boundary; production boundary failures pause only the Tester for repair and retry
 - [tester-tracked-mutations-restore-after-evidence](tester-tracked-mutations-restore-after-evidence.md) — Work Task Testers retain command evidence while a host guard restores only tracked candidate side effects after every launch
 - [token-bound-to-persisted-record](token-bound-to-persisted-record.md) — Identity tokens returned by dispatch operations must be constructed from persisted record fields, not from caller-supplied request fields
+- [trace-controls-corrupt-observed-identities](trace-controls-corrupt-observed-identities.md) — Derive trace identity corruption from observed values so negative controls remain effective across worker orderings
 - [unix-socket-bind-eperm-in-sandbox](unix-socket-bind-eperm-in-sandbox.md) — The execution test sandbox returns EPERM on Unix socket bind; socket-level tests must export fake types for downstream non-sandboxed consumers
 - [utf8-safe-diagnostic-truncation](utf8-safe-diagnostic-truncation.md) — Byte-capped diagnostic excerpts must realign truncation to a UTF-8 character boundary before slicing
 - [verification-requirements-ignore-diagnostic-wording](verification-requirements-ignore-diagnostic-wording.md) — Bind current verification obligations to approved requirements and native evidence rather than diagnostic lines or historical Task order
