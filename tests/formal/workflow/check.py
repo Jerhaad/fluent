@@ -109,6 +109,62 @@ def integrated_production_suite(source, root, output, jar, java):
     produced = fixture.returncode == 0 and trace_path.is_file()
     rows = [{"case": "fresh-queue-cancel", "pass": produced,
              "log": "production-fixture.log"}]
+    review_directory = directory / "review-only"
+    review_directory.mkdir(exist_ok=True)
+    for name in ("production-trace.json", "planned.json", "complete.json",
+                 "head-before.txt", "head-after.txt", "merge-candidates.txt"):
+        (review_directory / name).unlink(missing_ok=True)
+    review_command = ["cargo", "nextest", "run", "--offline", "--features",
+                      "test-support", "--test", "workflow_assurance", "--no-tests",
+                      "fail", "workflow_integrated_review_only_orders_tester_before_reviews"]
+    review_fixture = subprocess.run(review_command, cwd=root, capture_output=True, text=True)
+    (output / "review-only-fixture.log").write_text(
+        "$ " + " ".join(review_command) + "\n" +
+        review_fixture.stdout + review_fixture.stderr)
+    review_path = review_directory / "production-trace.json"
+    review_produced = review_fixture.returncode == 0 and review_path.is_file()
+    rows.append({"case": "fresh-review-only", "pass": review_produced,
+                 "log": "review-only-fixture.log"})
+    if review_produced:
+        try:
+            review_trace = json.loads(review_path.read_text())
+            review_bound = review_trace["fluent-commit"] == candidate_commit(root) and \
+                review_trace["fluent-binary-sha256"] == candidate_binary_digest(root)
+        except (ValueError, KeyError, OSError):
+            review_bound = False
+        command = ["python3", str(source / "project_review_only.py"), str(review_path)]
+        projected = subprocess.run(command, cwd=root, capture_output=True, text=True)
+        (output / "review-only-projection.log").write_text(
+            "$ " + " ".join(command) + "\n" + projected.stdout + projected.stderr)
+        rows.append({"case": "review-only-projection",
+                     "pass": review_bound and projected.returncode == 0,
+                     "log": "review-only-projection.log"})
+        if review_bound and projected.returncode == 0:
+            negative_dir = review_directory / "order-negative"
+            negative_dir.mkdir(exist_ok=True)
+            for entry in review_trace["artifacts"]:
+                shutil.copyfile(review_directory / entry["path"],
+                                negative_dir / entry["path"])
+            changed = json.loads(json.dumps(review_trace))
+            complete = changed["events"][1]["raw-facts"]["work"]
+            complete["attempts"][0]["tasks"][1]["started_at"] = \
+                "2000-01-01T00:00:00+00:00"
+            raw = json.dumps(complete).encode()
+            (negative_dir / "complete.json").write_bytes(raw)
+            for entry in changed["artifacts"]:
+                if entry["path"] == "complete.json":
+                    entry["sha256"] = hashlib.sha256(raw).hexdigest()
+            control = negative_dir / "production-trace.json"
+            control.write_text(json.dumps(changed))
+            command = ["python3", str(source / "project_review_only.py"), str(control)]
+            rejected = subprocess.run(command, cwd=root, capture_output=True, text=True)
+            (output / "review-only-order-negative.log").write_text(
+                "$ " + " ".join(command) + "\n" +
+                rejected.stdout + rejected.stderr)
+            rows.append({"case": "review-only-order-negative",
+                         "pass": rejected.returncode != 0 and
+                         "review started before Tester completed" in rejected.stderr,
+                         "log": "review-only-order-negative.log"})
     for config, violation in (("queue-dispatch-connection.cfg", None),
                               ("queue-dispatch-assumptions.cfg", None),
                               ("queue-dispatch-early.cfg",

@@ -595,6 +595,212 @@ fn workflow_integrated_rejects_missing_model_tool() {
 }
 
 #[test]
+fn workflow_integrated_review_only_orders_tester_before_reviews() {
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("main");
+    fs::create_dir(&project).unwrap();
+    let project = project.as_path();
+    assert!(
+        run(project, "git", &["init", "-b", "main"])
+            .status
+            .success()
+    );
+    assert!(
+        run(
+            project,
+            "git",
+            &["config", "user.email", "test@example.com"]
+        )
+        .status
+        .success()
+    );
+    assert!(
+        run(project, "git", &["config", "user.name", "Test"])
+            .status
+            .success()
+    );
+    fs::write(project.join("README.md"), "review fixture\n").unwrap();
+    fs::create_dir_all(project.join(".fluent")).unwrap();
+    fs::write(
+        project.join(".fluent/tester.yaml"),
+        "commands:\n  - command: 'true'\n    test_harness: shell-harness\n",
+    )
+    .unwrap();
+    let extractor = project.join(".fluent/extract-tester-results");
+    fs::write(&extractor, "#!/bin/sh\necho '[]'\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&extractor, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    for role in [
+        "documentation",
+        "behaviors",
+        "architecture",
+        "skills",
+        "tests",
+    ] {
+        let dir = project.join(format!("skills/review-{role}"));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("SKILL.md"), "review fixture\n").unwrap();
+    }
+    fs::write(project.join(".gitignore"), ".fluent/work/\n").unwrap();
+    assert!(run(project, "git", &["add", "."]).status.success());
+    assert!(
+        run(project, "git", &["commit", "-m", "Add review fixture"])
+            .status
+            .success()
+    );
+    let head = run(project, "git", &["rev-parse", "HEAD"]);
+    assert!(head.status.success());
+
+    let created = fluent(
+        project,
+        &["work-item", "create", "review", "--title", "Review fixture"],
+    );
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let planned = fluent(project, &["review", "codebase", "review", "attempt-review"]);
+    assert!(
+        planned.status.success(),
+        "{}",
+        String::from_utf8_lossy(&planned.stderr)
+    );
+    let before = fluent(project, &["work-item", "show", "review"]);
+    assert!(before.status.success());
+
+    let mock_dir = tmp.path().join("mock-bin");
+    fs::create_dir(&mock_dir).unwrap();
+    let mock = mock_dir.join("claude");
+    fs::write(&mock, r##"#!/bin/bash
+if [ "$1 $2 $3" = 'auth status --json' ]; then echo '{"loggedIn":true}'; exit 0; fi
+if [ "$1" = --version ]; then echo '2.1.211 (Claude Code)'; exit 0; fi
+prompt=''
+for arg in "$@"; do
+  case "$arg" in *'"candidate-commit"'*) prompt="$arg" ;; esac
+done
+if [ -z "$prompt" ]; then exit 0; fi
+candidate="$(printf '%s\n' "$prompt" | sed -n 's/^- Workspace: //p' | head -1)"
+if [ -z "$candidate" ]; then
+  candidate="$(printf '%s\n' "$prompt" | sed -n 's/^Review the codebase at \(.*\)\.$/\1/p' | head -1)"
+fi
+commit="$(printf '%s\n' "$prompt" | sed -n 's/^[[:space:]]*"candidate-commit": "\([^"]*\)",$/\1/p' | head -1)"
+role="$(printf '%s\n' "$prompt" | sed -n 's/^[[:space:]]*"role": "\([^"]*\)",$/\1/p' | head -1)"
+inspected="$(git -C "$candidate" ls-tree -r --name-only "$commit" | head -1)"
+jq -n --arg commit "$commit" --arg role "$role" --arg path "$inspected" \
+  '{"schema-version":1,"candidate-commit":$commit,role:$role,inspections:[{path:$path,summary:"Read tracked candidate file."}]}' > review-inspection.json
+printf 'Verdict: pass\n\nReview-only result.\n' > review.md
+jq -cn --arg absolute "$candidate/$inspected" \
+  '{type:"assistant",message:{content:[{type:"tool_use",id:"review-read",name:"Read",input:{file_path:$absolute}}]}}'
+jq -cn '{type:"user",message:{content:[{type:"tool_result",tool_use_id:"review-read",content:"review fixture"}]}}'
+"##).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&mock, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let completed = Command::new(env!("CARGO_BIN_EXE_fluent"))
+        .current_dir(project)
+        .env("FLUENT_NO_UPDATE_CHECK", "1")
+        .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "pass")
+        .env("FLUENT_TEST_HERMETIC_PROVIDERS", "1")
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                mock_dir.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .args(["attempt", "run", "review", "attempt-review", "--no-sandbox"])
+        .output()
+        .unwrap();
+    assert!(
+        completed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&completed.stderr)
+    );
+    let after = fluent(project, &["work-item", "show", "review"]);
+    assert!(after.status.success());
+    let merge_candidates = fluent(project, &["merge-candidate", "list", "review"]);
+    assert!(merge_candidates.status.success());
+    let final_head = run(project, "git", &["rev-parse", "HEAD"]);
+    assert!(final_head.status.success());
+
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let target = source.join("target/formal/workflow/integrated/production/review-only");
+    fs::create_dir_all(&target).unwrap();
+    let observed = [
+        ("planned.json", &before.stdout),
+        ("complete.json", &after.stdout),
+        ("head-before.txt", &head.stdout),
+        ("head-after.txt", &final_head.stdout),
+        ("merge-candidates.txt", &merge_candidates.stdout),
+    ];
+    let artifacts = observed
+        .iter()
+        .map(|(name, bytes)| {
+            fs::write(target.join(name), bytes).unwrap();
+            json!({"path":name,"sha256":digest(bytes)})
+        })
+        .collect::<Vec<_>>();
+    let trace = json!({"schema-version":1,"scenario":"review-only-order",
+    "fluent-commit":String::from_utf8_lossy(&run(source,"git", &["rev-parse","HEAD"]).stdout).trim(),
+    "fluent-binary-sha256":digest(&fs::read(env!("CARGO_BIN_EXE_fluent")).unwrap()),
+    "model-profile":"review-only","collection-complete":true,"artifacts":artifacts,
+    "events":[
+        event(1,"review-only-planned","review-codebase",&[],json!({
+            "exit-code":planned.status.code(),"work":serde_json::from_slice::<Value>(&before.stdout).unwrap()})),
+        event(2,"review-only-complete","attempt-run",&[1],json!({
+            "exit-code":completed.status.code(),"work":serde_json::from_slice::<Value>(&after.stdout).unwrap()}))
+    ]});
+    let path = target.join("production-trace.json");
+    fs::write(&path, serde_json::to_vec_pretty(&trace).unwrap()).unwrap();
+    let projected = run(
+        source,
+        "python3",
+        &[
+            "tests/formal/workflow/project_review_only.py",
+            path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        projected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&projected.stderr)
+    );
+    let negative = tmp.path().join("review-order-negative");
+    fs::create_dir(&negative).unwrap();
+    for (name, _) in observed {
+        fs::copy(target.join(name), negative.join(name)).unwrap();
+    }
+    let mut changed = trace;
+    changed["events"][1]["raw-facts"]["work"]["attempts"][0]["tasks"][1]["started_at"] =
+        json!("2000-01-01T00:00:00+00:00");
+    let bytes = serde_json::to_vec(&changed["events"][1]["raw-facts"]["work"]).unwrap();
+    fs::write(negative.join("complete.json"), &bytes).unwrap();
+    changed["artifacts"][1]["sha256"] = json!(digest(&bytes));
+    let negative_path = negative.join("production-trace.json");
+    fs::write(&negative_path, serde_json::to_vec_pretty(&changed).unwrap()).unwrap();
+    let rejected = run(
+        source,
+        "python3",
+        &[
+            "tests/formal/workflow/project_review_only.py",
+            negative_path.to_str().unwrap(),
+        ],
+    );
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr)
+            .contains("review started before Tester completed")
+    );
+}
+
+#[test]
 fn workflow_integrated_queue_survives_other_attempt_cancellation() {
     let tmp = TempDir::new().unwrap();
     let project = tmp.path();
