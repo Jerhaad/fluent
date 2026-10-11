@@ -10,9 +10,12 @@ from pathlib import Path
 from project import TraceError, exact_keys, load_json, require
 
 ARTIFACTS = ("queued-work.json", "foreground-work.json", "queue.txt",
-             "status.txt", "refused.txt")
-BOUNDARIES = ("queue-admitted", "other-canceled", "observed", "run-refused")
-OPERATIONS = ("queue-add", "attempt-cancel", "status", "task-run")
+             "status.txt", "refused.txt", "head-before.txt", "head-after.txt",
+             "queue-after-git.txt", "queued-after-git.json",
+             "foreground-after-git.json")
+BOUNDARIES = ("queue-admitted", "other-canceled", "observed", "run-refused",
+              "independent-git-change")
+OPERATIONS = ("queue-add", "attempt-cancel", "status", "task-run", "git-commit")
 
 
 def project(trace, root):
@@ -57,12 +60,15 @@ def project(trace, root):
                 "event identity or boundary differs")
         require(event["causal-predecessors"] == ([] if index == 0 else [index]),
                 "missing or ambiguous causal predecessor")
-    queued, canceled, inspection, refusal = [event["raw-facts"] for event in events]
+    queued, canceled, inspection, refusal, git_change = [
+        event["raw-facts"] for event in events]
     exact_keys(queued, ("exit-code", "work"), "queue facts")
     exact_keys(canceled, ("exit-code", "work"), "cancel facts")
     exact_keys(inspection, ("exit-code", "queue", "status", "work"),
                "inspection facts")
     exact_keys(refusal, ("exit-code", "stderr", "work"), "refusal facts")
+    exact_keys(git_change, ("exit-code", "head-before", "head-after", "queue",
+                            "queued-work", "foreground-work"), "Git change facts")
     require(all(type(facts["exit-code"]) is int and facts["exit-code"] == 0
                 for facts in (queued, canceled, inspection)) and
             type(refusal["exit-code"]) is int and refusal["exit-code"] != 0,
@@ -94,7 +100,26 @@ def project(trace, root):
             refusal["stderr"] ==
             "Error: Attempt has a durable cancellation request; explicitly resume after settlement\n",
             "cancellation refusal not observed")
-    return {"states": ["queued", "other-canceled", "observed", "refused"],
+    head_before = git_change["head-before"]
+    head_after = git_change["head-after"]
+    require(type(git_change["exit-code"]) is int and git_change["exit-code"] == 0 and
+            type(head_before) is str and type(head_after) is str and
+            re.fullmatch(r"[0-9a-f]{40}\n", head_before) and
+            re.fullmatch(r"[0-9a-f]{40}\n", head_after) and
+            head_before != head_after and
+            head_before == observed["head-before.txt"].decode() and
+            head_after == observed["head-after.txt"].decode(),
+            "independent Git commit not observed")
+    require(git_change["queue"] == observed["queue-after-git.txt"].decode() and
+            git_change["queue"] == inspection["queue"] and
+            git_change["queued-work"] == load_json(observed["queued-after-git.json"]) and
+            git_change["queued-work"] == queued["work"] and
+            git_change["foreground-work"] ==
+            load_json(observed["foreground-after-git.json"]) and
+            git_change["foreground-work"] == canceled["work"],
+            "independent Git change altered retained Work or queue")
+    return {"states": ["queued", "other-canceled", "observed", "refused",
+                       "independent-git-change"],
             "queued-work": "queued", "canceled-work": "foreground"}
 
 

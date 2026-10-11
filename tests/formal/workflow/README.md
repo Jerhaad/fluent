@@ -6,11 +6,13 @@ Run `python3 tests/formal/workflow/check.py --suite=integrated
 --jar=target/fluent-tools/tla2tools-1.7.4.jar` from the candidate checkout.
 The checker runs the five maintained workflow suites, fresh public
 queue/cancellation and no-change Writer sequences, and the scheduler recovery,
-lifecycle, launch, and landing suites. The queue/cancellation trace records two Work identities,
-the retained queue, the canceled foreground Attempt, read-only status, and a
-refused Task run. `project_integrated.py` checks the digest-bound raw facts and
-causal order independently of the command assertions. A rehashed trace that
-swaps the canceled Work identity must fail projection. The checker writes logs under
+lifecycle, launch, and landing suites. The queue/cancellation trace records two
+Work identities, the retained queue, the canceled foreground Attempt, read-only
+status, a refused Task run, and a later independent Git commit.
+`project_integrated.py` checks the digest-bound raw facts and causal order
+independently of the command assertions. Rehashed traces that swap the canceled
+Work identity or change retained Work after the Git commit must fail projection.
+The checker writes logs under
 `target/formal/workflow/integrated/` and a candidate-bound `report.json` with
 suite results, log digests, model hashes, and every connection row from
 `connections.md`. The scheduler checker also writes candidate-bound results

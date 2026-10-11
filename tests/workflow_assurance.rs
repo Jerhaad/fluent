@@ -681,6 +681,27 @@ fn workflow_integrated_queue_survives_other_attempt_cancellation() {
     let after_foreground = fluent(project, &["work-item", "show", "foreground"]);
     assert!(after_foreground.status.success());
     assert_eq!(foreground.stdout, after_foreground.stdout);
+    let old_head = run(project, "git", &["rev-parse", "HEAD"]);
+    assert!(old_head.status.success());
+    fs::write(project.join("README.md"), "independent change\n").unwrap();
+    assert!(run(project, "git", &["add", "README.md"]).status.success());
+    assert!(
+        run(project, "git", &["commit", "-m", "Update fixture"])
+            .status
+            .success()
+    );
+    let new_head = run(project, "git", &["rev-parse", "HEAD"]);
+    assert!(new_head.status.success());
+    assert_ne!(old_head.stdout, new_head.stdout);
+    let after_git_queue = fluent(project, &["queue", "list"]);
+    let after_git_queued = fluent(project, &["work-item", "show", "queued"]);
+    let after_git_foreground = fluent(project, &["work-item", "show", "foreground"]);
+    assert!(after_git_queue.status.success());
+    assert!(after_git_queued.status.success());
+    assert!(after_git_foreground.status.success());
+    assert_eq!(after_git_queue.stdout, queue.stdout);
+    assert_eq!(after_git_queued.stdout, before_queue.stdout);
+    assert_eq!(after_git_foreground.stdout, foreground.stdout);
 
     let source = Path::new(env!("CARGO_MANIFEST_DIR"));
     let trace_dir = tmp.path().join("integrated-trace");
@@ -691,6 +712,11 @@ fn workflow_integrated_queue_survives_other_attempt_cancellation() {
         ("queue.txt", &queue.stdout),
         ("status.txt", &status.stdout),
         ("refused.txt", &refused.stderr),
+        ("head-before.txt", &old_head.stdout),
+        ("head-after.txt", &new_head.stdout),
+        ("queue-after-git.txt", &after_git_queue.stdout),
+        ("queued-after-git.json", &after_git_queued.stdout),
+        ("foreground-after-git.json", &after_git_foreground.stdout),
     ];
     let artifacts = observed
         .iter()
@@ -714,7 +740,13 @@ fn workflow_integrated_queue_survives_other_attempt_cancellation() {
             "work":serde_json::from_slice::<Value>(&after_queue.stdout).unwrap()})),
         event(4,"run-refused","task-run",&[3],json!({"exit-code":refused.status.code(),
             "stderr":String::from_utf8_lossy(&refused.stderr),
-            "work":serde_json::from_slice::<Value>(&after_foreground.stdout).unwrap()}))
+            "work":serde_json::from_slice::<Value>(&after_foreground.stdout).unwrap()})),
+        event(5,"independent-git-change","git-commit",&[4],json!({
+            "exit-code":0,"head-before":String::from_utf8_lossy(&old_head.stdout),
+            "head-after":String::from_utf8_lossy(&new_head.stdout),
+            "queue":String::from_utf8_lossy(&after_git_queue.stdout),
+            "queued-work":serde_json::from_slice::<Value>(&after_git_queued.stdout).unwrap(),
+            "foreground-work":serde_json::from_slice::<Value>(&after_git_foreground.stdout).unwrap()}))
     ]});
     let trace_path = trace_dir.join("production-trace.json");
     fs::write(&trace_path, serde_json::to_vec_pretty(&trace).unwrap()).unwrap();
@@ -779,5 +811,36 @@ fn workflow_integrated_queue_survives_other_attempt_cancellation() {
     assert!(
         String::from_utf8_lossy(&rejected.stderr)
             .contains("missing or ambiguous causal predecessor")
+    );
+    let mut changed_work =
+        json!(serde_json::from_slice::<Value>(&fs::read(&trace_path).unwrap()).unwrap());
+    changed_work["events"][4]["raw-facts"]["queued-work"]["title"] = json!("changed");
+    let changed_work_dir = tmp.path().join("changed-work-trace");
+    fs::create_dir(&changed_work_dir).unwrap();
+    for (name, _) in observed {
+        fs::copy(trace_dir.join(name), changed_work_dir.join(name)).unwrap();
+    }
+    let bytes = serde_json::to_vec(&changed_work["events"][4]["raw-facts"]["queued-work"]).unwrap();
+    fs::write(changed_work_dir.join("queued-after-git.json"), &bytes).unwrap();
+    for artifact in changed_work["artifacts"].as_array_mut().unwrap() {
+        if artifact["path"] == "queued-after-git.json" {
+            artifact["sha256"] = json!(digest(&bytes));
+        }
+    }
+    let changed_path = changed_work_dir.join("production-trace.json");
+    fs::write(
+        &changed_path,
+        serde_json::to_vec_pretty(&changed_work).unwrap(),
+    )
+    .unwrap();
+    let rejected = run(
+        source,
+        "python3",
+        &[projector.to_str().unwrap(), changed_path.to_str().unwrap()],
+    );
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr)
+            .contains("independent Git change altered retained Work or queue")
     );
 }

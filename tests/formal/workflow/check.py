@@ -91,7 +91,9 @@ def integrated_production_suite(source, root, output, jar, java):
     directory = output / "production"
     directory.mkdir(parents=True, exist_ok=True)
     for name in ("production-trace.json", "queued-work.json", "foreground-work.json",
-                 "queue.txt", "status.txt", "refused.txt"):
+                 "queue.txt", "status.txt", "refused.txt", "head-before.txt",
+                 "head-after.txt", "queue-after-git.txt", "queued-after-git.json",
+                 "foreground-after-git.json"):
         (directory / name).unlink(missing_ok=True)
     command = ["cargo", "nextest", "run", "--offline", "--features", "test-support",
                "--test", "workflow_assurance", "--no-tests", "fail",
@@ -155,6 +157,30 @@ def integrated_production_suite(source, root, output, jar, java):
                          "pass": rejected.returncode != 0 and
                          "missing or ambiguous causal predecessor" in rejected.stderr,
                          "log": "ambiguous-order-negative.log"})
+            changed_work_dir = output / "post-git-work-negative"
+            changed_work_dir.mkdir(exist_ok=True)
+            for entry in trace["artifacts"]:
+                shutil.copyfile(directory / entry["path"],
+                                changed_work_dir / entry["path"])
+            changed = json.loads(json.dumps(trace))
+            work = changed["events"][4]["raw-facts"]["queued-work"]
+            work["title"] = "changed"
+            work_bytes = json.dumps(work).encode()
+            (changed_work_dir / "queued-after-git.json").write_bytes(work_bytes)
+            for entry in changed["artifacts"]:
+                if entry["path"] == "queued-after-git.json":
+                    entry["sha256"] = hashlib.sha256(work_bytes).hexdigest()
+            changed_path = changed_work_dir / "production-trace.json"
+            changed_path.write_text(json.dumps(changed))
+            command = ["python3", str(source / "project_integrated.py"),
+                       str(changed_path)]
+            rejected = subprocess.run(command, cwd=root, capture_output=True, text=True)
+            (output / "post-git-work-negative.log").write_text(
+                "$ " + " ".join(command) + "\n" + rejected.stdout + rejected.stderr)
+            rows.append({"case": "post-git-work-negative",
+                         "pass": rejected.returncode != 0 and
+                         "independent Git change altered retained Work or queue" in rejected.stderr,
+                         "log": "post-git-work-negative.log"})
     no_change = directory / "no-change"
     no_change.mkdir(exist_ok=True)
     for path in no_change.iterdir():
