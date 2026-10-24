@@ -26,8 +26,8 @@ pub const POLICY_VERSION: u32 = 1;
 /// Read-only system hierarchies. `/` itself is never granted: that would hand
 /// back every `$HOME` secret the rendered home rules exist to withhold.
 const SYSTEM_READ: &[&str] = &[
-    "/bin", "/sbin", "/lib", "/lib64", "/lib32", "/libx32", "/usr", "/etc", "/opt", "/nix", "/proc",
-    "/sys", "/var", "/run", "/snap", "/srv",
+    "/bin", "/sbin", "/lib", "/lib64", "/lib32", "/libx32", "/usr", "/etc", "/opt", "/nix",
+    "/proc", "/sys", "/var", "/run", "/snap", "/srv",
 ];
 
 /// Writable system hierarchies, each more specific than a `SYSTEM_READ` entry
@@ -166,6 +166,15 @@ pub struct PolicyRequest<'a> {
     /// writable `/tmp` is a channel around whatever `denied_write_roots`
     /// withholds.
     pub grant_shared_temp: bool,
+    /// Paths inside otherwise writable roots that the caller withholds.
+    ///
+    /// Landlock has no deny rule. The renderer therefore enumerates sibling
+    /// grants around each exclusion instead of granting the enclosing root.
+    pub denied_write_paths: &'a [PathBuf],
+    /// Paths inside otherwise readable roots that the caller withholds.
+    pub denied_read_paths: &'a [PathBuf],
+    /// Paths the caller grants explicitly even though an ancestor is withheld.
+    pub reallowed_write_paths: &'a [PathBuf],
 }
 
 pub fn render(request: &PolicyRequest<'_>) -> Result<Policy> {
@@ -249,7 +258,10 @@ fn push_home_rules(
         rules.push(Rule::optional(request.home.join(relative), Access::Read));
     }
     for relative in HOME_WRITE {
-        rules.push(Rule::optional(request.home.join(relative), Access::ReadWrite));
+        rules.push(Rule::optional(
+            request.home.join(relative),
+            Access::ReadWrite,
+        ));
     }
     Ok(())
 }
@@ -286,7 +298,9 @@ fn push_root_rules(request: &PolicyRequest<'_>, rules: &mut Vec<Rule>) -> Result
 
     for root in request.writable_roots {
         let mut granted = Vec::new();
-        grant_excluding(root, Access::ReadWrite, &denied, &mut granted)?;
+        let mut exclusions = denied.clone();
+        exclusions.extend(request.denied_write_paths.iter().cloned());
+        grant_excluding(root, Access::ReadWrite, &exclusions, &mut granted)?;
         for rule in &mut granted {
             rule.required = true;
         }
@@ -299,7 +313,20 @@ fn push_root_rules(request: &PolicyRequest<'_>, rules: &mut Vec<Rule>) -> Result
         rules.push(Rule::optional(root, Access::Read));
     }
     for root in request.readable_roots {
-        rules.push(Rule::required(root, Access::Read));
+        let mut granted = Vec::new();
+        grant_excluding(
+            root,
+            Access::Read,
+            &request.denied_read_paths.iter().cloned().collect(),
+            &mut granted,
+        )?;
+        for rule in &mut granted {
+            rule.required = true;
+        }
+        rules.append(&mut granted);
+    }
+    for path in request.reallowed_write_paths {
+        rules.push(Rule::optional(path, Access::ReadWrite));
     }
     Ok(())
 }
@@ -440,7 +467,9 @@ mod enforce {
                 .scope(Scope::Signal | Scope::AbstractUnixSocket)
                 .context("scoping signals and abstract sockets to the sandbox")?;
         }
-        let mut ruleset = attributes.create().context("creating the Landlock ruleset")?;
+        let mut ruleset = attributes
+            .create()
+            .context("creating the Landlock ruleset")?;
 
         for rule in &policy.rules {
             let fd = match PathFd::new(&rule.path) {
@@ -556,6 +585,9 @@ mod tests {
             coder_kind: Some(CoderKind::Claude),
             codex_home: None,
             grant_shared_temp: true,
+            denied_write_paths: &[],
+            denied_read_paths: &[],
+            reallowed_write_paths: &[],
         }
     }
 
@@ -678,7 +710,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(access_for(&policy, Path::new("/tmp")), None, "{policy:?}");
-        assert_eq!(access_for(&policy, Path::new("/var/tmp")), None, "{policy:?}");
+        assert_eq!(
+            access_for(&policy, Path::new("/var/tmp")),
+            None,
+            "{policy:?}"
+        );
     }
 
     #[test]

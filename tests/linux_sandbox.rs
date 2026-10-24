@@ -17,7 +17,7 @@
 #![cfg(target_os = "linux")]
 
 use fluent::coder::CoderKind;
-use fluent::linux_sandbox::{self, PolicyRequest};
+use fluent::linux_sandbox;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::TempDir;
@@ -57,7 +57,7 @@ fn fixture(grant_shared_temp: bool) -> Fixture {
     std::fs::write(home_path.join("project/tracked.txt"), "candidate").unwrap();
 
     let writable = vec![home_path.join("project")];
-    let policy = linux_sandbox::render(&PolicyRequest {
+    let policy = linux_sandbox::render(&linux_sandbox::PolicyRequest {
         home: &home_path,
         writable_roots: &writable,
         readable_roots: &[],
@@ -65,6 +65,9 @@ fn fixture(grant_shared_temp: bool) -> Fixture {
         coder_kind: Some(CoderKind::Claude),
         codex_home: None,
         grant_shared_temp,
+        denied_write_paths: &[],
+        denied_read_paths: &[],
+        reallowed_write_paths: &[],
     })
     .unwrap();
 
@@ -169,6 +172,117 @@ fn the_launcher_refuses_a_policy_it_cannot_parse() {
 
     assert!(!ok, "an unparsable policy ran the command anyway");
     assert!(stderr.contains("Landlock policy"), "{stderr}");
+}
+
+#[test]
+fn linux_writer_confinement_matches_seatbelt_probe() {
+    let root = fixture_root();
+    let physical_source = root.path().join("physical-source");
+    let source_link = root.path().join("source");
+    let candidate = root.path().join("candidate");
+    let artifact = source_link.join(".fluent/work/artifacts/work/attempt/task");
+    let cache = source_link.join(".fluent/work/cache/writers/work/attempt");
+    let sibling_artifact = source_link.join(".fluent/work/artifacts/work/attempt/other-task");
+    let gate_artifact = source_link.join(".fluent/work/artifacts/work/attempt/candidate-gates");
+    let sibling_cache = source_link.join(".fluent/work/cache/writers/work/other-attempt");
+    let work_model = source_link.join(".fluent/work/items/work.json");
+
+    std::fs::create_dir_all(&physical_source).unwrap();
+    std::os::unix::fs::symlink(&physical_source, &source_link).unwrap();
+    std::fs::create_dir_all(&candidate).unwrap();
+    std::fs::create_dir_all(physical_source.join("src")).unwrap();
+    std::fs::write(physical_source.join("src/lib.rs"), "source").unwrap();
+    std::fs::create_dir_all(physical_source.join(".git")).unwrap();
+    std::fs::create_dir_all(physical_source.join(".fluent/work/artifacts/work/attempt/task"))
+        .unwrap();
+    std::fs::create_dir_all(physical_source.join(".fluent/work/artifacts/work/attempt/other-task"))
+        .unwrap();
+    std::fs::create_dir_all(
+        physical_source.join(".fluent/work/artifacts/work/attempt/candidate-gates"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(physical_source.join(".fluent/work/cache/writers/work/attempt"))
+        .unwrap();
+    std::fs::create_dir_all(physical_source.join(".fluent/work/cache/writers/work/other-attempt"))
+        .unwrap();
+    std::fs::create_dir_all(physical_source.join(".fluent/work/items")).unwrap();
+    std::fs::write(
+        physical_source.join(".fluent/work/items/work.json"),
+        "host-owned",
+    )
+    .unwrap();
+
+    let confinement =
+        fluent::os::writer_confinement(&source_link, &candidate, &artifact, &cache).unwrap();
+    let writable = vec![candidate.clone(), source_link.clone(), artifact.clone()];
+    let landlock = linux_sandbox::render(&linux_sandbox::PolicyRequest {
+        home: root.path(),
+        writable_roots: &writable,
+        readable_roots: &[],
+        denied_write_roots: &[],
+        coder_kind: Some(CoderKind::Claude),
+        codex_home: None,
+        grant_shared_temp: false,
+        denied_write_paths: &confinement.denied,
+        denied_read_paths: &[],
+        reallowed_write_paths: &confinement.allowed,
+    })
+    .unwrap();
+    let policy_file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        policy_file.path(),
+        linux_sandbox::serialize(&landlock).unwrap(),
+    )
+    .unwrap();
+
+    let probes: [(u8, &Path, bool); 9] = [
+        (10, &physical_source.join("src/lib.rs"), false),
+        (11, &candidate.join("change.txt"), true),
+        (12, &physical_source.join(".git/test"), true),
+        (13, &artifact.join("test"), true),
+        (14, &work_model, false),
+        (15, &sibling_artifact.join("test"), false),
+        (16, &gate_artifact.join("test"), false),
+        (17, &cache.join("test"), true),
+        (18, &sibling_cache.join("test"), false),
+    ];
+
+    if kernel_enforces_landlock() {
+        for (row, path, allowed) in probes {
+            let script = format!("printf written > {}", path.display());
+            let (ok, stderr) = run_confined(policy_file.path(), &script);
+            if allowed {
+                assert!(ok, "row {row} should be allowed: {stderr}");
+                assert!(path.exists(), "row {row} did not create its file");
+            } else {
+                assert!(!ok, "row {row} should be denied");
+                assert!(
+                    !stderr.contains(NOT_ENFORCED),
+                    "row {row} failed because the launcher never confined anything: {stderr}"
+                );
+            }
+        }
+        assert_eq!(
+            std::fs::read_to_string(physical_source.join("src/lib.rs")).unwrap(),
+            "source",
+            "row 10 changed the source file"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&work_model).unwrap(),
+            "host-owned",
+            "row 14 changed the Work-model record"
+        );
+        let canonical = std::fs::canonicalize(&physical_source).unwrap();
+        assert_denied(
+            policy_file.path(),
+            &format!("printf written > {}/src/lib.rs", canonical.display()),
+            "the canonical source path was writable",
+        );
+    } else {
+        let (ok, stderr) = run_confined(policy_file.path(), "true");
+        assert!(!ok, "a kernel with no Landlock ran the Writer anyway");
+        assert!(stderr.contains(NOT_ENFORCED), "{stderr}");
+    }
 }
 
 #[test]

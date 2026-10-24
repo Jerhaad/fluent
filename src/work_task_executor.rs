@@ -4558,6 +4558,35 @@ fn preflight_write_sandbox_profile(
         .artifact_area
         .as_ref()
         .context("Writer Task has no artifact area for sandbox grant")?;
+    let task_artifact_path = project_root.join(&task_artifact.path);
+    if os::backend() == os::SandboxBackend::Landlock {
+        let confinement = os::writer_confinement(
+            project_root,
+            workspace_path,
+            &task_artifact_path,
+            writer_cache.root(),
+        )?;
+        let profile = os::render_profile_for_access_for_coder_with_denied_writes_and_codex_home_and_exclusions(
+            resolver,
+            &home,
+            &writable_roots,
+            &readable_roots,
+            &[],
+            coder_kind,
+            codex_worker.map(|worker| worker.home()),
+            &confinement.denied,
+            &[],
+            &confinement.allowed,
+        )?;
+        #[cfg(not(test))]
+        if let Some(worker) = codex_worker {
+            os::preflight_codex_launcher(&profile, worker)?;
+        } else {
+            os::preflight_profile(&profile)?;
+        }
+        os::preflight_readable_paths(&profile, prior_reviews)?;
+        return Ok(Some(profile));
+    }
     os::deny_writer_source_entries(
         &profile,
         project_root,

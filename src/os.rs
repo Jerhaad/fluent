@@ -69,6 +69,98 @@ pub fn sandbox_launcher_args(profile: &str) -> Vec<String> {
     }
 }
 
+/// Paths the Writer policy withholds and re-grants.
+///
+/// Landlock cannot subtract an ancestor grant. The renderer enumerates sibling
+/// grants around every denied path and then grants the two Task-owned
+/// descendants explicitly.
+#[derive(Debug, Clone, Default)]
+pub struct WriterConfinement {
+    pub denied: Vec<PathBuf>,
+    pub allowed: Vec<PathBuf>,
+}
+
+/// Compute the Writer's Landlock carve-outs from the same inputs as the
+/// Seatbelt profile mutation.
+pub fn writer_confinement(
+    source: &Path,
+    candidate: &Path,
+    task_artifact: &Path,
+    writer_cache: &Path,
+) -> Result<WriterConfinement> {
+    let physical_source = std::fs::canonicalize(source)?;
+    let physical_candidate = match std::fs::canonicalize(candidate) {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let parent = candidate
+                .parent()
+                .context("Writer candidate has no parent")?;
+            std::fs::canonicalize(parent)?.join(
+                candidate
+                    .file_name()
+                    .context("Writer candidate has no file name")?,
+            )
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let artifact_root = source.join(".fluent/work/artifacts");
+    let relative_artifact = task_artifact
+        .strip_prefix(&artifact_root)
+        .context("Writer artifact grant must stay inside the Work artifact tree")?;
+    anyhow::ensure!(
+        relative_artifact.components().count() >= 3
+            && relative_artifact
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_))),
+        "Writer artifact grant must name one Task artifact area"
+    );
+    let mut identity = relative_artifact.components();
+    let work_item = identity
+        .next()
+        .context("Writer artifact has no Work Item")?;
+    let attempt = identity.next().context("Writer artifact has no Attempt")?;
+    let expected_cache = source
+        .join(".fluent/work/cache/writers")
+        .join(work_item.as_os_str())
+        .join(attempt.as_os_str());
+    anyhow::ensure!(
+        writer_cache == expected_cache,
+        "Writer cache grant must name the exact current Attempt"
+    );
+    if physical_source == physical_candidate {
+        return Ok(WriterConfinement::default());
+    }
+
+    let mut denied = Vec::new();
+    let mut allowed = Vec::new();
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let path = entry.path();
+        if candidate.starts_with(&path)
+            || physical_candidate.starts_with(physical_source.join(entry.file_name()))
+            || entry.file_name() == ".git"
+        {
+            continue;
+        }
+        if entry.file_name() == ".fluent" {
+            for child in std::fs::read_dir(&path)? {
+                let child = child?;
+                if child.file_name() == "work" {
+                    denied.push(child.path());
+                    denied.push(child.path().join("progress"));
+                    allowed.push(task_artifact.to_path_buf());
+                    allowed.push(writer_cache.to_path_buf());
+                } else {
+                    denied.push(child.path());
+                }
+            }
+            continue;
+        }
+        denied.push(path);
+    }
+    Ok(WriterConfinement { denied, allowed })
+}
+
 /// Deny existing source product entries after the profile's broad temporary
 /// directory grants. Include the physical path because macOS resolves /var to
 /// /private/var before applying Seatbelt rules.
@@ -826,7 +918,35 @@ pub fn render_profile_for_access_for_coder_with_denied_writes_and_codex_home(
     coder_kind: CoderKind,
     codex_home: Option<&Path>,
 ) -> Result<SandboxProfile> {
-    let profile = render_profile_for_access(
+    render_profile_for_access_for_coder_with_denied_writes_and_codex_home_and_exclusions(
+        resolver,
+        home,
+        writable_roots,
+        readable_roots,
+        denied_write_roots,
+        coder_kind,
+        codex_home,
+        &[],
+        &[],
+        &[],
+    )
+}
+
+/// Render a confined coder profile with explicit write and read carve-outs.
+#[allow(clippy::too_many_arguments)]
+pub fn render_profile_for_access_for_coder_with_denied_writes_and_codex_home_and_exclusions(
+    resolver: &ContentResolver,
+    home: &str,
+    writable_roots: &[PathBuf],
+    readable_roots: &[PathBuf],
+    denied_write_roots: &[PathBuf],
+    coder_kind: CoderKind,
+    codex_home: Option<&Path>,
+    denied_write_paths: &[PathBuf],
+    denied_read_paths: &[PathBuf],
+    reallowed_write_paths: &[PathBuf],
+) -> Result<SandboxProfile> {
+    let profile = render_profile_for_access_with_exclusions(
         resolver,
         home,
         writable_roots,
@@ -835,17 +955,22 @@ pub fn render_profile_for_access_for_coder_with_denied_writes_and_codex_home(
         Some(coder_kind),
         codex_home,
         true,
+        denied_write_paths,
+        denied_read_paths,
+        reallowed_write_paths,
     )?;
-    let content = std::fs::read_to_string(&profile.path)?
-        .replace(
-            "(allow file-write* (subpath \"/private/var/folders\"))",
-            "; handoff-only profiles do not grant the shared macOS temp tree",
-        )
-        .replace(
-            "(allow file-write* (subpath \"/private/tmp\"))",
-            "; handoff-only profiles do not grant shared /private/tmp",
-        );
-    std::fs::write(&profile.path, content)?;
+    if backend() == SandboxBackend::Seatbelt {
+        let content = std::fs::read_to_string(&profile.path)?
+            .replace(
+                "(allow file-write* (subpath \"/private/var/folders\"))",
+                "; handoff-only profiles do not grant the shared macOS temp tree",
+            )
+            .replace(
+                "(allow file-write* (subpath \"/private/tmp\"))",
+                "; handoff-only profiles do not grant shared /private/tmp",
+            );
+        std::fs::write(&profile.path, content)?;
+    }
     Ok(profile)
 }
 
@@ -912,6 +1037,35 @@ fn render_profile_for_access(
     codex_home: Option<&Path>,
     deny_codex_source_home: bool,
 ) -> Result<SandboxProfile> {
+    render_profile_for_access_with_exclusions(
+        resolver,
+        home,
+        writable_roots,
+        readable_roots,
+        denied_write_roots,
+        coder_kind,
+        codex_home,
+        deny_codex_source_home,
+        &[],
+        &[],
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_profile_for_access_with_exclusions(
+    resolver: &ContentResolver,
+    home: &str,
+    writable_roots: &[PathBuf],
+    readable_roots: &[PathBuf],
+    denied_write_roots: &[PathBuf],
+    coder_kind: Option<CoderKind>,
+    codex_home: Option<&Path>,
+    deny_codex_source_home: bool,
+    denied_write_paths: &[PathBuf],
+    denied_read_paths: &[PathBuf],
+    reallowed_write_paths: &[PathBuf],
+) -> Result<SandboxProfile> {
     if writable_roots.is_empty() {
         bail!("At least one writable sandbox root is required");
     }
@@ -937,6 +1091,9 @@ fn render_profile_for_access(
             denied_write_roots,
             coder_kind,
             codex_home,
+            denied_write_paths,
+            denied_read_paths,
+            reallowed_write_paths,
         );
     }
 
@@ -1004,6 +1161,9 @@ fn render_landlock_policy(
     denied_write_roots: &[PathBuf],
     coder_kind: Option<CoderKind>,
     codex_home: Option<&Path>,
+    denied_write_paths: &[PathBuf],
+    denied_read_paths: &[PathBuf],
+    reallowed_write_paths: &[PathBuf],
 ) -> Result<SandboxProfile> {
     let policy = linux_sandbox::render(&linux_sandbox::PolicyRequest {
         home: Path::new(home),
@@ -1013,6 +1173,9 @@ fn render_landlock_policy(
         coder_kind,
         codex_home,
         grant_shared_temp: denied_write_roots.is_empty(),
+        denied_write_paths,
+        denied_read_paths,
+        reallowed_write_paths,
     })?;
 
     let temp_file = NamedTempFile::with_prefix("fluent-sandbox-")?;
