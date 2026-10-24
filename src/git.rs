@@ -8,7 +8,7 @@ const LOCK_RETRY_MAX_ATTEMPTS: usize = 8;
 const LOCK_RETRY_BASE_MS: u64 = 20;
 const LOCK_RETRY_CAP_MS: u64 = 320;
 
-fn build_command(cwd: &Path, args: &[&str]) -> Command {
+pub(crate) fn build_command(cwd: &Path, args: &[&str]) -> Command {
     let mut cmd = Command::new("git");
     cmd.current_dir(cwd);
     cmd.env("GIT_EDITOR", "true");
@@ -90,6 +90,26 @@ pub fn run(cwd: &Path, args: &[&str], action: &str) -> Result<()> {
     )
 }
 
+/// Fast-forward a target branch only while it still names the verified base.
+pub fn fast_forward_checked(cwd: &Path, branch: &str, base: &str, commit: &str) -> Result<()> {
+    let current = run_stdout(cwd, &["rev-parse", branch], "resolve target branch")?;
+    anyhow::ensure!(
+        current == base,
+        "target branch {branch} moved from {base} to {current}"
+    );
+    run(cwd, &["checkout", branch], "checkout target branch")?;
+    let checked_out = run_stdout(cwd, &["rev-parse", "HEAD"], "resolve checked-out target")?;
+    anyhow::ensure!(
+        checked_out == base,
+        "target checkout moved from {base} to {checked_out}"
+    );
+    run(
+        cwd,
+        &["merge", "--ff-only", commit],
+        "fast-forward target branch",
+    )
+}
+
 /// Run `git <args>` in `cwd`, return trimmed stdout on success.
 pub fn run_stdout(cwd: &Path, args: &[&str], action: &str) -> Result<String> {
     let output = run_with_lock_retry(|| build_command(cwd, args))?;
@@ -105,9 +125,129 @@ pub fn run_stdout(cwd: &Path, args: &[&str], action: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Run Git with one host-owned environment override through the central
+/// non-interactive command boundary.
+pub fn run_stdout_with_env(
+    cwd: &Path,
+    args: &[&str],
+    environment: (&str, &Path),
+    action: &str,
+) -> Result<String> {
+    let output = run_with_lock_retry(|| {
+        let mut command = build_command(cwd, args);
+        command.env(environment.0, environment.1);
+        command
+    })?;
+    if !output.status.success() {
+        bail!(
+            "git {} failed (exit {}) while {action}\n  cwd: {}\n{}",
+            args.join(" "),
+            exit_code_display(&output),
+            cwd.display(),
+            format_output(&output)
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+pub fn run_stdout_with_stdin_and_env(
+    cwd: &Path,
+    args: &[&str],
+    input: &[u8],
+    environment: (&str, &Path),
+    action: &str,
+) -> Result<String> {
+    let mut command = build_command(cwd, args);
+    command
+        .env(environment.0, environment.1)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().context("Failed to invoke git")?;
+    child
+        .stdin
+        .take()
+        .context("Failed to open git stdin")?
+        .write_all(input)?;
+    let output = child.wait_with_output().context("Failed to wait for git")?;
+    if !output.status.success() {
+        bail!(
+            "git {} failed (exit {}) while {action}\n  cwd: {}\n{}",
+            args.join(" "),
+            exit_code_display(&output),
+            cwd.display(),
+            format_output(&output)
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 /// Run `git <args>` in `cwd`, return the raw `Output`.
 pub fn run_raw(cwd: &Path, args: &[&str]) -> Result<Output> {
     run_with_lock_retry(|| build_command(cwd, args))
+}
+
+/// The effective ignore rule Git reports for one path.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct IgnoreMatch {
+    pub source: String,
+    pub line: String,
+    pub pattern: String,
+    pub path: String,
+}
+
+/// Return effective ignore rules for `paths`, including repository, info,
+/// global, nested, and command-line exclude sources.
+pub(crate) fn ignored_paths(cwd: &Path, paths: &[&str]) -> Result<Vec<IgnoreMatch>> {
+    let mut input = Vec::new();
+    for path in paths {
+        input.extend_from_slice(path.as_bytes());
+        input.push(0);
+    }
+    let output = run_raw_with_stdin(
+        cwd,
+        &["check-ignore", "-z", "-v", "--no-index", "--stdin"],
+        &input,
+    )?;
+    if !output.status.success() && output.status.code() != Some(1) {
+        bail!(
+            "git check-ignore failed (exit {}) while checking Fluent durable paths\n  cwd: {}\n{}",
+            exit_code_display(&output),
+            cwd.display(),
+            format_output(&output)
+        );
+    }
+    parse_ignore_matches(&output.stdout)
+}
+
+fn parse_ignore_matches(output: &[u8]) -> Result<Vec<IgnoreMatch>> {
+    let mut fields = output.split(|byte| *byte == 0).collect::<Vec<_>>();
+    if fields.last() == Some(&&[][..]) {
+        fields.pop();
+    }
+    if fields.len() % 4 != 0 {
+        bail!(
+            "git check-ignore returned a malformed verbose record with {} fields",
+            fields.len()
+        );
+    }
+    Ok(fields
+        .chunks_exact(4)
+        .filter_map(|fields| {
+            let pattern = String::from_utf8_lossy(fields[2]).into_owned();
+            // In verbose mode Git also reports the effective negation that made
+            // a path trackable. Only positive patterns describe ignored paths.
+            if pattern.starts_with('!') {
+                return None;
+            }
+            Some(IgnoreMatch {
+                source: String::from_utf8_lossy(fields[0]).into_owned(),
+                line: String::from_utf8_lossy(fields[1]).into_owned(),
+                pattern,
+                path: String::from_utf8_lossy(fields[3]).into_owned(),
+            })
+        })
+        .collect())
 }
 
 /// Return staged, unstaged, and untracked changes outside `.fluent/`.
@@ -141,18 +281,7 @@ pub fn non_fluent_worktree_status(cwd: &Path) -> Result<String> {
 
 /// Run `git <args>` with byte input on stdin and check the exit status.
 pub fn run_with_stdin(cwd: &Path, args: &[&str], input: &[u8], action: &str) -> Result<()> {
-    let mut child = build_command(cwd, args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("Failed to invoke git")?;
-    child
-        .stdin
-        .take()
-        .context("Failed to open git stdin")?
-        .write_all(input)?;
-    let output = child.wait_with_output()?;
+    let output = run_raw_with_stdin(cwd, args, input)?;
     if output.status.success() {
         return Ok(());
     }
@@ -163,6 +292,21 @@ pub fn run_with_stdin(cwd: &Path, args: &[&str], input: &[u8], action: &str) -> 
         cwd.display(),
         format_output(&output)
     )
+}
+
+fn run_raw_with_stdin(cwd: &Path, args: &[&str], input: &[u8]) -> Result<Output> {
+    let mut child = build_command(cwd, args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("Failed to invoke git")?;
+    child
+        .stdin
+        .take()
+        .context("Failed to open git stdin")?
+        .write_all(input)?;
+    child.wait_with_output().context("Failed to wait for git")
 }
 
 fn exit_code_display(output: &Output) -> String {
@@ -287,6 +431,33 @@ index 90be1a7..38f8e88 100644\n\
             std::fs::read_to_string(tmp.path().join("sample.txt")).unwrap(),
             "after\n"
         );
+    }
+
+    #[test]
+    fn parse_ignore_matches_keeps_positive_rules_and_discards_negations() {
+        let output = [
+            b".gitignore\0".as_slice(),
+            b"4\0.fluent/\0.fluent/tester.yaml\0".as_slice(),
+            b".gitignore\0".as_slice(),
+            b"5\0!.fluent/hooks/\0.fluent/hooks/check-pre-merge\0".as_slice(),
+        ]
+        .concat();
+
+        assert_eq!(
+            parse_ignore_matches(&output).unwrap(),
+            vec![IgnoreMatch {
+                source: ".gitignore".into(),
+                line: "4".into(),
+                pattern: ".fluent/".into(),
+                path: ".fluent/tester.yaml".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn parse_ignore_matches_rejects_incomplete_records() {
+        let error = parse_ignore_matches(b".gitignore\0").unwrap_err();
+        assert!(error.to_string().contains("malformed verbose record"));
     }
 
     // Lock-error detection tests

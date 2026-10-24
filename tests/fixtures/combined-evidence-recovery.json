@@ -1,0 +1,33 @@
+{
+  "schema-version": 1,
+  "work-item-id": "combined-saved",
+  "title": "Preserve combined host and canonical evidence history",
+  "commands": ["mkdir -p .fluent/check-count; printf x >> .fluent/check-count/passing", "false"],
+  "plan-row": "plan:step-2",
+  "host-evidence": {
+    "schema_version": 1,
+    "producer": "sanitized authorized code-check host",
+    "check": "bash tests/host.sh",
+    "working_directory": ".",
+    "result": "pass",
+    "run_at": "2026-09-09T12:00:00Z",
+    "output": "The exact unchanged candidate passed the host code check."
+  },
+  "no-change-writer": {
+    "id": "attempt-1-write-2",
+    "declaration": {
+      "schema_version": 1,
+      "reason": "The preserved candidate already implements the required behavior.",
+      "verification": [{"command": "true", "result": "pass"}]
+    }
+  },
+  "later-plan-review": "Verdict: pass\n\nThe preserved host result verifies the unchanged candidate.\n",
+  "preserved-history": [
+    "completed initial Writer with a pending host matrix row",
+    "accepted Plan host proof and targeted Tests Review",
+    "complete canonical Tester with one command still failing",
+    "completed no-change Writer preserving the exact candidate",
+    "later passing targeted Plan Review settled before advancement",
+    "no failed-command recheck"
+  ]
+}

@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -8,13 +9,418 @@ use crate::content::ContentResolver;
 use crate::git;
 use crate::hooks::{self, HookContext, HookOutcome};
 use crate::work_model::{
-    ArtifactRef, MergeCandidate, MergeCandidateMergeState, MergeCandidateMergeStatus,
-    MergeReviewState, Task, TaskKind, TaskStatus, WORK_ARTIFACTS_DIR, WorkItem, WorkModelError,
-    WorkModelStorageError, WorkModelStore, WorkspaceAccess,
-    resolve_expected_candidate_workspace_path, work_artifact_path,
+    ArtifactRef, DurableTransitionMetadata, DurableTransitionOrigin, LandingIntent, MergeCandidate,
+    MergeCandidateMergeState, MergeCandidateMergeStatus, MergeReviewState, Task, TaskKind,
+    TaskOutput, TaskStatus, WORK_ARTIFACTS_DIR, WorkItem, WorkModelError, WorkModelStorageError,
+    WorkModelStore, WorkspaceAccess, resolve_expected_candidate_workspace_path, work_artifact_path,
 };
 use crate::worktree;
 use crate::{credential, os};
+
+fn landing_transition() -> DurableTransitionMetadata {
+    DurableTransitionMetadata {
+        origin: DurableTransitionOrigin::Landing,
+        reason: None,
+        evidence_ref: None,
+    }
+}
+
+fn post_land_transition() -> DurableTransitionMetadata {
+    DurableTransitionMetadata {
+        origin: DurableTransitionOrigin::PostLand,
+        reason: None,
+        evidence_ref: None,
+    }
+}
+
+fn write_landing_work_item(
+    store: &WorkModelStore,
+    item: &WorkItem,
+) -> Result<(), WorkModelStorageError> {
+    store.write_work_item_with_transition(item, &landing_transition())
+}
+
+fn mutate_landing_work_item<T>(
+    store: &WorkModelStore,
+    id: &str,
+    reducer: impl FnOnce(&mut WorkItem) -> Result<T, WorkModelError>,
+) -> Result<T, WorkModelStorageError> {
+    store.mutate_work_item_with_transition(id, &landing_transition(), reducer)
+}
+
+fn landing_repository_identity(workspace: &Path) -> Result<String> {
+    let common = git::run_stdout(
+        workspace,
+        &["rev-parse", "--git-common-dir"],
+        "resolve repository identity",
+    )?;
+    let path = Path::new(&common);
+    Ok(fs::canonicalize(if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        workspace.join(path)
+    })?
+    .to_string_lossy()
+    .into_owned())
+}
+
+fn accepted_landing_model_digest(item: &WorkItem, candidate: &MergeCandidate) -> Result<String> {
+    let attempt = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == candidate.attempt_id)
+        .ok_or_else(|| anyhow::anyhow!("landing Attempt is missing"))?;
+    let bytes = serde_json::to_vec(&(
+        &attempt.tasks,
+        &attempt.review_state,
+        &attempt.learning,
+        &candidate.merge_review_state,
+    ))?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn landing_authorization_digest(item: &WorkItem) -> Result<String> {
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&item.authorization)?)
+    ))
+}
+
+fn ensure_review_bindings_current(
+    project_root: &Path,
+    item: &WorkItem,
+    candidate: &MergeCandidate,
+) -> Result<()> {
+    let attempt = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == candidate.attempt_id)
+        .context("landing Attempt is missing")?;
+    // A passed Attempt can reuse older ordinary reviews after a later Writer
+    // changes an unrelated file. Check each recorded review's identity without
+    // requiring its commit to equal the final Merge Candidate commit.
+    let source = resolve_managed_candidate_workspace_path(
+        project_root,
+        &candidate.source_workspace.path,
+        &item.id,
+        &candidate.attempt_id,
+    )?;
+    let last_writer = attempt
+        .tasks
+        .iter()
+        .rposition(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete);
+    let tested_commit = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Tester && task.status == TaskStatus::Complete)
+        .and_then(|task| task.review_context.as_ref())
+        .map(|context| context.candidate_commit.as_str());
+    let rebased_from = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Rebase && task.status == TaskStatus::Complete)
+        .and_then(|task| task.output.as_ref())
+        .filter(|output| {
+            output.workspace_id == candidate.source_workspace.id
+                && output.workspace_path == candidate.source_workspace.path
+                && output.source_branch == candidate.source_branch
+        })
+        .and_then(|output| output.base_commit.as_deref());
+    let mut preceding_writer = None;
+    for (index, task) in attempt.tasks.iter().enumerate() {
+        if task.kind == TaskKind::Write && task.status == TaskStatus::Complete {
+            preceding_writer = task.output.as_ref();
+        }
+        if task.kind != TaskKind::Review
+            || task.status != TaskStatus::Complete
+            || task.evidence_review_context.is_some()
+            || !crate::review::REVIEWERS.contains(&task.role.as_str())
+        {
+            continue;
+        }
+        let authentic_commit = preceding_writer.is_some_and(|output| {
+            task.review_context.as_ref().is_some_and(|context| {
+                context.candidate_commit == output.commit
+                    || (last_writer.is_some_and(|writer_index| index > writer_index)
+                        && (tested_commit == Some(context.candidate_commit.as_str())
+                            || rebased_from == Some(context.candidate_commit.as_str())))
+                    || output
+                        .learner_canonicalization
+                        .as_ref()
+                        .is_some_and(|transition| {
+                            context.candidate_commit == transition.from_commit
+                        })
+            })
+        });
+        let valid = task.review_context.as_ref().is_some_and(|context| {
+            authentic_commit
+                && context.candidate_workspace_id == candidate.source_workspace.id
+                && context.candidate_workspace_path == candidate.source_workspace.path
+                && context.source_branch == candidate.source_branch
+                && task
+                    .workspace_access
+                    .reads
+                    .contains(&candidate.source_workspace)
+                && crate::git::run_raw(
+                    &source,
+                    &[
+                        "cat-file",
+                        "-e",
+                        &format!("{}^{{commit}}", context.candidate_commit),
+                    ],
+                )
+                .is_ok_and(|output| output.status.success())
+        });
+        anyhow::ensure!(
+            valid,
+            "ordinary {} review binding changed before landing",
+            task.role
+        );
+    }
+    // Checking recorded Tasks alone misses a role removed after a later Writer
+    // invalidated its domain. Reconstruct coverage from the Writer history.
+    // Landing provenance can rewrite Writer outputs to the rebased tip. The
+    // bindings above must be authentic before coverage uses their Writer slot.
+    let mut coverage_attempt = attempt.clone();
+    let mut writer_commit = None;
+    for task in &mut coverage_attempt.tasks {
+        if task.kind == TaskKind::Write && task.status == TaskStatus::Complete {
+            writer_commit = task.output.as_ref().map(|output| output.commit.clone());
+        } else if task.kind == TaskKind::Review {
+            if let (Some(context), Some(commit)) = (task.review_context.as_mut(), &writer_commit) {
+                context.candidate_commit.clone_from(commit);
+            }
+        }
+    }
+    let pre_rebase_tip = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Rebase && task.status == TaskStatus::Complete)
+        .map(|task| {
+            task.output
+                .as_ref()
+                .and_then(|output| output.base_commit.as_deref())
+                .unwrap_or("")
+        });
+    let ordinary = crate::recovery_contracts::review_coverage::ordinary_review_tasks_for_landing(
+        project_root,
+        &coverage_attempt,
+        pre_rebase_tip,
+    );
+    for role in crate::review::REVIEWERS {
+        anyhow::ensure!(
+            ordinary.iter().any(|(task, verdict)| {
+                task.role == *role && *verdict == crate::review::Verdict::Pass
+            }),
+            "ordinary {role} review binding changed before landing"
+        );
+    }
+    Ok(())
+}
+
+fn persist_landing_intent(
+    config: &WorkMergeConfig<'_>,
+    candidate: &MergeCandidate,
+    target_workspace: &Path,
+    target_before: &str,
+    verified_commit: &str,
+    checks: Vec<ArtifactRef>,
+    reviews: Vec<ArtifactRef>,
+) -> Result<LandingIntent> {
+    let repository = landing_repository_identity(target_workspace)?;
+    let target_workspace_identity = fs::canonicalize(target_workspace)?
+        .to_string_lossy()
+        .into_owned();
+    let evidence_digest = crate::verification_assessment::landing_evidence_digest(
+        config.project_root,
+        &checks,
+        &reviews,
+    )?;
+    let current_item = config.store.read_work_item(config.work_item_id)?;
+    current_item.ensure_execution_ready()?;
+    let current_candidate = current_item
+        .merge_candidates
+        .iter()
+        .find(|entry| entry.id == candidate.id)
+        .ok_or_else(|| anyhow::anyhow!("landing candidate disappeared"))?;
+    let accepted_model_digest = accepted_landing_model_digest(&current_item, current_candidate)?;
+    let authorization_digest = landing_authorization_digest(&current_item)?;
+    let intent = LandingIntent {
+        schema_version: 1,
+        operation_id: format!(
+            "landing:{}:{}:{}",
+            config.work_item_id, candidate.id, verified_commit
+        ),
+        work_item_id: config.work_item_id.to_string(),
+        attempt_id: candidate.attempt_id.clone(),
+        merge_candidate_id: candidate.id.clone(),
+        learner_mode: current_item.learner_mode,
+        repository,
+        target_branch: candidate.target_branch.clone(),
+        target_workspace: target_workspace_identity,
+        target_before: target_before.to_string(),
+        verified_commit: verified_commit.to_string(),
+        evidence_digest,
+        accepted_model_digest,
+        authorization_digest,
+        check_artifacts: checks,
+        review_artifacts: reviews,
+    };
+    mutate_landing_work_item(config.store, config.work_item_id, |item| {
+        let attempt = item
+            .attempts
+            .iter()
+            .find(|attempt| attempt.id == candidate.attempt_id)
+            .ok_or_else(|| WorkModelError::MergeCandidateAttemptNotFound {
+                candidate_id: candidate.id.clone(),
+                attempt_id: candidate.attempt_id.clone(),
+            })?;
+        attempt.ensure_not_canceled()?;
+        item.ensure_execution_ready()?;
+        let actual_digest = item
+            .merge_candidates
+            .iter()
+            .find(|entry| entry.id == candidate.id)
+            .and_then(|entry| accepted_landing_model_digest(item, entry).ok());
+        if item.learner_mode != intent.learner_mode
+            || landing_authorization_digest(item).ok().as_deref()
+                != Some(intent.authorization_digest.as_str())
+            || actual_digest.as_deref() != Some(intent.accepted_model_digest.as_str())
+        {
+            return Err(WorkModelError::InvalidRecoveryOperation {
+                attempt_id: candidate.attempt_id.clone(),
+                reason: "accepted landing evidence changed before intent publication".into(),
+            });
+        }
+        let current = item
+            .merge_candidates
+            .iter_mut()
+            .find(|current| current.id == candidate.id)
+            .ok_or_else(|| WorkModelError::MergeCandidateNotFound {
+                candidate_id: candidate.id.clone(),
+            })?;
+        if current.merge_state.status != MergeCandidateMergeStatus::Executing
+            || current.candidate_commit != verified_commit
+            || current.target_branch != intent.target_branch
+            || current
+                .merge_state
+                .landing_intent
+                .as_ref()
+                .is_some_and(|prior| prior != &intent)
+        {
+            return Err(WorkModelError::InvalidRecoveryOperation {
+                attempt_id: candidate.attempt_id.clone(),
+                reason: "landing intent conflicts with candidate state".into(),
+            });
+        }
+        current.merge_state.landing_intent = Some(intent.clone());
+        current.merge_state.status = MergeCandidateMergeStatus::LandingPending;
+        Ok(())
+    })?;
+    Ok(intent)
+}
+
+fn recognized_landing_intent(
+    config: &WorkMergeConfig<'_>,
+    item: &WorkItem,
+    candidate: &MergeCandidate,
+) -> Result<Option<LandingIntent>> {
+    let Some(intent) = candidate.merge_state.landing_intent.as_ref() else {
+        return Ok(None);
+    };
+    let target = resolve_workspace_path(config.project_root, &candidate.target_workspace.path);
+    anyhow::ensure!(
+        intent.schema_version == 1
+            && intent.work_item_id == item.id
+            && intent.attempt_id == candidate.attempt_id
+            && intent.merge_candidate_id == candidate.id
+            && intent.operation_id
+                == format!(
+                    "landing:{}:{}:{}",
+                    item.id, candidate.id, intent.verified_commit
+                )
+            && intent.learner_mode == item.learner_mode
+            && intent.target_branch == candidate.target_branch
+            && intent.target_workspace == fs::canonicalize(&target)?.to_string_lossy()
+            && intent.repository == landing_repository_identity(&target)?
+            && intent.verified_commit == candidate.candidate_commit
+            && intent.accepted_model_digest == accepted_landing_model_digest(item, candidate)?
+            && intent.evidence_digest
+                == crate::verification_assessment::landing_evidence_digest(
+                    config.project_root,
+                    &intent.check_artifacts,
+                    &intent.review_artifacts
+                )?,
+        "landing intent no longer matches its authorized candidate, target, or evidence"
+    );
+    let tip = resolve_target_head(&target, &candidate.target_branch)?;
+    let verified_base = git::run_raw(
+        &target,
+        &[
+            "merge-base",
+            "--is-ancestor",
+            &intent.target_before,
+            &intent.verified_commit,
+        ],
+    )?;
+    anyhow::ensure!(
+        verified_base.status.success(),
+        "landing intent base is not an ancestor of its verified commit"
+    );
+    let ancestry = git::run_raw(
+        &target,
+        &["merge-base", "--is-ancestor", &intent.verified_commit, &tip],
+    )?;
+    if ancestry.status.success() {
+        return Ok(Some(intent.clone()));
+    }
+    anyhow::ensure!(
+        tip == intent.target_before,
+        "target moved before the authorized landing effect"
+    );
+    item.ensure_execution_ready()?;
+    ensure_review_bindings_current(config.project_root, &item, &candidate)?;
+    anyhow::ensure!(
+        intent.authorization_digest == landing_authorization_digest(item)?,
+        "landing authorization changed before Git effect"
+    );
+    Ok(None)
+}
+
+fn assert_landing_effect_ready(
+    config: &WorkMergeConfig<'_>,
+    candidate_id: &str,
+    target_before: &str,
+) -> Result<()> {
+    let item = config.store.read_work_item(config.work_item_id)?;
+    let candidate = item
+        .merge_candidates
+        .iter()
+        .find(|candidate| candidate.id == candidate_id)
+        .ok_or_else(|| anyhow::anyhow!("landing candidate disappeared"))?;
+    let attempt = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == candidate.attempt_id)
+        .ok_or_else(|| anyhow::anyhow!("landing Attempt disappeared"))?;
+    attempt.ensure_not_canceled()?;
+    anyhow::ensure!(
+        candidate.merge_state.status == MergeCandidateMergeStatus::LandingPending
+            && candidate.merge_state.landing_intent.is_some()
+            && recognized_landing_intent(config, &item, candidate)?.is_none(),
+        "landing effect authority changed before Git update"
+    );
+    let target = resolve_workspace_path(config.project_root, &candidate.target_workspace.path);
+    anyhow::ensure!(
+        resolve_target_head(&target, &candidate.target_branch)? == target_before,
+        "target moved before the authorized Git effect"
+    );
+    ensure_clean_worktree(&target)?;
+    Ok(())
+}
 
 #[derive(Clone, Copy)]
 pub struct WorkMergeConfig<'a> {
@@ -72,6 +478,7 @@ pub fn merge_candidate(config: WorkMergeConfig<'_>) -> Result<WorkMergeOutcome> 
         .map_err(|e| anyhow::anyhow!("failed to acquire land lock: {e}"))?;
 
     let item = read_work_item_or_not_found(config.store, config.work_item_id)?;
+    item.ensure_mutation_compatible()?;
     item.ensure_not_abandoned()?;
     let candidate = item
         .merge_candidates
@@ -97,6 +504,79 @@ pub fn merge_candidate(config: WorkMergeConfig<'_>) -> Result<WorkMergeOutcome> 
             )?;
         }
         bail!("{error}");
+    }
+
+    let mut recognized = if candidate.merge_state.status != MergeCandidateMergeStatus::Merged {
+        recognized_landing_intent(&config, &item, &candidate)?
+    } else {
+        None
+    };
+    if candidate.merge_state.status == MergeCandidateMergeStatus::LandingPending
+        && recognized.is_none()
+    {
+        let intent = candidate
+            .merge_state
+            .landing_intent
+            .as_ref()
+            .expect("validated landing-pending candidate has an intent");
+        let source = resolve_workspace_path(config.project_root, &candidate.source_workspace.path);
+        let target = resolve_workspace_path(config.project_root, &candidate.target_workspace.path);
+        ensure_same_git_repository(config.project_root, &source)?;
+        ensure_registered_worktree(config.project_root, &source)?;
+        ensure_clean_worktree(&source)?;
+        anyhow::ensure!(
+            head_commit(&source)? == intent.verified_commit,
+            "candidate HEAD changed before authorized landing effect"
+        );
+        let effect_lock =
+            crate::land_lock::acquire(&crate::land_lock::effect_lock_path(config.project_root))?;
+        assert_landing_effect_ready(&config, &candidate.id, &intent.target_before)?;
+        git::fast_forward_checked(
+            &target,
+            &candidate.target_branch,
+            &intent.target_before,
+            &intent.verified_commit,
+        )?;
+        drop(effect_lock);
+        recognized = Some(intent.clone());
+    }
+    if let Some(intent) = recognized {
+        record_candidate_merged(
+            config.store,
+            config.work_item_id,
+            &candidate.id,
+            &intent.verified_commit,
+            intent.check_artifacts.clone(),
+            intent.review_artifacts.clone(),
+        )?;
+        let outcome = WorkMergeOutcome {
+            merge_candidate_id: candidate.id.clone(),
+            merged_commit: intent.verified_commit,
+        };
+        if let Err(error) = process_landed_follow_ups(&config, &outcome) {
+            eprintln!("  Warning: failed to update follow-up-processing recovery state: {error}");
+        }
+        prepare_landed_baseline_or_warn(&config, &candidate, &outcome);
+        return Ok(outcome);
+    }
+    if candidate.merge_state.status == MergeCandidateMergeStatus::Executing
+        && candidate.merge_state.landing_intent.is_none()
+    {
+        let target = resolve_workspace_path(config.project_root, &candidate.target_workspace.path);
+        let target_tip = resolve_target_head(&target, &candidate.target_branch)?;
+        let already_present = git::run_raw(
+            &target,
+            &[
+                "merge-base",
+                "--is-ancestor",
+                &candidate.candidate_commit,
+                &target_tip,
+            ],
+        )?;
+        anyhow::ensure!(
+            !already_present.status.success(),
+            "candidate commit is already in target history without a landing intent; explicit recovery is required"
+        );
     }
 
     // Resolve an interactive land only after the executor has validated the
@@ -125,7 +605,6 @@ pub fn merge_candidate(config: WorkMergeConfig<'_>) -> Result<WorkMergeOutcome> 
     if let Err(error) = candidate.validate_advancement(&item) {
         bail!("{error}");
     }
-
     // Resolve the frozen reviewed identity once from the durable model. A value
     // here means this Attempt is no-expertise and its Learner has SUCCEEDED, so the
     // reviewed Writer SHA is frozen and the land route may only ever produce that
@@ -175,29 +654,35 @@ pub fn merge_candidate(config: WorkMergeConfig<'_>) -> Result<WorkMergeOutcome> 
                 );
             }
             let outcome = WorkMergeOutcome {
-                merge_candidate_id: candidate.id,
+                merge_candidate_id: candidate.id.clone(),
                 merged_commit: merged_commit.to_string(),
             };
+            reconcile_landed_attempt(config.store, config.work_item_id, &candidate.id)?;
             if let Err(error) = process_landed_follow_ups(&config, &outcome) {
                 eprintln!(
                     "  Warning: failed to update follow-up-processing recovery state: {error}"
                 );
             }
+            prepare_landed_baseline_or_warn(&config, &candidate, &outcome);
             return Ok(outcome);
         }
         if let Some(merged_commit) = candidate.merge_state.merged_commit.clone() {
             let outcome = WorkMergeOutcome {
-                merge_candidate_id: candidate.id,
+                merge_candidate_id: candidate.id.clone(),
                 merged_commit,
             };
+            reconcile_landed_attempt(config.store, config.work_item_id, &candidate.id)?;
             if let Err(error) = process_landed_follow_ups(&config, &outcome) {
                 eprintln!(
                     "  Warning: failed to update follow-up-processing recovery state: {error}"
                 );
             }
+            prepare_landed_baseline_or_warn(&config, &candidate, &outcome);
             return Ok(outcome);
         }
     }
+
+    item.ensure_execution_ready()?;
 
     // A fresh, unmerged no-expertise candidate whose Learning succeeded lands its
     // frozen reviewed SHA exactly: an identity-preserving preflight runs BEFORE any
@@ -213,13 +698,15 @@ pub fn merge_candidate(config: WorkMergeConfig<'_>) -> Result<WorkMergeOutcome> 
         )?;
         let target_workspace =
             resolve_workspace_path(config.project_root, &candidate.target_workspace.path);
-        return land_frozen_no_expertise(
+        let outcome = land_frozen_no_expertise(
             &config,
             &candidate,
             &source_workspace,
             &target_workspace,
             &reviewed_sha,
-        );
+        )?;
+        prepare_landed_baseline_or_warn(&config, &candidate, &outcome);
+        return Ok(outcome);
     }
 
     let source_workspace = resolve_managed_candidate_workspace_path(
@@ -228,6 +715,34 @@ pub fn merge_candidate(config: WorkMergeConfig<'_>) -> Result<WorkMergeOutcome> 
         config.work_item_id,
         &candidate.attempt_id,
     )?;
+    let live_tip = head_commit(&source_workspace)?;
+    // A failed capture landing can leave a completed rebase at a new source
+    // HEAD while provenance regeneration has not updated the candidate yet.
+    let recorded_rebase_tip = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == candidate.attempt_id)
+        .and_then(|attempt| {
+            attempt
+                .tasks
+                .iter()
+                .rev()
+                .find(|task| task.kind == TaskKind::Rebase)
+                .filter(|task| task.status == TaskStatus::Complete)
+                .and_then(|task| task.output.as_ref())
+                .filter(|output| {
+                    output.base_commit.as_deref() == Some(candidate.candidate_commit.as_str())
+                        && output.workspace_id == candidate.source_workspace.id
+                        && output.workspace_path == candidate.source_workspace.path
+                        && output.source_branch == candidate.source_branch
+                })
+                .map(|output| output.commit.as_str())
+        });
+    anyhow::ensure!(
+        live_tip == candidate.candidate_commit || recorded_rebase_tip == Some(live_tip.as_str()),
+        "candidate HEAD {live_tip} differs from reviewed Merge Candidate {}; rerun the Attempt before landing",
+        candidate.candidate_commit
+    );
     let target_workspace =
         resolve_workspace_path(config.project_root, &candidate.target_workspace.path);
     let artifact_dir = merge_artifact_dir(
@@ -248,7 +763,7 @@ pub fn merge_candidate(config: WorkMergeConfig<'_>) -> Result<WorkMergeOutcome> 
         &target_workspace,
         &artifact_dir,
     );
-    finish_fresh_land_with(
+    let outcome = finish_fresh_land_with(
         execution,
         |result| {
             recover_landed_candidate_result(
@@ -263,7 +778,9 @@ pub fn merge_candidate(config: WorkMergeConfig<'_>) -> Result<WorkMergeOutcome> 
             schedule_post_merge_review(&config, &candidate, outcome, base_commit)
         },
         config.run_post_merge_review,
-    )
+    )?;
+    prepare_landed_baseline_or_warn(&config, &candidate, &outcome);
+    Ok(outcome)
 }
 
 fn resolve_attempt_land_mapping(
@@ -359,6 +876,217 @@ fn finish_fresh_land_with(
     }
 
     Ok(outcome)
+}
+
+/// Make the exact landed commit's Tester boundary available before returning
+/// from land. An exact final Tester is promoted without execution; otherwise a
+/// detached checkout captures one fresh baseline. A failure cannot undo the
+/// already-durable fast-forward, so it warns and remains retryable by invoking
+/// land again or by the next Attempt's existing fallback capture.
+fn prepare_landed_baseline_or_warn(
+    config: &WorkMergeConfig<'_>,
+    candidate: &crate::work_model::MergeCandidate,
+    outcome: &WorkMergeOutcome,
+) {
+    match prepare_landed_baseline(config, candidate, outcome) {
+        Ok(crate::baseline_cache::LandedSeedDisposition::Promoted { cache_key }) => {
+            eprintln!("  Landed baseline   promoted {}", &cache_key[..12]);
+        }
+        Ok(crate::baseline_cache::LandedSeedDisposition::Captured { cache_key }) => {
+            eprintln!("  Landed baseline   captured {}", &cache_key[..12]);
+        }
+        Ok(crate::baseline_cache::LandedSeedDisposition::Reused { cache_key }) => {
+            eprintln!("  Landed baseline   reused {}", &cache_key[..12]);
+        }
+        Err(error) => {
+            eprintln!(
+                "  Warning: Merge Candidate {} landed, but its baseline was not prepared: {error:#}",
+                candidate.id
+            );
+        }
+    }
+}
+
+fn prepare_landed_baseline(
+    config: &WorkMergeConfig<'_>,
+    candidate: &crate::work_model::MergeCandidate,
+    outcome: &WorkMergeOutcome,
+) -> Result<crate::baseline_cache::LandedSeedDisposition> {
+    let item = read_work_item_or_not_found(config.store, config.work_item_id)?;
+    let merge_tester = item
+        .merge_candidates
+        .iter()
+        .find(|stored| stored.id == candidate.id)
+        .and_then(|stored| {
+            stored
+                .merge_state
+                .check_artifacts
+                .iter()
+                .rev()
+                .find(|artifact| artifact.producer_id == "merge-tester")
+        })
+        .map(|artifact| {
+            let path = Path::new(&artifact.path);
+            anyhow::ensure!(
+                path.file_name()
+                    .is_some_and(|name| name == "tester-results.json"),
+                "merge Tester artifact must name tester-results.json"
+            );
+            crate::work_task_executor::resolve_managed_artifact_area_path(
+                config.project_root,
+                &path
+                    .parent()
+                    .context("merge Tester artifact has no parent")?
+                    .to_string_lossy(),
+            )
+        })
+        .transpose()?;
+    let final_tester = merge_tester.or(latest_final_tester_artifact_dir(
+        config.project_root,
+        &item,
+        candidate,
+    )?);
+    let target_workspace =
+        resolve_workspace_path(config.project_root, &candidate.target_workspace.path);
+
+    if head_commit(&target_workspace).ok().as_deref() == Some(outcome.merged_commit.as_str())
+        && let Some(artifact_dir) = final_tester.as_deref()
+    {
+        match crate::baseline_cache::promote_final_tester(
+            config.project_root,
+            &target_workspace,
+            artifact_dir,
+            &outcome.merged_commit,
+            config.no_sandbox,
+        ) {
+            Ok(Some(disposition)) => return Ok(disposition),
+            Ok(None) => {}
+            Err(error) => eprintln!(
+                "  Warning: exact final Tester evidence could not be promoted; recapturing: {error:#}"
+            ),
+        }
+    }
+
+    with_detached_landed_checkout(
+        config.project_root,
+        &target_workspace,
+        &outcome.merged_commit,
+        |checkout| {
+            if let Some(artifact_dir) = final_tester.as_deref() {
+                match crate::baseline_cache::promote_final_tester(
+                    config.project_root,
+                    checkout,
+                    artifact_dir,
+                    &outcome.merged_commit,
+                    config.no_sandbox,
+                ) {
+                    Ok(Some(disposition)) => return Ok(disposition),
+                    Ok(None) => {}
+                    Err(error) => eprintln!(
+                        "  Warning: exact final Tester evidence could not be promoted; recapturing: {error:#}"
+                    ),
+                }
+            }
+
+            let artifact_dir = merge_artifact_dir(
+                config.project_root,
+                config.work_item_id,
+                &candidate.attempt_id,
+                &candidate.id,
+            )
+            .join("landed-baseline");
+            crate::baseline_cache::capture_landed(
+                config.project_root,
+                checkout,
+                &artifact_dir,
+                config.no_sandbox,
+                config.resolver,
+            )
+        },
+    )
+}
+
+fn latest_final_tester_artifact_dir(
+    project_root: &Path,
+    item: &WorkItem,
+    candidate: &crate::work_model::MergeCandidate,
+) -> Result<Option<PathBuf>> {
+    let attempt = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == candidate.attempt_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Attempt {:?} not found for Merge Candidate {:?}",
+                candidate.attempt_id,
+                candidate.id
+            )
+        })?;
+    let after_latest_write = attempt
+        .tasks
+        .iter()
+        .rposition(|task| task.kind == TaskKind::Write)
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    attempt.tasks[after_latest_write..]
+        .iter()
+        .rev()
+        .find(|task| {
+            task.kind == TaskKind::Tester && task.status == crate::work_model::TaskStatus::Complete
+        })
+        .and_then(|task| task.artifact_area.as_ref())
+        .map(|area| {
+            crate::work_task_executor::resolve_managed_artifact_area_path(project_root, &area.path)
+        })
+        .transpose()
+}
+
+fn with_detached_landed_checkout<T>(
+    project_root: &Path,
+    repository: &Path,
+    commit: &str,
+    operation: impl FnOnce(&Path) -> Result<T>,
+) -> Result<T> {
+    // Keep the detached checkout beside the project, not beneath it. Cargo
+    // searches parent directories for a workspace manifest; nesting this
+    // checkout under `.fluent/tmp` makes it inspect the target checkout's
+    // Cargo.toml, which the Tester sandbox deliberately cannot read.
+    let canonical_project = fs::canonicalize(project_root)
+        .with_context(|| format!("canonicalize project root {}", project_root.display()))?;
+    let temporary_root = canonical_project
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("project root has no parent directory"))?;
+    let holder = tempfile::Builder::new()
+        .prefix(".fluent-landed-baseline-")
+        .tempdir_in(&temporary_root)
+        .context("create landed baseline checkout holder")?;
+    let checkout = holder.path().join("checkout");
+    git::run(
+        repository,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            &checkout.to_string_lossy(),
+            commit,
+        ],
+        "create landed baseline checkout",
+    )?;
+
+    let result = operation(&checkout);
+    let cleanup = git::run(
+        repository,
+        &["worktree", "remove", "--force", &checkout.to_string_lossy()],
+        "remove landed baseline checkout",
+    );
+    match (result, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(cleanup)) => Err(cleanup),
+        (Err(error), Err(cleanup)) => Err(error.context(format!(
+            "additionally, removing landed baseline checkout failed: {cleanup:#}"
+        ))),
+    }
 }
 
 /// Schedule the optional detached post-merge review for a fresh land, after the
@@ -533,7 +1261,7 @@ fn record_follow_up_failure(
                 message: message.to_string(),
                 next_action: next_action.to_string(),
             });
-        store.write_work_item(&item)?;
+        store.write_work_item_with_transition(&item, &post_land_transition())?;
     }
     Ok(())
 }
@@ -552,7 +1280,7 @@ fn clear_follow_up_failure(
         && candidate.merge_state.follow_up_failure.is_some()
     {
         candidate.merge_state.follow_up_failure = None;
-        store.write_work_item(&item)?;
+        store.write_work_item_with_transition(&item, &post_land_transition())?;
     }
     Ok(())
 }
@@ -858,7 +1586,7 @@ fn execute_frozen_no_expertise_land(
     reviewed_sha: &str,
     target_head_before: &str,
 ) -> Result<WorkMergeOutcome> {
-    let check_artifacts = match run_frozen_pre_merge_check(
+    let mut check_artifacts = match run_frozen_pre_merge_check(
         config,
         candidate,
         source_workspace,
@@ -879,6 +1607,13 @@ fn execute_frozen_no_expertise_land(
             return Err(error);
         }
     };
+    let item = config.store.read_work_item(config.work_item_id)?;
+    if let Some(dir) = latest_final_tester_artifact_dir(config.project_root, &item, candidate)? {
+        check_artifacts.push(ArtifactRef {
+            producer_id: "accepted-final-tester".into(),
+            path: path_for_model(config.project_root, &dir.join("tester-results.json")),
+        });
+    }
 
     // Reacquire the live preconditions before mutating the target: the check ran in
     // an isolated worktree, but the live candidate and target must still hold before
@@ -919,18 +1654,36 @@ fn execute_frozen_no_expertise_land(
         return Err(error);
     }
 
+    let effect_lock =
+        crate::land_lock::acquire(&crate::land_lock::effect_lock_path(config.project_root))?;
+    persist_landing_intent(
+        config,
+        candidate,
+        target_workspace,
+        target_head_before,
+        reviewed_sha,
+        check_artifacts.clone(),
+        Vec::new(),
+    )?;
+    #[cfg(feature = "test-support")]
+    if std::env::var_os("FLUENT_TEST_INTERRUPT_BEFORE_LANDING_GIT").is_some() {
+        bail!("injected interruption before landing Git effect");
+    }
+    assert_landing_effect_ready(config, &candidate.id, target_head_before)?;
     // Fast-forward the target to exactly the reviewed SHA. No rebase, no provenance
     // regeneration, no autofix commit — the approved commit lands verbatim.
-    git::run(
+    git::fast_forward_checked(
         target_workspace,
-        &["checkout", &candidate.target_branch],
-        "checkout target branch",
+        &candidate.target_branch,
+        target_head_before,
+        reviewed_sha,
     )?;
-    git::run(
-        target_workspace,
-        &["merge", "--ff-only", reviewed_sha],
-        "fast-forward target branch to frozen reviewed SHA",
-    )?;
+    drop(effect_lock);
+
+    #[cfg(feature = "test-support")]
+    if std::env::var_os("FLUENT_TEST_INTERRUPT_AFTER_LANDING_GIT").is_some() {
+        bail!("injected interruption after landing Git effect");
+    }
 
     record_candidate_merged(
         config.store,
@@ -1208,6 +1961,7 @@ impl Drop for RebaseCoderOverrideGuard {
 fn build_rebase_coder(
     config: &WorkMergeConfig<'_>,
     sandbox: CoderSandbox,
+    executable: Option<&Path>,
 ) -> Box<dyn crate::coder::Coder> {
     if let Some(coder) = REBASE_CODER_OVERRIDE.with(|slot| {
         slot.borrow().as_ref().map(|f| {
@@ -1220,19 +1974,26 @@ fn build_rebase_coder(
     }) {
         return coder;
     }
-    config
-        .coder_kind
-        .boxed_with_model(sandbox, config.model, config.effort)
+    config.coder_kind.boxed_with_model_and_executable(
+        sandbox,
+        config.model,
+        config.effort,
+        executable,
+    )
 }
 
 #[cfg(not(test))]
 fn build_rebase_coder(
     config: &WorkMergeConfig<'_>,
     sandbox: CoderSandbox,
+    executable: Option<&Path>,
 ) -> Box<dyn crate::coder::Coder> {
-    config
-        .coder_kind
-        .boxed_with_model(sandbox, config.model, config.effort)
+    config.coder_kind.boxed_with_model_and_executable(
+        sandbox,
+        config.model,
+        config.effort,
+        executable,
+    )
 }
 
 fn execute_merge(
@@ -1252,7 +2013,7 @@ fn execute_merge(
         target_workspace,
         artifact_dir,
         &mut base_commit,
-        |sandbox| build_rebase_coder(config, sandbox),
+        |sandbox, executable| build_rebase_coder(config, sandbox, executable),
     );
     MergeExecution {
         result,
@@ -1275,7 +2036,7 @@ fn execute_merge_with_coder(
     target_workspace: &Path,
     artifact_dir: &Path,
     base_commit: &mut Option<String>,
-    make_rebase_coder: impl FnOnce(CoderSandbox) -> Box<dyn crate::coder::Coder>,
+    make_rebase_coder: impl FnOnce(CoderSandbox, Option<&Path>) -> Box<dyn crate::coder::Coder>,
 ) -> Result<WorkMergeOutcome> {
     ensure_same_git_repository(config.project_root, source_workspace)?;
     ensure_same_git_repository(config.project_root, target_workspace)?;
@@ -1289,6 +2050,51 @@ fn execute_merge_with_coder(
         "resolve target branch",
     )?;
     *base_commit = Some(target_head_before.clone());
+
+    // Preserve each verification run so a retry never overwrites failed evidence.
+    let verification_dir = tempfile::Builder::new()
+        .prefix("verification-")
+        .tempdir_in(artifact_dir)?
+        .keep();
+    let baseline_dir = verification_dir.join("target-baseline");
+    let baseline_artifact = ArtifactRef {
+        producer_id: "merge-target-baseline".to_string(),
+        path: path_for_model(
+            config.project_root,
+            &baseline_dir.join("tester-results.json"),
+        ),
+    };
+    let baseline_result = with_detached_landed_checkout(
+        config.project_root,
+        target_workspace,
+        &target_head_before,
+        |checkout| {
+            crate::baseline_cache::capture_landed_with(
+                config.project_root,
+                checkout,
+                &baseline_dir,
+                config.no_sandbox,
+                |artifact| {
+                    run_merge_tester(config, candidate, checkout, artifact, &target_head_before)
+                },
+            )
+        },
+    );
+    if let Err(error) = baseline_result {
+        let reason = format!(
+            "Cannot verify target baseline {target_head_before}: {error:#}. Inspect {} and retry landing after repairing the Tester boundary.",
+            baseline_dir.display()
+        );
+        record_candidate_failure(
+            config.store,
+            config.work_item_id,
+            &candidate.id,
+            reason.clone(),
+            vec![baseline_artifact],
+            Vec::new(),
+        )?;
+        bail!("{reason}");
+    }
 
     ensure_clean_worktree(source_workspace)?;
     let rebase_outcome = match rebase_candidate_with_coder(
@@ -1325,6 +2131,7 @@ fn execute_merge_with_coder(
                 config.work_item_id,
                 &candidate.id,
                 &candidate.attempt_id,
+                source_workspace,
                 &target_head_before,
                 &new_tip,
             )?;
@@ -1332,32 +2139,232 @@ fn execute_merge_with_coder(
     }
     ensure_clean_worktree(source_workspace)?;
 
-    let check_artifacts = match run_merge_checks(config, candidate, source_workspace, artifact_dir)
-    {
-        Ok(artifacts) => artifacts,
-        Err(error) => {
-            let artifacts = check_artifacts_for_failure(config.project_root, artifact_dir);
-            record_candidate_failure(
-                config.store,
-                config.work_item_id,
-                &candidate.id,
-                error.to_string(),
-                artifacts,
-                Vec::new(),
-            )?;
-            return Err(error);
-        }
-    };
+    let mut check_artifacts =
+        match run_merge_checks(config, candidate, source_workspace, artifact_dir) {
+            Ok(artifacts) => artifacts,
+            Err(error) => {
+                let artifacts = check_artifacts_for_failure(config.project_root, artifact_dir);
+                record_candidate_failure(
+                    config.store,
+                    config.work_item_id,
+                    &candidate.id,
+                    error.to_string(),
+                    artifacts,
+                    Vec::new(),
+                )?;
+                return Err(error);
+            }
+        };
 
-    finalize_merge(
+    let candidate_commit = head_commit(source_workspace)?;
+    regenerate_provenance(
+        config.store,
+        config.work_item_id,
+        &candidate.id,
+        &candidate.attempt_id,
+        source_workspace,
+        &target_head_before,
+        &candidate_commit,
+    )?;
+    let final_tester = latest_final_tester_artifact_dir(config.project_root, item, candidate)?;
+    let reusable = final_tester.as_deref().is_some_and(|artifact| {
+        match crate::baseline_cache::reusable_final_tester(
+            source_workspace,
+            artifact,
+            &candidate_commit,
+            config.no_sandbox,
+        ) {
+            Ok(exact) => exact,
+            Err(error) => {
+                eprintln!(
+                    "  Final Tester evidence cannot be reused; verifying candidate: {error:#}"
+                );
+                false
+            }
+        }
+    });
+    let tester_dir = if reusable {
+        final_tester.expect("reusable final Tester has an artifact directory")
+    } else {
+        verification_dir.join("tester")
+    };
+    let results_path = tester_dir.join("tester-results.json");
+    check_artifacts.push(baseline_artifact);
+    check_artifacts.push(ArtifactRef {
+        producer_id: "merge-tester".to_string(),
+        path: path_for_model(config.project_root, &results_path),
+    });
+    let verification: Result<()> = (|| {
+        if !reusable {
+            run_merge_tester(
+                config,
+                candidate,
+                source_workspace,
+                &tester_dir,
+                &candidate_commit,
+            )?;
+        }
+        compare_merge_tester(
+            &results_path,
+            &baseline_dir.join("tester-results.json"),
+            &candidate_commit,
+        )?;
+        if !reusable {
+            crate::baseline_cache::record_final_tester_seed(
+                source_workspace,
+                &tester_dir,
+                config.no_sandbox,
+            )?;
+        }
+        ensure_clean_worktree(source_workspace)?;
+        ensure_clean_worktree(target_workspace)?;
+        crate::work_task_executor::TesterCandidateGuard::begin(
+            source_workspace.to_path_buf(),
+            &candidate_commit,
+        )?;
+        Ok(())
+    })();
+    if let Err(error) = verification {
+        let reason = format!(
+            "Exact post-rebase Tester verification failed for {candidate_commit}: {error:#}. Inspect {} and repair the retained candidate or Tester boundary before retrying landing.",
+            results_path.display()
+        );
+        record_candidate_failure(
+            config.store,
+            config.work_item_id,
+            &candidate.id,
+            reason.clone(),
+            check_artifacts,
+            Vec::new(),
+        )?;
+        bail!("{reason}");
+    }
+
+    let result = finalize_merge(
         config,
         candidate,
         source_workspace,
         target_workspace,
         &target_head_before,
-        check_artifacts,
+        &candidate_commit,
+        check_artifacts.clone(),
         Vec::new(),
-    )
+    );
+    if let Err(error) = &result {
+        record_candidate_failure(
+            config.store,
+            config.work_item_id,
+            &candidate.id,
+            format!("{error:#}"),
+            check_artifacts,
+            Vec::new(),
+        )?;
+    }
+    result
+}
+
+/// Run the same sandboxed Tester and candidate guard used by final Tester Tasks.
+/// Landing owns these artifacts; it never reserves another Attempt Tester Task.
+fn run_merge_tester(
+    config: &WorkMergeConfig<'_>,
+    candidate: &MergeCandidate,
+    workspace: &Path,
+    artifact_dir: &Path,
+    candidate_commit: &str,
+) -> Result<crate::tester::TesterOutcome> {
+    fs::create_dir_all(artifact_dir)?;
+    let result = (|| {
+        let guard = crate::work_task_executor::TesterCandidateGuard::begin(
+            workspace.to_path_buf(),
+            candidate_commit,
+        )?;
+        let plan = crate::tester::plan(workspace)?;
+        let cache = crate::writer_cache::preflight_writer_dependency_cache(
+            config.project_root,
+            config.work_item_id,
+            &candidate.attempt_id,
+        )?;
+        crate::writer_cache::prepare_writer_dependency_cache_for_landing(
+            &cache,
+            crate::writer_cache::canonical_cargo_home_from_env().as_deref(),
+        )?;
+        let settlement = crate::tester::prepare_settlement_directories(artifact_dir, &plan)?;
+        let sandbox = crate::tester::render_sandbox_profile_with_cache(
+            workspace,
+            artifact_dir,
+            config.no_sandbox,
+            config.resolver,
+            settlement,
+            Some(&cache),
+        )?;
+        crate::work_task_executor::run_tester_with_candidate_guard(&guard, artifact_dir, &sandbox)
+    })();
+    if let Err(error) = &result {
+        // Retain both command and extracted test evidence when the host guard fails.
+        let results_path = artifact_dir.join("tester-results.json");
+        let existing = fs::read(&results_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<crate::tester::TesterResults>(&bytes).ok());
+        if let Some(mut results) = existing {
+            results.error = Some(crate::tester::TesterError {
+                kind: "merge_tester_boundary".to_string(),
+                message: "Landing Tester could not verify the candidate".to_string(),
+                details: format!("{error:#}"),
+            });
+            crate::atomic_write::atomic_write(
+                &results_path,
+                &serde_json::to_vec_pretty(&results)?,
+            )?;
+        } else {
+            crate::tester::persist_harness_error(
+                artifact_dir,
+                "merge_tester_boundary",
+                "Landing Tester could not verify the candidate".to_string(),
+                format!("{error:#}"),
+                Vec::new(),
+            )?;
+        }
+    }
+    crate::tester::bind_candidate_commit(artifact_dir, candidate_commit)?;
+    result
+}
+
+fn compare_merge_tester(
+    results_path: &Path,
+    baseline_path: &Path,
+    candidate_commit: &str,
+) -> Result<()> {
+    let results: crate::tester::TesterResults = serde_json::from_slice(&fs::read(results_path)?)?;
+    anyhow::ensure!(
+        results.candidate_commit.as_deref() == Some(candidate_commit),
+        "Tester evidence does not name the exact candidate commit"
+    );
+    if let Some(error) = results.error {
+        bail!(
+            "Tester harness error {}: {} ({})",
+            error.kind,
+            error.message,
+            error.details
+        );
+    }
+    anyhow::ensure!(
+        !results.commands.iter().any(|command| command
+            .process_settlement
+            .as_ref()
+            .is_some_and(|settlement| !settlement.leaks.is_empty())),
+        "Tester commands leaked processes"
+    );
+    let introduced =
+        crate::tester_evidence::introduced_tester_failures(results_path, Some(baseline_path));
+    let unexplained = crate::tester_evidence::unexplained_failed_tester_commands(
+        results_path,
+        Some(baseline_path),
+    );
+    anyhow::ensure!(
+        introduced == 0 && unexplained == 0,
+        "Tester found {introduced} newly failing tests and {unexplained} unexplained failed commands"
+    );
+    Ok(())
 }
 
 /// Whether the Attempt behind a landed candidate has a retryable (failed) Learner
@@ -1422,10 +2429,15 @@ fn finalize_merge(
     source_workspace: &Path,
     target_workspace: &Path,
     target_head_before: &str,
+    verified_commit: &str,
     check_artifacts: Vec<ArtifactRef>,
     review_artifacts: Vec<ArtifactRef>,
 ) -> Result<WorkMergeOutcome> {
-    let merged_commit = head_commit(source_workspace)?;
+    let merged_commit = verified_commit.to_string();
+    anyhow::ensure!(
+        head_commit(source_workspace)? == merged_commit,
+        "candidate HEAD changed after post-rebase Tester verification"
+    );
     let target_head_now = git::run_stdout(
         target_workspace,
         &["rev-parse", &candidate.target_branch],
@@ -1440,32 +2452,47 @@ fn finalize_merge(
         );
     }
 
-    git::run(
-        target_workspace,
-        &["checkout", &candidate.target_branch],
-        "checkout target branch",
-    )?;
-    git::run(
-        target_workspace,
-        &["merge", "--ff-only", &merged_commit],
-        "fast-forward target branch",
-    )?;
-
-    // The landed commit is the final tip, which includes any fix-pre-merge autofix
-    // commit made after the rebase. The first provenance regeneration ran against
-    // the pre-autofix rebase tip, so settle the Write provenance and candidate
-    // pointer onto the actually-landed commit here: every land pointer — the latest
-    // completed Write output, candidate_commit, merged_commit, the returned outcome,
-    // and target HEAD — then names one regenerated SHA (B4al). When no autofix ran
-    // the merged tip equals the rebase tip and this is a no-op.
+    // The final tip includes any fix-pre-merge autofix commit made after the
+    // rebase. Settle Write provenance and the candidate pointer onto that tip
+    // before authorizing Git. A retry can publish the same exact pointers.
     regenerate_provenance(
         config.store,
         config.work_item_id,
         &candidate.id,
         &candidate.attempt_id,
+        source_workspace,
         target_head_before,
         &merged_commit,
     )?;
+    let effect_lock =
+        crate::land_lock::acquire(&crate::land_lock::effect_lock_path(config.project_root))?;
+    persist_landing_intent(
+        config,
+        candidate,
+        target_workspace,
+        target_head_before,
+        &merged_commit,
+        check_artifacts.clone(),
+        review_artifacts.clone(),
+    )?;
+    #[cfg(feature = "test-support")]
+    if std::env::var_os("FLUENT_TEST_INTERRUPT_BEFORE_LANDING_GIT").is_some() {
+        bail!("injected interruption before landing Git effect");
+    }
+    assert_landing_effect_ready(config, &candidate.id, target_head_before)?;
+
+    git::fast_forward_checked(
+        target_workspace,
+        &candidate.target_branch,
+        target_head_before,
+        &merged_commit,
+    )?;
+    drop(effect_lock);
+
+    #[cfg(feature = "test-support")]
+    if std::env::var_os("FLUENT_TEST_INTERRUPT_AFTER_LANDING_GIT").is_some() {
+        bail!("injected interruption after landing Git effect");
+    }
 
     record_candidate_merged(
         config.store,
@@ -1495,14 +2522,6 @@ fn finalize_merge(
         merged_commit,
     })
 }
-
-/// Extract artifact paths for failed/uncertain reviewers so the
-/// follow-up writer can read concrete findings.
-
-/// Invoke the configured coder against the candidate workspace with
-/// the failed merge-time review artifacts as input, asking the
-/// coder to address the findings and commit. Errors if no new
-/// commits result or the worktree is left dirty.
 
 /// Run the `check-pre-merge` hook against the rebased candidate
 /// workspace. If it fails and a `fix-pre-merge` hook exists, run that,
@@ -1591,6 +2610,46 @@ fn run_merge_checks(
     .expect("check-pre-merge presence already confirmed");
     artifacts.push(hook_artifact(config.project_root, &recheck_outcome));
     if !recheck_outcome.passed {
+        // Fluent 0.2.0 could create its maintenance commit with only a subject.
+        // If a later project policy rejects exactly that generated commit, repair
+        // only the known Fluent commit message and retry the hook. This does not
+        // rewrite an arbitrary project commit: it requires that fix-pre-merge made
+        // no tree change, the current subject is Fluent's exact maintenance subject,
+        // and the hook reports the corresponding missing-body diagnostic.
+        if after_commit == baseline_commit
+            && generated_autofix_message_failure(source_workspace, &recheck_outcome)?
+        {
+            let preserved_log = recheck_outcome
+                .log_path
+                .with_file_name("check-pre-merge-before-autofix-message-repair.log");
+            fs::copy(&recheck_outcome.log_path, &preserved_log).with_context(|| {
+                format!(
+                    "preserve failed check-pre-merge log before repairing generated commit message: {}",
+                    recheck_outcome.log_path.display()
+                )
+            })?;
+            artifacts.push(ArtifactRef {
+                producer_id: "merge-hook-check-pre-merge-before-autofix-message-repair".to_string(),
+                path: path_for_model(config.project_root, &preserved_log),
+            });
+            amend_autofix_commit_message(source_workspace)?;
+            let repaired_outcome = hooks::run_hook(
+                config.project_root,
+                "check-pre-merge",
+                source_workspace,
+                &context,
+            )?
+            .expect("check-pre-merge presence already confirmed");
+            artifacts.push(hook_artifact(config.project_root, &repaired_outcome));
+            if !repaired_outcome.passed {
+                bail!(
+                    "check-pre-merge failed after generated commit-message repair (exit {}). Log: {}",
+                    repaired_outcome.exit_code,
+                    repaired_outcome.log_path.display()
+                );
+            }
+            return Ok(artifacts);
+        }
         bail!(
             "check-pre-merge failed after fix-pre-merge (exit {}). Log: {}",
             recheck_outcome.exit_code,
@@ -1626,6 +2685,47 @@ fn autofix_commit_message() -> &'static str {
     "Conform code to project standards"
 }
 
+fn autofix_commit_body() -> &'static str {
+    "Apply project formatting fixes."
+}
+
+fn generated_autofix_message_failure(worktree_dir: &Path, outcome: &HookOutcome) -> Result<bool> {
+    if outcome.passed {
+        return Ok(false);
+    }
+    let subject = git::run_stdout(
+        worktree_dir,
+        &["log", "-1", "--format=%s"],
+        "read HEAD subject",
+    )?;
+    if subject != autofix_commit_message() {
+        return Ok(false);
+    }
+    let head = head_commit(worktree_dir)?;
+    let expected = format!("commit {head} has no body separated from its subject by a blank line");
+    let log = match fs::read_to_string(&outcome.log_path) {
+        Ok(log) => log,
+        Err(_) => return Ok(false),
+    };
+    Ok(log.lines().any(|line| line.trim() == expected))
+}
+
+fn amend_autofix_commit_message(worktree_dir: &Path) -> Result<()> {
+    git::run(
+        worktree_dir,
+        &[
+            "commit",
+            "--amend",
+            "--allow-empty",
+            "-m",
+            autofix_commit_message(),
+            "-m",
+            autofix_commit_body(),
+        ],
+        "repair generated fix-pre-merge commit message",
+    )
+}
+
 fn commit_autofix(worktree_dir: &Path) -> Result<()> {
     git::run(
         worktree_dir,
@@ -1633,9 +2733,10 @@ fn commit_autofix(worktree_dir: &Path) -> Result<()> {
         "stage fix-pre-merge changes",
     )?;
     let subject = autofix_commit_message();
+    let body = autofix_commit_body();
     git::run(
         worktree_dir,
-        &["commit", "-m", subject],
+        &["commit", "-m", subject, "-m", body],
         "commit fix-pre-merge changes",
     )
 }
@@ -1657,7 +2758,80 @@ fn set_candidate_executing(
     work_item_id: &str,
     candidate_id: &str,
 ) -> Result<()> {
-    update_candidate(store, work_item_id, candidate_id, |candidate| {
+    mutate_landing_work_item(store, work_item_id, |item| {
+        let candidate_index = item
+            .merge_candidates
+            .iter()
+            .position(|candidate| candidate.id == candidate_id)
+            .ok_or_else(|| WorkModelError::MergeCandidateNotFound {
+                candidate_id: candidate_id.to_string(),
+            })?;
+        let attempt_id = item.merge_candidates[candidate_index].attempt_id.clone();
+        let retrying_terminal_land = matches!(
+            item.merge_candidates[candidate_index].merge_state.status,
+            MergeCandidateMergeStatus::Failed | MergeCandidateMergeStatus::NeedsUser
+        );
+
+        // A failed landing leaves a complete, reviewed candidate behind, but its
+        // Attempt may still carry the landing pause (or an older `attempt run`
+        // may have reopened it). Normalize that one audited retry boundary before
+        // marking the candidate Executing. This keeps the existing Rebase Tasks as
+        // history while making the aggregate valid for the new landing transition.
+        if retrying_terminal_land {
+            let attempt = item
+                .attempts
+                .iter_mut()
+                .find(|attempt| attempt.id == attempt_id)
+                .ok_or_else(|| WorkModelError::AttemptNotFound {
+                    id: attempt_id.clone(),
+                })?;
+            if attempt.review_state != Some(crate::work_model::AttemptReviewState::Passed) {
+                return Err(WorkModelError::MergeCandidateAttemptReviewsNotPassed {
+                    candidate_id: candidate_id.to_string(),
+                    attempt_id,
+                });
+            }
+            if let Some(task) = attempt.tasks.iter().find(|task| {
+                task.kind != TaskKind::Rebase
+                    && matches!(
+                        task.status,
+                        TaskStatus::Failed | TaskStatus::Executing | TaskStatus::NeedsUser
+                    )
+            }) {
+                return Err(WorkModelError::MergeCandidateCorrectionIneligible {
+                    candidate_id: candidate_id.to_string(),
+                    reason: format!(
+                        "Attempt has unresolved non-landing Task {} in {} state",
+                        task.id, task.status
+                    ),
+                });
+            }
+            if let Some(task) = attempt
+                .tasks
+                .iter()
+                .find(|task| task.kind == TaskKind::Rebase && task.status == TaskStatus::Executing)
+            {
+                return Err(WorkModelError::MergeCandidateCorrectionIneligible {
+                    candidate_id: candidate_id.to_string(),
+                    reason: format!(
+                        "landing Rebase Task {} is still executing; wait for it to settle",
+                        task.id
+                    ),
+                });
+            }
+            attempt.status = crate::work_model::AttemptStatus::Complete;
+            attempt.pause_kind = None;
+            attempt.pause_recovery = None;
+            if let Some(ready_at) = item.merge_candidates[candidate_index].ready_at.as_ref() {
+                attempt.completed_at = Some(ready_at.clone());
+            } else {
+                attempt
+                    .completed_at
+                    .get_or_insert_with(crate::work_model::now_iso8601);
+            }
+        }
+
+        let candidate = &mut item.merge_candidates[candidate_index];
         candidate.merge_review_state = MergeReviewState::Pending;
         candidate.merge_state = MergeCandidateMergeState {
             status: MergeCandidateMergeStatus::Executing,
@@ -1667,9 +2841,12 @@ fn set_candidate_executing(
             review_artifacts: Vec::new(),
             auto_merge_skipped: None,
             follow_up_failure: None,
+            landing_intent: None,
         };
         crate::work_model::mark_merge_candidate_started(candidate);
+        Ok(())
     })
+    .map_err(Into::into)
 }
 
 fn record_candidate_failure(
@@ -1686,6 +2863,9 @@ fn record_candidate_failure(
         {
             return;
         }
+        if candidate.merge_state.landing_intent.is_some() {
+            return;
+        }
         if !review_artifacts.is_empty()
             || candidate.merge_review_state == MergeReviewState::Reviewing
         {
@@ -1699,6 +2879,7 @@ fn record_candidate_failure(
             review_artifacts,
             auto_merge_skipped: None,
             follow_up_failure: None,
+            landing_intent: None,
         };
         crate::work_model::set_merge_candidate_terminal(
             candidate,
@@ -1715,7 +2896,21 @@ fn record_candidate_merged(
     check_artifacts: Vec<ArtifactRef>,
     review_artifacts: Vec<ArtifactRef>,
 ) -> Result<()> {
-    update_candidate(store, work_item_id, candidate_id, |candidate| {
+    let mut item = read_work_item_or_not_found(store, work_item_id)?;
+    let candidate_index = item
+        .merge_candidates
+        .iter()
+        .position(|candidate| candidate.id == candidate_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Merge Candidate {:?} not found in Work Item {:?}",
+                candidate_id,
+                work_item_id
+            )
+        })?;
+    {
+        let candidate = &mut item.merge_candidates[candidate_index];
+        let intent = candidate.merge_state.landing_intent.clone();
         candidate.merge_review_state = MergeReviewState::Passed;
         candidate.merge_state = MergeCandidateMergeState {
             status: MergeCandidateMergeStatus::Merged,
@@ -1725,12 +2920,77 @@ fn record_candidate_merged(
             review_artifacts,
             auto_merge_skipped: None,
             follow_up_failure: None,
+            landing_intent: intent,
         };
         crate::work_model::set_merge_candidate_terminal(
             candidate,
             MergeCandidateMergeStatus::Merged,
         );
-    })
+    }
+    reconcile_landed_attempt_in_item(&mut item, candidate_index);
+    store.write_work_item_with_transition(&item, &landing_transition())?;
+    Ok(())
+}
+
+/// Close a landing-owned host-sandbox pause once its Merge Candidate is
+/// authoritatively merged. The failed handoff and lifecycle transition remain
+/// durable history, while the old Rebase Task becomes explicitly non-actionable.
+fn reconcile_landed_attempt(
+    store: &WorkModelStore,
+    work_item_id: &str,
+    candidate_id: &str,
+) -> Result<()> {
+    let mut item = read_work_item_or_not_found(store, work_item_id)?;
+    let candidate_index = item
+        .merge_candidates
+        .iter()
+        .position(|candidate| candidate.id == candidate_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Merge Candidate {:?} not found in Work Item {:?}",
+                candidate_id,
+                work_item_id
+            )
+        })?;
+    if !reconcile_landed_attempt_in_item(&mut item, candidate_index) {
+        return Ok(());
+    }
+    store.write_work_item_with_transition(&item, &landing_transition())?;
+    Ok(())
+}
+
+fn reconcile_landed_attempt_in_item(item: &mut WorkItem, candidate_index: usize) -> bool {
+    let candidate = &item.merge_candidates[candidate_index];
+    if candidate.merge_state.status != MergeCandidateMergeStatus::Merged
+        || candidate.merge_state.merged_commit.is_none()
+    {
+        return false;
+    }
+    let attempt_id = candidate.attempt_id.clone();
+    let Some(attempt) = item
+        .attempts
+        .iter_mut()
+        .find(|attempt| attempt.id == attempt_id)
+    else {
+        return false;
+    };
+
+    let mut changed = false;
+    for task in &mut attempt.tasks {
+        if task.kind == TaskKind::Rebase && task.status == TaskStatus::NeedsUser {
+            crate::work_model::set_task_terminal(task, TaskStatus::Superseded);
+            changed = true;
+        }
+    }
+    if attempt.status == crate::work_model::AttemptStatus::NeedsUser
+        && attempt.pause_kind == Some(crate::work_model::PauseKind::HostSandbox)
+    {
+        attempt.status = crate::work_model::AttemptStatus::Complete;
+        attempt.pause_kind = None;
+        attempt.pause_recovery = None;
+        changed = true;
+    }
+    changed
 }
 
 fn update_candidate(
@@ -1752,7 +3012,7 @@ fn update_candidate(
             )
         })?;
     update(candidate);
-    store.write_work_item(&item)?;
+    write_landing_work_item(store, &item)?;
     Ok(())
 }
 
@@ -1876,46 +3136,60 @@ fn rebase_candidate_with_coder(
     source_workspace: &Path,
     target_branch: &str,
     artifact_dir: &Path,
-    make_coder: impl FnOnce(CoderSandbox) -> Box<dyn crate::coder::Coder>,
+    make_coder: impl FnOnce(CoderSandbox, Option<&Path>) -> Box<dyn crate::coder::Coder>,
 ) -> Result<RebaseOutcome> {
-    // A Codex login problem must not create an executing Rebase Task. Keep the
-    // prepared home alive through the eventual sandboxed launch.
-    let codex_worker = if config.coder_kind == CoderKind::Codex && !cfg!(test) {
-        let worker =
-            crate::codex_worker::CodexWorkerEnvironment::prepare().map_err(anyhow::Error::new)?;
-        worker.preflight().map_err(anyhow::Error::new)?;
-        Some(worker)
-    } else {
+    // A provider readiness failure must not create an executing Rebase Task.
+    // Keep a prepared Codex home alive through the eventual sandboxed launch.
+    let provider_readiness = if cfg!(test) {
         None
+    } else {
+        Some(
+            crate::provider_readiness::ProviderReadiness::prepare_for_project(
+                config.coder_kind,
+                config.project_root,
+            )
+            .map_err(anyhow::Error::new)?,
+        )
     };
     let rebase_task_id = next_rebase_task_id(item, &candidate.attempt_id);
     let rebase_artifact_dir = artifact_dir.join(&rebase_task_id);
+
+    // Render and probe the exact production boundary before creating the rebase
+    // artifact area or recording an executing Task. The deterministic artifact path
+    // may be granted before it exists; Seatbelt only needs its rendered pathname.
+    let (sandbox, sandbox_profile) = match preflight_rebase_sandbox(
+        config,
+        source_workspace,
+        &rebase_artifact_dir,
+        provider_readiness
+            .as_ref()
+            .and_then(|readiness| readiness.codex_worker()),
+    ) {
+        Ok(plan) => plan,
+        Err(error) => {
+            if let Some(host) = error.downcast_ref::<crate::os::HostSandboxPreflightError>() {
+                let task = new_rebase_task(config, candidate, &rebase_task_id, TaskStatus::Planned);
+                add_rebase_task_to_attempt(
+                    config.store,
+                    config.work_item_id,
+                    &candidate.attempt_id,
+                    task,
+                )?;
+                crate::work_task_executor::pause_task_for_host_sandbox(
+                    config.store,
+                    config.project_root,
+                    config.work_item_id,
+                    &candidate.attempt_id,
+                    &rebase_task_id,
+                    host,
+                )?;
+            }
+            return Err(error);
+        }
+    };
     fs::create_dir_all(&rebase_artifact_dir)?;
 
-    let now = crate::work_model::now_iso8601();
-    let rebase_task = Task {
-        id: rebase_task_id.clone(),
-        kind: TaskKind::Rebase,
-        status: TaskStatus::Executing,
-        role: "rebase".to_string(),
-        instructions: None,
-        work_item_id: config.work_item_id.to_string(),
-        attempt_id: Some(candidate.attempt_id.clone()),
-        workspace_access: WorkspaceAccess {
-            reads: Vec::new(),
-            writes: vec![candidate.source_workspace.clone()],
-        },
-        artifact_area: Some(crate::work_model::TaskArtifactArea {
-            path: work_artifact_path(config.work_item_id, &candidate.attempt_id, &rebase_task_id),
-        }),
-        review_context: None,
-        input_artifacts: Vec::new(),
-        depends_on: None,
-        output: None,
-        created_at: Some(now.clone()),
-        started_at: Some(now),
-        completed_at: None,
-    };
+    let rebase_task = new_rebase_task(config, candidate, &rebase_task_id, TaskStatus::Executing);
     add_rebase_task_to_attempt(
         config.store,
         config.work_item_id,
@@ -1937,7 +3211,11 @@ fn rebase_candidate_with_coder(
         target_branch,
         &rebase_artifact_dir,
         &rebase_task_id,
-        codex_worker.as_ref(),
+        provider_readiness
+            .as_ref()
+            .and_then(|readiness| readiness.codex_worker()),
+        sandbox,
+        sandbox_profile,
         make_coder,
     ) {
         Ok(RebaseOutcome::NeedsUser { diagnostic }) => {
@@ -1953,13 +3231,28 @@ fn rebase_candidate_with_coder(
             Ok(RebaseOutcome::NeedsUser { diagnostic })
         }
         Ok(outcome) => Ok(outcome),
-        Err(err) => Err(settle_reserved_rebase_failure(
-            config,
-            &candidate.attempt_id,
-            &rebase_task_id,
-            &candidate.id,
-            err,
-        )),
+        Err(err) => {
+            // A Seatbelt probe is an infrastructure pause, not a failed rebase.
+            // Record the owning Attempt and its handoff through the same boundary
+            // as ordinary Tasks before settling the Candidate's paired state.
+            if let Some(host) = err.downcast_ref::<crate::os::HostSandboxPreflightError>() {
+                crate::work_task_executor::pause_task_for_host_sandbox(
+                    config.store,
+                    config.project_root,
+                    config.work_item_id,
+                    &candidate.attempt_id,
+                    &rebase_task_id,
+                    host,
+                )?;
+            }
+            Err(settle_reserved_rebase_failure(
+                config,
+                &candidate.attempt_id,
+                &rebase_task_id,
+                &candidate.id,
+                err,
+            ))
+        }
     }
 }
 
@@ -1977,7 +3270,9 @@ fn run_reserved_rebase(
     rebase_artifact_dir: &Path,
     rebase_task_id: &str,
     codex_worker: Option<&crate::codex_worker::CodexWorkerEnvironment>,
-    make_coder: impl FnOnce(CoderSandbox) -> Box<dyn crate::coder::Coder>,
+    sandbox: CoderSandbox,
+    _sandbox_profile: Option<os::SandboxProfile>,
+    make_coder: impl FnOnce(CoderSandbox, Option<&Path>) -> Box<dyn crate::coder::Coder>,
 ) -> Result<RebaseOutcome> {
     let workspace_resolver = ContentResolver::new(Some(source_workspace));
     let system_prompt = workspace_resolver
@@ -2000,23 +3295,14 @@ fn run_reserved_rebase(
     let transcript_path = rebase_artifact_dir.join("transcript.jsonl");
 
     if !config.no_sandbox || codex_worker.is_some() {
-        os::check_prerequisites_for(config.coder_kind)?;
+        if codex_worker.is_some() {
+            os::check_sandbox_prerequisite()?;
+        } else {
+            os::check_prerequisites_for(config.coder_kind)?;
+        }
         credential::inject_credentials()?;
         credential::setup_git_signing();
     }
-
-    let (sandbox, _sandbox_profile) = if config.no_sandbox && codex_worker.is_none() {
-        (CoderSandbox::None, None)
-    } else {
-        let common_git_dir = worktree::git_common_dir(source_workspace)?;
-        build_coder_sandbox_with_codex_home(
-            config.coder_kind,
-            config.resolver,
-            source_workspace,
-            &[common_git_dir, rebase_artifact_dir.to_path_buf()],
-            codex_worker.map(|worker| worker.home()),
-        )?
-    };
 
     eprintln!("  Fluent           work rebase");
     eprintln!("  Work Item         {}", config.work_item_id);
@@ -2030,7 +3316,10 @@ fn run_reserved_rebase(
     let pump_config = crate::transcript_pump::resolve_config(config.project_root);
     let capture = crate::coder::TranscriptCapture::with_config(&transcript_path, pump_config);
 
-    let coder = make_coder(sandbox);
+    let coder = make_coder(
+        sandbox,
+        codex_worker.map(|worker| worker.launcher().execution_executable()),
+    );
     // Persist the coder's supervision report in the rebase artifact directory, then
     // take its terminal outcome, so a group-sweep diagnostic is durable rather than
     // dropped with the ManagedChild.
@@ -2098,6 +3387,7 @@ fn run_reserved_rebase(
             &candidate.attempt_id,
             rebase_task_id,
             TaskStatus::Complete,
+            Some((candidate, &new_tip)),
         )?;
         Ok(RebaseOutcome::Success { new_tip })
     } else {
@@ -2133,6 +3423,71 @@ fn next_rebase_task_id(item: &WorkItem, attempt_id: &str) -> String {
     }
 }
 
+fn new_rebase_task(
+    config: &WorkMergeConfig<'_>,
+    candidate: &MergeCandidate,
+    rebase_task_id: &str,
+    status: TaskStatus,
+) -> Task {
+    let now = crate::work_model::now_iso8601();
+    let started_at = (status == TaskStatus::Executing).then_some(now.clone());
+    Task {
+        id: rebase_task_id.to_string(),
+        kind: TaskKind::Rebase,
+        status,
+        role: "rebase".to_string(),
+        instructions: None,
+        work_item_id: config.work_item_id.to_string(),
+        attempt_id: Some(candidate.attempt_id.clone()),
+        workspace_access: WorkspaceAccess {
+            reads: Vec::new(),
+            writes: vec![candidate.source_workspace.clone()],
+        },
+        artifact_area: Some(crate::work_model::TaskArtifactArea {
+            path: work_artifact_path(config.work_item_id, &candidate.attempt_id, rebase_task_id),
+        }),
+        review_context: None,
+        writer_correction_assignment: None,
+        verification_context: None,
+        evidence_review_context: None,
+        input_artifacts: Vec::new(),
+        depends_on: None,
+        output: None,
+        created_at: Some(now.clone()),
+        started_at,
+        completed_at: None,
+    }
+}
+
+/// Render and probe the rebase boundary while all rebase state is still read-only.
+fn preflight_rebase_sandbox(
+    config: &WorkMergeConfig<'_>,
+    source_workspace: &Path,
+    rebase_artifact_dir: &Path,
+    codex_worker: Option<&crate::codex_worker::CodexWorkerEnvironment>,
+) -> Result<(CoderSandbox, Option<os::SandboxProfile>)> {
+    if config.no_sandbox && codex_worker.is_none() {
+        return Ok((CoderSandbox::None, None));
+    }
+
+    let common_git_dir = worktree::git_common_dir(source_workspace)?;
+    let (sandbox, profile) = build_coder_sandbox_with_codex_home(
+        config.coder_kind,
+        config.resolver,
+        source_workspace,
+        &[common_git_dir, rebase_artifact_dir.to_path_buf()],
+        codex_worker,
+    )?;
+    if let Some(profile) = profile.as_ref() {
+        if let Some(worker) = codex_worker {
+            os::preflight_codex_launcher(profile, worker)?;
+        } else {
+            os::preflight_profile(profile)?;
+        }
+    }
+    Ok((sandbox, profile))
+}
+
 fn add_rebase_task_to_attempt(
     store: &WorkModelStore,
     work_item_id: &str,
@@ -2146,7 +3501,7 @@ fn add_rebase_task_to_attempt(
         .find(|a| a.id == attempt_id)
         .ok_or_else(|| anyhow::anyhow!("Attempt {:?} not found", attempt_id))?;
     attempt.tasks.push(task);
-    store.write_work_item(&item)?;
+    write_landing_work_item(store, &item)?;
     Ok(())
 }
 
@@ -2176,7 +3531,10 @@ fn settle_reserved_rebase_failure(
 ) -> anyhow::Error {
     let hard_failure = primary
         .downcast_ref::<crate::transcript_pump::TranscriptPumpError>()
-        .is_none();
+        .is_none()
+        && primary
+            .downcast_ref::<crate::os::HostSandboxPreflightError>()
+            .is_none();
     match settle_reserved_rebase_together(
         config,
         attempt_id,
@@ -2231,78 +3589,71 @@ fn settle_reserved_rebase_together(
     let rebase_task_id = rebase_task_id.to_string();
     let candidate_id = candidate_id.to_string();
     let diagnostic = diagnostic.to_string();
-    config
-        .store
-        .mutate_work_item(config.work_item_id, move |item| {
-            let attempt_idx = item
-                .attempts
-                .iter()
-                .position(|a| a.id == attempt_id)
-                .ok_or(WorkModelError::AttemptNotFound {
-                    id: attempt_id.clone(),
-                })?;
-            let task_idx = item.attempts[attempt_idx]
-                .tasks
-                .iter()
-                .position(|t| t.id == rebase_task_id)
-                .ok_or(WorkModelError::TaskNotFound {
-                    id: rebase_task_id.clone(),
-                })?;
-            let candidate_idx = item
-                .merge_candidates
-                .iter()
-                .position(|c| c.id == candidate_id)
-                .ok_or(WorkModelError::MergeCandidateNotFound {
-                    candidate_id: candidate_id.clone(),
-                })?;
+    mutate_landing_work_item(config.store, config.work_item_id, move |item| {
+        let attempt_idx = item
+            .attempts
+            .iter()
+            .position(|a| a.id == attempt_id)
+            .ok_or(WorkModelError::AttemptNotFound {
+                id: attempt_id.clone(),
+            })?;
+        let task_idx = item.attempts[attempt_idx]
+            .tasks
+            .iter()
+            .position(|t| t.id == rebase_task_id)
+            .ok_or(WorkModelError::TaskNotFound {
+                id: rebase_task_id.clone(),
+            })?;
+        let candidate_idx = item
+            .merge_candidates
+            .iter()
+            .position(|c| c.id == candidate_id)
+            .ok_or(WorkModelError::MergeCandidateNotFound {
+                candidate_id: candidate_id.clone(),
+            })?;
 
-            // Decide ONE joint disposition from both peers' current states first.
-            let candidate_state = &item.merge_candidates[candidate_idx].merge_state;
-            let candidate_merged = candidate_state.status == MergeCandidateMergeStatus::Merged
-                && candidate_state.merged_commit.is_some();
-            let candidate_failed = candidate_state.status == MergeCandidateMergeStatus::Failed;
-            let task_failed =
-                item.attempts[attempt_idx].tasks[task_idx].status == TaskStatus::Failed;
-            let settlement = if candidate_merged {
-                RebaseSettlement::Merged
-            } else if hard_failure || task_failed || candidate_failed {
-                RebaseSettlement::Failed
-            } else {
-                RebaseSettlement::NeedsUser
-            };
+        // Decide ONE joint disposition from both peers' current states first.
+        let candidate_state = &item.merge_candidates[candidate_idx].merge_state;
+        let candidate_merged = candidate_state.status == MergeCandidateMergeStatus::Merged
+            && candidate_state.merged_commit.is_some();
+        let candidate_failed = candidate_state.status == MergeCandidateMergeStatus::Failed;
+        let task_failed = item.attempts[attempt_idx].tasks[task_idx].status == TaskStatus::Failed;
+        let settlement = if candidate_merged {
+            RebaseSettlement::Merged
+        } else if hard_failure || task_failed || candidate_failed {
+            RebaseSettlement::Failed
+        } else {
+            RebaseSettlement::NeedsUser
+        };
 
-            // Apply the SAME joint disposition to both entities. Only the Merged arm may
-            // leave (or complete) the Task in a preserved state; a non-Merged disposition
-            // FORCES the Task to match its Candidate — including downgrading an
-            // inconsistent pre-existing `Complete`, which is only ever valid beside a
-            // Merged Candidate — so the peers can never be persisted as a split.
-            let task = &mut item.attempts[attempt_idx].tasks[task_idx];
-            match settlement {
-                RebaseSettlement::Merged => settle_task_terminal(task, TaskStatus::Complete),
-                RebaseSettlement::Failed => {
-                    force_non_merged_task_terminal(task, TaskStatus::Failed)
-                }
-                RebaseSettlement::NeedsUser => {
-                    force_non_merged_task_terminal(task, TaskStatus::NeedsUser)
-                }
+        // Apply the SAME joint disposition to both entities. Only the Merged arm may
+        // leave (or complete) the Task in a preserved state; a non-Merged disposition
+        // FORCES the Task to match its Candidate — including downgrading an
+        // inconsistent pre-existing `Complete`, which is only ever valid beside a
+        // Merged Candidate — so the peers can never be persisted as a split.
+        let task = &mut item.attempts[attempt_idx].tasks[task_idx];
+        match settlement {
+            RebaseSettlement::Merged => settle_task_terminal(task, TaskStatus::Complete),
+            RebaseSettlement::Failed => force_non_merged_task_terminal(task, TaskStatus::Failed),
+            RebaseSettlement::NeedsUser => {
+                force_non_merged_task_terminal(task, TaskStatus::NeedsUser)
             }
-            let candidate = &mut item.merge_candidates[candidate_idx];
-            match settlement {
-                // A landed Candidate is left exactly as it merged.
-                RebaseSettlement::Merged => {}
-                RebaseSettlement::Failed => settle_candidate_terminal(
-                    candidate,
-                    MergeCandidateMergeStatus::Failed,
-                    &diagnostic,
-                ),
-                RebaseSettlement::NeedsUser => settle_candidate_terminal(
-                    candidate,
-                    MergeCandidateMergeStatus::NeedsUser,
-                    &diagnostic,
-                ),
+        }
+        let candidate = &mut item.merge_candidates[candidate_idx];
+        match settlement {
+            // A landed Candidate is left exactly as it merged.
+            RebaseSettlement::Merged => {}
+            RebaseSettlement::Failed => {
+                settle_candidate_terminal(candidate, MergeCandidateMergeStatus::Failed, &diagnostic)
             }
-            Ok(())
-        })?;
+            RebaseSettlement::NeedsUser => settle_candidate_terminal(
+                candidate,
+                MergeCandidateMergeStatus::NeedsUser,
+                &diagnostic,
+            ),
+        }
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -2369,6 +3720,7 @@ fn settle_candidate_terminal(
         review_artifacts: Vec::new(),
         auto_merge_skipped: None,
         follow_up_failure: None,
+        landing_intent: None,
     };
     crate::work_model::set_merge_candidate_terminal(candidate, terminal);
 }
@@ -2379,6 +3731,7 @@ fn update_rebase_task_status(
     attempt_id: &str,
     task_id: &str,
     status: TaskStatus,
+    result: Option<(&MergeCandidate, &str)>,
 ) -> Result<()> {
     let mut item = read_work_item_or_not_found(store, work_item_id)?;
     let attempt = item
@@ -2401,6 +3754,17 @@ fn update_rebase_task_status(
                 attempt_id
             )
         })?;
+    if let Some((candidate, tip)) = result {
+        task.output = Some(TaskOutput {
+            workspace_id: candidate.source_workspace.id.clone(),
+            workspace_path: candidate.source_workspace.path.clone(),
+            source_branch: candidate.source_branch.clone(),
+            base_commit: Some(candidate.candidate_commit.clone()),
+            commit: tip.to_string(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+    }
     if matches!(
         status,
         TaskStatus::Complete | TaskStatus::Failed | TaskStatus::NeedsUser
@@ -2409,7 +3773,7 @@ fn update_rebase_task_status(
     } else {
         task.status = status;
     }
-    store.write_work_item(&item)?;
+    write_landing_work_item(store, &item)?;
     Ok(())
 }
 
@@ -2463,15 +3827,16 @@ fn regenerate_provenance(
     work_item_id: &str,
     candidate_id: &str,
     attempt_id: &str,
+    source_workspace: &Path,
     accepted_base: &str,
     new_tip: &str,
 ) -> Result<()> {
-    let mut item = read_work_item_or_not_found(store, work_item_id)?;
+    #[cfg(feature = "test-support")]
+    if std::env::var_os("FLUENT_TEST_FAIL_CAPTURE_PROVENANCE_REGENERATION").is_some() {
+        bail!("test-only injected capture provenance regeneration failure");
+    }
 
-    // A frozen no-expertise identity must never be retargeted. Regenerating
-    // provenance rewrites the reviewed Writer SHA across the attempt, which is
-    // exactly the pointer move the freeze forbids, so this refuses to run rather
-    // than staging a change the model guard would reject.
+    let item = read_work_item_or_not_found(store, work_item_id)?;
     if let Some(candidate) = item
         .merge_candidates
         .iter()
@@ -2484,51 +3849,169 @@ fn regenerate_provenance(
         )));
     }
 
-    let attempt = item
+    enum NoChangeAdvance {
+        None,
+        Unchanged,
+        Rebased { from_commit: String },
+        Appended,
+    }
+
+    let latest_output = item
         .attempts
-        .iter_mut()
-        .find(|a| a.id == attempt_id)
-        .ok_or_else(|| anyhow::anyhow!("Attempt {:?} not found", attempt_id))?;
-
-    let write_task_ids: std::collections::HashSet<String> = attempt
-        .tasks
         .iter()
-        .filter(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
-        .map(|task| task.id.clone())
-        .collect();
+        .find(|attempt| attempt.id == attempt_id)
+        .and_then(|attempt| {
+            attempt
+                .tasks
+                .iter()
+                .rev()
+                .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+        })
+        .and_then(|task| task.output.as_ref())
+        .ok_or_else(|| anyhow::anyhow!("Attempt {attempt_id:?} has no completed Writer output"))?;
+    let no_change_advance = if latest_output.no_change.is_none() {
+        NoChangeAdvance::None
+    } else if latest_output.commit == new_tip {
+        NoChangeAdvance::Unchanged
+    } else {
+        let ancestor = git::run_raw(
+            source_workspace,
+            &[
+                "merge-base",
+                "--is-ancestor",
+                &latest_output.commit,
+                new_tip,
+            ],
+        )?;
+        match ancestor.status.code() {
+            Some(0) => NoChangeAdvance::Appended,
+            Some(1) => {
+                let from_commit = if let Some(transition) =
+                    latest_output.learner_canonicalization.as_ref()
+                {
+                    let prior_parent = git::run_stdout(
+                        source_workspace,
+                        &["rev-parse", &format!("{}^", transition.to_commit)],
+                        "resolve pre-rebase Learner parent",
+                    )?;
+                    if prior_parent != transition.from_commit {
+                        bail!(
+                            "cannot regenerate no-change Learner provenance: {:?} is not the parent of {:?}",
+                            transition.from_commit,
+                            transition.to_commit
+                        );
+                    }
+                    git::run_stdout(
+                        source_workspace,
+                        &["rev-parse", &format!("{new_tip}^")],
+                        "resolve rebased Learner parent",
+                    )?
+                } else {
+                    new_tip.to_string()
+                };
+                NoChangeAdvance::Rebased { from_commit }
+            }
+            _ => bail!(
+                "git merge-base --is-ancestor failed while regenerating no-change provenance: {}",
+                String::from_utf8_lossy(&ancestor.stderr).trim()
+            ),
+        }
+    };
+    let artifact_rewrite = match &no_change_advance {
+        NoChangeAdvance::None => Some((latest_output.commit.clone(), new_tip.to_string())),
+        NoChangeAdvance::Unchanged => None,
+        NoChangeAdvance::Rebased { from_commit } => Some((
+            latest_output
+                .learner_canonicalization
+                .as_ref()
+                .map(|transition| transition.from_commit.clone())
+                .unwrap_or_else(|| latest_output.commit.clone()),
+            from_commit.clone(),
+        )),
+        NoChangeAdvance::Appended => Some((
+            latest_output
+                .learner_canonicalization
+                .as_ref()
+                .map(|transition| transition.from_commit.clone())
+                .unwrap_or_else(|| latest_output.commit.clone()),
+            new_tip.to_string(),
+        )),
+    };
 
-    for task in &mut attempt.tasks {
-        if task.kind == TaskKind::Write && task.status == TaskStatus::Complete {
-            if let Some(ref mut output) = task.output {
-                output.base_commit = Some(accepted_base.to_string());
-                output.commit = new_tip.to_string();
+    mutate_landing_work_item(store, work_item_id, |item| {
+        let canonical_writer_id = {
+            let attempt = item
+                .attempts
+                .iter_mut()
+                .find(|attempt| attempt.id == attempt_id)
+                .ok_or_else(|| WorkModelError::AttemptNotFound {
+                    id: attempt_id.to_string(),
+                })?;
+            let canonical_writer_index = attempt
+                .tasks
+                .iter()
+                .rposition(|task| {
+                    task.kind == TaskKind::Write && task.status == TaskStatus::Complete
+                })
+                .ok_or_else(|| WorkModelError::AttemptMissingCompletedWriteTask {
+                    attempt_id: attempt_id.to_string(),
+                })?;
+            let canonical_writer = &mut attempt.tasks[canonical_writer_index];
+            let output = canonical_writer.output.as_mut().ok_or_else(|| {
+                WorkModelError::CompleteWriteTaskMissingOutput {
+                    task_id: canonical_writer.id.clone(),
+                }
+            })?;
+            match &no_change_advance {
+                NoChangeAdvance::None => {
+                    output.base_commit = Some(accepted_base.to_string());
+                    output.commit = new_tip.to_string();
+                }
+                NoChangeAdvance::Unchanged => {}
+                NoChangeAdvance::Rebased { from_commit } => {
+                    output.base_commit = Some(from_commit.clone());
+                    output.commit = new_tip.to_string();
+                    if let Some(transition) = output.learner_canonicalization.as_mut() {
+                        transition.from_commit = from_commit.clone();
+                        transition.to_commit = new_tip.to_string();
+                    }
+                }
+                NoChangeAdvance::Appended => {
+                    output.base_commit = Some(accepted_base.to_string());
+                    output.commit = new_tip.to_string();
+                    output.no_change = None;
+                    output.learner_canonicalization = None;
+                }
+            }
+            canonical_writer.id.clone()
+        };
+
+        // Only the latest completed Writer supplies the current candidate. Its
+        // artifact advances with that pointer; historical Writer outputs and their
+        // artifacts remain durable evidence of what those Writers actually produced.
+        let attempt = item
+            .attempts
+            .iter_mut()
+            .find(|attempt| attempt.id == attempt_id)
+            .expect("attempt selected above remains present");
+        if let Some((old_commit, new_commit)) = &artifact_rewrite {
+            for artifact in &mut attempt.artifacts {
+                if artifact.producer_id == canonical_writer_id && artifact.path == *old_commit {
+                    artifact.path = new_commit.clone();
+                }
             }
         }
-    }
 
-    // Only artifact references that represent Write output commits move to the
-    // new tip. Learner handoff, Tester, reviewer, and other non-Write references
-    // are preserved: rewriting them would corrupt pointers that are not commits.
-    for artifact in &mut attempt.artifacts {
-        if write_task_ids.contains(&artifact.producer_id) {
-            artifact.path = new_tip.to_string();
-        }
-    }
-
-    let candidate = item
-        .merge_candidates
-        .iter_mut()
-        .find(|c| c.id == candidate_id)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "Merge Candidate {:?} not found in Work Item {:?}",
-                candidate_id,
-                work_item_id
-            )
-        })?;
-    candidate.candidate_commit = new_tip.to_string();
-
-    store.write_work_item(&item)?;
+        let candidate = item
+            .merge_candidates
+            .iter_mut()
+            .find(|candidate| candidate.id == candidate_id)
+            .ok_or_else(|| WorkModelError::MergeCandidateNotFound {
+                candidate_id: candidate_id.to_string(),
+            })?;
+        candidate.candidate_commit = new_tip.to_string();
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -2537,23 +4020,32 @@ fn build_coder_sandbox_with_codex_home(
     resolver: &ContentResolver,
     working_dir: &Path,
     additional_writable_roots: &[PathBuf],
-    codex_home: Option<&Path>,
+    codex_worker: Option<&crate::codex_worker::CodexWorkerEnvironment>,
 ) -> Result<(CoderSandbox, Option<os::SandboxProfile>)> {
     let home = std::env::var("HOME").unwrap_or_default();
     let mut roots = vec![working_dir.to_path_buf()];
     roots.extend(additional_writable_roots.iter().cloned());
-    let profile = if let Some(codex_home) = codex_home {
+    let readable_roots = codex_worker
+        .map(|worker| worker.launcher().readable_roots())
+        .unwrap_or_default();
+    let profile = if let Some(worker) = codex_worker {
         os::render_profile_for_access_for_coder_with_denied_writes_and_codex_home(
             resolver,
             &home,
             &roots,
-            &[],
+            readable_roots,
             &[],
             coder_kind,
-            Some(codex_home),
+            Some(worker.home()),
         )?
     } else {
-        os::render_profile_for_access_for_coder(resolver, &home, &roots, &[], coder_kind)?
+        os::render_profile_for_access_for_coder(
+            resolver,
+            &home,
+            &roots,
+            readable_roots,
+            coder_kind,
+        )?
     };
     let sandbox = CoderSandbox::SeatbeltProfile(profile.path.to_string_lossy().to_string());
     Ok((sandbox, Some(profile)))
@@ -2569,40 +4061,11 @@ fn cleanup_managed_workspace(project_root: &Path, source_workspace: &Path) -> Re
 }
 
 fn ensure_same_git_repository(project_root: &Path, workspace_path: &Path) -> Result<()> {
-    let source_common = fs::canonicalize(worktree::git_common_dir(project_root)?)?;
-    let workspace_common = fs::canonicalize(worktree::git_common_dir(workspace_path)?)?;
-    if source_common != workspace_common {
-        bail!(
-            "Workspace {} belongs to a different git repository",
-            workspace_path.display()
-        );
-    }
-    Ok(())
+    worktree::ensure_same_git_repository(project_root, workspace_path)
 }
 
 fn ensure_registered_worktree(project_root: &Path, workspace_path: &Path) -> Result<()> {
-    let expected = fs::canonicalize(workspace_path)?;
-    let output = git::run_raw(project_root, &["worktree", "list", "--porcelain"])?;
-    if !output.status.success() {
-        bail!(
-            "Failed to list git worktrees: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let Some(path) = line.strip_prefix("worktree ") else {
-            continue;
-        };
-        if fs::canonicalize(path).is_ok_and(|actual| actual == expected) {
-            return Ok(());
-        }
-    }
-
-    bail!(
-        "Workspace {} exists but is not a registered git worktree",
-        workspace_path.display()
-    )
+    worktree::ensure_registered_worktree(project_root, workspace_path)
 }
 
 fn ensure_clean_worktree(workspace_path: &Path) -> Result<()> {
@@ -2684,7 +4147,11 @@ mod tests {
     use super::*;
     use crate::content::ContentResolver;
     use crate::work_model::WorkItemAbandonment;
-    use crate::work_model::{AttemptReviewState, AttemptStatus, TaskOutput, TaskStatus, WorkItem};
+    use crate::work_model::{
+        AttemptReviewState, AttemptStatus, LearnerCommitCanonicalization, NoChangeOutput,
+        NoChangeVerification, NoChangeVerificationResult, TaskArtifactArea, TaskOutput, TaskStatus,
+        WorkItem,
+    };
 
     #[test]
     fn non_codex_rebase_sandbox_retains_shared_temp_write_grants() {
@@ -2832,6 +4299,7 @@ mod tests {
             merge_review_state: MergeReviewState::Pending,
             merge_state: MergeCandidateMergeState::default(),
             created_at: None,
+            ready_at: None,
             started_at: None,
             completed_at: None,
         }
@@ -2867,6 +4335,8 @@ mod tests {
             source_branch: "main".to_string(),
             base_commit: None,
             commit: "abc123".to_string(),
+            no_change: None,
+            learner_canonicalization: None,
         });
 
         let candidate_id = item.create_or_get_merge_candidate("attempt-1").unwrap();
@@ -2878,6 +4348,80 @@ mod tests {
         candidate.merge_state.status = MergeCandidateMergeStatus::Executing;
         let candidate = candidate.clone();
         (item, candidate)
+    }
+
+    #[test]
+    fn failed_landing_retry_restores_reviewed_attempt_atomically() {
+        // A failed landing is retryable when all product work and reviews are
+        // already complete. The public landing retry must restore the Attempt's
+        // terminal review state in the same model write that marks the candidate
+        // Executing; otherwise candidate validation rejects the retry between the
+        // two states. Existing tasks and their history remain untouched.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let source_workspace = tmp.path().join("workspace");
+        fs::create_dir_all(&source_workspace).unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let (mut item, _) = executing_candidate_item("work-1", &source_workspace);
+        let ready_at = "2026-09-03T12:54:00.009455+00:00".to_string();
+        let attempt = &mut item.attempts[0];
+        attempt.status = crate::work_model::AttemptStatus::NeedsUser;
+        attempt.pause_kind = Some(crate::work_model::PauseKind::HostSandbox);
+        attempt.completed_at = Some("landing-paused-later".to_string());
+        attempt.learning = Some(crate::work_model::AttemptLearning::succeeded(
+            1,
+            crate::follow_up::ArtifactRef {
+                path: ".fluent/work/artifacts/work-1/attempt-1/learner/handoff.json".to_string(),
+                digest: "sha256:test".to_string(),
+            },
+        ));
+        let prior_task_ids = attempt
+            .tasks
+            .iter()
+            .map(|task| task.id.clone())
+            .collect::<Vec<_>>();
+        let candidate = &mut item.merge_candidates[0];
+        candidate.ready_at = Some(ready_at.clone());
+        candidate.merge_state = MergeCandidateMergeState {
+            status: MergeCandidateMergeStatus::Failed,
+            merged_commit: None,
+            failure_reason: Some("pre-merge hook failed".to_string()),
+            check_artifacts: Vec::new(),
+            review_artifacts: Vec::new(),
+            auto_merge_skipped: None,
+            follow_up_failure: None,
+            landing_intent: None,
+        };
+        crate::work_model::set_merge_candidate_terminal(
+            candidate,
+            MergeCandidateMergeStatus::Failed,
+        );
+        store.create_work_item(&item).unwrap();
+
+        set_candidate_executing(&store, "work-1", "attempt-1-merge-candidate").unwrap();
+
+        let after = store.read_work_item("work-1").unwrap();
+        let attempt = &after.attempts[0];
+        assert_eq!(attempt.status, crate::work_model::AttemptStatus::Complete);
+        assert_eq!(attempt.pause_kind, None);
+        assert_eq!(attempt.completed_at.as_deref(), Some(ready_at.as_str()));
+        assert_eq!(
+            attempt
+                .tasks
+                .iter()
+                .map(|task| task.id.clone())
+                .collect::<Vec<_>>(),
+            prior_task_ids,
+            "retry normalization preserves every prior Task"
+        );
+        assert_eq!(
+            after.merge_candidates[0].merge_state.status,
+            MergeCandidateMergeStatus::Executing
+        );
+        assert_eq!(
+            after.merge_candidates[0].merge_review_state,
+            MergeReviewState::Pending
+        );
+        after.validate().expect("the combined retry state is valid");
     }
 
     #[test]
@@ -2899,7 +4443,7 @@ mod tests {
 
         let source_workspace = project_root.join("workspace");
         std::fs::create_dir_all(&source_workspace).unwrap();
-        let artifact_dir = project_root.join("artifacts");
+        let artifact_dir = tmp.path().join("artifacts");
 
         let store = WorkModelStore::new(project_root);
         let mut item = WorkItem {
@@ -2938,7 +4482,7 @@ mod tests {
             &source_workspace,
             "main",
             &artifact_dir,
-            move |_sandbox| {
+            move |_sandbox, _executable| {
                 Box::new(RecordingRebaseCoder {
                     recorded: recorded_for_coder,
                     outcome: FakeOutcome::GenericError(
@@ -3008,6 +4552,7 @@ mod tests {
                                 message: Some("Operation not permitted".to_string()),
                             },
                         ),
+                        provider_liveness: None,
                     }],
                 },
             }
@@ -3072,7 +4617,7 @@ mod tests {
             &source_workspace,
             "main",
             &artifact_dir,
-            move |_sandbox| Box::new(SupervisionRebaseCoder),
+            move |_sandbox, _executable| Box::new(SupervisionRebaseCoder),
         );
         assert!(
             artifact_dir
@@ -3126,7 +4671,7 @@ mod tests {
             &source_workspace,
             "main",
             &artifact_dir,
-            |_sandbox| {
+            |_sandbox, _executable| {
                 Box::new(RecordingRebaseCoder {
                     recorded: std::sync::Arc::new(std::sync::Mutex::new(None)),
                     outcome: FakeOutcome::PumpError(
@@ -3202,6 +4747,9 @@ mod tests {
                     path: work_artifact_path(work_id, "attempt-1", &rebase_task_id),
                 }),
                 review_context: None,
+                writer_correction_assignment: None,
+                verification_context: None,
+                evidence_review_context: None,
                 input_artifacts: Vec::new(),
                 depends_on: None,
                 output: None,
@@ -3339,6 +4887,9 @@ mod tests {
                     path: work_artifact_path(work_id, "attempt-1", &rebase_task_id),
                 }),
                 review_context: None,
+                writer_correction_assignment: None,
+                verification_context: None,
+                evidence_review_context: None,
                 input_artifacts: Vec::new(),
                 depends_on: None,
                 output: None,
@@ -3460,6 +5011,9 @@ mod tests {
                     path: work_artifact_path(work_id, "attempt-1", &rebase_task_id),
                 }),
                 review_context: None,
+                writer_correction_assignment: None,
+                verification_context: None,
+                evidence_review_context: None,
                 input_artifacts: Vec::new(),
                 depends_on: None,
                 output: None,
@@ -3558,12 +5112,24 @@ mod tests {
         // Nest the project so any managed sibling resolves inside this TempDir.
         let project_root = tmp.path().join("project");
         fs::create_dir_all(&project_root).unwrap();
+        fs::create_dir_all(project_root.join(".fluent")).unwrap();
+        fs::write(
+            project_root.join(".fluent/tester.yaml"),
+            "commands:\n  - command: true\n    test_harness: shell-harness\n",
+        )
+        .unwrap();
+        write_executable(
+            &project_root.join(".fluent/extract-tester-results"),
+            "#!/bin/sh\necho '[]'\n",
+        );
+
         let git = |args: &[&str]| {
             crate::git::run(&project_root, args, "merge route test setup").unwrap();
         };
         git(&["init", "-q", "-b", "main"]);
         git(&["config", "user.email", "t@t.co"]);
         git(&["config", "user.name", "t"]);
+        git(&["add", ".fluent"]);
         git(&["commit", "-q", "--allow-empty", "-m", "baseline"]);
 
         // A registered source worktree for the candidate; the clean main checkout is
@@ -3611,7 +5177,7 @@ mod tests {
             &target_workspace,
             &artifact_dir,
             &mut base_commit,
-            |_sandbox| {
+            |_sandbox, _executable| {
                 Box::new(RecordingRebaseCoder {
                     recorded: std::sync::Arc::new(std::sync::Mutex::new(None)),
                     outcome: FakeOutcome::PumpError(
@@ -3724,6 +5290,8 @@ mod tests {
             source_branch: "main".to_string(),
             base_commit: None,
             commit: "abc123".to_string(),
+            no_change: None,
+            learner_canonicalization: None,
         });
 
         let candidate_id = item.create_or_get_merge_candidate("attempt-1").unwrap();
@@ -3743,6 +5311,17 @@ mod tests {
             }],
         )
         .unwrap();
+
+        let transition = store
+            .read_work_item("work-1")
+            .unwrap()
+            .transitions
+            .last()
+            .cloned()
+            .unwrap();
+        assert_eq!(transition.object_kind, "merge-candidate");
+        assert_eq!(transition.object_id, candidate_id);
+        assert_eq!(transition.origin, DurableTransitionOrigin::Landing);
 
         (
             tmp,
@@ -3951,6 +5530,8 @@ mod tests {
             source_branch: "main".to_string(),
             base_commit: None,
             commit: "old-sha-1".to_string(),
+            no_change: None,
+            learner_canonicalization: None,
         });
 
         let second_write = Task {
@@ -3967,6 +5548,9 @@ mod tests {
             },
             artifact_area: None,
             review_context: None,
+            writer_correction_assignment: None,
+            verification_context: None,
+            evidence_review_context: None,
             input_artifacts: Vec::new(),
             depends_on: None,
             output: Some(TaskOutput {
@@ -3975,6 +5559,8 @@ mod tests {
                 source_branch: "main".to_string(),
                 base_commit: None,
                 commit: "old-sha-2".to_string(),
+                no_change: None,
+                learner_canonicalization: None,
             }),
             created_at: None,
             started_at: None,
@@ -3996,14 +5582,64 @@ mod tests {
     }
 
     #[test]
-    fn regenerate_provenance_updates_all_write_tasks_and_candidate() {
+    fn landing_origin_preserves_the_candidate_failure_reason() {
         let (_tmp, store, _item, candidate_id) = completed_write_item();
+
+        record_candidate_failure(
+            &store,
+            "work-1",
+            &candidate_id,
+            "required review rejected the candidate".to_string(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        let transition = store
+            .read_work_item("work-1")
+            .unwrap()
+            .transitions
+            .last()
+            .cloned()
+            .unwrap();
+        assert_eq!(transition.object_kind, "merge-candidate");
+        assert_eq!(transition.origin, DurableTransitionOrigin::Landing);
+        assert_eq!(
+            transition.reason.as_deref(),
+            Some("required review rejected the candidate")
+        );
+    }
+
+    #[test]
+    fn regenerate_provenance_preserves_historical_no_change_writer() {
+        let (tmp, store, _item, candidate_id) = completed_write_item();
+
+        let mut item = store.read_work_item("work-1").unwrap();
+        let historical_writer = &mut item.attempts[0].tasks[0];
+        historical_writer.artifact_area = Some(TaskArtifactArea {
+            path: ".fluent/work/artifacts/work-1/attempt-1/attempt-1-write-1".to_string(),
+        });
+        let historical_output = historical_writer.output.as_mut().unwrap();
+        historical_output.base_commit = Some("old-sha-1".to_string());
+        historical_output.no_change = Some(NoChangeOutput {
+            schema_version: 1,
+            declaration_path:
+                ".fluent/work/artifacts/work-1/attempt-1/attempt-1-write-1/no-change.json"
+                    .to_string(),
+            reason: "The earlier correction was already present".to_string(),
+            verification: vec![NoChangeVerification {
+                command: "cargo test historical_writer".to_string(),
+                result: NoChangeVerificationResult::Pass,
+            }],
+        });
+        store.write_work_item(&item).unwrap();
 
         regenerate_provenance(
             &store,
             "work-1",
             &candidate_id,
             "attempt-1",
+            tmp.path(),
             "new-base-sha",
             "new-tip-sha",
         )
@@ -4012,28 +5648,19 @@ mod tests {
         let item = store.read_work_item("work-1").unwrap();
         let attempt = &item.attempts[0];
 
-        for task in &attempt.tasks {
-            if task.kind == TaskKind::Write && task.status == TaskStatus::Complete {
-                assert_eq!(
-                    task.output.as_ref().unwrap().commit,
-                    "new-tip-sha",
-                    "write task {} commit should be updated",
-                    task.id
-                );
-                assert_eq!(
-                    task.output.as_ref().unwrap().base_commit.as_deref(),
-                    Some("new-base-sha")
-                );
-            }
-        }
+        let historical_output = attempt.tasks[0].output.as_ref().unwrap();
+        assert_eq!(historical_output.base_commit.as_deref(), Some("old-sha-1"));
+        assert_eq!(historical_output.commit, "old-sha-1");
+        assert!(historical_output.no_change.is_some());
+        assert_eq!(attempt.artifacts[0].path, "old-sha-1");
 
-        for artifact in &attempt.artifacts {
-            assert_eq!(
-                artifact.path, "new-tip-sha",
-                "attempt artifact {} path should be updated",
-                artifact.producer_id
-            );
-        }
+        let canonical_output = attempt.tasks[1].output.as_ref().unwrap();
+        assert_eq!(
+            canonical_output.base_commit.as_deref(),
+            Some("new-base-sha")
+        );
+        assert_eq!(canonical_output.commit, "new-tip-sha");
+        assert_eq!(attempt.artifacts[1].path, "new-tip-sha");
 
         let candidate = item
             .merge_candidates
@@ -4044,8 +5671,192 @@ mod tests {
     }
 
     #[test]
+    fn regenerate_provenance_rejects_invalid_candidate_atomically() {
+        let (tmp, store, _item, candidate_id) = completed_write_item();
+
+        let mut item = store.read_work_item("work-1").unwrap();
+        let canonical_writer = &mut item.attempts[0].tasks[1];
+        canonical_writer.artifact_area = Some(TaskArtifactArea {
+            path: ".fluent/work/artifacts/work-1/attempt-1/attempt-1-write-2".to_string(),
+        });
+        let output = canonical_writer.output.as_mut().unwrap();
+        output.base_commit = Some("old-sha-2".to_string());
+        output.no_change = Some(NoChangeOutput {
+            schema_version: 1,
+            declaration_path:
+                ".fluent/work/artifacts/work-1/attempt-1/attempt-1-write-2/no-change.json"
+                    .to_string(),
+            reason: "The canonical Writer made no change".to_string(),
+            verification: vec![NoChangeVerification {
+                command: "cargo test canonical_writer".to_string(),
+                result: NoChangeVerificationResult::Pass,
+            }],
+        });
+        store.write_work_item(&item).unwrap();
+        let before = store.read_work_item("work-1").unwrap();
+
+        assert!(
+            regenerate_provenance(
+                &store,
+                "work-1",
+                &candidate_id,
+                "attempt-1",
+                tmp.path(),
+                "new-base-sha",
+                "new-tip-sha",
+            )
+            .is_err()
+        );
+
+        assert_eq!(store.read_work_item("work-1").unwrap(), before);
+    }
+
+    #[test]
+    fn regenerate_provenance_maps_no_change_learner_across_rebase() {
+        let (tmp, store, _item, candidate_id) = completed_write_item();
+        git::run(
+            tmp.path(),
+            &["init", "-b", "main"],
+            "initialize test repository",
+        )
+        .unwrap();
+        git::run(
+            tmp.path(),
+            &["config", "user.name", "Test"],
+            "configure test author",
+        )
+        .unwrap();
+        git::run(
+            tmp.path(),
+            &["config", "user.email", "test@example.com"],
+            "configure test email",
+        )
+        .unwrap();
+        git::run(
+            tmp.path(),
+            &["config", "commit.gpgsign", "false"],
+            "disable test signing",
+        )
+        .unwrap();
+        fs::write(tmp.path().join("candidate.txt"), "base\n").unwrap();
+        git::run(tmp.path(), &["add", "candidate.txt"], "stage base").unwrap();
+        git::run(tmp.path(), &["commit", "-m", "Base"], "commit base").unwrap();
+        let base = head_commit(tmp.path()).unwrap();
+        fs::write(tmp.path().join("candidate.txt"), "writer\n").unwrap();
+        git::run(tmp.path(), &["add", "candidate.txt"], "stage writer").unwrap();
+        git::run(tmp.path(), &["commit", "-m", "Writer"], "commit writer").unwrap();
+        let old_from = head_commit(tmp.path()).unwrap();
+        fs::write(tmp.path().join("expertise.txt"), "learned\n").unwrap();
+        git::run(tmp.path(), &["add", "expertise.txt"], "stage learner").unwrap();
+        git::run(tmp.path(), &["commit", "-m", "Learner"], "commit learner").unwrap();
+        let old_tip = head_commit(tmp.path()).unwrap();
+        git::run(
+            tmp.path(),
+            &["checkout", "-b", "rebased", &base],
+            "create rebased branch",
+        )
+        .unwrap();
+        fs::write(tmp.path().join("candidate.txt"), "writer\n").unwrap();
+        git::run(
+            tmp.path(),
+            &["add", "candidate.txt"],
+            "stage rebased writer",
+        )
+        .unwrap();
+        git::run(
+            tmp.path(),
+            &["commit", "-m", "Writer rebased"],
+            "commit rebased writer",
+        )
+        .unwrap();
+        let new_from = head_commit(tmp.path()).unwrap();
+        fs::write(tmp.path().join("expertise.txt"), "learned\n").unwrap();
+        git::run(
+            tmp.path(),
+            &["add", "expertise.txt"],
+            "stage rebased learner",
+        )
+        .unwrap();
+        git::run(
+            tmp.path(),
+            &["commit", "-m", "Learner rebased"],
+            "commit rebased learner",
+        )
+        .unwrap();
+        let new_tip = head_commit(tmp.path()).unwrap();
+
+        let mut item = store.read_work_item("work-1").unwrap();
+        item.attempts[0].learning = Some(crate::work_model::AttemptLearning::succeeded(
+            1,
+            crate::follow_up::ArtifactRef {
+                path: ".fluent/work/artifacts/work-1/attempt-1/learner/handoff.json".to_string(),
+                digest: "sha256:abc".to_string(),
+            },
+        ));
+        let writer = &mut item.attempts[0].tasks[1];
+        writer.artifact_area = Some(TaskArtifactArea {
+            path: ".fluent/work/artifacts/work-1/attempt-1/attempt-1-write-2".to_string(),
+        });
+        let output = writer.output.as_mut().unwrap();
+        output.base_commit = Some(old_from.clone());
+        output.commit = old_tip.clone();
+        output.no_change = Some(NoChangeOutput {
+            schema_version: 1,
+            declaration_path:
+                ".fluent/work/artifacts/work-1/attempt-1/attempt-1-write-2/no-change.json"
+                    .to_string(),
+            reason: "The candidate already contains the correction".to_string(),
+            verification: vec![NoChangeVerification {
+                command: "cargo test focused".to_string(),
+                result: NoChangeVerificationResult::Pass,
+            }],
+        });
+        output.learner_canonicalization = Some(LearnerCommitCanonicalization {
+            from_commit: old_from.clone(),
+            to_commit: old_tip.clone(),
+        });
+        item.attempts[0].artifacts[1].path = old_from;
+        item.attempts[0].artifacts.push(ArtifactRef {
+            producer_id: "attempt-1-write-2".to_string(),
+            path: ".fluent/work/artifacts/work-1/attempt-1/candidate-gate.json".to_string(),
+        });
+        item.merge_candidates[0].candidate_commit = old_tip;
+        store.write_work_item(&item).unwrap();
+
+        regenerate_provenance(
+            &store,
+            "work-1",
+            &candidate_id,
+            "attempt-1",
+            tmp.path(),
+            &base,
+            &new_tip,
+        )
+        .unwrap();
+
+        let stored = store.read_work_item("work-1").unwrap();
+        let output = stored.attempts[0].tasks[1].output.as_ref().unwrap();
+        assert_eq!(output.base_commit.as_deref(), Some(new_from.as_str()));
+        assert_eq!(output.commit, new_tip);
+        assert_eq!(
+            output.learner_canonicalization.as_ref(),
+            Some(&LearnerCommitCanonicalization {
+                from_commit: new_from.clone(),
+                to_commit: new_tip.clone(),
+            })
+        );
+        assert!(output.no_change.is_some());
+        assert_eq!(stored.attempts[0].artifacts[1].path, new_from);
+        assert_eq!(
+            stored.attempts[0].artifacts[2].path,
+            ".fluent/work/artifacts/work-1/attempt-1/candidate-gate.json"
+        );
+        assert_eq!(stored.merge_candidates[0].candidate_commit, new_tip);
+    }
+
+    #[test]
     fn regenerate_provenance_leaves_non_write_tasks_unchanged() {
-        let (_tmp, store, _item, candidate_id) = completed_write_item();
+        let (tmp, store, _item, candidate_id) = completed_write_item();
 
         // Add a rebase task with its own commit to verify it is not modified
         let mut item = store.read_work_item("work-1").unwrap();
@@ -4065,6 +5876,9 @@ mod tests {
             },
             artifact_area: None,
             review_context: None,
+            writer_correction_assignment: None,
+            verification_context: None,
+            evidence_review_context: None,
             input_artifacts: Vec::new(),
             depends_on: None,
             output: None,
@@ -4080,6 +5894,7 @@ mod tests {
             "work-1",
             &candidate_id,
             "attempt-1",
+            tmp.path(),
             "new-base-sha",
             "new-tip-sha",
         )
@@ -4088,17 +5903,14 @@ mod tests {
         let item = store.read_work_item("work-1").unwrap();
         let attempt = &item.attempts[0];
 
-        // Write tasks should be updated
-        for task in &attempt.tasks {
-            if task.kind == TaskKind::Write && task.status == TaskStatus::Complete {
-                assert_eq!(
-                    task.output.as_ref().unwrap().commit,
-                    "new-tip-sha",
-                    "write task {} should be updated",
-                    task.id
-                );
-            }
-        }
+        assert_eq!(
+            attempt.tasks[0].output.as_ref().unwrap().commit,
+            "old-sha-1"
+        );
+        assert_eq!(
+            attempt.tasks[1].output.as_ref().unwrap().commit,
+            "new-tip-sha"
+        );
 
         // Rebase task should remain unmodified
         let rebase = attempt
@@ -4121,7 +5933,7 @@ mod tests {
 
     #[test]
     fn regenerate_provenance_updates_write_commit_artifacts_only() {
-        let (_tmp, store, _item, candidate_id) = completed_write_item();
+        let (tmp, store, _item, candidate_id) = completed_write_item();
 
         // A non-Write artifact reference — e.g. a Tester result — is not a commit.
         let mut item = store.read_work_item("work-1").unwrap();
@@ -4137,6 +5949,7 @@ mod tests {
             "work-1",
             &candidate_id,
             "attempt-1",
+            tmp.path(),
             "new-base-sha",
             "new-tip-sha",
         )
@@ -4145,14 +5958,23 @@ mod tests {
         let item = store.read_work_item("work-1").unwrap();
         let artifacts = &item.attempts[0].artifacts;
         for artifact in artifacts {
-            if artifact.producer_id.contains("-write-") {
+            if artifact.producer_id == "attempt-1-write-2" {
                 assert_eq!(
                     artifact.path, "new-tip-sha",
-                    "write-commit artifact {} moves to the new tip",
+                    "the canonical Writer artifact {} moves to the new tip",
                     artifact.producer_id
                 );
             }
         }
+        assert_eq!(
+            artifacts
+                .iter()
+                .find(|artifact| artifact.producer_id == "attempt-1-write-1")
+                .unwrap()
+                .path,
+            "old-sha-1",
+            "the historical Writer artifact remains truthful"
+        );
         let tester = artifacts
             .iter()
             .find(|a| a.producer_id == "attempt-1-tester")
@@ -4166,7 +5988,7 @@ mod tests {
 
     #[test]
     fn regenerate_provenance_preserves_learner_handoff_reference() {
-        let (_tmp, store, _item, candidate_id) = completed_write_item();
+        let (tmp, store, _item, candidate_id) = completed_write_item();
 
         let handoff = crate::follow_up::ArtifactRef {
             path: ".fluent/work/artifacts/work-1/attempt-1/learner/handoff.json".to_string(),
@@ -4184,6 +6006,7 @@ mod tests {
             "work-1",
             &candidate_id,
             "attempt-1",
+            tmp.path(),
             "new-base-sha",
             "new-tip-sha",
         )
@@ -4229,6 +6052,9 @@ mod tests {
             },
             artifact_area: None,
             review_context: None,
+            writer_correction_assignment: None,
+            verification_context: None,
+            evidence_review_context: None,
             input_artifacts: Vec::new(),
             depends_on: None,
             output: None,
@@ -4293,6 +6119,36 @@ mod tests {
         fs::write(dir.join("file.txt"), "initial").unwrap();
         git::run(dir, &["add", "."], "stage").unwrap();
         git::run(dir, &["commit", "-m", "initial"], "commit").unwrap();
+    }
+
+    #[test]
+    fn landed_baseline_checkout_uses_exact_commit_and_is_removed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        init_test_repo(&repo);
+        let landed = head_commit(&repo).unwrap();
+
+        fs::write(repo.join("file.txt"), "later").unwrap();
+        git::run(&repo, &["add", "file.txt"], "stage later commit").unwrap();
+        git::run(&repo, &["commit", "-m", "later"], "commit later change").unwrap();
+        let current = head_commit(&repo).unwrap();
+
+        let mut checkout_path = None;
+        let observed = with_detached_landed_checkout(&repo, &repo, &landed, |checkout| {
+            assert!(
+                !checkout.starts_with(&repo),
+                "the landed checkout must not be nested under the target repository"
+            );
+            checkout_path = Some(checkout.to_path_buf());
+            assert_eq!(fs::read_to_string(checkout.join("file.txt"))?, "initial");
+            head_commit(checkout)
+        })
+        .unwrap();
+
+        assert_eq!(observed, landed);
+        assert_eq!(head_commit(&repo).unwrap(), current);
+        assert!(!checkout_path.unwrap().exists());
     }
 
     #[test]
@@ -4394,6 +6250,7 @@ mod tests {
             "attempt-1",
             "attempt-1-rebase",
             TaskStatus::Failed,
+            None,
         )
         .expect_err("a missing reserved Rebase Task must fail, not silently no-op");
         assert!(
@@ -4488,36 +6345,127 @@ mod tests {
         // any persisted divergence fails.
         assert_eq!(
             persisted,
-            autofix_commit_message(),
+            format!("{}\n\n{}", autofix_commit_message(), autofix_commit_body()),
             "persisted message must equal the production message source"
         );
 
         // Policy (B2): the complete persisted message equals the approved
-        // maintenance wording.
+        // maintenance wording, including its required explanatory body.
         assert_eq!(
-            persisted, "Conform code to project standards",
+            persisted, "Conform code to project standards\n\nApply project formatting fixes.",
             "persisted message must equal the approved wording"
         );
 
-        // Shape (B1): nonempty, exactly one subject and no body.
+        // Shape (B1): nonempty subject, blank separator, and explanatory body.
         assert!(!persisted.is_empty(), "message must not be empty");
         assert!(
-            !persisted.contains('\n'),
-            "message must be a single subject line with no body: {persisted:?}"
+            persisted.contains("\n\n"),
+            "message must separate its subject and body: {persisted:?}"
+        );
+        assert!(persisted.ends_with(autofix_commit_body()));
+    }
+
+    #[test]
+    fn old_generated_autofix_message_is_repaired_during_merge_checks() {
+        // A candidate produced by an older Fluent build can contain the exact
+        // maintenance subject without a body. A failing policy hook may repair
+        // that narrow, generated commit in place and continue, while preserving
+        // the original failed hook log as an audit artifact.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_root = tmp.path().join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        init_test_repo(&project_root);
+        git::run(
+            &project_root,
+            &["commit", "--allow-empty", "-m", autofix_commit_message()],
+            "create legacy generated commit",
+        )
+        .unwrap();
+        let candidate_commit = head_commit(&project_root).unwrap();
+        write_hook(
+            &project_root,
+            "check-pre-merge",
+            "#!/bin/sh
+subject=$(git log -1 --format=%s)
+body=$(git log -1 --format=%b)
+if [ \"$subject\" = \"Conform code to project standards\" ] && [ -z \"$body\" ]; then
+  head=$(git rev-parse HEAD)
+  echo \"commit $head has no body separated from its subject by a blank line\"
+  exit 1
+fi
+exit 0
+",
+        );
+        write_hook(
+            &project_root,
+            "fix-pre-merge",
+            "#!/bin/sh
+exit 0
+",
+        );
+
+        let store = WorkModelStore::new(&project_root);
+        let resolver = ContentResolver::new(None);
+        let config = WorkMergeConfig {
+            project_root: &project_root,
+            store: &store,
+            work_item_id: "work-1",
+            merge_candidate_id: "attempt-1-merge-candidate",
+            resolver: &resolver,
+            extra_args: &[],
+            coder_kind: CoderKind::Codex,
+            coder_override: None,
+            model: None,
+            effort: None,
+            use_attempt_mapping: false,
+            no_sandbox: true,
+            run_post_merge_review: false,
+        };
+        let mut candidate = merge_candidate_fixture(&project_root);
+        candidate.candidate_commit = candidate_commit;
+        let artifact_dir = tmp.path().join("artifacts");
+        fs::create_dir_all(&artifact_dir).unwrap();
+
+        let artifacts = run_merge_checks(&config, &candidate, &project_root, &artifact_dir)
+            .expect("the exact legacy Fluent message is repaired");
+        let persisted = git::run_stdout(
+            &project_root,
+            &["log", "-1", "--format=%B"],
+            "read repaired message",
+        )
+        .unwrap();
+        assert_eq!(
+            persisted,
+            format!("{}\n\n{}", autofix_commit_message(), autofix_commit_body())
+        );
+        assert!(
+            artifact_dir
+                .join("hooks/check-pre-merge-before-autofix-message-repair.log")
+                .is_file(),
+            "the rejected legacy hook result remains available"
+        );
+        assert!(
+            artifacts.iter().any(|artifact| artifact
+                .path
+                .ends_with("check-pre-merge-before-autofix-message-repair.log")),
+            "the preserved failed hook result is included in merge artifacts"
         );
     }
 
     // --- Exact-SHA no-expertise land (B4u–B4z) ---
 
-    fn write_hook(project_root: &Path, name: &str, script: &str) {
+    fn write_executable(path: &Path, script: &str) {
         use std::os::unix::fs::OpenOptionsExt;
-        let hooks_dir = project_root.join(".fluent/hooks");
-        fs::create_dir_all(&hooks_dir).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
         let mut opts = fs::OpenOptions::new();
         opts.create(true).write(true).truncate(true).mode(0o755);
         use std::io::Write;
-        let mut file = opts.open(hooks_dir.join(name)).unwrap();
+        let mut file = opts.open(path).unwrap();
         file.write_all(script.as_bytes()).unwrap();
+    }
+
+    fn write_hook(project_root: &Path, name: &str, script: &str) {
+        write_executable(&project_root.join(".fluent/hooks").join(name), script);
     }
 
     struct FrozenLandFixture {
@@ -4569,6 +6517,16 @@ mod tests {
         git(&project_root, &["config", "user.email", "t@t.co"]);
         git(&project_root, &["config", "user.name", "t"]);
         fs::write(project_root.join("file.txt"), "base").unwrap();
+        fs::create_dir_all(project_root.join(".fluent")).unwrap();
+        fs::write(
+            project_root.join(".fluent/tester.yaml"),
+            "commands:\n  - command: true\n    test_harness: shell-harness\n",
+        )
+        .unwrap();
+        write_executable(
+            &project_root.join(".fluent/extract-tester-results"),
+            "#!/bin/sh\nprintf '[]\\n'\n",
+        );
         git(&project_root, &["add", "."]);
         git(&project_root, &["commit", "-q", "-m", "baseline"]);
 
@@ -4621,7 +6579,25 @@ mod tests {
             source_branch: "main".to_string(),
             base_commit: None,
             commit: reviewed_sha.clone(),
+            no_change: None,
+            learner_canonicalization: None,
         });
+        let review_ids = item
+            .add_review_tasks("attempt-1", crate::review::REVIEWERS)
+            .unwrap();
+        for id in review_ids {
+            let review = item.attempts[0]
+                .tasks
+                .iter_mut()
+                .find(|task| task.id == id)
+                .unwrap();
+            review.status = TaskStatus::Complete;
+            let area = project_root.join(&review.artifact_area.as_ref().unwrap().path);
+            fs::create_dir_all(&area).unwrap();
+            fs::write(area.join("review.md"), "Verdict: pass\n").unwrap();
+        }
+        item.attempts[0].review_state = Some(AttemptReviewState::Passed);
+        item.attempts[0].status = AttemptStatus::Complete;
         item.create_or_get_merge_candidate("attempt-1").unwrap();
         configure(&mut item, &reviewed_sha);
         store.create_work_item(&item).unwrap();
@@ -4661,6 +6637,127 @@ mod tests {
 
     fn target_head(fx: &FrozenLandFixture) -> String {
         git::run_stdout(&fx.project_root, &["rev-parse", "main"], "target head").unwrap()
+    }
+
+    #[test]
+    fn public_land_promotes_final_tester_and_merged_retry_reuses_it() {
+        let fx = build_frozen_fixture(|item, reviewed_sha| {
+            item.merge_candidates.clear();
+            let tester_id = item.add_final_tester_task("attempt-1").unwrap();
+            let attempt = item.attempts.first_mut().unwrap();
+            let tester = attempt
+                .tasks
+                .iter_mut()
+                .find(|task| task.id == tester_id)
+                .unwrap();
+            tester.status = TaskStatus::Complete;
+            attempt.status = AttemptStatus::Complete;
+            attempt.review_state = Some(AttemptReviewState::Passed);
+            attempt.learning = Some(crate::work_model::AttemptLearning::succeeded(
+                1,
+                crate::follow_up::ArtifactRef {
+                    path: ".fluent/work/artifacts/work-1/attempt-1/learner/handoff.json"
+                        .to_string(),
+                    digest: "sha256:test".to_string(),
+                },
+            ));
+            item.create_or_get_merge_candidate("attempt-1").unwrap();
+            assert_eq!(
+                item.merge_candidates[0].candidate_commit, reviewed_sha,
+                "the fixture's final Tester and candidate name the reviewed commit"
+            );
+        });
+        let tester_artifact = fx
+            .project_root
+            .join(".fluent/work/artifacts/work-1/attempt-1/attempt-1-tester");
+        fs::create_dir_all(tester_artifact.join("commands")).unwrap();
+        fs::write(tester_artifact.join("commands/0-stdout.log"), "tested").unwrap();
+        fs::write(
+            tester_artifact.join("tester-results.json"),
+            serde_json::to_vec_pretty(&crate::tester::TesterResults {
+                candidate_commit: Some(fx.reviewed_sha.clone()),
+                commands: Vec::new(),
+                tests: Vec::new(),
+                summary: crate::tester::Summary {
+                    total: 0,
+                    pass: 0,
+                    fail: 0,
+                    skipped: 0,
+                },
+                error: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        crate::baseline_cache::record_final_tester_seed(
+            &fx.source_workspace,
+            &tester_artifact,
+            true,
+        )
+        .unwrap();
+
+        let resolver = ContentResolver::new(None);
+        let first = merge_candidate(frozen_config(&fx, &resolver, false)).unwrap();
+        assert_eq!(first.merged_commit, fx.reviewed_sha);
+
+        let landed_root = fx.project_root.join(".fluent/work/baselines/landed");
+        let cache_entries: Vec<PathBuf> = fs::read_dir(&landed_root)
+            .unwrap()
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.len() == 64)
+            })
+            .collect();
+        assert_eq!(cache_entries.len(), 1);
+        let cached: crate::tester::TesterResults = serde_json::from_slice(
+            &fs::read(cache_entries[0].join("artifact/tester-results.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            cached.candidate_commit.as_deref(),
+            Some(fx.reviewed_sha.as_str()),
+            "the landed cache contains the promoted final Tester, not a fresh baseline run"
+        );
+
+        let second = merge_candidate(frozen_config(&fx, &resolver, false)).unwrap();
+        assert_eq!(second.merged_commit, fx.reviewed_sha);
+        let cache_entry_count = fs::read_dir(&landed_root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().len() == 64)
+            .count();
+        assert_eq!(cache_entry_count, 1, "merged recovery reuses the seed");
+    }
+
+    #[test]
+    fn baseline_preparation_failure_keeps_land_merged_and_retry_recovers() {
+        let fx = frozen_land_fixture(true);
+        let landed_root = fx.project_root.join(".fluent/work/baselines/landed");
+        fs::create_dir_all(landed_root.parent().unwrap()).unwrap();
+        fs::write(&landed_root, "blocked").unwrap();
+
+        let resolver = ContentResolver::new(None);
+        let first = merge_candidate(frozen_config(&fx, &resolver, false)).unwrap();
+        assert_eq!(first.merged_commit, fx.reviewed_sha);
+        let stored = fx.store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            stored.merge_candidates[0].merge_state.status,
+            MergeCandidateMergeStatus::Merged,
+            "baseline preparation cannot turn a durable land into a failed candidate"
+        );
+
+        fs::remove_file(&landed_root).unwrap();
+        let second = merge_candidate(frozen_config(&fx, &resolver, false)).unwrap();
+        assert_eq!(second.merged_commit, fx.reviewed_sha);
+        assert!(
+            fs::read_dir(&landed_root)
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| entry.file_name().to_string_lossy().len() == 64),
+            "retrying an already-merged candidate prepares the missing baseline"
+        );
     }
 
     /// A complete snapshot of a workspace's Git state, used to prove a rejected land
@@ -4893,6 +6990,7 @@ mod tests {
             "work-1",
             "attempt-1-merge-candidate",
             "attempt-1",
+            &fx.source_workspace,
             "new-base",
             "new-tip",
         )
@@ -5923,6 +8021,17 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let project_root = tmp.path().join("project");
         fs::create_dir_all(&project_root).unwrap();
+        fs::create_dir_all(project_root.join(".fluent")).unwrap();
+        fs::write(
+            project_root.join(".fluent/tester.yaml"),
+            "commands:\n  - command: true\n    test_harness: shell-harness\n",
+        )
+        .unwrap();
+        write_executable(
+            &project_root.join(".fluent/extract-tester-results"),
+            "#!/bin/sh\necho '[]'\n",
+        );
+
         let git = |cwd: &Path, args: &[&str]| {
             git::run(cwd, args, "capture land fixture setup").unwrap();
         };
@@ -6012,7 +8121,25 @@ mod tests {
             source_branch: "main".to_string(),
             base_commit: None,
             commit: candidate_commit.clone(),
+            no_change: None,
+            learner_canonicalization: None,
         });
+        let review_ids = item
+            .add_review_tasks("attempt-1", crate::review::REVIEWERS)
+            .unwrap();
+        for id in review_ids {
+            let review = item.attempts[0]
+                .tasks
+                .iter_mut()
+                .find(|task| task.id == id)
+                .unwrap();
+            review.status = TaskStatus::Complete;
+            let area = project_root.join(&review.artifact_area.as_ref().unwrap().path);
+            fs::create_dir_all(&area).unwrap();
+            fs::write(area.join("review.md"), "Verdict: pass\n").unwrap();
+        }
+        item.attempts[0].review_state = Some(AttemptReviewState::Passed);
+        item.attempts[0].status = AttemptStatus::Complete;
         item.create_or_get_merge_candidate("attempt-1").unwrap();
         item.attempts[0].coder_mapping.write = crate::work_model::CoderModelPair {
             coder: CoderKind::Codex,

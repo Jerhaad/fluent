@@ -100,6 +100,17 @@ FLUENT_BIN_OVERRIDE="$REVIEW_ARTIFACT_DIR/target/debug/fluent" \
 | Prefer peer Work Items for independent parallel work | `parallel-work-items-plan` |
 | Define sync points without default Task dependencies or child-run groups | `parallel-work-items-plan` |
 
+### Planning-wide delegation
+
+| Behavior | Test |
+|---|---|
+| Offer explicit planning delegation once after grounding | `test-planning-wide-delegation.sh` |
+| Keep intermediate artifacts provisional and skip recommendation-level questions | `test-planning-wide-delegation.sh` |
+| Interrupt delegated planning for consequential or unsupported choices | `test-planning-wide-delegation.sh` |
+| Present the complete planning set through one final confirmation | `test-planning-wide-delegation.sh` |
+| Keep Work creation, execution, exceptional scope, and landing outside delegation | `test-planning-wide-delegation.sh` |
+| Restore ordered confirmations from the earliest provisional artifact after revocation | `test-planning-wide-delegation.sh` |
+
 ### Operational (tested by binary.rs and operation scripts)
 
 | Behavior | Test |
@@ -125,6 +136,8 @@ FLUENT_BIN_OVERRIDE="$REVIEW_ARTIFACT_DIR/target/debug/fluent" \
 | Work Task run completes review Tasks from durable artifacts while preserving verdict boundaries | `binary.rs`, `test-work-task-run.sh` |
 | Work Attempt run advances planned Tasks, plans reviews, and interprets review outcomes | `binary.rs`, `test-work-attempt-loop.sh` |
 | Work Attempt run creates follow-up writes or needs-user handoffs at review boundaries | `binary.rs`, `test-work-attempt-loop.sh` |
+| Repeated candidate-gate rejection pauses, and explicit recovery admits one correction on the same Attempt | `binary.rs`, `test-work-attempt-loop.sh` |
+| Tree-identical metadata repair preserves its protected base or recovers the same candidate through an audited, idempotent Attempt transition | `candidate_ancestry_recovery.rs`, `work_task_executor.rs` |
 | Merge Candidate inspection prints stored candidate JSON without changing state | `binary.rs`, `test-work-merge-candidate.sh` |
 | Work merge executes ready Merge Candidates only after validating candidate ownership, provenance, source branch, target safety, checks, and reviewers | `binary.rs`, `test-work-merge-candidate.sh` |
 | Work merge rejects invalid stored candidate provenance without rewriting state | `binary.rs`, `test-work-merge-candidate.sh` |

@@ -1,6 +1,6 @@
 ---
 name: next-action-guidance-is-an-executable-interface
-description: A next-action line must match the real CLI signature with authoritative identifiers, and tests must assert and execute the emitted command shape
+description: Render exact eligible CLI commands and preserve recovery blockers through status and show without generic resume fallbacks
 metadata:
   type: testing
 ---
@@ -16,6 +16,13 @@ A prefix assertion is insufficient. Output such as a valid command followed by
 an extra positional argument still contains the expected prefix but is not
 executable. Reconstructing a separate hard-coded command in the test also leaves
 the emitted line unverified.
+
+Preserve a recovery validator's rejection alongside the absence of an eligible
+action. An absent command alone lets outer guidance substitute a generic resume
+hint for a blocked recovery. Derive both the blocker and action from the same
+shared contract, and carry them through status, JSON show, and stderr hints.
+Public-command regressions must check all rendered surfaces after cancellation
+and candidate drift, and verify that observation leaves saved Work unchanged.
 
 At the public binary boundary, assert the complete next-action line, including
 identifiers, delimiters, and the absence of placeholders or forbidden

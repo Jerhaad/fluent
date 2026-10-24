@@ -1,12 +1,20 @@
 use anyhow::{Context, Result, bail};
 use std::env;
 use std::ffi::OsString;
+use std::fmt;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use tempfile::NamedTempFile;
 
 use crate::coder::CoderKind;
 use crate::content::ContentResolver;
 use crate::linux_sandbox;
+
+pub const HOST_SANDBOX_BLOCKED_CODE: &str = "FLUENT_HOST_SANDBOX_BLOCKED";
+pub const HOST_SANDBOX_RECOVERY_GUIDANCE: &str = "Run this Fluent command outside the enclosing \
+Codex or Claude Code sandbox through that agent's normal per-command approval flow, then retry \
+the same command. Fluent will still sandbox its workers; do not pass --no-sandbox or grant the \
+host agent full-session access to recover this boundary.";
 
 /// Rendered sandbox profile that cleans up on drop.
 pub struct SandboxProfile {
@@ -28,13 +36,6 @@ pub enum SandboxBackend {
 
 /// Backend this host confines with, unless `FLUENT_SANDBOX_BACKEND` names
 /// `seatbelt` or `landlock`.
-///
-/// The override exists for tests that stand a mock launcher on `PATH` to
-/// exercise the orchestration around the sandbox: Seatbelt's launcher is a
-/// binary and can be replaced, while Landlock is a kernel facility and cannot.
-/// It selects which backend renders and launches, never whether confinement
-/// happens — naming a backend the host cannot run makes the launch fail. Any
-/// other value leaves the host default in place.
 pub fn backend() -> SandboxBackend {
     match env::var("FLUENT_SANDBOX_BACKEND").as_deref() {
         Ok("seatbelt") => SandboxBackend::Seatbelt,
@@ -45,11 +46,6 @@ pub fn backend() -> SandboxBackend {
 }
 
 /// Program that applies a rendered profile and then runs the confined command.
-///
-/// `trusted` asks for a path that a `PATH` entry cannot shadow. Landlock has no
-/// launcher binary of its own, so Fluent re-executes itself; `current_exe`
-/// resolves through `/proc/self/exe` and is already unshadowable, which is why
-/// both cases return the same path there.
 pub fn sandbox_launcher(trusted: bool) -> OsString {
     match backend() {
         SandboxBackend::Seatbelt if trusted => OsString::from("/usr/bin/sandbox-exec"),
@@ -71,6 +67,535 @@ pub fn sandbox_launcher_args(profile: &str) -> Vec<String> {
             "--".to_string(),
         ],
     }
+}
+
+/// Deny existing source product entries after the profile's broad temporary
+/// directory grants. Include the physical path because macOS resolves /var to
+/// /private/var before applying Seatbelt rules.
+pub(crate) fn deny_writer_source_entries(
+    profile: &SandboxProfile,
+    source: &Path,
+    candidate: &Path,
+    task_artifact: &Path,
+    writer_cache: &Path,
+) -> Result<()> {
+    let physical_source = std::fs::canonicalize(source)?;
+    // The Writer profile is rendered before the worktree is created. Resolve
+    // its existing parent without creating the workspace during preflight.
+    let physical_candidate = match std::fs::canonicalize(candidate) {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let parent = candidate
+                .parent()
+                .context("Writer candidate has no parent")?;
+            std::fs::canonicalize(parent)?.join(
+                candidate
+                    .file_name()
+                    .context("Writer candidate has no file name")?,
+            )
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let artifact_root = source.join(".fluent/work/artifacts");
+    let relative_artifact = task_artifact
+        .strip_prefix(&artifact_root)
+        .context("Writer artifact grant must stay inside the Work artifact tree")?;
+    anyhow::ensure!(
+        relative_artifact.components().count() >= 3
+            && relative_artifact
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_))),
+        "Writer artifact grant must name one Task artifact area"
+    );
+    let mut identity = relative_artifact.components();
+    let work_item = identity
+        .next()
+        .context("Writer artifact has no Work Item")?;
+    let attempt = identity.next().context("Writer artifact has no Attempt")?;
+    let expected_cache = source
+        .join(".fluent/work/cache/writers")
+        .join(work_item.as_os_str())
+        .join(attempt.as_os_str());
+    anyhow::ensure!(
+        writer_cache == expected_cache,
+        "Writer cache grant must name the exact current Attempt"
+    );
+    if physical_source == physical_candidate {
+        return Ok(());
+    }
+    let mut content = std::fs::read_to_string(&profile.path)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let path = entry.path();
+        if candidate.starts_with(&path)
+            || physical_candidate.starts_with(physical_source.join(entry.file_name()))
+            || entry.file_name() == ".git"
+        {
+            continue;
+        }
+        if entry.file_name() == ".fluent" {
+            for child in std::fs::read_dir(&path)? {
+                let child = child?;
+                if child.file_name() == "work" {
+                    append_writer_source_rule(
+                        &mut content,
+                        source,
+                        &physical_source,
+                        &child.path(),
+                        "deny",
+                    );
+                    for allowed in ["progress"] {
+                        append_writer_source_rule(
+                            &mut content,
+                            source,
+                            &physical_source,
+                            &child.path().join(allowed),
+                            "allow",
+                        );
+                    }
+                    append_writer_source_rule(
+                        &mut content,
+                        source,
+                        &physical_source,
+                        task_artifact,
+                        "allow",
+                    );
+                    append_writer_source_rule(
+                        &mut content,
+                        source,
+                        &physical_source,
+                        writer_cache,
+                        "allow",
+                    );
+                } else {
+                    append_writer_source_rule(
+                        &mut content,
+                        source,
+                        &physical_source,
+                        &child.path(),
+                        "deny",
+                    );
+                }
+            }
+            continue;
+        }
+        append_writer_source_rule(&mut content, source, &physical_source, &path, "deny");
+    }
+    std::fs::write(&profile.path, content)?;
+    Ok(())
+}
+
+fn append_writer_source_rule(
+    content: &mut String,
+    source: &Path,
+    physical_source: &Path,
+    path: &Path,
+    decision: &str,
+) {
+    content.push_str(&format!(
+        "\n({decision} file-write* (subpath {}))",
+        sbpl_string(path)
+    ));
+    let physical_path = physical_source.join(path.strip_prefix(source).unwrap());
+    if physical_path != path {
+        content.push_str(&format!(
+            "\n({decision} file-write* (subpath {}))",
+            sbpl_string(&physical_path)
+        ));
+    }
+}
+
+/// The enclosing host could not apply Fluent's production Seatbelt profile.
+///
+/// This is distinct from a coder failure: the workload never started, so callers
+/// can pause and later retry the same Task without charging its work budget.
+#[derive(Debug)]
+pub struct HostSandboxPreflightError {
+    message: String,
+}
+
+impl fmt::Display for HostSandboxPreflightError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{HOST_SANDBOX_BLOCKED_CODE}: host sandbox preflight failed: {}\n\
+             {HOST_SANDBOX_RECOVERY_GUIDANCE}",
+            self.message,
+        )
+    }
+}
+
+impl std::error::Error for HostSandboxPreflightError {}
+
+impl HostSandboxPreflightError {
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+/// A provider process started, but its runtime could not inspect inherited
+/// process streams inside Fluent's production Seatbelt boundary. This is a host
+/// boundary failure rather than model work and is therefore safely resumable.
+#[derive(Debug)]
+pub(crate) struct HostSandboxLaunchError {
+    message: String,
+}
+
+impl fmt::Display for HostSandboxLaunchError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{HOST_SANDBOX_BLOCKED_CODE}: provider launch was blocked by the sandbox boundary: {}",
+            self.message
+        )
+    }
+}
+
+impl std::error::Error for HostSandboxLaunchError {}
+
+impl HostSandboxLaunchError {
+    pub(crate) fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+/// Recognize the narrow Claude/Bun startup failure seen when an inherited
+/// stdout or stderr descriptor points outside the worker's readable boundary.
+/// Requiring both the fstat denial and stream-construction evidence avoids
+/// treating ordinary workspace permission errors as host-sandbox failures.
+pub(crate) fn classify_host_sandbox_launch_stderr(path: &Path) -> Option<HostSandboxLaunchError> {
+    let diagnostic = std::fs::read_to_string(path).ok()?;
+    let denied_fstat = diagnostic.contains("EPERM: operation not permitted, fstat");
+    let inherited_stream = diagnostic.contains("new WriteStream")
+        || diagnostic.contains("process.stderr.fd")
+        || diagnostic.contains("process.stdout.fd");
+    (denied_fstat && inherited_stream).then(|| HostSandboxLaunchError {
+        message: format!(
+            "Claude's runtime could not inspect its standard stream; diagnostic saved at {}",
+            path.display()
+        ),
+    })
+}
+
+/// Claude 2.1.220's Bash tool ignores TMPDIR and creates per-session command
+/// state beneath `/private/tmp/claude-<uid>/<workspace-key>/`. Learner profiles
+/// intentionally remove the shared temp-tree grant, so grant only the current
+/// workspace's namespace rather than restoring write access to `/private/tmp`.
+#[cfg(unix)]
+pub(crate) fn claude_bash_temp_root(workspace_path: &Path) -> PathBuf {
+    // SAFETY: geteuid has no preconditions and does not mutate process state.
+    let uid = unsafe { libc::geteuid() };
+    let workspace_key: String = workspace_path
+        .to_string_lossy()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    PathBuf::from(format!("/private/tmp/claude-{uid}/{workspace_key}"))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn claude_bash_temp_root(workspace_path: &Path) -> PathBuf {
+    std::env::temp_dir()
+        .join("claude")
+        .join(workspace_path.to_string_lossy().replace(['/', '\\'], "-"))
+}
+
+/// Apply an already-rendered production profile to a harmless command.
+///
+/// macOS is the only platform where Fluent uses Seatbelt. Keeping this probe
+/// adjacent to profile rendering makes it impossible for launch planners to
+/// accidentally test a weaker boundary than the one they later hand to a coder.
+pub fn preflight_profile(profile: &SandboxProfile) -> Result<()> {
+    #[cfg(feature = "test-support")]
+    if let Some(result) = test_preflight_result() {
+        return result;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        preflight_profile_with(profile, |profile_path| {
+            Command::new(sandbox_exec_program())
+                .arg("-f")
+                .arg(profile_path)
+                .arg("/usr/bin/true")
+                .output()
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = profile;
+        Ok(())
+    }
+}
+
+/// Verify that an already-rendered profile can read every existing root in a
+/// Reviewer launch plan.
+///
+/// Run this before reserving the model call. A profile that launches correctly
+/// but cannot open its declared candidate or evidence inputs is not a usable
+/// reviewer boundary.
+pub fn preflight_readable_paths(profile: &SandboxProfile, paths: &[PathBuf]) -> Result<()> {
+    #[cfg(feature = "test-support")]
+    if let Some(result) = test_reviewer_read_preflight_result() {
+        return result;
+    }
+    #[cfg(feature = "test-support")]
+    if let Some(result) = test_preflight_result() {
+        return result;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let existing = paths
+            .iter()
+            .filter(|path| path.exists())
+            .collect::<Vec<_>>();
+        if existing.is_empty() {
+            return Ok(());
+        }
+
+        let files = existing
+            .iter()
+            .copied()
+            .filter(|path| path.is_file())
+            .collect::<Vec<_>>();
+        let directories = existing
+            .iter()
+            .copied()
+            .filter(|path| path.is_dir())
+            .collect::<Vec<_>>();
+        let run_probe = |program: &str, args: &[&str], probe_paths: &[&PathBuf]| {
+            let mut command = Command::new(sandbox_exec_program());
+            command
+                .arg("-f")
+                .arg(&profile.path)
+                .arg(program)
+                .args(args)
+                .args(probe_paths)
+                .stdout(Stdio::null());
+            command.output()
+        };
+        for (kind, program, args, group) in [
+            ("file", "/bin/cat", Vec::new(), files),
+            ("directory", "/bin/ls", vec!["-1"], directories),
+        ] {
+            if group.is_empty() {
+                continue;
+            }
+            let output =
+                run_probe(program, &args, &group).map_err(|error| HostSandboxPreflightError {
+                    message: format!("could not probe reviewer {kind} read paths: {error}"),
+                })?;
+            if output.status.success() {
+                continue;
+            }
+
+            for path in group {
+                let output = run_probe(program, &args, &[path]).map_err(|error| {
+                    HostSandboxPreflightError {
+                        message: format!(
+                            "could not probe reviewer read path {}: {error}",
+                            path.display()
+                        ),
+                    }
+                })?;
+                if output.status.success() {
+                    continue;
+                }
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                let detail = if stderr.is_empty() {
+                    format!("{program} exited with {}", output.status)
+                } else {
+                    stderr
+                };
+                return Err(HostSandboxPreflightError {
+                    message: format!(
+                        "reviewer cannot read declared path {}: {detail}",
+                        path.display()
+                    ),
+                }
+                .into());
+            }
+            return Err(HostSandboxPreflightError {
+                message: format!(
+                    "reviewer {kind} read-path probe failed without identifying a path"
+                ),
+            }
+            .into());
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (profile, paths);
+        Ok(())
+    }
+}
+
+/// Verify that the enclosing host lets Fluent establish its own worker sandbox.
+///
+/// This probe applies Fluent's production common Seatbelt layer to a harmless
+/// process. Call it before provider authentication or durable execution state so
+/// an outer agent sandbox cannot masquerade as a provider login failure or claim
+/// work that the host cannot run.
+pub fn preflight_host_execution(project_root: &Path, resolver: &ContentResolver) -> Result<()> {
+    check_sandbox_prerequisite()?;
+    let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let project_root =
+        std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    let profile = render_profile_common_only(resolver, &home, &[project_root], &[])?;
+    preflight_profile(&profile)
+}
+
+/// Authenticate through the prepared Codex launcher inside the exact profile
+/// that the autonomous role will retain for its model launch.
+pub fn preflight_codex_launcher(
+    profile: &SandboxProfile,
+    worker: &crate::codex_worker::CodexWorkerEnvironment,
+) -> Result<()> {
+    // Exercise this later gate independently of the coordinator's host probe.
+    #[cfg(feature = "test-support")]
+    if env::var("FLUENT_TEST_CODEX_SANDBOX_PREFLIGHT").as_deref() == Ok("fail") {
+        return Err(HostSandboxPreflightError {
+            message: "test private Codex sandbox preflight failure".into(),
+        }
+        .into());
+    }
+    #[cfg(feature = "test-support")]
+    if let Some(result) = test_preflight_result() {
+        return result;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let output =
+            codex_preflight_command(&profile.path, worker.launcher().executable(), worker.home())
+                .output()
+                .map_err(|error| HostSandboxPreflightError {
+                    message: format!(
+                        "could not execute prepared Codex launcher {}: {error}",
+                        worker.launcher().executable().display()
+                    ),
+                })?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let detail = if stderr.is_empty() {
+                format!("prepared Codex launcher exited with {}", output.status)
+            } else {
+                stderr
+            };
+            return Err(HostSandboxPreflightError { message: detail }.into());
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (profile, worker);
+        Ok(())
+    }
+}
+
+fn codex_preflight_command(profile_path: &Path, launcher: &Path, worker_home: &Path) -> Command {
+    let mut command = Command::new(sandbox_exec_program());
+    command
+        .arg("-f")
+        .arg(profile_path)
+        .arg(launcher)
+        .args(["login", "status"])
+        // The production profile does not grant the caller's arbitrary current
+        // directory. The staged private home is an explicit capability even
+        // when a strict profile denies the shared system temporary directory.
+        .current_dir(worker_home)
+        .env("CODEX_HOME", worker_home);
+    command
+}
+
+/// Enable a deterministic probe outcome only for test-support binaries.
+///
+/// Production builds always execute the system-owned Seatbelt launcher. The
+/// test runner opts into this narrow seam so integration fixtures can control
+/// the host capability without replacing the trusted launcher through `PATH`.
+#[cfg(feature = "test-support")]
+fn test_preflight_result() -> Option<Result<()>> {
+    match env::var("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT")
+        .ok()
+        .as_deref()
+    {
+        Some("pass" | "render-pass") => Some(Ok(())),
+        Some("fail") => Some(Err(HostSandboxPreflightError {
+            message: "test host sandbox preflight failure".to_string(),
+        }
+        .into())),
+        _ => None,
+    }
+}
+
+/// Fail only the Reviewer read-path probe in route tests. The general host
+/// preflight can still pass, proving that this later gate prevents reservation.
+#[cfg(feature = "test-support")]
+fn test_reviewer_read_preflight_result() -> Option<Result<()>> {
+    match env::var("FLUENT_TEST_REVIEWER_READ_PREFLIGHT")
+        .ok()
+        .as_deref()
+    {
+        Some("fail") => Some(Err(HostSandboxPreflightError {
+            message: "test reviewer read-path preflight failure".to_string(),
+        }
+        .into())),
+        _ => None,
+    }
+}
+
+/// Select the system-owned Seatbelt launcher.
+///
+/// The preflight must exercise the same trusted production boundary in every
+/// build. Tests that need to control the probe inject its executor through
+/// [`preflight_profile_with`] instead of replacing a security boundary via
+/// `PATH`.
+fn sandbox_exec_program() -> &'static str {
+    "/usr/bin/sandbox-exec"
+}
+
+/// Build a command under the exact rendered Seatbelt profile. Production
+/// always uses the system launcher; route tests may replace only that launcher
+/// in test-support builds.
+pub(crate) fn command_under_profile(profile: &SandboxProfile, program: &Path) -> Command {
+    #[cfg(feature = "test-support")]
+    let launcher = env::var_os("FLUENT_TEST_FOCUSED_EVIDENCE_SANDBOX_EXEC")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(sandbox_exec_program()));
+    #[cfg(not(feature = "test-support"))]
+    let launcher = PathBuf::from(sandbox_exec_program());
+    let mut command = Command::new(launcher);
+    command.arg("-f").arg(&profile.path).arg(program);
+    command
+}
+
+/// Run a rendered profile through a caller-supplied probe executor.
+///
+/// Production calls this through [`preflight_profile`] with the trusted absolute
+/// Seatbelt launcher. Route tests can inject only the probe execution, while
+/// retaining the real rendered profile and every surrounding state transition.
+pub fn preflight_profile_with(
+    profile: &SandboxProfile,
+    run_probe: impl FnOnce(&Path) -> std::io::Result<std::process::Output>,
+) -> Result<()> {
+    let output = run_probe(&profile.path).map_err(|error| HostSandboxPreflightError {
+        message: format!("could not execute sandbox-exec: {error}"),
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let detail = if stderr.is_empty() {
+            format!("sandbox-exec exited with {}", output.status)
+        } else {
+            stderr
+        };
+        return Err(HostSandboxPreflightError { message: detail }.into());
+    }
+    Ok(())
 }
 
 /// Render a Claude Seatbelt sandbox profile with placeholder substitution.
@@ -141,7 +666,132 @@ pub fn render_profile_for_access_for_coder_with_codex_home(
         &[],
         Some(coder_kind),
         codex_home,
+        true,
     )
+}
+
+/// Render a Codex profile whose private home and explicit scope roots replace
+/// access to the runner owner's home.
+pub fn render_profile_for_scoped_codex_provider(
+    resolver: &ContentResolver,
+    private_home: &Path,
+    writable_roots: &[PathBuf],
+    readable_roots: &[PathBuf],
+    codex_home: &Path,
+) -> Result<SandboxProfile> {
+    // Include the overlay's private home in root rendering so realpath can
+    // traverse its ancestors without reading unrelated temporary contents.
+    let mut readable = readable_roots.to_vec();
+    readable.push(codex_home.to_path_buf());
+    let profile = render_profile_for_access(
+        resolver,
+        &private_home.to_string_lossy(),
+        writable_roots,
+        &readable,
+        &[],
+        Some(CoderKind::Codex),
+        Some(codex_home),
+        false,
+    )?;
+    let mut content = std::fs::read_to_string(&profile.path)?;
+    for broad_grant in [
+        "(allow file-read* (subpath \"/private/var\"))",
+        "(allow file-read* (subpath \"/private/tmp\"))",
+        "(allow file-read* (subpath \"/var\"))",
+        "(allow file-read* (subpath \"/tmp\"))",
+        "(allow file-read*  (subpath \"/private/var/folders\"))",
+        "(allow file-write* (subpath \"/private/var/folders\"))",
+        "(allow file-write* (subpath \"/private/tmp\"))",
+        "(allow file-read* (subpath \"/Volumes\"))",
+    ] {
+        content = content.replace(
+            broad_grant,
+            "; scoped providers do not receive shared filesystem access",
+        );
+    }
+    std::fs::write(&profile.path, content)?;
+    Ok(profile)
+}
+
+/// Admit installed tools read-only while allowing compiled workspace programs.
+/// Keep these grants separate from the provider's private mutable home.
+pub(crate) fn render_profile_for_scoped_codex_provider_with_tools(
+    resolver: &ContentResolver,
+    private_home: &Path,
+    writable_roots: &[PathBuf],
+    readable_roots: &[PathBuf],
+    codex_home: &Path,
+    installed_tools: &[PathBuf],
+) -> Result<SandboxProfile> {
+    let mut readable = readable_roots.to_vec();
+    readable.extend_from_slice(installed_tools);
+    let profile = render_profile_for_scoped_codex_provider(
+        resolver,
+        private_home,
+        writable_roots,
+        &readable,
+        codex_home,
+    )?;
+    let mut content = std::fs::read_to_string(&profile.path)?;
+    for root in writable_roots.iter().chain(installed_tools) {
+        content.push_str(&format!(
+            "\n(allow file-map-executable (subpath {}))",
+            sbpl_string(root)
+        ));
+    }
+    for root in installed_tools {
+        content.push_str(&format!(
+            "\n(deny file-write* (subpath {}))",
+            sbpl_string(root)
+        ));
+    }
+    std::fs::write(&profile.path, content)?;
+    Ok(profile)
+}
+
+/// Render an autonomous Claude profile whose mutable provider state lives under
+/// a Fluent-managed home. The operator's project/session tree is denied even
+/// though the shared profile keeps legacy interactive Claude grants.
+pub fn render_profile_for_access_for_autonomous_claude(
+    resolver: &ContentResolver,
+    source_home: &str,
+    writable_roots: &[PathBuf],
+    readable_roots: &[PathBuf],
+) -> Result<SandboxProfile> {
+    let profile = render_profile_for_access(
+        resolver,
+        source_home,
+        writable_roots,
+        readable_roots,
+        &[],
+        Some(CoderKind::Claude),
+        None,
+        true,
+    )?;
+    let source_home = PathBuf::from(source_home);
+    let canonical_source_home =
+        std::fs::canonicalize(&source_home).unwrap_or_else(|_| source_home.clone());
+    let mut source_projects = vec![source_home.join(".claude/projects")];
+    let canonical_projects = canonical_source_home.join(".claude/projects");
+    if canonical_projects != source_projects[0] {
+        source_projects.push(canonical_projects);
+    }
+    let deny = source_projects
+        .iter()
+        .flat_map(|projects| {
+            [
+                format!("(deny file-read* (subpath {}))", sbpl_string(projects)),
+                format!("(deny file-write* (subpath {}))", sbpl_string(projects)),
+            ]
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    // File rules are resolved by the most specific matching operation and
+    // filter. Keep these explicit denials after the shared Claude grants so a
+    // broad home or macOS temp allowance cannot win for the project tree.
+    let content = format!("{}\n{deny}\n", std::fs::read_to_string(&profile.path)?);
+    std::fs::write(&profile.path, content)?;
+    Ok(profile)
 }
 
 /// Render a coder profile with explicit write denials that override broad
@@ -184,19 +834,18 @@ pub fn render_profile_for_access_for_coder_with_denied_writes_and_codex_home(
         denied_write_roots,
         Some(coder_kind),
         codex_home,
+        true,
     )?;
-    if backend() == SandboxBackend::Seatbelt {
-        let content = std::fs::read_to_string(&profile.path)?
-            .replace(
-                "(allow file-write* (subpath \"/private/var/folders\"))",
-                "; handoff-only profiles do not grant the shared macOS temp tree",
-            )
-            .replace(
-                "(allow file-write* (subpath \"/private/tmp\"))",
-                "; handoff-only profiles do not grant shared /private/tmp",
-            );
-        std::fs::write(&profile.path, content)?;
-    }
+    let content = std::fs::read_to_string(&profile.path)?
+        .replace(
+            "(allow file-write* (subpath \"/private/var/folders\"))",
+            "; handoff-only profiles do not grant the shared macOS temp tree",
+        )
+        .replace(
+            "(allow file-write* (subpath \"/private/tmp\"))",
+            "; handoff-only profiles do not grant shared /private/tmp",
+        );
+    std::fs::write(&profile.path, content)?;
     Ok(profile)
 }
 
@@ -215,7 +864,42 @@ pub fn render_profile_common_only(
         &[],
         None,
         None,
+        true,
     )
+}
+
+/// Render the common tool profile and deny access to exact user-state trees
+/// that a host-owned check never needs. Keep these denials after the common
+/// grants so broad provider compatibility rules cannot expose agent sessions.
+pub fn render_profile_common_only_with_denied_access(
+    resolver: &ContentResolver,
+    home: &str,
+    writable_roots: &[PathBuf],
+    readable_roots: &[PathBuf],
+    denied_read_roots: &[PathBuf],
+    denied_write_roots: &[PathBuf],
+) -> Result<SandboxProfile> {
+    let profile = render_profile_common_only(resolver, home, writable_roots, readable_roots)?;
+    let mut rules = Vec::new();
+    rules.extend(
+        denied_read_roots
+            .iter()
+            .map(|root| format!("(deny file-read* (subpath {}))", sbpl_string(root))),
+    );
+    rules.extend(
+        denied_write_roots
+            .iter()
+            .map(|root| format!("(deny file-write* (subpath {}))", sbpl_string(root))),
+    );
+    if !rules.is_empty() {
+        let content = format!(
+            "{}\n{}\n",
+            std::fs::read_to_string(&profile.path)?,
+            rules.join("\n")
+        );
+        std::fs::write(&profile.path, content)?;
+    }
+    Ok(profile)
 }
 
 fn render_profile_for_access(
@@ -226,69 +910,7 @@ fn render_profile_for_access(
     denied_write_roots: &[PathBuf],
     coder_kind: Option<CoderKind>,
     codex_home: Option<&Path>,
-) -> Result<SandboxProfile> {
-    match backend() {
-        SandboxBackend::Seatbelt => render_seatbelt_profile(
-            resolver,
-            home,
-            writable_roots,
-            readable_roots,
-            denied_write_roots,
-            coder_kind,
-            codex_home,
-        ),
-        SandboxBackend::Landlock => render_landlock_policy(
-            home,
-            writable_roots,
-            readable_roots,
-            denied_write_roots,
-            coder_kind,
-            codex_home,
-        ),
-    }
-}
-
-/// Render a Landlock policy and write it where the launcher will read it.
-///
-/// A handoff-only profile — one that names denied write roots — also loses the
-/// shared temp trees, matching what the Seatbelt renderer strips from
-/// `common.sb`: a writable `/tmp` is a channel out of the confinement the
-/// denials exist to create.
-fn render_landlock_policy(
-    home: &str,
-    writable_roots: &[PathBuf],
-    readable_roots: &[PathBuf],
-    denied_write_roots: &[PathBuf],
-    coder_kind: Option<CoderKind>,
-    codex_home: Option<&Path>,
-) -> Result<SandboxProfile> {
-    let policy = linux_sandbox::render(&linux_sandbox::PolicyRequest {
-        home: Path::new(home),
-        writable_roots,
-        readable_roots,
-        denied_write_roots,
-        coder_kind,
-        codex_home,
-        grant_shared_temp: denied_write_roots.is_empty(),
-    })?;
-
-    let temp_file = NamedTempFile::with_prefix("fluent-sandbox-")?;
-    std::fs::write(temp_file.path(), linux_sandbox::serialize(&policy)?)?;
-    let path = temp_file.path().to_path_buf();
-    Ok(SandboxProfile {
-        _temp_file: temp_file,
-        path,
-    })
-}
-
-fn render_seatbelt_profile(
-    resolver: &ContentResolver,
-    home: &str,
-    writable_roots: &[PathBuf],
-    readable_roots: &[PathBuf],
-    denied_write_roots: &[PathBuf],
-    coder_kind: Option<CoderKind>,
-    codex_home: Option<&Path>,
+    deny_codex_source_home: bool,
 ) -> Result<SandboxProfile> {
     if writable_roots.is_empty() {
         bail!("At least one writable sandbox root is required");
@@ -307,6 +929,17 @@ fn render_seatbelt_profile(
         common
     };
 
+    if backend() == SandboxBackend::Landlock {
+        return render_landlock_policy(
+            home,
+            writable_roots,
+            readable_roots,
+            denied_write_roots,
+            coder_kind,
+            codex_home,
+        );
+    }
+
     let root_rules = render_root_rules(writable_roots, readable_roots);
     let primary_root = writable_roots[0].to_string_lossy();
     let combined = if combined.contains("_SANDBOX_ROOT_RULES_") {
@@ -324,7 +957,7 @@ fn render_seatbelt_profile(
     // Autonomous Codex workers use a staged home.  Deny the interactive source
     // explicitly before common.sb's broad home read grants so the profile cannot
     // reach hooks, configuration, sessions, or the original credentials.
-    if let Some(worker_home) = codex_home {
+    if deny_codex_source_home && let Some(worker_home) = codex_home {
         let source_home = crate::codex_worker::effective_source_home();
         if worker_home != source_home {
             let source = sbpl_string(&source_home);
@@ -363,6 +996,34 @@ fn render_seatbelt_profile(
     })
 }
 
+/// Render a Landlock policy and write it where the launcher will read it.
+fn render_landlock_policy(
+    home: &str,
+    writable_roots: &[PathBuf],
+    readable_roots: &[PathBuf],
+    denied_write_roots: &[PathBuf],
+    coder_kind: Option<CoderKind>,
+    codex_home: Option<&Path>,
+) -> Result<SandboxProfile> {
+    let policy = linux_sandbox::render(&linux_sandbox::PolicyRequest {
+        home: Path::new(home),
+        writable_roots,
+        readable_roots,
+        denied_write_roots,
+        coder_kind,
+        codex_home,
+        grant_shared_temp: denied_write_roots.is_empty(),
+    })?;
+
+    let temp_file = NamedTempFile::with_prefix("fluent-sandbox-")?;
+    std::fs::write(temp_file.path(), linux_sandbox::serialize(&policy)?)?;
+    let path = temp_file.path().to_path_buf();
+    Ok(SandboxProfile {
+        _temp_file: temp_file,
+        path,
+    })
+}
+
 fn sandbox_profile_path(coder_kind: CoderKind) -> &'static str {
     match coder_kind {
         CoderKind::Claude => "sandbox/claude-code.sb",
@@ -372,6 +1033,19 @@ fn sandbox_profile_path(coder_kind: CoderKind) -> &'static str {
 }
 
 fn render_root_rules(writable_roots: &[PathBuf], readable_roots: &[PathBuf]) -> String {
+    let mut traversal_roots = writable_roots
+        .iter()
+        .chain(readable_roots)
+        .flat_map(|root| root.ancestors().skip(1))
+        .filter(|ancestor| ancestor.parent().is_some())
+        .map(Path::to_path_buf)
+        .collect::<Vec<_>>();
+    traversal_roots.sort();
+    traversal_roots.dedup();
+    let traversal_rules = traversal_roots
+        .iter()
+        .map(|root| format!("(allow file-read-metadata (literal {}))", sbpl_string(root)))
+        .collect::<Vec<_>>();
     let writable_rules = writable_roots
         .iter()
         .map(|root| {
@@ -386,8 +1060,9 @@ fn render_root_rules(writable_roots: &[PathBuf], readable_roots: &[PathBuf]) -> 
             format!("(allow file-read*  (subpath {root}))")
         })
         .collect::<Vec<_>>();
-    writable_rules
+    traversal_rules
         .into_iter()
+        .chain(writable_rules)
         .chain(readable_rules)
         .collect::<Vec<_>>()
         .join("\n")
@@ -401,13 +1076,7 @@ fn sbpl_string(path: &Path) -> String {
     format!("\"{escaped}\"")
 }
 
-/// Report whether a rendered profile grants `target` as a writable root.
-///
-/// Tests assert what the renderer emitted for a named root, not whether the
-/// path is reachable by some broader system grant — a workspace under `/tmp` is
-/// writable on both backends, which is why handoff profiles drop the shared
-/// temp trees. The two backends spell the same grant differently, so the
-/// comparison is on the root, not on the syntax.
+// Report whether a rendered profile grants `target` as a writable root.
 #[cfg(test)]
 pub(crate) fn profile_grants_write(profile_text: &str, target: &Path) -> bool {
     profile_grants(profile_text, target, true)
@@ -451,8 +1120,7 @@ fn profile_grants(profile_text: &str, target: &Path, writable: bool) -> bool {
     }
 }
 
-/// Shared temporary trees a coder may write. Handoff-only profiles withhold
-/// them so a confined coder cannot pass files around the confinement.
+/// Shared temporary trees a coder may write.
 #[cfg(test)]
 pub(crate) fn shared_temp_roots() -> Vec<PathBuf> {
     match backend() {
@@ -474,22 +1142,15 @@ pub fn check_prerequisites() -> Result<()> {
 
 /// Check that sandbox prerequisites and the selected coder are available.
 pub fn check_prerequisites_for(coder_kind: CoderKind) -> Result<()> {
-    match backend() {
-        SandboxBackend::Seatbelt => {
-            if !command_exists("sandbox-exec") {
-                bail!("sandbox-exec not found; Fluent confines coders with Seatbelt on macOS");
-            }
-        }
-        SandboxBackend::Landlock => {
-            if !linux_sandbox::is_available() {
-                bail!(
-                    "this kernel offers no Landlock; Fluent confines coders with it on Linux, \
-                     which needs Linux 5.13 or newer with the LSM enabled"
-                );
-            }
-        }
-    }
+    check_sandbox_prerequisite()?;
     check_coder_prerequisite(coder_kind)?;
+    Ok(())
+}
+
+pub fn check_sandbox_prerequisite() -> Result<()> {
+    if !command_exists("sandbox-exec") {
+        bail!("sandbox-exec not found (macOS only)");
+    }
     Ok(())
 }
 
@@ -529,32 +1190,43 @@ fn is_executable(path: &std::path::Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
-    /// The public renderers dispatch on the host, so these drive the Seatbelt
-    /// writer directly and keep asserting SBPL on a Linux builder.
-    fn seatbelt(
-        home: &str,
-        writable: &[PathBuf],
-        readable: &[PathBuf],
-        coder: Option<CoderKind>,
-        codex_home: Option<&Path>,
-    ) -> SandboxProfile {
-        render_seatbelt_profile(
+    #[test]
+    fn scoped_writer_tools_allow_mapping_and_deny_installed_writes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let private = tmp.path().join("private");
+        let installed = tmp.path().join("installed");
+        let workspace = tmp.path().join("workspace");
+        let profile = render_profile_for_scoped_codex_provider_with_tools(
             &ContentResolver::new(None),
-            home,
-            writable,
-            readable,
+            &private,
+            &[workspace.clone()],
             &[],
-            coder,
-            codex_home,
+            &private,
+            &[installed.clone()],
         )
-        .unwrap()
+        .unwrap();
+        let text = std::fs::read_to_string(profile.path).unwrap();
+        assert!(text.contains(&format!(
+            "(allow file-map-executable (subpath {}))",
+            sbpl_string(&installed)
+        )));
+        assert!(text.contains(&format!(
+            "(deny file-write* (subpath {}))",
+            sbpl_string(&installed)
+        )));
+        assert!(text.contains(&format!(
+            "(allow file-map-executable (subpath {}))",
+            sbpl_string(&workspace)
+        )));
+        assert!(!text.contains("(allow file-write* (subpath \"/private/tmp\"))"));
     }
+    use super::*;
 
     #[test]
     fn test_render_profile_substitution() {
-        let profile = seatbelt("/Users/test", &[PathBuf::from("/Users/test/project")], &[], Some(CoderKind::Claude), None);
+        let resolver = ContentResolver::new(None);
+        let profile = render_profile(&resolver, "/Users/test", "/Users/test/project").unwrap();
 
         let content = std::fs::read_to_string(&profile.path).unwrap();
         assert!(content.contains("/Users/test"));
@@ -565,8 +1237,215 @@ mod tests {
     }
 
     #[test]
+    fn task_host_sandbox_preflight_runs_before_reservation_or_launch() {
+        let resolver = ContentResolver::new(None);
+        let profile = render_profile(&resolver, "/Users/test", "/Users/test/project").unwrap();
+        let expected_path = profile.path.clone();
+        let observed_path = std::cell::RefCell::new(None);
+
+        preflight_profile_with(&profile, |path| {
+            *observed_path.borrow_mut() = Some(path.to_path_buf());
+            Command::new("/usr/bin/true").output()
+        })
+        .unwrap();
+
+        assert_eq!(observed_path.into_inner(), Some(expected_path));
+    }
+
+    #[test]
+    fn host_sandbox_preflight_uses_the_system_launcher() {
+        assert_eq!(sandbox_exec_program(), "/usr/bin/sandbox-exec");
+    }
+
+    #[test]
+    fn host_sandbox_failure_explains_scoped_agent_recovery() {
+        let error = HostSandboxPreflightError {
+            message: "sandbox_apply: Operation not permitted".to_string(),
+        };
+        let rendered = error.to_string();
+
+        assert!(rendered.contains(HOST_SANDBOX_BLOCKED_CODE));
+        assert!(rendered.contains("outside the enclosing Codex or Claude Code sandbox"));
+        assert!(rendered.contains("normal per-command approval flow"));
+        assert!(rendered.contains("Fluent will still sandbox its workers"));
+        assert!(rendered.contains("do not pass --no-sandbox"));
+        assert!(rendered.contains("full-session access"));
+    }
+
+    #[test]
+    fn claude_stream_fstat_denial_is_a_host_sandbox_launch_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let diagnostic = dir.path().join("provider-stderr.log");
+        std::fs::write(
+            &diagnostic,
+            "EPERM: operation not permitted, fstat\n    at new WriteStream\nprocess.stderr.fd\n",
+        )
+        .unwrap();
+
+        let failure = classify_host_sandbox_launch_stderr(&diagnostic)
+            .expect("the Claude/Bun inherited-stream failure must be recognized");
+        assert!(failure.message().contains("standard stream"));
+        assert!(failure.message().contains("provider-stderr.log"));
+    }
+
+    #[test]
+    fn unrelated_permission_failure_is_not_a_host_sandbox_launch_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let diagnostic = dir.path().join("provider-stderr.log");
+        std::fs::write(
+            &diagnostic,
+            "EPERM: operation not permitted, open '/project/private-file'\n",
+        )
+        .unwrap();
+
+        assert!(classify_host_sandbox_launch_stderr(&diagnostic).is_none());
+    }
+
+    #[test]
+    fn claude_bash_temp_root_is_scoped_to_uid_and_workspace() {
+        let first = claude_bash_temp_root(Path::new("/workspace/attempt-a"));
+        let second = claude_bash_temp_root(Path::new("/workspace/attempt-b"));
+        let dotted = claude_bash_temp_root(Path::new("/workspace/.scratch/release-0.2"));
+
+        assert!(first.to_string_lossy().starts_with("/private/tmp/claude-"));
+        assert!(first.ends_with("-workspace-attempt-a"));
+        assert!(dotted.ends_with("-workspace--scratch-release-0-2"));
+        assert_ne!(first, second);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn confined_profile_writes_only_its_claude_bash_temp_namespace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let own_temp = claude_bash_temp_root(workspace.path());
+        let sibling_temp = own_temp.with_file_name(format!(
+            "{}-sibling",
+            own_temp.file_name().unwrap().to_string_lossy()
+        ));
+        let resolver = ContentResolver::new(None);
+        let profile = render_profile_for_access_for_coder_with_denied_writes(
+            &resolver,
+            "/Users/test",
+            std::slice::from_ref(&own_temp),
+            &[],
+            &[],
+            CoderKind::Claude,
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(&profile.path).unwrap();
+        let own_rule = format!("(allow file-write* (subpath {}))", sbpl_string(&own_temp));
+        let sibling_rule = format!(
+            "(allow file-write* (subpath {}))",
+            sbpl_string(&sibling_temp)
+        );
+        assert!(
+            content.contains(&own_rule),
+            "the profile must grant the task-owned Claude temp namespace"
+        );
+        assert!(
+            !content.contains(&sibling_rule),
+            "the profile must not grant a sibling Claude temp namespace"
+        );
+        assert!(
+            !content.contains("(allow file-write* (subpath \"/private/tmp\"))"),
+            "the profile must not grant the shared temp namespace"
+        );
+
+        let sandbox_usable = Command::new("/usr/bin/sandbox-exec")
+            .args(["-p", "(version 1)(allow default)", "/usr/bin/true"])
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false);
+        if sandbox_usable {
+            let own_session = own_temp.join("session");
+            let own = Command::new("/usr/bin/sandbox-exec")
+                .arg("-f")
+                .arg(&profile.path)
+                .arg("/bin/mkdir")
+                .arg("-p")
+                .arg(&own_session)
+                .output()
+                .unwrap();
+            assert!(
+                own.status.success(),
+                "the task-owned Claude temp must be writable"
+            );
+
+            let sibling = Command::new("/usr/bin/sandbox-exec")
+                .arg("-f")
+                .arg(&profile.path)
+                .arg("/bin/mkdir")
+                .arg("-p")
+                .arg(sibling_temp.join("session"))
+                .output()
+                .unwrap();
+            assert!(
+                !sibling.status.success(),
+                "a sibling Claude temp namespace must remain denied"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(own_temp);
+    }
+
+    #[test]
+    fn codex_preflight_uses_the_explicit_private_home() {
+        let profile = PathBuf::from("/tmp/profile.sb");
+        let launcher = PathBuf::from("/opt/codex/bin/codex");
+        let worker_home = PathBuf::from("/tmp/fluent-codex-worker");
+
+        let command = codex_preflight_command(&profile, &launcher, &worker_home);
+
+        assert_eq!(command.get_current_dir(), Some(worker_home.as_path()));
+    }
+
+    #[test]
+    fn codex_preflight_grants_private_home_ancestor_metadata_only() {
+        let home = PathBuf::from("/private/var/folders/isolated/T/worker/codex");
+        let profile = render_profile_for_scoped_codex_provider(
+            &ContentResolver::new(None),
+            &home,
+            &[PathBuf::from("/Users/test/project")],
+            &[],
+            &home,
+        )
+        .unwrap();
+        let content = std::fs::read_to_string(profile.path).unwrap();
+        for ancestor in home.ancestors().skip(1).filter(|p| p.parent().is_some()) {
+            assert!(
+                content.contains(&format!(
+                    "(allow file-read-metadata (literal {}))",
+                    sbpl_string(ancestor)
+                )),
+                "missing traversal for {}",
+                ancestor.display()
+            );
+            for operation in ["file-read*", "file-write*"] {
+                assert!(
+                    !content.contains(&format!(
+                        "(allow {operation} (subpath {}))",
+                        sbpl_string(ancestor)
+                    )),
+                    "broad access to {}",
+                    ancestor.display()
+                );
+                assert!(
+                    !content.contains(&format!(
+                        "(allow {operation}  (subpath {}))",
+                        sbpl_string(ancestor)
+                    )),
+                    "broad access to {}",
+                    ancestor.display()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_render_profile_contains_seatbelt_version() {
-        let profile = seatbelt("/Users/test", &[PathBuf::from("/Users/test/project")], &[], Some(CoderKind::Claude), None);
+        let resolver = ContentResolver::new(None);
+        let profile = render_profile(&resolver, "/Users/test", "/Users/test/project").unwrap();
 
         let content = std::fs::read_to_string(&profile.path).unwrap();
         assert!(content.contains("(version 1)"));
@@ -575,10 +1454,16 @@ mod tests {
 
     #[test]
     fn test_render_profile_contains_multiple_roots() {
-        let profile = seatbelt("/Users/test", &[
+        let resolver = ContentResolver::new(None);
+        let profile = render_profile_for_roots(
+            &resolver,
+            "/Users/test",
+            &[
                 PathBuf::from("/Users/test/workspace/run"),
                 PathBuf::from("/Users/test/workspace/main/.git"),
-            ], &[], Some(CoderKind::Claude), None);
+            ],
+        )
+        .unwrap();
 
         let content = std::fs::read_to_string(&profile.path).unwrap();
         assert!(content.contains("/Users/test/workspace/run"), "{content}");
@@ -590,9 +1475,17 @@ mod tests {
 
     #[test]
     fn test_render_profile_contains_read_only_roots() {
+        let resolver = ContentResolver::new(None);
         let writable_root = PathBuf::from("/Users/test/workspace/artifacts");
         let readable_root = PathBuf::from("/Users/test/workspace/candidate");
-        let profile = seatbelt("/Users/test", std::slice::from_ref(&writable_root), std::slice::from_ref(&readable_root), Some(CoderKind::Claude), None);
+        let profile = render_profile_for_access_for_coder(
+            &resolver,
+            "/Users/test",
+            std::slice::from_ref(&writable_root),
+            std::slice::from_ref(&readable_root),
+            CoderKind::Claude,
+        )
+        .unwrap();
 
         let content = std::fs::read_to_string(&profile.path).unwrap();
         assert!(
@@ -609,9 +1502,98 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn readable_path_preflight_accepts_exact_file_and_rejects_sibling() {
+        let host_preflight_override = std::env::var_os("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT");
+        unsafe { std::env::remove_var("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT") };
+        let root = tempfile::tempdir_in("target").unwrap();
+        let artifact = root.path().join("review");
+        let evidence = root.path().join("writer/evidence.json");
+        let completion = root.path().join("writer/completion.json");
+        let sibling = root.path().join("writer/private.json");
+        std::fs::create_dir_all(&artifact).unwrap();
+        std::fs::create_dir_all(evidence.parent().unwrap()).unwrap();
+        std::fs::write(&evidence, "allowed\n").unwrap();
+        std::fs::write(&completion, "allowed\n").unwrap();
+        std::fs::write(&sibling, "denied\n").unwrap();
+
+        let resolver = ContentResolver::new(None);
+        let profile = render_profile_for_access_for_coder(
+            &resolver,
+            "/Users/test",
+            std::slice::from_ref(&artifact),
+            &[evidence.clone(), completion.clone()],
+            CoderKind::Codex,
+        )
+        .unwrap();
+
+        if let Err(error) = preflight_profile(&profile) {
+            if let Some(value) = host_preflight_override {
+                unsafe { std::env::set_var("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", value) };
+            }
+            if error.to_string().contains("Operation not permitted") {
+                return;
+            }
+            panic!("reviewer profile preflight failed: {error:#}");
+        }
+
+        let allowed = preflight_readable_paths(&profile, &[artifact, evidence, completion]);
+        let denied = preflight_readable_paths(&profile, std::slice::from_ref(&sibling));
+        if let Some(value) = host_preflight_override {
+            unsafe { std::env::set_var("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", value) };
+        }
+
+        allowed.unwrap();
+        let error = denied.expect_err("an undeclared sibling must remain unreadable");
+        assert!(
+            error
+                .to_string()
+                .contains("reviewer cannot read declared path"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn external_launcher_root_grants_only_metadata_to_enclosing_home() {
+        let resolver = ContentResolver::new(None);
+        let operator_home = PathBuf::from("/Users/operator");
+        let launcher_root = operator_home.join(".nvm/versions/node/lib/node_modules/@openai/codex");
+        let profile = render_profile_for_access_for_coder(
+            &resolver,
+            "/isolated/home",
+            &[PathBuf::from("/workspace")],
+            &[launcher_root.clone()],
+            CoderKind::Codex,
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(&profile.path).unwrap();
+
+        assert!(content.contains(&format!(
+            "(allow file-read*  (subpath {}))",
+            sbpl_string(&launcher_root)
+        )));
+        assert!(content.contains(&format!(
+            "(allow file-read-metadata (literal {}))",
+            sbpl_string(&operator_home)
+        )));
+        assert!(!content.contains(&format!(
+            "(allow file-read*  (subpath {}))",
+            sbpl_string(&operator_home)
+        )));
+    }
+
     #[test]
     fn test_render_profile_uses_codex_specific_layer() {
-        let profile = seatbelt("/Users/test", &[PathBuf::from("/Users/test/workspace/run")], &[], Some(CoderKind::Codex), None);
+        let resolver = ContentResolver::new(None);
+        let profile = render_profile_for_roots_for_coder(
+            &resolver,
+            "/Users/test",
+            &[PathBuf::from("/Users/test/workspace/run")],
+            CoderKind::Codex,
+        )
+        .unwrap();
 
         let content = std::fs::read_to_string(&profile.path).unwrap();
         assert!(content.contains("Codex CLI -- profile-specific Seatbelt rules"));
@@ -621,11 +1603,20 @@ mod tests {
 
     #[test]
     fn autonomous_codex_profile_grants_only_worker_home() {
+        let resolver = ContentResolver::new(None);
         let worker_home = PathBuf::from("/private/tmp/fluent-codex-worker");
-        let profile = seatbelt("/Users/test", &[
+        let profile = render_profile_for_access_for_coder_with_codex_home(
+            &resolver,
+            "/Users/test",
+            &[
                 PathBuf::from("/Users/test/workspace/run"),
                 worker_home.clone(),
-            ], &[], Some(CoderKind::Codex), Some(&worker_home));
+            ],
+            &[],
+            CoderKind::Codex,
+            Some(&worker_home),
+        )
+        .unwrap();
 
         let content = std::fs::read_to_string(&profile.path).unwrap();
         assert!(
@@ -637,7 +1628,14 @@ mod tests {
 
     #[test]
     fn interactive_codex_profile_preserves_source_home_access() {
-        let profile = seatbelt("/Users/test", &[PathBuf::from("/Users/test/workspace/run")], &[], Some(CoderKind::Codex), None);
+        let resolver = ContentResolver::new(None);
+        let profile = render_profile_for_roots_for_coder(
+            &resolver,
+            "/Users/test",
+            &[PathBuf::from("/Users/test/workspace/run")],
+            CoderKind::Codex,
+        )
+        .unwrap();
 
         let content = std::fs::read_to_string(&profile.path).unwrap();
         assert!(content.contains("/Users/test/.codex"), "{content}");
@@ -645,7 +1643,14 @@ mod tests {
 
     #[test]
     fn rendered_profile_with_no_overlay_uses_common_only() {
-        let profile = seatbelt("/Users/test", &[PathBuf::from("/Users/test/workspace")], &[], None, None);
+        let resolver = ContentResolver::new(None);
+        let profile = render_profile_common_only(
+            &resolver,
+            "/Users/test",
+            &[PathBuf::from("/Users/test/workspace")],
+            &[],
+        )
+        .unwrap();
 
         let content = std::fs::read_to_string(&profile.path).unwrap();
         assert!(content.contains("(version 1)"));
@@ -666,9 +1671,16 @@ mod tests {
 
     #[test]
     fn rendered_profile_grants_workspace_and_artifact_writable() {
+        let resolver = ContentResolver::new(None);
         let workspace = PathBuf::from("/Users/test/workspace/candidate");
         let artifact = PathBuf::from("/Users/test/.fluent/artifacts/tester");
-        let profile = seatbelt("/Users/test", &[workspace.clone(), artifact.clone()], &[], None, None);
+        let profile = render_profile_common_only(
+            &resolver,
+            "/Users/test",
+            &[workspace.clone(), artifact.clone()],
+            &[],
+        )
+        .unwrap();
 
         let content = std::fs::read_to_string(&profile.path).unwrap();
         assert!(
@@ -683,11 +1695,140 @@ mod tests {
     }
 
     #[test]
+    fn writer_profile_blocks_actual_source_write_in_temporary_checkout() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let candidate = root.path().join("candidate");
+        let artifact = source.join(".fluent/work/artifacts/work/attempt/task");
+        let cache = source.join(".fluent/work/cache/writers/work/attempt");
+        let sibling_cache = source.join(".fluent/work/cache/writers/work/other-attempt");
+        let sibling_artifact = source.join(".fluent/work/artifacts/work/attempt/other-task");
+        let gate_artifact = source.join(".fluent/work/artifacts/work/attempt/candidate-gates");
+        let model = source.join(".fluent/work/items/work.json");
+        std::fs::create_dir_all(&artifact).unwrap();
+        std::fs::create_dir_all(&sibling_artifact).unwrap();
+        std::fs::create_dir_all(&gate_artifact).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::create_dir_all(&sibling_cache).unwrap();
+        std::fs::create_dir_all(model.parent().unwrap()).unwrap();
+        std::fs::write(&model, "host-owned").unwrap();
+        std::fs::create_dir_all(source.join(".git")).unwrap();
+        std::fs::create_dir_all(source.join("src")).unwrap();
+        std::fs::create_dir_all(&candidate).unwrap();
+        std::fs::write(source.join("src/lib.rs"), "source").unwrap();
+        let profile = render_profile_common_only(
+            &ContentResolver::new(None),
+            "/Users/test",
+            &[candidate.clone(), source.clone(), artifact.clone()],
+            &[],
+        )
+        .unwrap();
+        deny_writer_source_entries(&profile, &source, &candidate, &artifact, &cache).unwrap();
+        let content = std::fs::read_to_string(&profile.path).unwrap();
+        let denial = format!(
+            "(deny file-write* (subpath {}))",
+            sbpl_string(&source.join("src"))
+        );
+        let physical_source = std::fs::canonicalize(&source).unwrap();
+        let physical_denial = format!(
+            "(deny file-write* (subpath {}))",
+            sbpl_string(&physical_source.join("src"))
+        );
+        assert!(
+            content.contains(&physical_denial),
+            "physical source path must be denied"
+        );
+        assert!(
+            content.rfind(&denial).unwrap()
+                > content
+                    .rfind(&format!(
+                        "(allow file-write* (subpath {}))",
+                        sbpl_string(&source)
+                    ))
+                    .unwrap()
+        );
+        assert!(!content.contains(&format!(
+            "(deny file-write* (subpath {}))",
+            sbpl_string(&source.join(".git"))
+        )));
+        assert!(content.contains(&format!(
+            "(deny file-write* (subpath {}))",
+            sbpl_string(&source.join(".fluent/work"))
+        )));
+        for root in [&source, &physical_source] {
+            assert!(!content.contains(&format!(
+                "(allow file-write* (subpath {}))",
+                sbpl_string(&root.join(".fluent/work/artifacts"))
+            )));
+            assert!(content.contains(&format!(
+                "(allow file-write* (subpath {}))",
+                sbpl_string(&root.join(".fluent/work/artifacts/work/attempt/task"))
+            )));
+            assert!(content.contains(&format!(
+                "(allow file-write* (subpath {}))",
+                sbpl_string(&root.join(".fluent/work/cache/writers/work/attempt"))
+            )));
+            assert!(!content.contains(&format!(
+                "(allow file-write* (subpath {}))",
+                sbpl_string(&root.join(".fluent/work/cache/writers/work/other-attempt"))
+            )));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            if let Err(error) = preflight_profile_with(&profile, |profile_path| {
+                std::process::Command::new("/usr/bin/sandbox-exec")
+                    .arg("-f")
+                    .arg(profile_path)
+                    .arg("/usr/bin/true")
+                    .output()
+            }) {
+                if std::env::var_os("FLUENT_TEST_REQUIRE_LIVE_SOURCE_CONFINEMENT").is_none()
+                    && error.to_string().contains("Operation not permitted")
+                {
+                    return;
+                }
+                panic!("live Writer source-confinement preflight failed: {error:#}");
+            }
+            let output = std::process::Command::new("/usr/bin/sandbox-exec")
+                .arg("-f").arg(&profile.path)
+                .args(["/bin/sh", "-c", "if /bin/echo changed > \"$1\"; then exit 10; fi; /bin/echo candidate > \"$2\" || exit 11; /bin/echo git > \"$3\" || exit 12; /bin/echo artifact > \"$4\" || exit 13; if /bin/echo model > \"$5\"; then exit 14; fi; if /bin/echo sibling > \"$6\"; then exit 15; fi; if /bin/echo gate > \"$7\"; then exit 16; fi; /bin/echo cache > \"$8\" || exit 17; if /bin/echo sibling-cache > \"$9\"; then exit 18; fi", "writer-profile-probe"])
+                .arg(source.join("src/lib.rs"))
+                .arg(candidate.join("change.txt"))
+                .arg(source.join(".git/test"))
+                .arg(artifact.join("test"))
+                .arg(&model)
+                .arg(sibling_artifact.join("test"))
+                .arg(gate_artifact.join("test"))
+                .arg(cache.join("test"))
+                .arg(sibling_cache.join("test"))
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "Writer source-confinement child exited with {} (10: source write allowed; 11: candidate write denied; 12: Git write denied; 13: Task-artifact write denied; 14: Work-model write allowed; 15: sibling artifact write allowed; 16: gate artifact write allowed). stderr: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                std::fs::read_to_string(source.join("src/lib.rs")).unwrap(),
+                "source"
+            );
+            assert_eq!(std::fs::read_to_string(&model).unwrap(), "host-owned");
+        }
+    }
+
+    #[test]
     fn rendered_profile_grants_private_ancestor_metadata() {
         // git's realpath() lstats the bare /private node while resolving a
         // /private/var/folders temp path; without metadata access it fails with
         // "Invalid path '/private'". Tests that git-init in system temp rely on this.
-        let profile = seatbelt("/Users/test", &[PathBuf::from("/Users/test/workspace")], &[], None, None);
+        let resolver = ContentResolver::new(None);
+        let profile = render_profile_common_only(
+            &resolver,
+            "/Users/test",
+            &[PathBuf::from("/Users/test/workspace")],
+            &[],
+        )
+        .unwrap();
 
         let content = std::fs::read_to_string(&profile.path).unwrap();
         assert!(
@@ -699,10 +1840,90 @@ mod tests {
 
     #[test]
     fn test_render_profile_uses_claude_specific_layer() {
-        let profile = seatbelt("/Users/test", &[PathBuf::from("/Users/test/workspace/run")], &[], Some(CoderKind::Claude), None);
+        let resolver = ContentResolver::new(None);
+        let profile = render_profile_for_roots_for_coder(
+            &resolver,
+            "/Users/test",
+            &[PathBuf::from("/Users/test/workspace/run")],
+            CoderKind::Claude,
+        )
+        .unwrap();
 
         let content = std::fs::read_to_string(&profile.path).unwrap();
         assert!(content.contains("Claude Code CLI -- profile-specific Seatbelt rules"));
         assert!(!content.contains("Codex CLI -- profile-specific Seatbelt rules"));
+    }
+
+    #[test]
+    fn autonomous_claude_profile_denies_operator_project_state() {
+        let resolver = ContentResolver::new(None);
+        let worker_home = PathBuf::from("/workspace/artifacts/claude-home");
+        let profile = render_profile_for_access_for_autonomous_claude(
+            &resolver,
+            "/Users/operator",
+            &[PathBuf::from("/workspace/candidate"), worker_home.clone()],
+            &[],
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(&profile.path).unwrap();
+        assert!(
+            content.contains("(deny file-read* (subpath \"/Users/operator/.claude/projects\"))")
+        );
+        assert!(
+            content.contains("(deny file-write* (subpath \"/Users/operator/.claude/projects\"))")
+        );
+        assert!(content.contains(&format!(
+            "(allow file-write* (subpath {}))",
+            sbpl_string(&worker_home)
+        )));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn autonomous_claude_profile_confines_memory_writes_to_worker_home() {
+        let source = tempfile::tempdir().unwrap();
+        let managed = tempfile::tempdir().unwrap();
+        let source_memory = source.path().join(".claude/projects/project/memory");
+        let worker_home = managed.path().join("claude-home");
+        std::fs::create_dir_all(&source_memory).unwrap();
+        std::fs::create_dir_all(worker_home.join(".claude/projects/project/memory")).unwrap();
+        let resolver = ContentResolver::new(None);
+        let profile = render_profile_for_access_for_autonomous_claude(
+            &resolver,
+            &source.path().to_string_lossy(),
+            std::slice::from_ref(&worker_home),
+            &[],
+        )
+        .unwrap();
+        if let Err(error) = preflight_profile_with(&profile, |profile_path| {
+            Command::new(sandbox_exec_program())
+                .args(["-f", profile_path.to_str().unwrap(), "/usr/bin/true"])
+                .output()
+        }) {
+            if error.to_string().contains("Operation not permitted") {
+                // A parent Seatbelt profile cannot apply a nested profile. The
+                // production host preflight and unsandboxed macOS CI exercise the
+                // command-level assertions below.
+                return;
+            }
+            panic!("autonomous Claude profile preflight failed: {error:#}");
+        }
+
+        let managed_status = Command::new(sandbox_exec_program())
+            .args(["-f", profile.path.to_str().unwrap(), "/usr/bin/touch"])
+            .arg(worker_home.join(".claude/projects/project/memory/managed"))
+            .status()
+            .unwrap();
+        assert!(managed_status.success());
+
+        let escaped = source_memory.join("escaped");
+        let escaped_status = Command::new(sandbox_exec_program())
+            .args(["-f", profile.path.to_str().unwrap(), "/usr/bin/touch"])
+            .arg(&escaped)
+            .status()
+            .unwrap();
+        assert!(!escaped_status.success());
+        assert!(!escaped.exists());
     }
 }

@@ -19,12 +19,16 @@ pub fn after_attempt_create() -> &'static str {
     "\n→ Next: fluent attempt run <work-item-id>"
 }
 
+pub fn after_init_preexisting_changes(status: &str) -> String {
+    format!("\n  Pre-existing Git changes before initialization:\n{status}")
+}
+
 pub fn after_init_instruction_changes(paths: &[String]) -> String {
     let mut lines =
         vec!["\n  Resolve the Fluent instruction changes before running an Attempt:".to_string()];
     lines.extend(paths.iter().map(|path| format!("    {path}")));
     lines.push(
-        "  commit or revert these files first; candidate worktrees use committed Git state."
+        "  Commit or revert these files first; candidate worktrees use committed Git state."
             .to_string(),
     );
     lines.join("\n")
@@ -57,12 +61,6 @@ pub fn format_coder_plan(mapping: &CoderMapping) -> String {
         &mapping.review.model,
         mapping.review.effort.as_deref(),
     ));
-    lines.push(role_line(
-        "behavior-tests",
-        mapping.behavior_tests.coder.as_str(),
-        &mapping.behavior_tests.model,
-        mapping.behavior_tests.effort.as_deref(),
-    ));
     lines.join("\n")
 }
 
@@ -74,6 +72,7 @@ pub struct AttemptRunContext<'a> {
     pub pause_kind: Option<&'a PauseKind>,
     pub coder: Option<&'a str>,
     pub review_artifact: Option<&'a str>,
+    pub evidence_action: Option<&'a str>,
 }
 
 /// Name the coder-specific re-authentication step, falling back to a coder-agnostic
@@ -127,8 +126,18 @@ pub fn after_attempt_run(
                 .to_string(),
         ),
         WorkAttemptRunOutcome::PlannedWriteRound { .. } => Some(
-            "\n→ Next: a follow-up write round was planned from failed reviewers; fluent attempt run <work-item-id> to keep iterating".to_string(),
+            "\n→ Next: a follow-up Writer round is ready; fluent attempt run <work-item-id> to continue the candidate".to_string(),
         ),
+        WorkAttemptRunOutcome::NeedsUser { handoff_path } if ctx.evidence_action.is_some() => {
+            let action = ctx.evidence_action.unwrap();
+            // Legacy outcomes can name an evidence JSON file instead of a handoff.
+            // Keep the operator-facing handoff when a saved action takes priority.
+            if handoff_path.ends_with(".md") {
+                Some(format!("\n→ Next: read the handoff {handoff_path}, then {action}"))
+            } else {
+                Some(format!("\n→ Next: {action}"))
+            }
+        }
         WorkAttemptRunOutcome::NeedsUser { handoff_path } => match ctx.pause_kind {
             Some(PauseKind::Auth) => Some(format!(
                 "\n→ Next: {}, then fluent attempt run <work-item-id>",
@@ -136,6 +145,10 @@ pub fn after_attempt_run(
             )),
             Some(PauseKind::TranscriptPump) => Some(format!(
                 "\n→ Next: fix the transcript/console transport (see {handoff_path}), then fluent attempt run <work-item-id> to retry"
+            )),
+            Some(PauseKind::HostEvidence) => Some(format!("\n→ Next: inspect the outstanding check and missing proof in {handoff_path}")),
+            Some(PauseKind::CandidateGate) => Some(format!(
+                "\n→ Next: read the candidate-gate handoff {handoff_path}, then run fluent queue resume {work_item_id} --attempt <attempt-id> and fluent scheduler run; use fluent attempt run {work_item_id} <attempt-id> for foreground recovery"
             )),
             _ => Some(format!(
                 "\n→ Next: read the handoff {handoff_path}, then fluent attempt run <work-item-id>"
@@ -147,9 +160,10 @@ pub fn after_attempt_run(
         WorkAttemptRunOutcome::ReviewOnlyFailed => {
             Some(review_only_hint(ctx.review_artifact, false))
         }
-        WorkAttemptRunOutcome::RanTask { .. } | WorkAttemptRunOutcome::PlannedReviews { .. } => {
-            None
-        }
+        WorkAttemptRunOutcome::RanTask { .. }
+        | WorkAttemptRunOutcome::PlannedReviews { .. }
+        | WorkAttemptRunOutcome::PlannedFinalTester { .. }
+        | WorkAttemptRunOutcome::PlannedFailedCommandRecheck { .. } => None,
     }
 }
 
@@ -198,13 +212,24 @@ pub fn next_action_for_action(action: &str, id: &str, merge_candidate_id: &str) 
     }
 }
 
+pub fn next_action_for_status_row(row: &crate::work_status::WorkItemStatus) -> Option<String> {
+    if row.recovery_blocker.is_some() && row.next_action.is_none() {
+        return None;
+    }
+    row.next_action
+        .as_ref()
+        .map(|action| format!("\n→ Next: {action}"))
+        .or_else(|| next_action_for_action(&row.action, &row.id, &row.merge_candidate))
+}
+
 /// Name the next command for the most-actionable Work Item on a populated board.
 /// Priority follows `work_status`: needs-user > merge-ready > learner-not-ready >
 /// task-ready. A `learner-blocked` row remains visible but is not repeatedly
 /// actionable: the originating Attempt already emitted its one-time inspection
 /// hint. Returns `None` when nothing on the board is actionable.
 pub fn status_next_action(status: &WorkStatus) -> Option<String> {
-    const PRIORITY: [&str; 4] = [
+    const PRIORITY: [&str; 5] = [
+        "evidence-needed",
         "needs-user",
         "merge-ready",
         "learner-not-ready",
@@ -212,7 +237,7 @@ pub fn status_next_action(status: &WorkStatus) -> Option<String> {
     ];
     for action in PRIORITY {
         if let Some(row) = status.rows.iter().find(|row| row.action == action) {
-            return next_action_for_action(&row.action, &row.id, &row.merge_candidate);
+            return next_action_for_status_row(row);
         }
     }
     None
@@ -309,6 +334,7 @@ mod tests {
             pause_kind: Some(&PauseKind::Auth),
             coder: Some("codex"),
             review_artifact: None,
+            evidence_action: None,
         };
         let hint = after_attempt_run(&outcome, "work-1", &ctx).unwrap();
         assert!(hint.contains("re-authenticate"));
@@ -329,6 +355,58 @@ mod tests {
         assert!(hint.contains("handoff"));
         assert!(hint.contains("needs-user.md"));
         assert!(hint.contains("attempt run"));
+    }
+
+    #[test]
+    fn after_attempt_run_recorded_action_keeps_handoff() {
+        let handoff_path = ".fluent/work/artifacts/work-1/attempt-1/needs-user.md";
+        let outcome = WorkAttemptRunOutcome::NeedsUser {
+            handoff_path: handoff_path.to_string(),
+        };
+        let action = "fluent queue resume work-1 --attempt attempt-1";
+        let ctx = AttemptRunContext {
+            pause_kind: Some(&PauseKind::Uncertain),
+            evidence_action: Some(action),
+            ..AttemptRunContext::default()
+        };
+        let hint = after_attempt_run(&outcome, "work-1", &ctx).unwrap();
+        assert!(hint.contains(handoff_path), "{hint}");
+        assert!(hint.contains(action), "{hint}");
+    }
+
+    #[test]
+    fn after_attempt_run_evidence_needed_names_attachment_action() {
+        let outcome = WorkAttemptRunOutcome::NeedsUser {
+            handoff_path: ".fluent/work/artifacts/work-1/attempt-1/host-evidence/old.json"
+                .to_string(),
+        };
+        let action = "fluent attempt evidence attach work-1 attempt-1 --candidate abc123 --evidence-file <path> --review-artifact .fluent/work/artifacts/work-1/attempt-1/evidence-review/review.md";
+        let ctx = AttemptRunContext {
+            pause_kind: Some(&PauseKind::Uncertain),
+            evidence_action: Some(action),
+            ..AttemptRunContext::default()
+        };
+
+        let hint = after_attempt_run(&outcome, "work-1", &ctx).unwrap();
+
+        assert_eq!(hint, format!("\n→ Next: {action}"));
+        assert!(!hint.contains("old.json"));
+    }
+
+    #[test]
+    fn candidate_gate_guidance_names_scheduler_and_foreground_recovery() {
+        let outcome = WorkAttemptRunOutcome::NeedsUser {
+            handoff_path: ".fluent/work/artifacts/work-1/attempt-1/candidate-gate-needs-user.md"
+                .to_string(),
+        };
+        let ctx = AttemptRunContext {
+            pause_kind: Some(&PauseKind::CandidateGate),
+            ..AttemptRunContext::default()
+        };
+        let hint = after_attempt_run(&outcome, "work-1", &ctx).unwrap();
+        assert!(hint.contains("fluent queue resume work-1 --attempt <attempt-id>"));
+        assert!(hint.contains("fluent scheduler run"));
+        assert!(hint.contains("fluent attempt run work-1 <attempt-id>"));
     }
 
     #[test]
@@ -443,6 +521,9 @@ mod tests {
 
     fn status_row(id: &str, action: &str) -> crate::work_status::WorkItemStatus {
         crate::work_status::WorkItemStatus {
+            recovery_blocker: None,
+            verification: None,
+            evidence_history: None,
             id: id.to_string(),
             title: "Title".to_string(),
             attempt: "-".to_string(),
@@ -451,7 +532,30 @@ mod tests {
             merge_candidate: "-".to_string(),
             merge: "-".to_string(),
             action: action.to_string(),
+            next_action: None,
+            metrics: Default::default(),
+            compatibility_warnings: Vec::new(),
+            release: None,
         }
+    }
+
+    #[test]
+    fn missing_check_proof_does_not_offer_generic_resume() {
+        let mut row = status_row("work-1", "needs-user");
+        row.recovery_blocker = Some("Required check evidence digest changed".into());
+        assert!(next_action_for_status_row(&row).is_none());
+        let outcome = WorkAttemptRunOutcome::NeedsUser {
+            handoff_path: "required-check.md".into(),
+        };
+        let context = AttemptRunContext {
+            pause_kind: Some(&PauseKind::HostEvidence),
+            ..Default::default()
+        };
+        assert!(
+            !after_attempt_run(&outcome, "work-1", &context)
+                .unwrap()
+                .contains("attempt run")
+        );
     }
 
     #[test]
@@ -626,11 +730,6 @@ mod tests {
                 model: "o3".to_string(),
                 effort: None,
             },
-            behavior_tests: CoderModelPair {
-                coder: CoderKind::Pi,
-                model: "pi-model".to_string(),
-                effort: None,
-            },
         };
         let plan = format_coder_plan(&mapping);
         assert!(plan.contains("writer"));
@@ -639,8 +738,6 @@ mod tests {
         assert!(plan.contains("reviewer"));
         assert!(plan.contains("codex"));
         assert!(plan.contains("o3"));
-        assert!(plan.contains("behavior-tests"));
-        assert!(plan.contains("pi"));
         assert!(!plan.contains("effort="));
     }
 
@@ -656,11 +753,6 @@ mod tests {
                 effort: None,
             },
             review: CoderModelPair {
-                coder: CoderKind::Claude,
-                model: String::new(),
-                effort: None,
-            },
-            behavior_tests: CoderModelPair {
                 coder: CoderKind::Claude,
                 model: String::new(),
                 effort: None,
@@ -689,20 +781,11 @@ mod tests {
                 model: "model-r".to_string(),
                 effort: None,
             },
-            behavior_tests: CoderModelPair {
-                coder: CoderKind::Claude,
-                model: "model-bt".to_string(),
-                effort: Some("low".to_string()),
-            },
         };
         let plan = format_coder_plan(&mapping);
         assert!(
             plan.contains("effort=high"),
             "writer effort should appear; got:\n{plan}"
-        );
-        assert!(
-            plan.contains("effort=low"),
-            "behavior-tests effort should appear; got:\n{plan}"
         );
         let reviewer_line = plan.lines().find(|l| l.contains("reviewer")).unwrap();
         assert!(

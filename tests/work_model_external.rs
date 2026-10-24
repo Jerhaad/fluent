@@ -1,6 +1,6 @@
 use fluent::work_model::{
-    Attempt, AttemptKind, AttemptReviewState, AttemptStatus, CoderMapping, LearnerMode,
-    MergeCandidate, MergeCandidateMergeState, MergeReviewState, ReviewContext, Task,
+    Attempt, AttemptKind, AttemptReviewState, AttemptStatus, CoderMapping, DurableTransitionOrigin,
+    LearnerMode, MergeCandidate, MergeCandidateMergeState, MergeReviewState, ReviewContext, Task,
     TaskArtifactArea, TaskKind, TaskOutput, TaskStatus, WorkItem, WorkModelError,
     WorkModelStorageError, WorkModelStore, WorkspaceAccess, WorkspaceRef, from_json,
 };
@@ -30,6 +30,9 @@ fn task(kind: TaskKind) -> Task {
             path: ".fluent/work/artifacts/write-code".to_string(),
         }),
         review_context: None,
+        writer_correction_assignment: None,
+        verification_context: None,
+        evidence_review_context: None,
         input_artifacts: Vec::new(),
         depends_on: None,
         output: Some(TaskOutput {
@@ -38,6 +41,8 @@ fn task(kind: TaskKind) -> Task {
             source_branch: "main".to_string(),
             base_commit: None,
             commit: "abc123".to_string(),
+            no_change: None,
+            learner_canonicalization: None,
         }),
         created_at: None,
         started_at: None,
@@ -84,6 +89,7 @@ fn merge_candidate() -> MergeCandidate {
         merge_review_state: MergeReviewState::Pending,
         merge_state: MergeCandidateMergeState::default(),
         created_at: None,
+        ready_at: None,
         started_at: None,
         completed_at: None,
     }
@@ -633,11 +639,20 @@ fn work_model_store_writes_deterministic_pretty_json() {
     let content = fs::read_to_string(path).unwrap();
     assert_eq!(
         content,
-        r#"{
+        format!(
+            r#"{{
+  "schema_version": 12,
   "id": "work-1",
-  "title": "Add durable model storage"
-}
-"#
+  "title": "Add durable model storage",
+  "model_writer_version": {{
+    "format": "fluent-work-item-writer",
+    "schema_version": 10,
+    "version": "{version}"
+  }}
+}}
+"#,
+            version = env!("CARGO_PKG_VERSION")
+        )
     );
     let attempt = fs::read_to_string(
         temp.path()
@@ -661,8 +676,8 @@ fn work_model_store_writes_deterministic_pretty_json() {
 
 #[test]
 fn capture_mode_preserves_minimal_work_item_json() {
-    // The default `capture` Learner mode is omitted from the split record so a
-    // minimal Work Item stays byte-identical to legacy `{id, title}` storage.
+    // The default `capture` Learner mode is omitted from the split record while
+    // every successful write stamps the record schema and model writer versions.
     let temp = tempfile::tempdir().unwrap();
     let store = WorkModelStore::new(temp.path());
 
@@ -678,11 +693,20 @@ fn capture_mode_preserves_minimal_work_item_json() {
     let content = fs::read_to_string(path).unwrap();
     assert_eq!(
         content,
-        r#"{
+        format!(
+            r#"{{
+  "schema_version": 12,
   "id": "work-1",
-  "title": "Add durable model storage"
-}
-"#
+  "title": "Add durable model storage",
+  "model_writer_version": {{
+    "format": "fluent-work-item-writer",
+    "schema_version": 10,
+    "version": "{version}"
+  }}
+}}
+"#,
+            version = env!("CARGO_PKG_VERSION")
+        )
     );
     assert!(!content.contains("learner_mode"));
 }
@@ -744,7 +768,60 @@ fn work_model_store_prunes_stale_split_records() {
     assert!(!task_path.exists());
     assert!(!candidate_path.exists());
     assert!(attempt_path.exists());
-    assert_eq!(store.read_work_item("work-1").unwrap(), without_task);
+    let after_prune = store.read_work_item("work-1").unwrap();
+    assert_eq!(
+        after_prune
+            .transitions
+            .iter()
+            .map(|transition| (
+                transition.object_kind.as_str(),
+                transition.object_id.as_str(),
+                transition.old_state.as_deref(),
+                transition.new_state.as_str(),
+                transition.origin,
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "work-item",
+                "work-1",
+                None,
+                "authorized",
+                DurableTransitionOrigin::Unknown
+            ),
+            (
+                "attempt",
+                "attempt-1",
+                None,
+                "complete",
+                DurableTransitionOrigin::Unknown
+            ),
+            (
+                "task",
+                "write-code",
+                None,
+                "complete",
+                DurableTransitionOrigin::Unknown
+            ),
+            (
+                "merge-candidate",
+                "attempt-1-merge-candidate",
+                None,
+                "pending",
+                DurableTransitionOrigin::Unknown,
+            ),
+            (
+                "attempt",
+                "attempt-1",
+                Some("complete"),
+                "planned",
+                DurableTransitionOrigin::Fluent,
+            ),
+        ]
+    );
+    let mut business_state = after_prune.clone();
+    business_state.transitions.clear();
+    assert_eq!(business_state, without_task);
 
     let mut without_attempt = without_task.clone();
     without_attempt.attempts.clear();
@@ -752,7 +829,11 @@ fn work_model_store_prunes_stale_split_records() {
 
     assert!(!attempt_path.exists());
     assert!(!task_attempt_dir.exists());
-    assert_eq!(store.read_work_item("work-1").unwrap(), without_attempt);
+    let after_attempt_prune = store.read_work_item("work-1").unwrap();
+    assert_eq!(after_attempt_prune.transitions, after_prune.transitions);
+    let mut business_state = after_attempt_prune;
+    business_state.transitions.clear();
+    assert_eq!(business_state, without_attempt);
 }
 
 #[test]
@@ -1322,4 +1403,389 @@ fn work_model_store_reports_file_for_split_merge_candidate_attempt_mismatch() {
         }
         other => panic!("unexpected error: {other}"),
     }
+}
+
+// Include directories as well as bytes so observation cannot hide lock creation.
+fn work_tree(
+    root: &std::path::Path,
+) -> std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>> {
+    fn visit(
+        root: &std::path::Path,
+        path: &std::path::Path,
+        tree: &mut std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>>,
+    ) {
+        if !path.exists() {
+            return;
+        }
+        let bytes = if path.is_dir() {
+            None
+        } else {
+            Some(fs::read(path).unwrap())
+        };
+        tree.insert(path.strip_prefix(root).unwrap().to_path_buf(), bytes);
+        if path.is_dir() {
+            for entry in fs::read_dir(path).unwrap() {
+                visit(root, &entry.unwrap().path(), tree);
+            }
+        }
+    }
+    let mut tree = std::collections::BTreeMap::new();
+    visit(root, &root.join(".fluent/work"), &mut tree);
+    tree
+}
+
+fn pending_transaction(root: &std::path::Path, mut item: WorkItem, published: bool) {
+    use sha2::Digest;
+    let base_children_digest = published.then(|| {
+        format!(
+            "{:x}",
+            sha2::Sha256::digest(
+                serde_json::to_vec(&(&item.attempts, &item.merge_candidates)).unwrap()
+            )
+        )
+    });
+    item.title = "Unpublished title".into();
+    let dir = root.join(".fluent/work/transactions");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join(format!("{}.json", item.id)), serde_json::to_vec_pretty(&serde_json::json!({
+        "schema_version": 1, "id": item.id, "base_revision": if published { Some(0) } else { None },
+        "target_revision": if published { 1 } else { 0 }, "base_children_digest": base_children_digest, "work_item": item
+    })).unwrap()).unwrap();
+}
+
+#[test]
+fn status_snapshot_is_nonmutating() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = WorkModelStore::new(temp.path());
+    store.create_work_item(&work_item()).unwrap();
+    let mut running = WorkItem::planned("running", "Observe running Task");
+    running.add_initial_attempt("attempt-1").unwrap();
+    running.attempts[0].status = AttemptStatus::Executing;
+    running.attempts[0].tasks[0].status = TaskStatus::Executing;
+    store.create_work_item(&running).unwrap();
+    let area = &running.attempts[0].tasks[0]
+        .artifact_area
+        .as_ref()
+        .unwrap()
+        .path;
+    fs::create_dir_all(temp.path().join(area)).unwrap();
+    fs::write(
+        temp.path().join(area).join("execution.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1, "state": "running", "owner_pid": std::process::id(),
+            "leader_pid": std::process::id(), "process_group_id": std::process::id(),
+            "started_at": "2026-09-06T00:00:00Z", "heartbeat_at": "2026-09-06T00:00:00Z"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    pending_transaction(temp.path(), work_item(), true);
+    fs::remove_dir_all(temp.path().join(".fluent/work/locks")).unwrap();
+    let before = work_tree(temp.path());
+    let status = fluent::work_status::load_work_status(temp.path()).unwrap();
+    assert_cmd::Command::new(assert_cmd::cargo::cargo_bin!("fluent"))
+        .current_dir(temp.path())
+        .arg("status")
+        .assert()
+        .success();
+    assert_eq!(work_tree(temp.path()), before);
+    assert_eq!(
+        status
+            .rows
+            .iter()
+            .find(|row| row.id == "work-1")
+            .unwrap()
+            .title,
+        "Add durable model storage"
+    );
+}
+
+#[test]
+fn snapshot_reports_pending_transaction_without_recovery() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = WorkModelStore::new(temp.path());
+    store.create_work_item(&work_item()).unwrap();
+    pending_transaction(temp.path(), work_item(), true);
+    pending_transaction(
+        temp.path(),
+        WorkItem::planned("unpublished", "Pending creation"),
+        false,
+    );
+    let before = work_tree(temp.path());
+    let snapshot = store.snapshot_work_items().unwrap();
+    assert_eq!(snapshot.items.len(), 1);
+    assert_eq!(snapshot.items[0].title, "Add durable model storage");
+    assert_eq!(snapshot.diagnostics.len(), 2);
+    for id in ["work-1", "unpublished"] {
+        assert!(
+            snapshot
+                .diagnostics
+                .iter()
+                .any(|d| d.contains(id) && d.contains("host-owned recovery is pending")),
+            "{:?}",
+            snapshot.diagnostics
+        );
+    }
+    assert_eq!(work_tree(temp.path()), before);
+}
+
+#[test]
+fn snapshot_does_not_migrate_legacy_artifacts() {
+    use std::os::unix::process::CommandExt;
+    let temp = tempfile::tempdir().unwrap();
+    let store = WorkModelStore::new(temp.path());
+    let mut running = work_item();
+    running.attempts[0].status = AttemptStatus::Executing;
+    running.attempts[0].review_state = None;
+    running.attempts[0].tasks[0].status = TaskStatus::Executing;
+    running.attempts[0].tasks[0].output = None;
+    store.create_work_item(&running).unwrap();
+    let path = store
+        .work_task_path("work-1", "attempt-1", "write-code")
+        .unwrap();
+    let mut record: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let legacy = ".fluent/work/artifacts/attempt-1/write-code";
+    record["artifact_area"]["path"] = legacy.into();
+    fs::write(path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+    let area = temp.path().join(legacy);
+    fs::create_dir_all(&area).unwrap();
+    let transcript = area.join("transcript.jsonl");
+    fs::write(&transcript, "stored transcript").unwrap();
+    assert!(
+        !temp
+            .path()
+            .join(".fluent/work/artifacts/work-1/attempt-1/write-code")
+            .exists()
+    );
+    assert!(!fluent::lease::task_lock_path(temp.path(), "work-1", "write-code").exists());
+
+    // Keep a real execution identity only in the stored legacy artifact area.
+    // Piped stdin holds cat open without spawning descendants or a heartbeat.
+    let mut command = std::process::Command::new("/bin/cat");
+    command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .process_group(0);
+    fluent::execution::configure_identity_lock(&mut command, &transcript).unwrap();
+    let mut child = command.spawn().unwrap();
+    let execution = fluent::execution::ExecutionRecord {
+        schema_version: 1,
+        state: fluent::execution::ExecutionState::Running,
+        owner_pid: std::process::id(),
+        leader_pid: child.id(),
+        process_group_id: child.id(),
+        started_at: "2026-09-06T00:00:00Z".into(),
+        heartbeat_at: "2026-09-06T00:00:00Z".into(),
+        settled_at: None,
+        attempt_owner: None,
+        launch_generation: None,
+    };
+    fs::write(
+        area.join("execution.json"),
+        serde_json::to_vec(&execution).unwrap(),
+    )
+    .unwrap();
+    let before = work_tree(temp.path());
+    let status = fluent::work_status::load_work_status(temp.path());
+    let snapshot = store.snapshot_work_items();
+    let after = work_tree(temp.path());
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    let status = status.unwrap();
+    assert!(status.errors.is_empty(), "{:?}", status.errors);
+    assert_eq!(status.rows[0].task, "write:write-code [executing]");
+    assert_eq!(status.rows[0].action, "executing");
+    let snapshot = snapshot.unwrap();
+    assert!(
+        snapshot.diagnostics.is_empty(),
+        "{:?}",
+        snapshot.diagnostics
+    );
+    assert_eq!(
+        snapshot.items[0].attempts[0].tasks[0]
+            .artifact_area
+            .as_ref()
+            .unwrap()
+            .path,
+        legacy
+    );
+    assert_eq!(after, before);
+    // Releasing the same legacy identity must change status without changing files.
+    let stopped = fluent::work_status::load_work_status(temp.path()).unwrap();
+    assert_eq!(stopped.rows[0].task, "write:write-code [interrupted]");
+    assert_eq!(work_tree(temp.path()), before);
+}
+
+#[test]
+fn snapshot_isolates_item_and_transaction_errors() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = WorkModelStore::new(temp.path());
+    store
+        .create_work_item(&WorkItem::planned("valid", "Visible"))
+        .unwrap();
+    store.create_work_item(&work_item()).unwrap();
+    fs::write(
+        store
+            .work_task_path("work-1", "attempt-1", "write-code")
+            .unwrap(),
+        "bad task",
+    )
+    .unwrap();
+    fs::write(store.work_item_path("broken").unwrap(), "bad item").unwrap();
+    let dir = temp.path().join(".fluent/work/transactions");
+    fs::write(dir.join("bad name.json"), "bad filename").unwrap();
+    fs::write(dir.join("broken-journal.json"), "bad journal").unwrap();
+    let before = work_tree(temp.path());
+    let snapshot = store.snapshot_work_items().unwrap();
+    assert_eq!(snapshot.items.len(), 1);
+    assert_eq!(snapshot.items[0].id, "valid");
+    for name in [
+        "write-code.json",
+        "broken.json",
+        "bad name",
+        "broken-journal",
+    ] {
+        assert!(
+            snapshot.diagnostics.iter().any(|d| d.contains(name)),
+            "{:?}",
+            snapshot.diagnostics
+        );
+    }
+    assert!(snapshot.diagnostics.iter().all(|d| d.len() <= 512));
+    assert_eq!(work_tree(temp.path()), before);
+}
+
+#[test]
+fn current_record_has_old_reader_wire_fence() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = WorkModelStore::new(temp.path());
+    store.create_work_item(&work_item()).unwrap();
+    let record: serde_json::Value =
+        serde_json::from_slice(&fs::read(store.work_item_path("work-1").unwrap()).unwrap())
+            .unwrap();
+    assert_eq!(
+        record["model_writer_version"],
+        serde_json::json!({
+            "format": "fluent-work-item-writer", "schema_version": 10,
+            "version": env!("CARGO_PKG_VERSION")
+        })
+    );
+    // The actual release executable is exercised by test-work-model-old-reader-fence.sh.
+    assert_eq!(
+        store
+            .read_work_item_snapshot("work-1")
+            .unwrap()
+            .model_writer_version
+            .as_deref(),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
+}
+
+#[test]
+fn current_reader_accepts_legacy_writer_string_without_rewrite() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = WorkModelStore::new(temp.path());
+    store.create_work_item(&work_item()).unwrap();
+    for path in [
+        store.work_item_path("work-1").unwrap(),
+        store.work_attempt_path("work-1", "attempt-1").unwrap(),
+    ] {
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        record.as_object_mut().unwrap().remove("schema_version");
+        if record.get("model_writer_version").is_some() {
+            record["model_writer_version"] = "0.3.0".into();
+        }
+        fs::write(path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+    }
+    let before = work_tree(temp.path());
+    let item = store.read_work_item_snapshot("work-1").unwrap();
+    assert_eq!(item.model_writer_version.as_deref(), Some("0.3.0"));
+    assert_eq!(item.attempts, work_item().attempts);
+    let status = fluent::work_status::load_work_status(temp.path()).unwrap();
+    assert!(status.errors.is_empty());
+    assert_eq!(status.rows.len(), 1);
+    assert_eq!(work_tree(temp.path()), before);
+}
+
+#[test]
+fn current_reader_round_trips_fenced_record() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = WorkModelStore::new(temp.path());
+    let mut initial = work_item();
+    initial.learner_mode = LearnerMode::NoExpertise;
+    initial.post_merge_review_fix_depth = Some(2);
+    initial.merge_candidates.push(merge_candidate());
+    store.create_work_item(&initial).unwrap();
+    let stale = store.read_work_item_snapshot("work-1").unwrap();
+    store
+        .mutate_work_item("work-1", |item| {
+            item.title = "Updated fenced record".into();
+            Ok(())
+        })
+        .unwrap();
+    let mut expected = stale.clone();
+    expected.title = "stale update".into();
+    assert_stale_write(store.write_work_item(&expected).unwrap_err());
+    let current = store.read_work_item_snapshot("work-1").unwrap();
+    assert_eq!(current.title, "Updated fenced record");
+    assert_eq!(current.attempts, initial.attempts);
+    assert_eq!(current.merge_candidates, initial.merge_candidates);
+    assert_eq!(current.learner_mode, initial.learner_mode);
+    assert_eq!(
+        current.post_merge_review_fix_depth,
+        initial.post_merge_review_fix_depth
+    );
+    let before = work_tree(temp.path());
+    store.write_work_item(&current).unwrap();
+    assert_eq!(work_tree(temp.path()), before);
+    assert!(
+        !temp
+            .path()
+            .join(".fluent/work/transactions/work-1.json")
+            .exists()
+    );
+}
+
+#[test]
+fn writer_envelope_rejects_unknown_or_malformed_values() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = WorkModelStore::new(temp.path());
+    store.create_work_item(&work_item()).unwrap();
+    let path = store.work_item_path("work-1").unwrap();
+    let mut record: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let future_schema = record["model_writer_version"]["schema_version"]
+        .as_u64()
+        .unwrap()
+        + 1;
+    for envelope in [
+        serde_json::json!({"format": "other", "schema_version": 1, "version": "0.3.0"}),
+        serde_json::json!({"format": "fluent-work-item-writer", "schema_version": future_schema, "version": "0.3.0"}),
+        serde_json::json!({"format": "fluent-work-item-writer", "schema_version": 0, "version": "0.3.0"}),
+        serde_json::json!({"format": "fluent-work-item-writer", "schema_version": 1, "version": "invalid"}),
+        serde_json::json!({"format": "fluent-work-item-writer", "schema_version": 1}),
+    ] {
+        record["model_writer_version"] = envelope;
+        fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+        let before = work_tree(temp.path());
+        assert!(store.read_work_item_snapshot("work-1").is_err());
+        assert!(store.mutate_work_item("work-1", |_| Ok(())).is_err());
+        assert_eq!(work_tree(temp.path()), before);
+    }
+}
+
+#[test]
+fn explicit_upgrade_replaces_current_version_legacy_string() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = WorkModelStore::new(temp.path());
+    store.create_work_item(&work_item()).unwrap();
+    let path = store.work_item_path("work-1").unwrap();
+    let mut record: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    record["model_writer_version"] = env!("CARGO_PKG_VERSION").into();
+    fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+    assert!(!store.upgrade_work_item("work-1").unwrap().already_current);
+    let record: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    assert!(record["model_writer_version"].is_object());
+    assert!(store.upgrade_work_item("work-1").unwrap().already_current);
 }

@@ -14,6 +14,7 @@ LOG_DIR="${PROJECT_DIR}/tests/output/$(basename "$0" .sh)"
 setup_test_project() {
   TEST_DIR="$(mktemp -d -t fluent-work-merge-candidate-XXXXXX)"
   mkdir -p "$TEST_DIR/project" "$TEST_DIR/bin"
+  install_review_inspection_provider_helper "$TEST_DIR/bin"
   cd "$TEST_DIR/project"
   TEST_PROJECT_PWD="$(pwd -P)"
   git init -b main > /dev/null 2>&1
@@ -41,6 +42,11 @@ cleanup_test_project() {
 write_mock_claude() {
   cat > "${TEST_DIR}/bin/claude" <<'MOCK_SCRIPT'
 #!/usr/bin/env bash
+trap 'status=$?; fluent-test-review-inspection claude "$status" "$@" || exit $?; exit "$status"' EXIT
+if [ "$1 $2 $3" = "auth status --json" ]; then
+  printf '{"loggedIn":true}\n'
+  exit 0
+fi
 # Skip side effects for --version probes from capture_coder_info()
 if [ "$1" = "--version" ]; then
   exit 0
@@ -256,9 +262,11 @@ EOF
   [ "$(cat target.txt)" = "target update" ] || RESULT=1
   [ "$(cat "$TEST_DIR/check-pwd")" = "$CANDIDATE_PWD" ] || RESULT=1
   [ "$(json_value '.merge_candidates[0].merge_state.status')" = "merged" ] || RESULT=1
-  [ "$(json_value '.merge_candidates[0].merge_state.check_artifacts | length')" = "1" ] || RESULT=1
-  # Merge-time reviewers are gone in slice 3 — no review_artifacts on the
-  # candidate, the post-merge review fires asynchronously instead.
+  [ "$(json_value '.merge_candidates[0].merge_state.check_artifacts | map(.producer_id) | sort | join(",")')" = \
+    "merge-hook-check-pre-merge,merge-target-baseline,merge-tester" ] || RESULT=1
+  TESTER_ARTIFACT="$(json_value '.merge_candidates[0].merge_state.check_artifacts[] | select(.producer_id == "merge-tester") | .path')"
+  [ "$(jq -r '.candidate_commit' "$TESTER_ARTIFACT")" = "$LANDED_COMMIT" ] || RESULT=1
+  # Attempt reviews are complete; landing runs deterministic checks only.
   [ "$(json_value '.merge_candidates[0].merge_state.review_artifacts | length')" = "0" ] || RESULT=1
   assert_contains "$(cat "$TEST_DIR/stdout")" "Merged Merge Candidate attempt-1-merge-candidate" || RESULT=1
   "$FLUENT_BIN" merge-candidate show work-1 attempt-1-merge-candidate \

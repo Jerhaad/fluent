@@ -8,35 +8,43 @@
 //! Candidate stays pending for an explicit land or the separately authorized
 //! auto-merge policy.
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rustix::fs::{FlockOperation, flock};
 
 use crate::lease::{self, TaskLease};
-use crate::queue::{self, Dispatch, DispatchStatus, DispatchToken};
+use crate::queue::{self, Dispatch, DispatchIntent, DispatchStatus, DispatchToken};
+use crate::scheduler_service::BuildIdentity;
 use crate::work_model::{AttemptStatus, WorkModelStore};
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+const COORDINATOR_METADATA_SCHEMA: u32 = 1;
+const STOP_REQUEST_SCHEMA: u32 = 1;
 
 /// The terminal outcome of running a bound Attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttemptOutcome {
-    Complete,
+    CandidateReady,
     Failed,
     NeedsUser,
+    Blocked,
 }
 
 impl AttemptOutcome {
     fn to_dispatch_status(self) -> DispatchStatus {
         match self {
-            Self::Complete => DispatchStatus::CandidateReady,
+            Self::CandidateReady => DispatchStatus::CandidateReady,
             Self::Failed => DispatchStatus::Failed,
             Self::NeedsUser => DispatchStatus::NeedsUser,
+            Self::Blocked => DispatchStatus::Blocked,
         }
     }
 }
@@ -49,6 +57,7 @@ pub trait AttemptRunner: Send + Sync {
         project_root: &Path,
         work_item_id: &str,
         attempt_id: &str,
+        tester_no_sandbox: bool,
     ) -> Result<AttemptOutcome>;
 }
 
@@ -61,22 +70,102 @@ impl AttemptRunner for CliAttemptRunner {
         project_root: &Path,
         work_item_id: &str,
         attempt_id: &str,
+        tester_no_sandbox: bool,
     ) -> Result<AttemptOutcome> {
         let fluent_bin = std::env::current_exe()?;
-        let run_status = Command::new(&fluent_bin)
-            .current_dir(project_root)
-            .args(["attempt", "run", work_item_id, attempt_id, "--no-sandbox"])
-            .status()?;
-
-        if run_status.success() {
-            classify_attempt_outcome(project_root, work_item_id, attempt_id)
-        } else {
-            Ok(AttemptOutcome::Failed)
+        let ledger = queue::read_ledger(project_root, work_item_id)?
+            .ok_or_else(|| anyhow::anyhow!("scheduler dispatch ledger is missing"))?;
+        let dispatch = ledger
+            .active()
+            .ok_or_else(|| anyhow::anyhow!("scheduler dispatch is no longer active"))?;
+        if tester_no_sandbox {
+            eprintln!(
+                "[scheduler] approving one unsandboxed retry of the paused Tester for {attempt_id}"
+            );
         }
+        let mut command = attempt_run_command(
+            &fluent_bin,
+            project_root,
+            work_item_id,
+            attempt_id,
+            &dispatch.dispatch_id,
+            scheduler_baseline_session(),
+            tester_no_sandbox,
+        );
+        // The configured test-support service runs inside an outer Fluent
+        // sandbox that forbids applying a nested Seatbelt profile. Its real
+        // service coordinator already passed the host gate before claiming;
+        // keep only hermetic fixture providers unsandboxed in that test binary.
+        // Production builds cannot enter this branch.
+        #[cfg(feature = "test-support")]
+        if std::env::var_os("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT").is_some()
+            && std::env::var_os("FLUENT_TEST_HERMETIC_PROVIDERS").is_some()
+        {
+            command
+                .arg("--no-sandbox")
+                .env("FLUENT_TEST_HERMETIC_NO_SANDBOX", "1");
+        }
+        let _run_status = command.status()?;
+
+        // Durable Attempt state is authoritative even when the child exits
+        // non-zero. In particular, a resume can fail closed while preserving
+        // `needs-user`; recording that dispatch as `failed` would lose the
+        // scheduler's recoverable disposition.
+        classify_attempt_outcome(project_root, work_item_id, attempt_id)
     }
 }
 
-/// Classify a bound Attempt's terminal outcome from its persisted status.
+fn scheduler_baseline_session() -> &'static str {
+    static SESSION: OnceLock<String> = OnceLock::new();
+    SESSION.get_or_init(|| {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        format!("{}-{nanos}", std::process::id())
+    })
+}
+
+/// Prepare the same host and baseline gates for a service-owned project
+/// coordinator that `scheduler run` prepares for a project-local coordinator.
+pub fn prepare_service_execution(project_root: &Path) -> Result<()> {
+    let resolver = crate::content::ContentResolver::new(Some(project_root));
+    crate::os::preflight_host_execution(project_root, &resolver)?;
+    crate::baseline_cache::prepare_scheduler_session(project_root, scheduler_baseline_session())
+}
+
+/// Release baseline state prepared for a service-owned project coordinator.
+pub fn finish_service_execution(project_root: &Path) -> Result<()> {
+    crate::baseline_cache::finish_scheduler_session(project_root, scheduler_baseline_session())
+}
+
+fn attempt_run_command(
+    fluent_bin: &Path,
+    project_root: &Path,
+    work_item_id: &str,
+    attempt_id: &str,
+    dispatch_id: &str,
+    baseline_session: &str,
+    tester_no_sandbox: bool,
+) -> Command {
+    let mut command = Command::new(fluent_bin);
+    command
+        .current_dir(project_root)
+        .args(["attempt", "run", "--dispatch-id", dispatch_id])
+        .env(
+            crate::baseline_cache::BASELINE_SESSION_ENV,
+            baseline_session,
+        );
+    if tester_no_sandbox {
+        command.arg("--tester-no-sandbox");
+    }
+    command.args([work_item_id, attempt_id]);
+    command
+}
+
+/// Classify a bound Attempt's terminal outcome from its persisted lifecycle.
+/// Completion alone is insufficient: `candidate-ready` means the pending Merge
+/// Candidate can pass the same Learner advancement gate used by landing.
 pub fn classify_attempt_outcome(
     project_root: &Path,
     work_item_id: &str,
@@ -84,35 +173,75 @@ pub fn classify_attempt_outcome(
 ) -> Result<AttemptOutcome> {
     let store = WorkModelStore::new(project_root);
     let item = store.read_work_item(work_item_id)?;
-    let outcome = item
+    Ok(classify_persisted_attempt(&item, attempt_id))
+}
+
+fn classify_persisted_attempt(
+    item: &crate::work_model::WorkItem,
+    attempt_id: &str,
+) -> AttemptOutcome {
+    let Some(attempt) = item
         .attempts
         .iter()
         .find(|attempt| attempt.id == attempt_id)
-        .map(|attempt| match attempt.status {
-            AttemptStatus::Failed => AttemptOutcome::Failed,
-            AttemptStatus::NeedsUser => AttemptOutcome::NeedsUser,
-            _ => AttemptOutcome::Complete,
-        })
-        .unwrap_or(AttemptOutcome::Failed);
-    Ok(outcome)
+    else {
+        return AttemptOutcome::Failed;
+    };
+    match attempt.status {
+        AttemptStatus::Failed => AttemptOutcome::Failed,
+        AttemptStatus::NeedsUser => AttemptOutcome::NeedsUser,
+        AttemptStatus::Complete => item
+            .merge_candidates
+            .iter()
+            .find(|candidate| candidate.attempt_id == attempt_id)
+            .filter(|candidate| candidate.validate_advancement(item).is_ok())
+            .map(|_| AttemptOutcome::CandidateReady)
+            .unwrap_or(AttemptOutcome::Blocked),
+        AttemptStatus::Planned | AttemptStatus::Executing | AttemptStatus::Reviewing => {
+            AttemptOutcome::Blocked
+        }
+    }
 }
 
 /// Elect one coordinator per project and, when elected, run its capacity-limited
 /// worker pool. A start that finds another live coordinator reports reuse and
 /// returns successfully without claiming Work.
 pub fn run(project_root: &Path, poll_seconds: u64, runner: &dyn AttemptRunner) -> Result<()> {
+    SHUTDOWN.store(false, Ordering::Release);
     install_signal_handler();
+    let executable = std::env::current_exe().context("resolve current Fluent executable")?;
+    let build = crate::scheduler_service::executable_build_identity(&executable)?;
 
-    match start_or_reuse(project_root)? {
-        CoordinatorStart::Reused => {
-            eprintln!("[scheduler] reusing live coordinator for this project");
+    match start_or_reuse(project_root, &build)? {
+        CoordinatorStart::Reused(metadata) => {
+            eprintln!(
+                "[scheduler] reusing live coordinator {} running {} ({})",
+                metadata.instance_id, metadata.build.version, metadata.build.hash
+            );
             Ok(())
         }
-        CoordinatorStart::Elected(lease) => {
-            let capacity = resolve_capacity(project_root)?;
-            let result = run_coordinator(project_root, poll_seconds, capacity, runner, &SHUTDOWN);
+        CoordinatorStart::Elected(mut lease) => {
+            // A newly elected coordinator must prove the host can apply Fluent's
+            // worker boundary before it prepares baselines, polls, or claims Work.
+            // A caller that merely reuses an existing coordinator performs no new
+            // execution and therefore does not need this process-local probe.
+            let resolver = crate::content::ContentResolver::new(Some(project_root));
+            crate::os::preflight_host_execution(project_root, &resolver)?;
+            let capacity = configured_capacity(project_root)?;
+            let baseline_session = scheduler_baseline_session();
+            crate::baseline_cache::prepare_scheduler_session(project_root, baseline_session)?;
+            let result = run_coordinator_controlled(
+                project_root,
+                poll_seconds,
+                capacity,
+                runner,
+                &SHUTDOWN,
+                Some(&mut lease),
+            );
+            let cleanup =
+                crate::baseline_cache::finish_scheduler_session(project_root, baseline_session);
             drop(lease);
-            result
+            result.and(cleanup)
         }
     }
 }
@@ -121,6 +250,7 @@ pub fn run(project_root: &Path, poll_seconds: u64, runner: &dyn AttemptRunner) -
 /// newly claimed dispatches, launching each on its own worker thread. Running
 /// Work is never interrupted; once `shutdown` is set the coordinator stops
 /// claiming, and the scope drains live workers before returning.
+#[cfg(test)]
 fn run_coordinator(
     project_root: &Path,
     poll_seconds: u64,
@@ -128,12 +258,23 @@ fn run_coordinator(
     runner: &dyn AttemptRunner,
     shutdown: &AtomicBool,
 ) -> Result<()> {
+    run_coordinator_controlled(project_root, poll_seconds, capacity, runner, shutdown, None)
+}
+
+fn run_coordinator_controlled(
+    project_root: &Path,
+    poll_seconds: u64,
+    capacity: usize,
+    runner: &dyn AttemptRunner,
+    shutdown: &AtomicBool,
+    mut coordinator: Option<&mut CoordinatorLease>,
+) -> Result<()> {
     std::thread::scope(|scope| -> Result<()> {
         let mut workers: Vec<std::thread::ScopedJoinHandle<()>> = Vec::new();
         loop {
             workers.retain(|handle| !handle.is_finished());
 
-            if is_shutdown(shutdown) {
+            if shutdown_requested(project_root, shutdown, coordinator.as_deref_mut())? {
                 break;
             }
 
@@ -142,7 +283,7 @@ fn run_coordinator(
             let mut spawned = false;
             for (token, lease) in claim_available(project_root, capacity)? {
                 let handle = scope.spawn(move || {
-                    if let Err(error) = run_claimed(project_root, token, lease, runner) {
+                    if let Err(error) = run_claimed_dispatch(project_root, token, lease, runner) {
                         eprintln!("[scheduler] worker error: {error}");
                     }
                 });
@@ -150,16 +291,26 @@ fn run_coordinator(
                 spawned = true;
             }
 
-            if is_shutdown(shutdown) {
+            if shutdown_requested(project_root, shutdown, coordinator.as_deref_mut())? {
                 break;
             }
 
             if spawned {
                 // Re-evaluate promptly so freed capacity refills without waiting
                 // a full poll interval.
-                sleep_until_shutdown(Duration::from_millis(50), shutdown);
+                sleep_until_shutdown(
+                    project_root,
+                    Duration::from_millis(50),
+                    shutdown,
+                    coordinator.as_deref_mut(),
+                )?;
             } else {
-                sleep_until_shutdown(Duration::from_secs(poll_seconds), shutdown);
+                sleep_until_shutdown(
+                    project_root,
+                    Duration::from_secs(poll_seconds),
+                    shutdown,
+                    coordinator.as_deref_mut(),
+                )?;
             }
         }
         // The scope join drains any live workers, recording their outcomes.
@@ -184,7 +335,8 @@ pub fn coordinator_is_live(project_root: &Path) -> bool {
     lease::is_leased(&coordinator_lock_path(project_root))
 }
 
-fn resolve_capacity(project_root: &Path) -> Result<usize> {
+/// Resolve the capacity that the scheduler service applies to one project.
+pub fn configured_capacity(project_root: &Path) -> Result<usize> {
     let config = crate::config::resolve_scheduler_config(project_root)?;
     Ok(config.max_local_concurrency.value as usize)
 }
@@ -215,7 +367,7 @@ pub fn claim_available(
 
 /// Claim the next eligible queued dispatch, binding an Attempt id and acquiring
 /// its whole-Attempt lease before returning.
-fn claim_next(project_root: &Path) -> Result<Option<(DispatchToken, TaskLease)>> {
+pub(crate) fn claim_next(project_root: &Path) -> Result<Option<(DispatchToken, TaskLease)>> {
     let Some(dispatch) = pick_next_queued(project_root)? else {
         return Ok(None);
     };
@@ -240,10 +392,10 @@ pub fn project_local_capacity_used(project_root: &Path) -> Result<usize> {
         if matches!(
             active.status,
             DispatchStatus::Claimed | DispatchStatus::Running
-        ) && lease::is_leased(&queue::dispatch_lease_path(
+        ) && lease::is_leased_checked(&queue::dispatch_lease_path(
             project_root,
             &ledger.work_item_id,
-        )) {
+        ))? {
             used += 1;
         }
     }
@@ -259,28 +411,103 @@ pub fn project_local_capacity_used(project_root: &Path) -> Result<usize> {
 /// references, and reflects human-resumed suspensions. One bad entry never
 /// stalls the others.
 pub fn recover_and_reconcile(project_root: &Path) -> Result<()> {
+    recover_and_reconcile_with_observer(project_root, &|_, _| {})
+}
+
+pub(crate) fn recover_and_reconcile_with_observer(
+    project_root: &Path,
+    observer: &dyn Fn(&Path, &Dispatch),
+) -> Result<()> {
     for ledger in queue::list_ledgers(project_root)? {
         let work_item_id = ledger.work_item_id.clone();
         let Some(dispatch) = ledger.latest() else {
             continue;
         };
+        observer(project_root, dispatch);
         let result = match dispatch.status {
-            DispatchStatus::Queued => reconcile_queued(project_root, &work_item_id),
-            DispatchStatus::Claimed | DispatchStatus::Running => reconcile_claim(
-                project_root,
-                &work_item_id,
-                dispatch.bound_attempt_id.as_deref(),
-            ),
-            DispatchStatus::NeedsUser => reconcile_suspension(
-                project_root,
-                &work_item_id,
-                dispatch.bound_attempt_id.as_deref(),
-            ),
+            DispatchStatus::Queued => reconcile_queued(project_root, dispatch),
+            DispatchStatus::Claimed | DispatchStatus::Running => {
+                reconcile_claim(project_root, dispatch)
+            }
+            DispatchStatus::NeedsUser => reconcile_suspension(project_root, dispatch),
             _ => Ok(()),
         };
         if let Err(error) = result {
-            eprintln!("[scheduler] recovery skipped {work_item_id}: {error}");
+            eprintln!(
+                "[scheduler] project {} recovery work item {} dispatch {} generation {}: {error:#}",
+                project_root.display(),
+                work_item_id,
+                dispatch.dispatch_id,
+                dispatch.generation,
+            );
         }
+    }
+    Ok(())
+}
+
+/// Reconcile a queue dispatch after a foreground `fluent attempt run` has
+/// advanced the exact bound Attempt. Direct runs do not claim a queue entry,
+/// so without this small boundary the queue can keep showing an old
+/// `needs-user` pause (or a queued resume) after the Attempt has completed.
+///
+/// The operation is deliberately limited to the dispatch bound to the exact
+/// Attempt just run. A live scheduler claim is left to its owning worker, and
+/// a changed dispatch is ignored by the generation-checked queue update.
+pub fn reconcile_direct_attempt(
+    project_root: &Path,
+    work_item_id: &str,
+    attempt_id: &str,
+) -> Result<()> {
+    let Some(ledger) = queue::read_ledger(project_root, work_item_id)? else {
+        return Ok(());
+    };
+    let Some(dispatch) = ledger.latest().cloned() else {
+        return Ok(());
+    };
+    if dispatch.bound_attempt_id.as_deref() != Some(attempt_id)
+        || matches!(
+            dispatch.status,
+            DispatchStatus::Claimed | DispatchStatus::Running
+        )
+    {
+        return Ok(());
+    }
+
+    let store = WorkModelStore::new(project_root);
+    let item = store.read_work_item(work_item_id)?;
+    match bound_attempt_terminal_status_for_item(&item, attempt_id) {
+        BoundAttemptState::Terminal(status) => {
+            let _ = queue::reconcile_if_current(
+                project_root,
+                work_item_id,
+                &dispatch.dispatch_id,
+                dispatch.generation,
+                status,
+            )?;
+        }
+        BoundAttemptState::Nonterminal => {
+            let should_requeue = item
+                .attempts
+                .iter()
+                .find(|attempt| attempt.id == attempt_id)
+                .is_some_and(|attempt| {
+                    attempt.status == AttemptStatus::Planned
+                        && !attempt
+                            .tasks
+                            .iter()
+                            .any(|task| task.status == crate::work_model::TaskStatus::Executing)
+                });
+            if should_requeue && dispatch.status == DispatchStatus::NeedsUser {
+                let _ = queue::requeue_if_current(
+                    project_root,
+                    work_item_id,
+                    &dispatch.dispatch_id,
+                    dispatch.generation,
+                    false,
+                )?;
+            }
+        }
+        BoundAttemptState::Unbound => {}
     }
     Ok(())
 }
@@ -288,27 +515,71 @@ pub fn recover_and_reconcile(project_root: &Path) -> Result<()> {
 /// A queued dispatch that has since become abandoned is canceled; one that
 /// references missing, malformed, or non-executable Work is blocked. Both leave
 /// other eligible entries untouched.
-fn reconcile_queued(project_root: &Path, work_item_id: &str) -> Result<()> {
+fn reconcile_queued(project_root: &Path, dispatch: &Dispatch) -> Result<()> {
+    let work_item_id = &dispatch.work_item_id;
     let store = WorkModelStore::new(project_root);
     match store.read_work_item(work_item_id) {
         Ok(item) => {
             if item.abandonment.is_some() {
-                queue::cancel_active(project_root, work_item_id)?;
-            } else if item.authorization.is_proposed() {
-                queue::block_active(
+                let _ = queue::cancel_if_current(
                     project_root,
                     work_item_id,
+                    &dispatch.dispatch_id,
+                    dispatch.generation,
+                )?;
+            } else if item.authorization.is_proposed() {
+                let _ = queue::block_if_current(
+                    project_root,
+                    work_item_id,
+                    &dispatch.dispatch_id,
+                    dispatch.generation,
                     "Work Item is not execution-ready",
                 )?;
+            } else if let Some(attempt_id) = dispatch.bound_attempt_id.as_deref() {
+                // A foreground `attempt run` may finish a queued, bound
+                // resume before a coordinator gets to claim it. Reconcile
+                // that durable outcome instead of launching the same Attempt
+                // a second time.
+                if let BoundAttemptState::Terminal(status) =
+                    bound_attempt_terminal_status_for_item(&item, attempt_id)
+                {
+                    // A queued explicit resume may still have the previous
+                    // pause or failed Learner outcome. Let that resume run;
+                    // a normal dispatch may instead have finished in the
+                    // foreground and must publish its durable outcome.
+                    if dispatch.intent == DispatchIntent::Run
+                        || !matches!(status, DispatchStatus::NeedsUser | DispatchStatus::Blocked)
+                    {
+                        let _ = queue::reconcile_if_current(
+                            project_root,
+                            work_item_id,
+                            &dispatch.dispatch_id,
+                            dispatch.generation,
+                            status,
+                        )?;
+                    }
+                }
             }
             Ok(())
         }
         Err(error) if is_missing(&error) => {
-            queue::block_active(project_root, work_item_id, "Work Item not found")?;
+            let _ = queue::block_if_current(
+                project_root,
+                work_item_id,
+                &dispatch.dispatch_id,
+                dispatch.generation,
+                "Work Item not found",
+            )?;
             Ok(())
         }
         Err(_) => {
-            queue::block_active(project_root, work_item_id, "Work Item could not be read")?;
+            let _ = queue::block_if_current(
+                project_root,
+                work_item_id,
+                &dispatch.dispatch_id,
+                dispatch.generation,
+                "Work Item could not be read",
+            )?;
             Ok(())
         }
     }
@@ -319,42 +590,108 @@ fn reconcile_queued(project_root: &Path, work_item_id: &str) -> Result<()> {
 /// terminal Attempt reconciles the dispatch from its outcome, and a nonterminal
 /// Attempt returns to `queued` with its binding preserved so the same Attempt
 /// resumes.
-fn reconcile_claim(
-    project_root: &Path,
-    work_item_id: &str,
-    bound_attempt_id: Option<&str>,
-) -> Result<()> {
-    if lease::is_leased(&queue::dispatch_lease_path(project_root, work_item_id)) {
+fn reconcile_claim(project_root: &Path, dispatch: &Dispatch) -> Result<()> {
+    let work_item_id = &dispatch.work_item_id;
+    if lease::is_leased_checked(&queue::dispatch_lease_path(project_root, work_item_id))? {
         return Ok(());
     }
 
-    match bound_attempt_terminal_status(project_root, work_item_id, bound_attempt_id)? {
+    match bound_attempt_terminal_status(
+        project_root,
+        work_item_id,
+        dispatch.bound_attempt_id.as_deref(),
+    )? {
         BoundAttemptState::Unbound => {
-            queue::requeue_active(project_root, work_item_id, true)?;
+            if lease::is_leased_checked(&queue::dispatch_lease_path(project_root, work_item_id))? {
+                return Ok(());
+            }
+            let _ = queue::requeue_if_current(
+                project_root,
+                work_item_id,
+                &dispatch.dispatch_id,
+                dispatch.generation,
+                true,
+            )?;
         }
         BoundAttemptState::Nonterminal => {
-            queue::requeue_active(project_root, work_item_id, false)?;
+            if lease::is_leased_checked(&queue::dispatch_lease_path(project_root, work_item_id))? {
+                return Ok(());
+            }
+            let _ = queue::requeue_if_current(
+                project_root,
+                work_item_id,
+                &dispatch.dispatch_id,
+                dispatch.generation,
+                false,
+            )?;
         }
         BoundAttemptState::Terminal(status) => {
-            queue::reconcile_active(project_root, work_item_id, status)?;
+            if lease::is_leased_checked(&queue::dispatch_lease_path(project_root, work_item_id))? {
+                return Ok(());
+            }
+            let _ = queue::reconcile_if_current(
+                project_root,
+                work_item_id,
+                &dispatch.dispatch_id,
+                dispatch.generation,
+                status,
+            )?;
         }
     }
     Ok(())
 }
 
 /// A needs-user dispatch whose bound Attempt has been resumed to a new terminal
-/// outcome reconciles to that outcome; one still suspended is left untouched.
-fn reconcile_suspension(
-    project_root: &Path,
-    work_item_id: &str,
-    bound_attempt_id: Option<&str>,
-) -> Result<()> {
-    if let BoundAttemptState::Terminal(status) =
-        bound_attempt_terminal_status(project_root, work_item_id, bound_attempt_id)?
-    {
-        if status != DispatchStatus::NeedsUser {
-            queue::reconcile_active(project_root, work_item_id, status)?;
+/// outcome reconciles to that outcome; a reopened, idle Attempt returns the
+/// dispatch to `queued`; one still suspended is left untouched.
+fn reconcile_suspension(project_root: &Path, dispatch: &Dispatch) -> Result<()> {
+    let work_item_id = &dispatch.work_item_id;
+    match bound_attempt_terminal_status(
+        project_root,
+        work_item_id,
+        dispatch.bound_attempt_id.as_deref(),
+    )? {
+        BoundAttemptState::Terminal(status) if status != DispatchStatus::NeedsUser => {
+            let _ = queue::reconcile_if_current(
+                project_root,
+                work_item_id,
+                &dispatch.dispatch_id,
+                dispatch.generation,
+                status,
+            )?;
         }
+        BoundAttemptState::Nonterminal => {
+            // A direct foreground resume clears the Attempt pause before it
+            // starts the next Writer. If that run exits or is interrupted in
+            // this planned state, return the old suspension dispatch to the
+            // queue so the scheduler can continue the same Attempt.
+            let Some(attempt_id) = dispatch.bound_attempt_id.as_deref() else {
+                return Ok(());
+            };
+            let store = WorkModelStore::new(project_root);
+            let item = store.read_work_item(work_item_id)?;
+            let should_requeue = item
+                .attempts
+                .iter()
+                .find(|attempt| attempt.id == attempt_id)
+                .is_some_and(|attempt| {
+                    attempt.status == AttemptStatus::Planned
+                        && !attempt
+                            .tasks
+                            .iter()
+                            .any(|task| task.status == crate::work_model::TaskStatus::Executing)
+                });
+            if should_requeue {
+                let _ = queue::requeue_if_current(
+                    project_root,
+                    work_item_id,
+                    &dispatch.dispatch_id,
+                    dispatch.generation,
+                    false,
+                )?;
+            }
+        }
+        BoundAttemptState::Unbound | BoundAttemptState::Terminal(_) => {}
     }
     Ok(())
 }
@@ -375,16 +712,28 @@ fn bound_attempt_terminal_status(
     };
     let store = WorkModelStore::new(project_root);
     let item = store.read_work_item(work_item_id)?;
-    let Some(attempt) = item.attempts.iter().find(|a| a.id == attempt_id) else {
+    let Some(_attempt) = item.attempts.iter().find(|a| a.id == attempt_id) else {
         // The binding was recorded but the Attempt was never created.
         return Ok(BoundAttemptState::Unbound);
     };
-    Ok(match attempt.status {
-        AttemptStatus::Complete => BoundAttemptState::Terminal(DispatchStatus::CandidateReady),
+    Ok(bound_attempt_terminal_status_for_item(&item, attempt_id))
+}
+
+fn bound_attempt_terminal_status_for_item(
+    item: &crate::work_model::WorkItem,
+    attempt_id: &str,
+) -> BoundAttemptState {
+    let Some(attempt) = item.attempts.iter().find(|a| a.id == attempt_id) else {
+        return BoundAttemptState::Unbound;
+    };
+    match attempt.status {
+        AttemptStatus::Complete => BoundAttemptState::Terminal(
+            classify_persisted_attempt(&item, attempt_id).to_dispatch_status(),
+        ),
         AttemptStatus::Failed => BoundAttemptState::Terminal(DispatchStatus::Failed),
         AttemptStatus::NeedsUser => BoundAttemptState::Terminal(DispatchStatus::NeedsUser),
         _ => BoundAttemptState::Nonterminal,
-    })
+    }
 }
 
 fn is_missing(error: &crate::work_model::WorkModelStorageError) -> bool {
@@ -418,13 +767,15 @@ pub fn dispatch_one(
     // Hold the whole-Attempt lease for the life of this dispatch so the claim
     // reads as live to capacity counting and duplicate-dispatch prevention.
     let lease = acquire_dispatch_lease(project_root, work_item_id)?;
-    run_claimed(project_root, token, lease, runner)
+    run_claimed_dispatch(project_root, token, lease, runner)
 }
 
 /// Run an already-claimed dispatch on the current thread: ensure its bound
 /// Attempt, transition to running, drive it, and reconcile. Holds the passed
 /// lease for the full lifetime of the dispatch.
-fn run_claimed(
+/// Run a service-owned real queue claim through the existing Attempt executor
+/// and reconcile its authoritative queue outcome.
+pub fn run_claimed_dispatch(
     project_root: &Path,
     token: DispatchToken,
     lease: TaskLease,
@@ -438,7 +789,27 @@ fn run_claimed(
     let token = queue::mark_running(project_root, &token)?;
     eprintln!("[scheduler] starting {work_item_id}");
 
-    let outcome = runner.run(project_root, &work_item_id, &token.bound_attempt_id)?;
+    // Pause at an observable running boundary before any child can inherit
+    // the lease. Tests kill this process to exercise actual OS lease release.
+    #[cfg(feature = "test-support")]
+    if let Some(barrier) = std::env::var_os("FLUENT_TEST_DISPATCH_RUNNING_BARRIER") {
+        let barrier = std::path::PathBuf::from(barrier);
+        std::fs::write(&barrier, token.generation.to_string())?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !barrier.with_extension("release").exists() {
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!("test dispatch barrier timed out");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    let outcome = runner.run(
+        project_root,
+        &work_item_id,
+        &token.bound_attempt_id,
+        token.tester_no_sandbox,
+    )?;
 
     let status = outcome.to_dispatch_status();
     queue::reconcile(project_root, &token, status)?;
@@ -454,30 +825,328 @@ fn run_claimed(
 /// live coordinator already owns the project.
 pub enum CoordinatorStart {
     Elected(CoordinatorLease),
-    Reused,
+    Reused(CoordinatorMetadata),
 }
 
 /// The lifetime lease of an elected coordinator. Held for the coordinator's run
 /// and released when it exits, so the next start can be elected.
 pub struct CoordinatorLease {
-    _file: File,
+    file: File,
+    project_root: PathBuf,
+    metadata: CoordinatorMetadata,
+}
+
+/// Durable identity and lifecycle state for one elected coordinator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoordinatorMetadata {
+    pub schema: u32,
+    pub instance_id: String,
+    /// Display-only process identifier. Fluent never signals this PID.
+    pub pid: u32,
+    pub started_at: String,
+    pub state: CoordinatorState,
+    pub build: BuildIdentity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CoordinatorState {
+    Running,
+    Draining,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StopRequest {
+    schema: u32,
+    instance_id: String,
+    requested_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SchedulerStatus {
+    Stopped,
+    Running(CoordinatorMetadata),
 }
 
 fn coordinator_lock_path(project_root: &Path) -> PathBuf {
     project_root.join(".fluent/work/scheduler/coordinator.lock")
 }
 
+fn coordinator_metadata_path(project_root: &Path) -> PathBuf {
+    project_root.join(".fluent/work/scheduler/coordinator.json")
+}
+
+fn stop_request_path(project_root: &Path) -> PathBuf {
+    project_root.join(".fluent/work/scheduler/stop-request.json")
+}
+
 /// Try to become the project's coordinator. Elects this process when the
 /// coordinator lease is free; otherwise reports reuse of the live coordinator.
-pub fn start_or_reuse(project_root: &Path) -> Result<CoordinatorStart> {
+pub fn start_or_reuse(project_root: &Path, build: &BuildIdentity) -> Result<CoordinatorStart> {
     let path = coordinator_lock_path(project_root);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let file = OpenOptions::new().create(true).write(true).open(&path)?;
-    match flock(&file, FlockOperation::NonBlockingLockExclusive) {
-        Ok(()) => Ok(CoordinatorStart::Elected(CoordinatorLease { _file: file })),
-        Err(_) => Ok(CoordinatorStart::Reused),
+    loop {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        match flock(&file, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => {
+                let metadata = CoordinatorMetadata {
+                    schema: COORDINATOR_METADATA_SCHEMA,
+                    instance_id: crate::scheduler_service::generate_random_hex(16)?,
+                    pid: std::process::id(),
+                    started_at: chrono::Utc::now().to_rfc3339(),
+                    state: CoordinatorState::Running,
+                    build: build.clone(),
+                };
+                publish_lock_identity(&mut file, &metadata.instance_id)?;
+                write_coordinator_metadata(project_root, &metadata)?;
+                return Ok(CoordinatorStart::Elected(CoordinatorLease {
+                    file,
+                    project_root: project_root.to_path_buf(),
+                    metadata,
+                }));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                let Some(metadata) = read_live_coordinator_metadata(project_root)? else {
+                    // The owner exited after this start lost election. Retry the
+                    // lease instead of misclassifying its cleanup gap as legacy.
+                    continue;
+                };
+                if metadata.state == CoordinatorState::Draining {
+                    bail!(
+                        "scheduler coordinator {} is draining; wait for `fluent scheduler stop` to finish, then run `fluent scheduler run`",
+                        metadata.instance_id
+                    );
+                }
+                if metadata.build != *build {
+                    bail!(
+                        "a live scheduler coordinator is running {} ({}), but this Fluent build is {} ({}); run `fluent scheduler stop`, then `fluent scheduler run`",
+                        metadata.build.version,
+                        metadata.build.hash,
+                        build.version,
+                        build.hash
+                    );
+                }
+                return Ok(CoordinatorStart::Reused(metadata));
+            }
+            Err(error) => return Err(error).context("elect scheduler coordinator"),
+        }
+    }
+}
+
+impl CoordinatorLease {
+    fn mark_draining(&mut self) -> Result<()> {
+        if self.metadata.state == CoordinatorState::Draining {
+            return Ok(());
+        }
+        let mut draining = self.metadata.clone();
+        draining.state = CoordinatorState::Draining;
+        write_coordinator_metadata(&self.project_root, &draining)?;
+        self.metadata = draining;
+        Ok(())
+    }
+}
+
+impl Drop for CoordinatorLease {
+    fn drop(&mut self) {
+        remove_if_instance_matches(
+            &coordinator_metadata_path(&self.project_root),
+            &self.metadata.instance_id,
+        );
+        remove_if_instance_matches(
+            &stop_request_path(&self.project_root),
+            &self.metadata.instance_id,
+        );
+        let _ = flock(&self.file, FlockOperation::Unlock);
+    }
+}
+
+fn write_coordinator_metadata(project_root: &Path, metadata: &CoordinatorMetadata) -> Result<()> {
+    let path = coordinator_metadata_path(project_root);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    crate::atomic_write::atomic_write(&path, &serde_json::to_vec_pretty(metadata)?)
+        .with_context(|| format!("write scheduler coordinator metadata {}", path.display()))
+}
+
+fn publish_lock_identity(file: &mut File, instance_id: &str) -> Result<()> {
+    file.set_len(0)
+        .context("clear scheduler coordinator identity")?;
+    file.seek(SeekFrom::Start(0))
+        .context("seek scheduler coordinator identity")?;
+    file.write_all(instance_id.as_bytes())
+        .context("write scheduler coordinator identity")?;
+    file.sync_data()
+        .context("sync scheduler coordinator identity")
+}
+
+fn read_lock_identity(project_root: &Path) -> Result<Option<String>> {
+    let path = coordinator_lock_path(project_root);
+    let value = fs::read_to_string(&path)
+        .with_context(|| format!("read scheduler coordinator identity {}", path.display()))?;
+    let value = value.trim();
+    if value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Ok(Some(value.to_string()))
+    } else {
+        Ok(None)
+    }
+}
+
+fn read_coordinator_metadata(project_root: &Path) -> Result<Option<CoordinatorMetadata>> {
+    let path = coordinator_metadata_path(project_root);
+    match fs::read(&path) {
+        Ok(bytes) => {
+            let metadata: CoordinatorMetadata =
+                serde_json::from_slice(&bytes).with_context(|| {
+                    format!("parse scheduler coordinator metadata {}", path.display())
+                })?;
+            if metadata.schema != COORDINATOR_METADATA_SCHEMA || metadata.instance_id.is_empty() {
+                bail!(
+                    "unsupported scheduler coordinator metadata in {}",
+                    path.display()
+                );
+            }
+            Ok(Some(metadata))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error)
+            .with_context(|| format!("read scheduler coordinator metadata {}", path.display())),
+    }
+}
+
+fn read_live_coordinator_metadata(project_root: &Path) -> Result<Option<CoordinatorMetadata>> {
+    // Election acquires the lease before it can publish metadata. Give that
+    // bounded startup window time to complete, then treat absence as a legacy
+    // or malformed live coordinator and fail closed.
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        let problem = match (
+            read_lock_identity(project_root),
+            read_coordinator_metadata(project_root),
+        ) {
+            (Ok(Some(lock_id)), Ok(Some(metadata))) if metadata.instance_id == lock_id => {
+                return Ok(Some(metadata));
+            }
+            (Ok(Some(lock_id)), Ok(Some(metadata))) => format!(
+                "metadata instance {} does not match lease instance {lock_id}",
+                metadata.instance_id
+            ),
+            (Err(error), _) | (_, Err(error)) => format!("{error:#}"),
+            _ => "identity metadata is missing".to_string(),
+        };
+        if !coordinator_is_live(project_root) {
+            return Ok(None);
+        }
+        if std::time::Instant::now() >= deadline {
+            bail!(
+                "a live scheduler coordinator has no valid identity metadata ({problem}); stop its owning process manually before starting another coordinator",
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn read_stop_request(project_root: &Path) -> Result<Option<StopRequest>> {
+    let path = stop_request_path(project_root);
+    match fs::read(&path) {
+        Ok(bytes) => {
+            let request: StopRequest = serde_json::from_slice(&bytes)
+                .with_context(|| format!("parse scheduler stop request {}", path.display()))?;
+            if request.schema != STOP_REQUEST_SCHEMA || request.instance_id.is_empty() {
+                bail!("unsupported scheduler stop request in {}", path.display());
+            }
+            Ok(Some(request))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => {
+            Err(error).with_context(|| format!("read scheduler stop request {}", path.display()))
+        }
+    }
+}
+
+fn remove_if_instance_matches(path: &Path, instance_id: &str) {
+    let Ok(bytes) = fs::read(path) else {
+        return;
+    };
+    let matches = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|value| value.get("instance_id")?.as_str().map(str::to_owned))
+        .is_some_and(|stored| stored == instance_id);
+    if matches {
+        let _ = fs::remove_file(path);
+    }
+}
+
+/// Read the current coordinator without changing scheduler state.
+pub fn status(project_root: &Path) -> Result<SchedulerStatus> {
+    if !coordinator_is_live(project_root) {
+        return Ok(SchedulerStatus::Stopped);
+    }
+    match read_live_coordinator_metadata(project_root)? {
+        Some(metadata) => Ok(SchedulerStatus::Running(metadata)),
+        None => Ok(SchedulerStatus::Stopped),
+    }
+}
+
+/// Ask the exact live coordinator to stop claiming, drain workers, and exit.
+pub fn stop(project_root: &Path) -> Result<CoordinatorMetadata> {
+    let target = match status(project_root)? {
+        SchedulerStatus::Stopped => bail!("scheduler coordinator is not running"),
+        SchedulerStatus::Running(metadata) => metadata,
+    };
+    let request = StopRequest {
+        schema: STOP_REQUEST_SCHEMA,
+        instance_id: target.instance_id.clone(),
+        requested_at: chrono::Utc::now().to_rfc3339(),
+    };
+    let path = stop_request_path(project_root);
+    crate::atomic_write::atomic_write(&path, &serde_json::to_vec_pretty(&request)?)
+        .with_context(|| format!("write scheduler stop request {}", path.display()))?;
+
+    // Revalidate after publication. A replacement instance ignores this request.
+    match status(project_root)? {
+        SchedulerStatus::Stopped => {
+            remove_if_instance_matches(&path, &target.instance_id);
+            return Ok(target);
+        }
+        SchedulerStatus::Running(current) if current.instance_id != target.instance_id => {
+            remove_if_instance_matches(&path, &target.instance_id);
+            bail!(
+                "scheduler coordinator changed while requesting stop; instance {} is now running",
+                current.instance_id
+            );
+        }
+        SchedulerStatus::Running(_) => {}
+    }
+
+    loop {
+        if !coordinator_is_live(project_root) {
+            remove_if_instance_matches(&path, &target.instance_id);
+            return Ok(target);
+        }
+        match read_coordinator_metadata(project_root) {
+            Ok(Some(current)) if current.instance_id == target.instance_id => {}
+            Ok(Some(current)) => {
+                remove_if_instance_matches(&path, &target.instance_id);
+                bail!(
+                    "scheduler coordinator changed while draining; instance {} is now running",
+                    current.instance_id
+                )
+            }
+            // The elected process removes metadata immediately before releasing
+            // its lease. Let that short cleanup window finish.
+            Ok(None) => {}
+            Err(error) => return Err(error),
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -495,18 +1164,33 @@ fn resolve_bound_attempt_id(project_root: &Path, work_item_id: &str) -> Result<S
     }
     let store = WorkModelStore::new(project_root);
     let item = store.read_work_item(work_item_id)?;
+    if let Some(attempt) = item
+        .attempts
+        .last()
+        .filter(|attempt| attempt.status == AttemptStatus::Planned)
+    {
+        return Ok(attempt.id.clone());
+    }
     Ok(item.next_attempt_id())
 }
 
 /// Ensure exactly the bound Attempt exists, creating it once when absent.
 fn ensure_bound_attempt(project_root: &Path, work_item_id: &str, attempt_id: &str) -> Result<()> {
     let store = WorkModelStore::new(project_root);
-    let mut item = store.read_work_item(work_item_id)?;
-    if item.attempts.iter().any(|a| a.id == attempt_id) {
-        return Ok(());
-    }
-    item.add_initial_attempt(attempt_id)?;
-    store.write_work_item(&item)?;
+    let coder_mapping = crate::work_model::resolve_coder_mapping(
+        &crate::config::attempt_creation_inputs(project_root)?,
+    )?;
+    let metadata = crate::work_model::DurableTransitionMetadata {
+        origin: crate::work_model::DurableTransitionOrigin::Scheduler,
+        reason: Some("bind queued Work to an Attempt".to_string()),
+        evidence_ref: Some(format!("queue:{}", work_item_id)),
+    };
+    store.mutate_work_item_with_transition(work_item_id, &metadata, |item| {
+        if item.attempts.iter().any(|attempt| attempt.id == attempt_id) {
+            return Ok(());
+        }
+        item.add_initial_attempt_with_coder_mapping(attempt_id, coder_mapping)
+    })?;
     Ok(())
 }
 
@@ -527,27 +1211,73 @@ fn is_shutdown(shutdown: &AtomicBool) -> bool {
     shutdown.load(Ordering::Acquire)
 }
 
+fn shutdown_requested(
+    project_root: &Path,
+    shutdown: &AtomicBool,
+    coordinator: Option<&mut CoordinatorLease>,
+) -> Result<bool> {
+    if is_shutdown(shutdown) {
+        if let Some(coordinator) = coordinator {
+            coordinator.mark_draining()?;
+        }
+        return Ok(true);
+    }
+    let Some(coordinator) = coordinator else {
+        return Ok(false);
+    };
+    match read_stop_request(project_root) {
+        Ok(Some(request)) if request.instance_id == coordinator.metadata.instance_id => {
+            coordinator.mark_draining()?;
+            Ok(true)
+        }
+        Ok(Some(request)) => {
+            remove_if_instance_matches(&stop_request_path(project_root), &request.instance_id);
+            Ok(false)
+        }
+        Ok(None) => Ok(false),
+        Err(error) => {
+            eprintln!("[scheduler] ignoring invalid stop request: {error:#}");
+            Ok(false)
+        }
+    }
+}
+
+/// Observe and acknowledge a stop request for a service-owned coordinator.
+/// The caller stops claiming and drops the lease after its workers drain.
+pub fn service_stop_requested(
+    project_root: &Path,
+    coordinator: &mut CoordinatorLease,
+) -> Result<bool> {
+    shutdown_requested(project_root, &AtomicBool::new(false), Some(coordinator))
+}
+
 /// Sleep up to `duration`, checking the shutdown signal each second so a
 /// SIGTERM or SIGINT stops an idle coordinator without waiting the full poll
 /// interval.
-fn sleep_until_shutdown(duration: Duration, shutdown: &AtomicBool) {
+fn sleep_until_shutdown(
+    project_root: &Path,
+    duration: Duration,
+    shutdown: &AtomicBool,
+    mut coordinator: Option<&mut CoordinatorLease>,
+) -> Result<()> {
     let one_second = Duration::from_secs(1);
     let mut remaining = duration;
     while remaining > Duration::ZERO {
-        if is_shutdown(shutdown) {
-            return;
+        if shutdown_requested(project_root, shutdown, coordinator.as_deref_mut())? {
+            return Ok(());
         }
         let sleep_for = remaining.min(one_second);
         std::thread::sleep(sleep_for);
         remaining = remaining.saturating_sub(sleep_for);
     }
+    Ok(())
 }
 
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
     use crate::work_model::{
-        AttemptReviewState, TaskOutput, TaskStatus, WorkspaceAccess, WorkspaceRef,
+        AttemptReviewState, TaskOutput, TaskStatus, WorkItem, WorkspaceAccess, WorkspaceRef,
     };
     use std::fs;
     use std::sync::Mutex;
@@ -579,6 +1309,7 @@ pub(crate) mod test_support {
             _project_root: &Path,
             work_item_id: &str,
             _attempt_id: &str,
+            _tester_no_sandbox: bool,
         ) -> Result<AttemptOutcome> {
             self.invocations
                 .lock()
@@ -589,7 +1320,8 @@ pub(crate) mod test_support {
     }
 
     /// A runner that drives the bound Attempt to a passing Merge Candidate
-    /// before returning `Complete`, so reconcile can produce `candidate-ready`.
+    /// before returning `CandidateReady`, so reconcile can produce
+    /// `candidate-ready`.
     pub struct PassingRunner;
 
     impl AttemptRunner for PassingRunner {
@@ -598,14 +1330,22 @@ pub(crate) mod test_support {
             project_root: &Path,
             work_item_id: &str,
             attempt_id: &str,
+            _tester_no_sandbox: bool,
         ) -> Result<AttemptOutcome> {
             make_attempt_pass_with_candidate(project_root, work_item_id, attempt_id);
-            Ok(AttemptOutcome::Complete)
+            Ok(AttemptOutcome::CandidateReady)
         }
     }
 
     pub fn setup_project(tmp: &Path) {
         fs::create_dir_all(tmp.join(".fluent/work/items")).unwrap();
+    }
+
+    pub fn test_build(hash: &str) -> BuildIdentity {
+        BuildIdentity {
+            version: "0.1.5 test".to_string(),
+            hash: hash.to_string(),
+        }
     }
 
     pub fn write_ready_work_item(tmp: &Path, id: &str) {
@@ -614,6 +1354,13 @@ pub(crate) mod test_support {
             format!(r#"{{"id": "{id}", "title": "Test"}}"#),
         )
         .unwrap();
+    }
+
+    pub fn write_planned_attempt(tmp: &Path, id: &str, attempt_id: &str) {
+        let store = WorkModelStore::new(tmp);
+        let mut item = WorkItem::planned(id, "Test");
+        item.add_initial_attempt(attempt_id).unwrap();
+        store.create_work_item(&item).unwrap();
     }
 
     /// Drive a bound write Attempt to `Complete` + passing review with a Merge
@@ -648,9 +1395,19 @@ pub(crate) mod test_support {
             source_branch: "main".to_string(),
             base_commit: None,
             commit: "abc123".to_string(),
+            no_change: None,
+            learner_canonicalization: None,
         });
         attempt.status = AttemptStatus::Complete;
         attempt.review_state = Some(AttemptReviewState::Passed);
+        attempt.pause_kind = None;
+        attempt.learning = Some(crate::work_model::AttemptLearning::succeeded(
+            1,
+            crate::follow_up::ArtifactRef {
+                path: "handoff.json".to_string(),
+                digest: "sha256:test".to_string(),
+            },
+        ));
         item.create_or_get_merge_candidate(attempt_id).unwrap();
         store.write_work_item(&item).unwrap();
     }
@@ -660,10 +1417,193 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::*;
     use super::*;
-    use crate::work_model::MergeCandidateMergeStatus;
+    use crate::work_model::{
+        MergeCandidateMergeStatus, PauseKind, PauseRecovery, TaskStatus, WorkItem,
+    };
 
     fn add_queued(project_root: &Path, id: &str, priority: i64) {
         queue::add(project_root, id, Some(priority)).unwrap();
+    }
+
+    #[test]
+    fn scheduler_child_receives_one_shared_baseline_session_without_disabling_sandbox() {
+        let command = attempt_run_command(
+            Path::new("/tmp/fluent"),
+            Path::new("/tmp/project"),
+            "work-1",
+            "attempt-1",
+            "dispatch-1",
+            "scheduler-session-1",
+            false,
+        );
+        let session = command
+            .get_envs()
+            .find(|(key, _)| *key == crate::baseline_cache::BASELINE_SESSION_ENV)
+            .and_then(|(_, value)| value)
+            .and_then(|value| value.to_str());
+
+        assert_eq!(session, Some("scheduler-session-1"));
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                "attempt",
+                "run",
+                "--dispatch-id",
+                "dispatch-1",
+                "work-1",
+                "attempt-1"
+            ]
+        );
+    }
+
+    #[test]
+    fn scheduler_child_uses_tester_only_capability_for_approved_recovery() {
+        let approved = attempt_run_command(
+            Path::new("/tmp/fluent"),
+            Path::new("/tmp/project"),
+            "work-1",
+            "attempt-1",
+            "dispatch-1",
+            "scheduler-session-1",
+            true,
+        );
+        assert_eq!(
+            approved.get_args().collect::<Vec<_>>(),
+            [
+                "attempt",
+                "run",
+                "--dispatch-id",
+                "dispatch-1",
+                "--tester-no-sandbox",
+                "work-1",
+                "attempt-1"
+            ]
+        );
+    }
+
+    #[test]
+    fn persisted_needs_user_is_authoritative_scheduler_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        let store = WorkModelStore::new(dir.path());
+        let mut item = WorkItem::planned("wi-paused", "Paused");
+        item.add_initial_attempt("attempt-1").unwrap();
+        item.attempts[0].status = AttemptStatus::NeedsUser;
+        item.attempts[0].tasks[0].status = TaskStatus::NeedsUser;
+        store.create_work_item(&item).unwrap();
+
+        assert_eq!(
+            classify_attempt_outcome(dir.path(), "wi-paused", "attempt-1").unwrap(),
+            AttemptOutcome::NeedsUser
+        );
+    }
+
+    #[test]
+    fn scheduler_created_attempt_snapshots_project_coder_mapping() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        write_ready_work_item(dir.path(), "wi-profile");
+        std::fs::create_dir_all(dir.path().join(".fluent")).unwrap();
+        std::fs::write(
+            dir.path().join(".fluent/config.yaml"),
+            "coders:\n  writer:\n    coder: codex\n    model: gpt-write\n    effort: medium\n  reviewer:\n    coder: claude\n    model: claude-review\n    effort: high\n",
+        )
+        .unwrap();
+
+        ensure_bound_attempt(dir.path(), "wi-profile", "attempt-1").unwrap();
+
+        let item = WorkModelStore::new(dir.path())
+            .read_work_item("wi-profile")
+            .unwrap();
+        let mapping = &item.attempts[0].coder_mapping;
+        assert_eq!(mapping.write.coder, crate::coder::CoderKind::Codex);
+        assert_eq!(mapping.write.model, "gpt-write");
+        assert_eq!(mapping.write.effort.as_deref(), Some("medium"));
+        assert_eq!(mapping.review.coder, crate::coder::CoderKind::Claude);
+        assert_eq!(mapping.review.model, "claude-review");
+        assert_eq!(mapping.review.effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn scheduler_preserves_existing_attempt_coder_mapping() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        let store = WorkModelStore::new(dir.path());
+        let mut item = WorkItem::planned("wi-resume-profile", "Resume profile");
+        let persisted = crate::work_model::CoderMapping {
+            write: crate::work_model::CoderModelPair {
+                coder: crate::coder::CoderKind::Pi,
+                model: "persisted-write".to_string(),
+                effort: Some("high".to_string()),
+            },
+            review: crate::work_model::CoderModelPair {
+                coder: crate::coder::CoderKind::Codex,
+                model: "persisted-review".to_string(),
+                effort: Some("medium".to_string()),
+            },
+        };
+        item.add_initial_attempt_with_coder_mapping("attempt-1", persisted.clone())
+            .unwrap();
+        store.create_work_item(&item).unwrap();
+        std::fs::create_dir_all(dir.path().join(".fluent")).unwrap();
+        std::fs::write(
+            dir.path().join(".fluent/config.yaml"),
+            "coders:\n  writer:\n    coder: claude\n  reviewer:\n    coder: claude\n",
+        )
+        .unwrap();
+
+        ensure_bound_attempt(dir.path(), "wi-resume-profile", "attempt-1").unwrap();
+
+        let item = store.read_work_item("wi-resume-profile").unwrap();
+        assert_eq!(item.attempts[0].coder_mapping, persisted);
+    }
+
+    #[test]
+    fn complete_attempt_without_succeeded_learner_is_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        write_ready_work_item(dir.path(), "wi-unlearned");
+        let store = WorkModelStore::new(dir.path());
+        let mut item = store.read_work_item("wi-unlearned").unwrap();
+        item.add_initial_attempt("attempt-1").unwrap();
+        store.write_work_item(&item).unwrap();
+        make_attempt_pass_with_candidate(dir.path(), "wi-unlearned", "attempt-1");
+        store
+            .mutate_work_item("wi-unlearned", |item| {
+                item.attempts[0].learning = Some(crate::work_model::AttemptLearning::failed(
+                    1,
+                    "Learner candidate gate rejected the candidate",
+                ));
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(
+            classify_attempt_outcome(dir.path(), "wi-unlearned", "attempt-1").unwrap(),
+            AttemptOutcome::Blocked
+        );
+        assert!(matches!(
+            bound_attempt_terminal_status(dir.path(), "wi-unlearned", Some("attempt-1")).unwrap(),
+            BoundAttemptState::Terminal(DispatchStatus::Blocked)
+        ));
+    }
+
+    #[test]
+    fn claim_binds_existing_current_planned_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        let store = WorkModelStore::new(dir.path());
+        let mut item = WorkItem::planned("wi-retry", "Retry");
+        item.add_initial_attempt("attempt-1").unwrap();
+        item.attempts[0].status = AttemptStatus::NeedsUser;
+        item.attempts[0].tasks[0].status = TaskStatus::NeedsUser;
+        item.add_initial_attempt("attempt-2").unwrap();
+        store.create_work_item(&item).unwrap();
+        add_queued(dir.path(), "wi-retry", 0);
+
+        let (token, _lease) = claim_next(dir.path()).unwrap().unwrap();
+
+        assert_eq!(token.bound_attempt_id, "attempt-2");
     }
 
     /// Acquire and return the whole-Attempt lease for a Work Item so a test can
@@ -810,6 +1750,7 @@ mod tests {
 
         let elected = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let build = test_build("same-build");
 
         std::thread::scope(|scope| {
             let mut handles = Vec::new();
@@ -817,9 +1758,10 @@ mod tests {
                 let root = root.clone();
                 let elected = elected.clone();
                 let barrier = barrier.clone();
+                let build = build.clone();
                 handles.push(scope.spawn(move || {
                     barrier.wait();
-                    let start = start_or_reuse(&root).unwrap();
+                    let start = start_or_reuse(&root, &build).unwrap();
                     match start {
                         CoordinatorStart::Elected(lease) => {
                             elected.fetch_add(1, Ordering::SeqCst);
@@ -828,7 +1770,9 @@ mod tests {
                             std::thread::sleep(Duration::from_millis(100));
                             drop(lease);
                         }
-                        CoordinatorStart::Reused => {}
+                        CoordinatorStart::Reused(metadata) => {
+                            assert_eq!(metadata.build, build);
+                        }
                     }
                 }));
             }
@@ -839,6 +1783,289 @@ mod tests {
             1,
             "exactly one coordinator is elected among concurrent starts"
         );
+    }
+
+    #[test]
+    fn same_build_reuse_reports_the_elected_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        let build = test_build("build-a");
+        let elected = match start_or_reuse(dir.path(), &build).unwrap() {
+            CoordinatorStart::Elected(lease) => lease,
+            CoordinatorStart::Reused(_) => panic!("first start must elect"),
+        };
+
+        let reused = match start_or_reuse(dir.path(), &build).unwrap() {
+            CoordinatorStart::Reused(metadata) => metadata,
+            CoordinatorStart::Elected(_) => panic!("live coordinator must be reused"),
+        };
+        assert_eq!(reused.instance_id, elected.metadata.instance_id);
+        assert_eq!(reused.build, build);
+        assert_eq!(reused.state, CoordinatorState::Running);
+    }
+
+    #[test]
+    fn status_reads_live_identity_without_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        let build = test_build("build-a");
+        let elected = match start_or_reuse(dir.path(), &build).unwrap() {
+            CoordinatorStart::Elected(lease) => lease,
+            CoordinatorStart::Reused(_) => panic!("first start must elect"),
+        };
+        let metadata_path = coordinator_metadata_path(dir.path());
+        let lock_path = coordinator_lock_path(dir.path());
+        let metadata_before = fs::read(&metadata_path).unwrap();
+        let lock_before = fs::read(&lock_path).unwrap();
+
+        assert_eq!(
+            status(dir.path()).unwrap(),
+            SchedulerStatus::Running(elected.metadata.clone())
+        );
+        assert_eq!(fs::read(metadata_path).unwrap(), metadata_before);
+        assert_eq!(fs::read(lock_path).unwrap(), lock_before);
+        assert!(!stop_request_path(dir.path()).exists());
+    }
+
+    #[test]
+    fn stopped_status_does_not_create_scheduler_state() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        let scheduler_dir = dir.path().join(".fluent/work/scheduler");
+
+        assert_eq!(status(dir.path()).unwrap(), SchedulerStatus::Stopped);
+        assert!(!scheduler_dir.exists());
+    }
+
+    #[test]
+    fn different_build_reuse_requires_explicit_stop_then_run() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        let _elected = match start_or_reuse(dir.path(), &test_build("build-a")).unwrap() {
+            CoordinatorStart::Elected(lease) => lease,
+            CoordinatorStart::Reused(_) => panic!("first start must elect"),
+        };
+
+        let error = match start_or_reuse(dir.path(), &test_build("build-b")) {
+            Ok(_) => panic!("different build must not reuse"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(message.contains("build-a"));
+        assert!(message.contains("build-b"));
+        assert!(message.contains("`fluent scheduler stop`, then `fluent scheduler run`"));
+    }
+
+    #[test]
+    fn run_does_not_reuse_a_draining_coordinator() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        let build = test_build("build-a");
+        let mut elected = match start_or_reuse(dir.path(), &build).unwrap() {
+            CoordinatorStart::Elected(lease) => lease,
+            CoordinatorStart::Reused(_) => panic!("first start must elect"),
+        };
+        elected.mark_draining().unwrap();
+
+        let error = match start_or_reuse(dir.path(), &build) {
+            Ok(_) => panic!("draining coordinator must not be reused"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("is draining"));
+        assert!(error.to_string().contains("`fluent scheduler run`"));
+    }
+
+    #[test]
+    fn live_coordinator_with_malformed_metadata_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        let path = coordinator_lock_path(dir.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let lock = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        flock(&lock, FlockOperation::LockExclusive).unwrap();
+        fs::write(coordinator_metadata_path(dir.path()), b"not json").unwrap();
+
+        assert!(status(dir.path()).is_err());
+        assert!(start_or_reuse(dir.path(), &test_build("build-a")).is_err());
+    }
+
+    #[test]
+    fn live_legacy_coordinator_without_metadata_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        let path = coordinator_lock_path(dir.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let lock = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        flock(&lock, FlockOperation::LockExclusive).unwrap();
+
+        let error = match start_or_reuse(dir.path(), &test_build("build-a")) {
+            Ok(_) => panic!("legacy coordinator must not be reused"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("stop its owning process manually")
+        );
+    }
+
+    #[test]
+    fn metadata_from_an_earlier_lease_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        let path = coordinator_lock_path(dir.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        flock(&lock, FlockOperation::LockExclusive).unwrap();
+        publish_lock_identity(&mut lock, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        write_coordinator_metadata(
+            dir.path(),
+            &CoordinatorMetadata {
+                schema: COORDINATOR_METADATA_SCHEMA,
+                instance_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+                pid: 42,
+                started_at: "2026-08-10T00:00:00Z".to_string(),
+                state: CoordinatorState::Running,
+                build: test_build("stale"),
+            },
+        )
+        .unwrap();
+
+        let error = status(dir.path()).unwrap_err();
+        assert!(error.to_string().contains("does not match lease instance"));
+    }
+
+    #[test]
+    fn matching_stop_request_publishes_draining_before_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        let mut elected = match start_or_reuse(dir.path(), &test_build("build-a")).unwrap() {
+            CoordinatorStart::Elected(lease) => lease,
+            CoordinatorStart::Reused(_) => panic!("first start must elect"),
+        };
+        let request = StopRequest {
+            schema: STOP_REQUEST_SCHEMA,
+            instance_id: elected.metadata.instance_id.clone(),
+            requested_at: chrono::Utc::now().to_rfc3339(),
+        };
+        crate::atomic_write::atomic_write(
+            &stop_request_path(dir.path()),
+            &serde_json::to_vec_pretty(&request).unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            shutdown_requested(dir.path(), &AtomicBool::new(false), Some(&mut elected)).unwrap()
+        );
+        assert_eq!(
+            read_coordinator_metadata(dir.path())
+                .unwrap()
+                .unwrap()
+                .state,
+            CoordinatorState::Draining
+        );
+    }
+
+    #[test]
+    fn stale_stop_request_cannot_stop_replacement_instance() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        fs::create_dir_all(dir.path().join(".fluent/work/scheduler")).unwrap();
+        let stale = StopRequest {
+            schema: STOP_REQUEST_SCHEMA,
+            instance_id: "departed-instance".to_string(),
+            requested_at: chrono::Utc::now().to_rfc3339(),
+        };
+        fs::write(
+            stop_request_path(dir.path()),
+            serde_json::to_vec_pretty(&stale).unwrap(),
+        )
+        .unwrap();
+        let mut elected = match start_or_reuse(dir.path(), &test_build("build-a")).unwrap() {
+            CoordinatorStart::Elected(lease) => lease,
+            CoordinatorStart::Reused(_) => panic!("first start must elect"),
+        };
+
+        assert!(
+            !shutdown_requested(dir.path(), &AtomicBool::new(false), Some(&mut elected)).unwrap()
+        );
+        assert_eq!(elected.metadata.state, CoordinatorState::Running);
+        assert!(!stop_request_path(dir.path()).exists());
+    }
+
+    #[test]
+    fn durable_stop_request_drains_and_releases_exact_coordinator() {
+        struct SlowRunner;
+        impl AttemptRunner for SlowRunner {
+            fn run(
+                &self,
+                _project_root: &Path,
+                _work_item_id: &str,
+                _attempt_id: &str,
+                _tester_no_sandbox: bool,
+            ) -> Result<AttemptOutcome> {
+                std::thread::sleep(Duration::from_millis(300));
+                Ok(AttemptOutcome::Failed)
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        write_ready_work_item(dir.path(), "wi-drain");
+        add_queued(dir.path(), "wi-drain", 0);
+        let elected = match start_or_reuse(dir.path(), &test_build("build-a")).unwrap() {
+            CoordinatorStart::Elected(lease) => lease,
+            CoordinatorStart::Reused(_) => panic!("first start must elect"),
+        };
+        let target_id = elected.metadata.instance_id.clone();
+        let shutdown = AtomicBool::new(false);
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let mut elected = elected;
+                run_coordinator_controlled(
+                    dir.path(),
+                    30,
+                    4,
+                    &SlowRunner,
+                    &shutdown,
+                    Some(&mut elected),
+                )
+                .unwrap();
+            });
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while latest_status(dir.path(), "wi-drain") != DispatchStatus::Running {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "scheduled Work did not start"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let stopped = stop(dir.path()).unwrap();
+            assert_eq!(stopped.instance_id, target_id);
+        });
+
+        assert_eq!(
+            latest_status(dir.path(), "wi-drain"),
+            DispatchStatus::Failed
+        );
+        assert_eq!(status(dir.path()).unwrap(), SchedulerStatus::Stopped);
+        assert!(!coordinator_metadata_path(dir.path()).exists());
+        assert!(!stop_request_path(dir.path()).exists());
     }
 
     #[test]
@@ -874,18 +2101,30 @@ mod tests {
     struct AttemptRecordingRunner {
         outcome: AttemptOutcome,
         attempts: std::sync::Mutex<Vec<String>>,
+        tester_no_sandbox: std::sync::Mutex<Vec<bool>>,
     }
     impl AttemptRecordingRunner {
         fn new(outcome: AttemptOutcome) -> Self {
             Self {
                 outcome,
                 attempts: std::sync::Mutex::new(Vec::new()),
+                tester_no_sandbox: std::sync::Mutex::new(Vec::new()),
             }
         }
     }
     impl AttemptRunner for AttemptRecordingRunner {
-        fn run(&self, _p: &Path, _wi: &str, attempt_id: &str) -> Result<AttemptOutcome> {
+        fn run(
+            &self,
+            _p: &Path,
+            _wi: &str,
+            attempt_id: &str,
+            tester_no_sandbox: bool,
+        ) -> Result<AttemptOutcome> {
             self.attempts.lock().unwrap().push(attempt_id.to_string());
+            self.tester_no_sandbox
+                .lock()
+                .unwrap()
+                .push(tester_no_sandbox);
             Ok(self.outcome)
         }
     }
@@ -906,6 +2145,23 @@ mod tests {
             .unwrap()
             .status = status;
         store.write_work_item(&item).unwrap();
+    }
+
+    fn suspend_bound_attempt(project_root: &Path, work_item_id: &str, attempt_id: &str) {
+        let store = WorkModelStore::new(project_root);
+        store
+            .mutate_work_item(work_item_id, |item| {
+                let attempt = item
+                    .attempts
+                    .iter_mut()
+                    .find(|attempt| attempt.id == attempt_id)
+                    .unwrap();
+                attempt.status = AttemptStatus::NeedsUser;
+                attempt.pause_kind = Some(PauseKind::WriterCompletion);
+                attempt.tasks[0].status = TaskStatus::NeedsUser;
+                Ok(())
+            })
+            .unwrap();
     }
 
     fn active_dispatch(project_root: &Path, work_item_id: &str) -> Dispatch {
@@ -947,7 +2203,7 @@ mod tests {
         assert_eq!(active.bound_attempt_id.as_deref(), Some("attempt-1"));
 
         // A subsequent dispatch advances that same Attempt, creating no new one.
-        let runner = AttemptRecordingRunner::new(AttemptOutcome::Complete);
+        let runner = AttemptRecordingRunner::new(AttemptOutcome::CandidateReady);
         dispatch_one(dir.path(), &active, &runner).unwrap();
         assert_eq!(runner.attempts.lock().unwrap().as_slice(), ["attempt-1"]);
         let store = WorkModelStore::new(dir.path());
@@ -994,7 +2250,7 @@ mod tests {
         assert_eq!(active.bound_attempt_id, None, "binding is cleared");
 
         // The next claim creates exactly one Attempt.
-        let runner = AttemptRecordingRunner::new(AttemptOutcome::Complete);
+        let runner = AttemptRecordingRunner::new(AttemptOutcome::CandidateReady);
         dispatch_one(dir.path(), &active, &runner).unwrap();
         let store = WorkModelStore::new(dir.path());
         assert_eq!(store.read_work_item("wi-1").unwrap().attempts.len(), 1);
@@ -1052,6 +2308,319 @@ mod tests {
             DispatchStatus::CandidateReady
         );
         assert_eq!(store.read_work_item("wi-1").unwrap().attempts.len(), 1);
+    }
+
+    #[test]
+    fn queued_resume_reconciles_after_foreground_attempt_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        write_planned_attempt(dir.path(), "wi-foreground", "attempt-1");
+        add_queued(dir.path(), "wi-foreground", 0);
+        queue::claim(dir.path(), "wi-foreground", "attempt-1")
+            .unwrap()
+            .unwrap();
+        suspend_bound_attempt(dir.path(), "wi-foreground", "attempt-1");
+        queue::reconcile_active(dir.path(), "wi-foreground", DispatchStatus::NeedsUser).unwrap();
+
+        // Authorize a scheduler resume, then let a foreground `attempt run`
+        // finish the same Attempt before the scheduler claims that dispatch.
+        queue::resume(dir.path(), "wi-foreground", "attempt-1", None).unwrap();
+        make_attempt_pass_with_candidate(dir.path(), "wi-foreground", "attempt-1");
+
+        // The foreground command reconciles its bound queue entry immediately;
+        // a later scheduler restart is therefore a harmless no-op.
+        reconcile_direct_attempt(dir.path(), "wi-foreground", "attempt-1").unwrap();
+        assert_eq!(
+            latest_status(dir.path(), "wi-foreground"),
+            DispatchStatus::CandidateReady
+        );
+
+        recover_and_reconcile(dir.path()).unwrap();
+        recover_and_reconcile(dir.path()).unwrap();
+
+        let ledger = queue::read_ledger(dir.path(), "wi-foreground")
+            .unwrap()
+            .unwrap();
+        assert_eq!(ledger.dispatches.len(), 2);
+        assert_eq!(ledger.dispatches[0].status, DispatchStatus::NeedsUser);
+        assert_eq!(ledger.dispatches[1].status, DispatchStatus::CandidateReady);
+        assert!(ledger.active().is_none());
+        assert_eq!(
+            classify_attempt_outcome(dir.path(), "wi-foreground", "attempt-1").unwrap(),
+            AttemptOutcome::CandidateReady
+        );
+    }
+
+    #[test]
+    fn suspended_dispatch_requeues_after_foreground_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        write_planned_attempt(dir.path(), "wi-reopen", "attempt-1");
+        add_queued(dir.path(), "wi-reopen", 0);
+        queue::claim(dir.path(), "wi-reopen", "attempt-1")
+            .unwrap()
+            .unwrap();
+        suspend_bound_attempt(dir.path(), "wi-reopen", "attempt-1");
+        WorkModelStore::new(dir.path())
+            .mutate_work_item("wi-reopen", |item| {
+                item.attempts[0].completed_at = Some("2026-08-19T00:00:00Z".to_string());
+                Ok(())
+            })
+            .unwrap();
+        queue::reconcile_active(dir.path(), "wi-reopen", DispatchStatus::NeedsUser).unwrap();
+
+        // This is the state written by a direct `attempt run` immediately
+        // after it reopens a Writer-completion pause.
+        WorkModelStore::new(dir.path())
+            .mutate_work_item("wi-reopen", |item| {
+                crate::work_model::reopen_attempt(&mut item.attempts[0]);
+                Ok(())
+            })
+            .unwrap();
+
+        let store = WorkModelStore::new(dir.path());
+        let reopened = store.read_work_item("wi-reopen").unwrap();
+        assert_eq!(reopened.attempts[0].status, AttemptStatus::Planned);
+        assert!(reopened.attempts[0].completed_at.is_none());
+
+        // A direct resume that reopens the paused Attempt returns its old
+        // suspension dispatch to the queue before the scheduler is restarted.
+        reconcile_direct_attempt(dir.path(), "wi-reopen", "attempt-1").unwrap();
+        let active = active_dispatch(dir.path(), "wi-reopen");
+        assert_eq!(active.status, DispatchStatus::Queued);
+        assert_eq!(active.bound_attempt_id.as_deref(), Some("attempt-1"));
+
+        recover_and_reconcile(dir.path()).unwrap();
+        let active = active_dispatch(dir.path(), "wi-reopen");
+        assert_eq!(active.status, DispatchStatus::Queued);
+        assert_eq!(active.bound_attempt_id.as_deref(), Some("attempt-1"));
+
+        dispatch_one(dir.path(), &active, &PassingRunner).unwrap();
+        assert_eq!(
+            latest_status(dir.path(), "wi-reopen"),
+            DispatchStatus::CandidateReady
+        );
+        let final_item = store.read_work_item("wi-reopen").unwrap();
+        assert_eq!(final_item.attempts.len(), 1);
+        assert_eq!(final_item.attempts[0].status, AttemptStatus::Complete);
+    }
+
+    #[test]
+    fn direct_resume_that_pauses_again_settles_its_queued_authorization() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        write_planned_attempt(dir.path(), "wi-pauses-again", "attempt-1");
+        add_queued(dir.path(), "wi-pauses-again", 0);
+        queue::claim(dir.path(), "wi-pauses-again", "attempt-1")
+            .unwrap()
+            .unwrap();
+        suspend_bound_attempt(dir.path(), "wi-pauses-again", "attempt-1");
+        queue::reconcile_active(dir.path(), "wi-pauses-again", DispatchStatus::NeedsUser).unwrap();
+        queue::resume(dir.path(), "wi-pauses-again", "attempt-1", None).unwrap();
+
+        // Simulate a direct resume that reopens the Attempt and then reaches a
+        // second needs-user pause before the foreground command returns.
+        WorkModelStore::new(dir.path())
+            .mutate_work_item("wi-pauses-again", |item| {
+                let attempt = &mut item.attempts[0];
+                crate::work_model::reopen_attempt(attempt);
+                attempt.status = AttemptStatus::NeedsUser;
+                attempt.pause_kind = Some(PauseKind::WriterCompletion);
+                attempt.tasks[0].status = TaskStatus::NeedsUser;
+                Ok(())
+            })
+            .unwrap();
+
+        reconcile_direct_attempt(dir.path(), "wi-pauses-again", "attempt-1").unwrap();
+        let ledger = queue::read_ledger(dir.path(), "wi-pauses-again")
+            .unwrap()
+            .unwrap();
+        assert_eq!(ledger.dispatches.len(), 2);
+        assert_eq!(ledger.dispatches[0].status, DispatchStatus::NeedsUser);
+        assert_eq!(ledger.dispatches[1].status, DispatchStatus::NeedsUser);
+
+        let before_repeat = ledger.clone();
+        reconcile_direct_attempt(dir.path(), "wi-pauses-again", "attempt-1").unwrap();
+        assert_eq!(
+            queue::read_ledger(dir.path(), "wi-pauses-again")
+                .unwrap()
+                .unwrap(),
+            before_repeat,
+            "repeating direct reconciliation does not change queue history"
+        );
+    }
+
+    #[test]
+    fn explicit_resume_survives_restart_and_runs_exact_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        let store = WorkModelStore::new(dir.path());
+        let mut item = WorkItem::planned("wi-resume", "Resume");
+        let persisted_mapping = crate::work_model::CoderMapping {
+            write: crate::work_model::CoderModelPair {
+                coder: crate::coder::CoderKind::Codex,
+                model: "persisted-write".to_string(),
+                effort: Some("medium".to_string()),
+            },
+            review: crate::work_model::CoderModelPair {
+                coder: crate::coder::CoderKind::Pi,
+                model: "persisted-review".to_string(),
+                effort: Some("high".to_string()),
+            },
+        };
+        item.add_initial_attempt_with_coder_mapping("attempt-1", persisted_mapping.clone())
+            .unwrap();
+        store.create_work_item(&item).unwrap();
+        std::fs::create_dir_all(dir.path().join(".fluent")).unwrap();
+        std::fs::write(
+            dir.path().join(".fluent/config.yaml"),
+            "coders:\n  writer:\n    coder: claude\n  reviewer:\n    coder: claude\n",
+        )
+        .unwrap();
+        add_queued(dir.path(), "wi-resume", 0);
+        queue::claim(dir.path(), "wi-resume", "attempt-1")
+            .unwrap()
+            .unwrap();
+        suspend_bound_attempt(dir.path(), "wi-resume", "attempt-1");
+        queue::reconcile_active(dir.path(), "wi-resume", DispatchStatus::NeedsUser).unwrap();
+
+        queue::resume(dir.path(), "wi-resume", "attempt-1", Some(9)).unwrap();
+        // A coordinator restart reconciles durable state without consuming or
+        // replacing the queued resume authorization.
+        recover_and_reconcile(dir.path()).unwrap();
+        let resumed = active_dispatch(dir.path(), "wi-resume");
+        assert_eq!(resumed.bound_attempt_id.as_deref(), Some("attempt-1"));
+
+        dispatch_one(dir.path(), &resumed, &PassingRunner).unwrap();
+
+        let item = store.read_work_item("wi-resume").unwrap();
+        assert_eq!(item.attempts.len(), 1, "resume creates no new Attempt");
+        assert_eq!(item.attempts[0].id, "attempt-1");
+        assert_eq!(item.attempts[0].status, AttemptStatus::Complete);
+        assert_eq!(item.attempts[0].coder_mapping, persisted_mapping);
+        assert_eq!(item.merge_candidates.len(), 1);
+        let ledger = queue::read_ledger(dir.path(), "wi-resume")
+            .unwrap()
+            .unwrap();
+        assert_eq!(ledger.dispatches.len(), 2);
+        assert_eq!(ledger.dispatches[0].status, DispatchStatus::NeedsUser);
+        assert_eq!(ledger.dispatches[1].status, DispatchStatus::CandidateReady);
+    }
+
+    #[test]
+    fn candidate_gate_resume_runs_the_same_attempt_through_scheduler() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        let store = WorkModelStore::new(dir.path());
+        let mut item = WorkItem::planned("wi-resume", "Resume candidate gate");
+        item.add_initial_attempt("attempt-1").unwrap();
+        store.create_work_item(&item).unwrap();
+        add_queued(dir.path(), "wi-resume", 0);
+        queue::claim(dir.path(), "wi-resume", "attempt-1")
+            .unwrap()
+            .unwrap();
+        suspend_bound_attempt(dir.path(), "wi-resume", "attempt-1");
+        store
+            .mutate_work_item("wi-resume", |item| {
+                item.attempts[0].pause_kind = Some(PauseKind::CandidateGate);
+                Ok(())
+            })
+            .unwrap();
+        queue::reconcile_active(dir.path(), "wi-resume", DispatchStatus::NeedsUser).unwrap();
+
+        queue::resume(dir.path(), "wi-resume", "attempt-1", None).unwrap();
+        let resumed = active_dispatch(dir.path(), "wi-resume");
+        dispatch_one(dir.path(), &resumed, &PassingRunner).unwrap();
+
+        let item = store.read_work_item("wi-resume").unwrap();
+        assert_eq!(item.attempts.len(), 1);
+        assert_eq!(item.attempts[0].id, "attempt-1");
+        assert_eq!(item.attempts[0].status, AttemptStatus::Complete);
+        let ledger = queue::read_ledger(dir.path(), "wi-resume")
+            .unwrap()
+            .unwrap();
+        assert_eq!(ledger.dispatches.len(), 2);
+        assert_eq!(ledger.dispatches[0].status, DispatchStatus::NeedsUser);
+        assert_eq!(ledger.dispatches[1].status, DispatchStatus::CandidateReady);
+    }
+
+    #[test]
+    fn explicit_resume_can_return_to_needs_user_without_losing_history() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        let store = WorkModelStore::new(dir.path());
+        let mut item = WorkItem::planned("wi-resume", "Resume");
+        item.add_initial_attempt("attempt-1").unwrap();
+        store.create_work_item(&item).unwrap();
+        add_queued(dir.path(), "wi-resume", 0);
+        queue::claim(dir.path(), "wi-resume", "attempt-1")
+            .unwrap()
+            .unwrap();
+        suspend_bound_attempt(dir.path(), "wi-resume", "attempt-1");
+        queue::reconcile_active(dir.path(), "wi-resume", DispatchStatus::NeedsUser).unwrap();
+        queue::resume(dir.path(), "wi-resume", "attempt-1", None).unwrap();
+
+        let resumed = active_dispatch(dir.path(), "wi-resume");
+        dispatch_one(
+            dir.path(),
+            &resumed,
+            &AttemptRecordingRunner::new(AttemptOutcome::NeedsUser),
+        )
+        .unwrap();
+
+        let ledger = queue::read_ledger(dir.path(), "wi-resume")
+            .unwrap()
+            .unwrap();
+        assert_eq!(ledger.dispatches.len(), 2);
+        assert!(
+            ledger
+                .dispatches
+                .iter()
+                .all(|dispatch| dispatch.status == DispatchStatus::NeedsUser)
+        );
+        assert_eq!(store.read_work_item("wi-resume").unwrap().attempts.len(), 1);
+    }
+
+    #[test]
+    fn tester_recovery_dispatch_forwards_one_run_no_sandbox_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        let store = WorkModelStore::new(dir.path());
+        let mut item = WorkItem::planned("wi-resume", "Resume Tester");
+        item.add_initial_attempt("attempt-1").unwrap();
+        store.create_work_item(&item).unwrap();
+        add_queued(dir.path(), "wi-resume", 0);
+        queue::claim(dir.path(), "wi-resume", "attempt-1")
+            .unwrap()
+            .unwrap();
+        store
+            .mutate_work_item("wi-resume", |item| {
+                let attempt = &mut item.attempts[0];
+                attempt.status = AttemptStatus::NeedsUser;
+                attempt.pause_kind = Some(PauseKind::TesterHarness);
+                attempt.pause_recovery = Some(PauseRecovery::TesterNoSandbox);
+                attempt.tasks[0].status = TaskStatus::NeedsUser;
+                Ok(())
+            })
+            .unwrap();
+        queue::reconcile_active(dir.path(), "wi-resume", DispatchStatus::NeedsUser).unwrap();
+        queue::resume_with_tester_no_sandbox(dir.path(), "wi-resume", "attempt-1", None, true)
+            .unwrap();
+
+        let runner = AttemptRecordingRunner::new(AttemptOutcome::NeedsUser);
+        let resumed = active_dispatch(dir.path(), "wi-resume");
+        dispatch_one(dir.path(), &resumed, &runner).unwrap();
+
+        assert_eq!(runner.attempts.lock().unwrap().as_slice(), ["attempt-1"]);
+        assert_eq!(runner.tester_no_sandbox.lock().unwrap().as_slice(), [true]);
+        let terminal = queue::read_ledger(dir.path(), "wi-resume")
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminal.latest().unwrap().status, DispatchStatus::NeedsUser);
+        assert!(
+            terminal.latest().unwrap().tester_no_sandbox,
+            "the terminal dispatch retains the approval as audit evidence"
+        );
     }
 
     #[test]
@@ -1160,7 +2729,7 @@ mod tests {
             dir.path(),
             1,
             4,
-            &MockRunner::new(AttemptOutcome::Complete),
+            &MockRunner::new(AttemptOutcome::CandidateReady),
             &shutdown,
         )
         .unwrap();
@@ -1177,9 +2746,15 @@ mod tests {
         // A runner that lingers so shutdown arrives while its Attempt is live.
         struct SlowRunner;
         impl AttemptRunner for SlowRunner {
-            fn run(&self, _p: &Path, _wi: &str, _a: &str) -> Result<AttemptOutcome> {
+            fn run(
+                &self,
+                _p: &Path,
+                _wi: &str,
+                _a: &str,
+                _tester_no_sandbox: bool,
+            ) -> Result<AttemptOutcome> {
                 std::thread::sleep(Duration::from_millis(300));
-                Ok(AttemptOutcome::Complete)
+                Ok(AttemptOutcome::CandidateReady)
             }
         }
 
@@ -1218,6 +2793,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         setup_project(dir.path());
         write_ready_work_item(dir.path(), "wi-1");
+        std::fs::create_dir_all(dir.path().join(".fluent")).unwrap();
+        std::fs::write(
+            dir.path().join(".fluent/config.yaml"),
+            "coders:\n  writer:\n    coder: codex\n    model: scheduled-write\n  reviewer:\n    coder: pi\n    model: scheduled-review\n",
+        )
+        .unwrap();
         add_queued(dir.path(), "wi-1", 1);
 
         // A runner that inspects the ledger and Work model at launch time:
@@ -1226,7 +2807,13 @@ mod tests {
             root: std::path::PathBuf,
         }
         impl AttemptRunner for InspectRunner {
-            fn run(&self, _p: &Path, wi: &str, attempt_id: &str) -> Result<AttemptOutcome> {
+            fn run(
+                &self,
+                _p: &Path,
+                wi: &str,
+                attempt_id: &str,
+                _tester_no_sandbox: bool,
+            ) -> Result<AttemptOutcome> {
                 let ledger = queue::read_ledger(&self.root, wi).unwrap().unwrap();
                 let active = ledger.active().unwrap();
                 assert_eq!(active.bound_attempt_id.as_deref(), Some(attempt_id));
@@ -1237,7 +2824,41 @@ mod tests {
                     1,
                     "exactly one bound Attempt exists at launch"
                 );
-                Ok(AttemptOutcome::Complete)
+                let attempt = item
+                    .attempts
+                    .iter()
+                    .find(|attempt| attempt.id == attempt_id)
+                    .unwrap();
+                assert_eq!(
+                    attempt.coder_mapping.write.coder,
+                    crate::coder::CoderKind::Codex
+                );
+                assert_eq!(attempt.coder_mapping.write.model, "scheduled-write");
+                assert_eq!(
+                    attempt.coder_mapping.review.coder,
+                    crate::coder::CoderKind::Pi
+                );
+                assert_eq!(attempt.coder_mapping.review.model, "scheduled-review");
+                let attempt_transition = item
+                    .transitions
+                    .iter()
+                    .find(|transition| {
+                        transition.object_kind == "attempt" && transition.object_id == attempt_id
+                    })
+                    .unwrap();
+                assert_eq!(
+                    attempt_transition.origin,
+                    crate::work_model::DurableTransitionOrigin::Scheduler
+                );
+                assert_eq!(
+                    attempt_transition.reason.as_deref(),
+                    Some("bind queued Work to an Attempt")
+                );
+                assert_eq!(
+                    item.transitions.last().unwrap().origin,
+                    crate::work_model::DurableTransitionOrigin::Scheduler
+                );
+                Ok(AttemptOutcome::CandidateReady)
             }
         }
 
@@ -1259,14 +2880,20 @@ mod tests {
             root: std::path::PathBuf,
         }
         impl AttemptRunner for RunningCheckRunner {
-            fn run(&self, _p: &Path, wi: &str, _a: &str) -> Result<AttemptOutcome> {
+            fn run(
+                &self,
+                _p: &Path,
+                wi: &str,
+                _a: &str,
+                _tester_no_sandbox: bool,
+            ) -> Result<AttemptOutcome> {
                 let ledger = queue::read_ledger(&self.root, wi).unwrap().unwrap();
                 assert_eq!(
                     ledger.active().unwrap().status,
                     DispatchStatus::Running,
                     "dispatch is running during launch"
                 );
-                Ok(AttemptOutcome::Complete)
+                Ok(AttemptOutcome::CandidateReady)
             }
         }
 

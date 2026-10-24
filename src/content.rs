@@ -112,6 +112,12 @@ pub fn bundled_content(relative: &str) -> Option<String> {
     match relative {
         "prompts/write-system.md" => Some(include_str!("../prompts/write-system.md").to_string()),
         "prompts/write-user.md" => Some(include_str!("../prompts/write-user.md").to_string()),
+        "prompts/write-continuation-user.md" => {
+            Some(include_str!("../prompts/write-continuation-user.md").to_string())
+        }
+        "prompts/write-correction-user.md" => {
+            Some(include_str!("../prompts/write-correction-user.md").to_string())
+        }
         "prompts/review-system.md" => Some(include_str!("../prompts/review-system.md").to_string()),
         "prompts/review-user.md" => Some(include_str!("../prompts/review-user.md").to_string()),
         "prompts/review-only-system.md" => {
@@ -122,8 +128,6 @@ pub fn bundled_content(relative: &str) -> Option<String> {
         }
         "prompts/rebase-system.md" => Some(include_str!("../prompts/rebase-system.md").to_string()),
         "prompts/rebase-user.md" => Some(include_str!("../prompts/rebase-user.md").to_string()),
-        "prompts/seed-system.md" => Some(include_str!("../prompts/seed-system.md").to_string()),
-        "prompts/seed-user.md" => Some(include_str!("../prompts/seed-user.md").to_string()),
         "prompts/learner-system.md" => {
             Some(include_str!("../prompts/learner-system.md").to_string())
         }
@@ -690,24 +694,18 @@ Check item {{ITEM_ID}}.
     fn test_bundled_content_prompts() {
         assert!(bundled_content("prompts/write-system.md").is_some());
         assert!(bundled_content("prompts/write-user.md").is_some());
+        assert!(bundled_content("prompts/write-continuation-user.md").is_some());
+        assert!(bundled_content("prompts/write-correction-user.md").is_some());
         assert!(bundled_content("prompts/review-system.md").is_some());
         assert!(bundled_content("prompts/review-user.md").is_some());
         assert!(bundled_content("prompts/rebase-system.md").is_some());
         assert!(bundled_content("prompts/rebase-user.md").is_some());
-        assert!(bundled_content("prompts/seed-system.md").is_some());
-        assert!(bundled_content("prompts/seed-user.md").is_some());
         assert!(bundled_content("prompts/learner-system.md").is_some());
         assert!(bundled_content("prompts/learner-user.md").is_some());
     }
 
     #[test]
-    fn bundled_content_resolves_seed_and_learner_system_prompts() {
-        let seed = bundled_content("prompts/seed-system.md").unwrap();
-        assert!(
-            !seed.contains("Fluent Writer"),
-            "seed system prompt must not reuse writer identity"
-        );
-
+    fn bundled_content_resolves_learner_system_prompt() {
         let learner = bundled_content("prompts/learner-system.md").unwrap();
         assert!(
             !learner.contains("Fluent Writer"),
@@ -771,6 +769,24 @@ Check item {{ITEM_ID}}.
     }
 
     #[test]
+    fn bundled_tests_review_matches_final_tester_order() {
+        let content = bundled_skill_content("review-tests/references/tests.md")
+            .expect("review-tests testing reference should be bundled");
+        assert!(content.contains(
+            "domain review intentionally runs before\n\
+             the canonical final Tester"
+        ));
+        assert!(content.contains(
+            "Do not fail a review solely because the full\n\
+             configured suite has not yet run for that candidate"
+        ));
+        assert!(content.contains(
+            "Baseline-covered failures\n\
+             are not candidate regressions"
+        ));
+    }
+
+    #[test]
     fn bundled_skill_names_lists_all_skills() {
         let names = bundled_skill_names();
         assert!(
@@ -809,6 +825,223 @@ Check item {{ITEM_ID}}.
                 .iter()
                 .any(|(p, _)| p.starts_with("fluent/references/")),
             "bundled fluent skill must include references"
+        );
+    }
+
+    #[test]
+    fn bundled_fluent_skill_separates_host_evidence_recovery_paths() {
+        let skill = bundled_skill_content("fluent/SKILL.md")
+            .expect("bundled fluent skill must have SKILL.md");
+        assert!(
+            skill.lines().count() <= 500,
+            "bundled fluent SKILL.md must stay under 500 lines"
+        );
+        let pointer = skill
+            .split_once("### Recover a host-evidence finding")
+            .and_then(|(_, section)| section.split_once("### Codex authentication pauses"))
+            .map(|(section, _)| section)
+            .expect("the bundled skill must point to host-evidence recovery guidance");
+        assert!(pointer.contains("host-only evidence attachment"));
+        assert!(pointer.contains("candidate-bound source correction"));
+        assert!(pointer.contains("single malformed `Disposition: evidence-needed` marker"));
+        assert!(pointer.contains("missing, duplicate, or unknown disposition"));
+        assert!(bundled_skill_content("fluent/references/coder-environment.md").is_some());
+
+        let guide = bundled_skill_content("fluent/references/host-evidence-recovery.md")
+            .expect("bundled host-evidence recovery guide must be present");
+        assert!(guide.contains("## Contents"));
+        assert!(guide.contains("[Classify a candidate-bound source correction]"));
+        assert!(guide.contains("[Approve responsibility for a saved mixed Plan row](#approve-responsibility-for-a-saved-mixed-plan-row)"));
+        assert!(guide.contains("[Recover an interrupted Writer awaiting a host check](#recover-an-interrupted-writer-awaiting-a-host-check)"));
+        let plan_evidence = guide
+            .split_once("For example, for a Plan command")
+            .expect("Plan-specific evidence example")
+            .1;
+        assert!(plan_evidence.contains("\"working_directory\":\".\""));
+        assert!(plan_evidence.contains("candidate checkout root"));
+
+        let attachment = guide
+            .split_once("## Attach host-only evidence")
+            .and_then(|(_, rest)| rest.split_once("\n## "))
+            .map(|(section, _)| section)
+            .expect("the guide must separate host-only attachment from other recovery paths");
+        assert!(attachment.contains("candidate does not need a source change"));
+        assert!(
+            !attachment.contains("malformed") && !attachment.contains("evidence-needed"),
+            "malformed-marker rules belong only to classification guidance"
+        );
+        let carried_finding = guide
+            .split_once("## Attach proof for a carried finding")
+            .and_then(|(_, rest)| rest.split_once("\n## "))
+            .map(|(section, _)| section)
+            .expect("the guide must separate carried findings from other recovery paths");
+        let carried_finding = carried_finding
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(carried_finding.contains("Use `--finding` alone"));
+        assert!(carried_finding.contains("After an `evidence-needed` Review"));
+        assert!(
+            carried_finding.contains("it need not contain an evidence-targeted disposition marker")
+        );
+        let classification = guide
+            .split_once("## Classify a candidate-bound source correction")
+            .map(|(_, section)| section)
+            .expect("the guide must document candidate-bound classification");
+        assert!(classification.contains("source correction"));
+        assert!(classification.contains("malformed qualification"));
+        assert!(classification.contains("new-review qualification rule"));
+        assert!(classification.contains("`--evidence-digest` remains required"));
+        assert!(classification.contains("derive only the missing persisted"));
+        assert!(guide.contains("## Run one focused Tests check"));
+        assert!(guide.contains("fluent attempt evidence run <work-item-id> <attempt-id>"));
+        let normalized_guide = guide.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(normalized_guide.contains("use `attach` when an authorized host"));
+        let environment = bundled_skill_content("fluent/references/coder-environment.md")
+            .expect("bundled coder environment guide must be present");
+        assert!(environment.contains("Project-relative roots resolve from the project root"));
+    }
+
+    #[test]
+    fn bundled_fluent_skill_points_to_self_contained_round_cap_recovery() {
+        let skill = bundled_skill_content("fluent/SKILL.md")
+            .expect("bundled fluent skill must have SKILL.md");
+        assert!(skill.contains("references/round-cap-approach-recovery.md"));
+
+        let guide = bundled_skill_content("fluent/references/round-cap-approach-recovery.md")
+            .expect("bundled round-cap recovery guide must be present");
+        assert!(guide.contains("## Contents"));
+        assert!(guide.contains("fluent attempt extend <work-item-id> <attempt-id>"));
+        assert!(guide.contains("fluent attempt revise-approach <work-item-id> <attempt-id>"));
+        assert!(guide.contains("fluent queue resume <work-item-id> --attempt <attempt-id>"));
+        assert!(guide.contains("fluent attempt run <work-item-id> <attempt-id>"));
+        assert!(guide.contains("Exact retries reuse the same revision and Writer"));
+        assert!(guide.contains("later host, Tester, review, and Learning gates"));
+    }
+
+    #[test]
+    fn bundled_fluent_skill_describes_assignment_context_recovery() {
+        let guide = bundled_skill_content("fluent/references/host-evidence-recovery.md").unwrap();
+        for text in [
+            "## Recover mutable Writer assignment context",
+            "recover-assignment-context",
+            "--assignment-digest",
+            "--original-file",
+            "matching the recorded digest",
+            "does not resume",
+            "current progress",
+            "ordinary reviews",
+        ] {
+            assert!(guide.contains(text), "missing recovery guidance: {text}");
+        }
+    }
+
+    #[test]
+    fn living_host_evidence_recovery_docs_require_fail_closed_replay() {
+        let architecture = read_living_doc("documentation/architecture.md");
+        let guide = read_living_doc("skills/fluent.full/references/host-evidence-recovery.md");
+        let decisions = read_living_doc(".fluent/expertise/decisions.md");
+
+        for (name, document) in [
+            ("architecture", architecture.as_str()),
+            ("host-evidence guide", guide.as_str()),
+            ("expertise decisions", decisions.as_str()),
+        ] {
+            assert!(
+                document.contains(
+                    "Source-correction classification requires an immutable candidate-bound \
+                     evidence snapshot whose `result` is `fail`."
+                ),
+                "{name} must require failed candidate-bound evidence for source correction"
+            );
+            assert!(
+                document.contains(
+                    "Passing evidence follows the ordinary host-only attachment path and cannot \
+                     authorize a source correction."
+                ),
+                "{name} must keep passing evidence on the attachment path"
+            );
+            assert!(
+                document.contains(
+                    "Exact classification replay is idempotent only while the saved classified \
+                     Writer remains resumable."
+                ),
+                "{name} must qualify classification replay by Writer lifecycle"
+            );
+            assert!(
+                document
+                    .contains("A `Failed` or `Superseded` classified Writer is not replayable."),
+                "{name} must reject hard-failed and superseded replay"
+            );
+            assert!(
+                document.contains("repeating `classify` is rejected without mutation"),
+                "{name} must state the no-mutation rejection for unsupported replay"
+            );
+            assert!(
+                document
+                    .contains("For a `Complete` Writer with output, replay retains the original"),
+                "{name} must validate the saved completed Writer output during replay"
+            );
+            for requirement in [
+                "classification grants no retry authority",
+                "`classify` still rejects a failed Writer",
+                "`attempt recover-usage-limit`",
+                "separate explicit resume",
+                "unrelated failed Writers remain ineligible",
+            ] {
+                assert!(
+                    document.contains(requirement),
+                    "{name} must retain {requirement}"
+                );
+            }
+        }
+
+        for (name, document) in [
+            ("architecture", architecture.as_str()),
+            ("host-evidence guide", guide.as_str()),
+        ] {
+            assert!(
+                document
+                    .contains("While the classified Writer remains resumable, repeating the exact"),
+                "{name} must qualify duplicate-request replay by Writer lifecycle"
+            );
+        }
+    }
+
+    #[test]
+    fn quota_recovery_guidance_requires_confined_rust_execution() {
+        for path in [
+            "documentation/architecture.md",
+            "skills/fluent.full/references/host-evidence-recovery.md",
+        ] {
+            let document = read_living_doc(path);
+            for requirement in [
+                "offline Rust test that compiles and runs inside the production retry profile",
+                "installed tools remain read-only",
+                "private dependency cache",
+                "FLUENT_USAGE_LIMIT_REQUIRE_REAL_CONFINEMENT=1",
+                "targeted Tests Review",
+            ] {
+                assert!(
+                    document.contains(requirement),
+                    "{path} must require {requirement}"
+                );
+            }
+        }
+        let architecture = read_living_doc("documentation/architecture.md");
+        assert!(architecture.contains("source symlink leaves"));
+        assert!(architecture.contains("literal target bytes without following their targets"));
+        assert!(!architecture.contains("snapshot rejects symlinks,"));
+    }
+
+    #[test]
+    fn bundled_fluent_skill_uses_public_description() {
+        const DESCRIPTION: &str = "description: Operate Fluent, a self-improving software factory. Use when a user wants to review, build, fix, or improve software with Fluent. Invoke when they ask to install or initialize Fluent; capture an Observation; define a slice; create or refine a Brief, Behavior Specification, Technical Approach, Implementation Plan, or Work Item; run, queue, inspect, resume, or recover an Attempt; review a codebase through Fluent; manage or land a Merge Candidate; capture project Expertise; or configure Fluent's agents, scheduler, sandboxes, or remote execution.";
+        let skill = bundled_skill_content("fluent/SKILL.md")
+            .expect("bundled fluent skill must have SKILL.md");
+        assert!(
+            skill.lines().any(|line| line == DESCRIPTION),
+            "bundled fluent skill must use the approved public description"
         );
     }
 
@@ -880,7 +1113,7 @@ Check item {{ITEM_ID}}.
     }
 
     #[test]
-    fn bundled_fluent_skill_orders_first_init_choice() {
+    fn bundled_fluent_skill_offers_coder_profiles_before_init() {
         let skill = bundled_skill_content("fluent/SKILL.md")
             .expect("bundled fluent skill must have SKILL.md");
         let setup = skill
@@ -894,16 +1127,16 @@ Check item {{ITEM_ID}}.
                 "Before running `fluent init`",
                 "(a) propose",
                 "(b) execute",
-                "After the user chooses, run `fluent init`",
-                "If the user chose `propose`",
-                "If the user chose `execute`",
+                "Which coder setup should Fluent use",
+                "After all choices are complete, run one configured command",
+                "fluent init --coder-profile codex-balanced --follow-up-mode propose",
             ],
         );
         assert!(setup.contains("recommended"));
     }
 
     #[test]
-    fn bundled_fluent_skill_writes_nested_execute_mode() {
+    fn bundled_fluent_skill_offers_curated_and_custom_profiles() {
         let skill = bundled_skill_content("fluent/SKILL.md")
             .expect("bundled fluent skill must have SKILL.md");
         let setup = skill
@@ -911,23 +1144,134 @@ Check item {{ITEM_ID}}.
             .map(|(_, section)| section)
             .expect("the bundled skill must have first-time setup guidance");
         assert!(
-            setup.contains("leave `.fluent/config.yaml` unchanged"),
-            "propose must leave project configuration unchanged"
+            setup.contains("(a) Codex only")
+                && setup.contains("(b) Claude only")
+                && setup.contains("(c) Mixed providers")
+                && setup.contains("(d) Custom")
+                && setup.contains("codex-balanced")
+                && setup.contains("codex-stronger")
+                && setup.contains("claude-balanced")
+                && setup.contains("codex-write-claude-review")
+                && setup.contains("claude-write-codex-review")
         );
-        assert!(
-            setup.contains("follow-up:\n     mode: execute"),
-            "execute must use the exact nested YAML mapping"
+    }
+
+    #[test]
+    fn bundled_fluent_skill_names_complete_curated_profiles() {
+        let skill = bundled_skill_content("fluent/SKILL.md").unwrap();
+        let setup = skill.split_once("## First-time project setup").unwrap().1;
+        assert!(setup.contains("codex-balanced — gpt-5.6-terra, medium"));
+        assert!(setup.contains("codex-stronger — gpt-5.6-sol, medium"));
+        assert!(setup.contains("Claude's default model at medium effort"));
+    }
+
+    #[test]
+    fn bundled_fluent_skill_explains_roles_before_custom_profile() {
+        let skill = bundled_skill_content("fluent/SKILL.md").unwrap();
+        let setup = skill.split_once("## First-time project setup").unwrap().1;
+        let normalized = setup.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert_ordered(
+            &normalized,
+            &[
+                "For `custom`, explain that the writer implements the change and tests",
+                "Ask separately for each role's coder, model, and effort",
+            ],
         );
-        assert!(
-            !skill.contains("follow-up.mode: execute"),
-            "the invalid flat execute spelling must be absent"
+    }
+
+    #[test]
+    fn bundled_fluent_skill_orders_profile_preflight_before_init() {
+        let skill = bundled_skill_content("fluent/SKILL.md").unwrap();
+        let setup = skill.split_once("## First-time project setup").unwrap().1;
+        let setup = setup.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert_ordered(
+            &setup,
+            &[
+                "After all choices are complete, run one configured command",
+                "Configured init checks durable Git paths, the host sandbox, and each distinct selected provider before mutation",
+            ],
         );
+    }
+
+    #[test]
+    fn bundled_fluent_skill_allows_curated_profile_field_overrides() {
+        let skill = bundled_skill_content("fluent/SKILL.md").unwrap();
+        assert!(skill.contains(
+            "Explicit role\n   flags may also override individual values in a curated profile"
+        ));
+    }
+
+    #[test]
+    fn bundled_fluent_skill_recovers_ignored_durable_paths() {
+        let skill = bundled_skill_content("fluent/SKILL.md").unwrap();
+        let setup = skill.split_once("## First-time project setup").unwrap().1;
+
+        assert!(setup.contains("FLUENT_INIT_DURABLE_PATH_IGNORED"));
+        assert!(setup.contains("source, line, pattern, and affected path"));
+        assert!(setup.contains("generated `.fluent/.gitignore`"));
+        assert!(setup.contains("`.fluent/work/`"));
+    }
+
+    #[test]
+    fn bundled_fluent_skill_recovers_host_sandbox_without_disabling_fluent_sandbox() {
+        let skill = bundled_skill_content("fluent/SKILL.md").unwrap();
+        let recovery = skill
+            .split_once("## Recover an enclosing agent sandbox")
+            .map(|(_, section)| section)
+            .expect("the bundled skill must explain enclosing sandbox recovery");
+        let recovery = recovery.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        assert!(recovery.contains("FLUENT_HOST_SANDBOX_BLOCKED"));
+        assert!(recovery.contains("enclosing host-agent boundary, not a provider login failure"));
+        assert!(recovery.contains("In Codex, request escalated execution for that command"));
+        assert!(recovery.contains("In Claude Code, retry that Bash command"));
+        assert!(recovery.contains("Fluent will still sandbox every worker"));
+        assert!(recovery.contains("Do not add Fluent's `--no-sandbox`"));
+        assert!(recovery.contains("do not switch the whole host-agent session to full access"));
+    }
+
+    #[test]
+    fn bundled_fluent_skill_offers_preflight_retry_or_reselection() {
+        let skill = bundled_skill_content("fluent/SKILL.md").unwrap();
+        assert!(skill.contains("offer the user a retry or a different profile"));
+    }
+
+    #[test]
+    fn bundled_fluent_skill_bounds_provider_preflight_claim() {
+        let skill = bundled_skill_content("fluent/SKILL.md").unwrap();
+        let normalized = skill.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(normalized.contains("do not promise future provider capacity"));
+    }
+
+    #[test]
+    fn bundled_fluent_skill_distinguishes_claude_readiness_recovery() {
+        let skill = bundled_skill_content("fluent/SKILL.md").unwrap();
+        let recovery = skill
+            .split_once("### Recover Claude readiness failures")
+            .map(|(_, section)| section)
+            .expect("the bundled skill must explain Claude readiness recovery");
+        let recovery = recovery
+            .split_once("### Coder selection")
+            .map(|(section, _)| section)
+            .unwrap_or(recovery);
+
+        assert!(recovery.contains("FLUENT_CLAUDE_AUTH_REQUIRED"));
+        assert!(recovery.contains("FLUENT_CLAUDE_HOST_CREDENTIAL_BLOCKED"));
+        assert!(recovery.contains("do not substitute login"));
+        assert!(recovery.contains("Retry the same `fluent init` command"));
+        assert!(recovery.contains("resume an existing Task"));
+        assert!(recovery.contains("older than 2.1.211"));
+    }
+
+    #[test]
+    fn bundled_fluent_skill_reports_saved_profile_and_attempt_boundary() {
+        let skill = bundled_skill_content("fluent/SKILL.md").unwrap();
         assert!(
-            setup.contains("authorizes and queues")
-                && setup.contains("does not start")
-                && setup.contains("fluent scheduler run")
-                && setup.contains("human inspection and landing"),
-            "execute must distinguish queue authorization, scheduler execution, and landing"
+            skill.contains("show the saved coder, model, and effort for both roles")
+                && skill.contains(
+                    "new Attempts store them unless the user supplies explicit overrides"
+                ),
+            "setup must explain saved profile and Attempt freezing"
         );
     }
 

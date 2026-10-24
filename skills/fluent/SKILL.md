@@ -1,6 +1,6 @@
 ---
 name: fluent
-description: Operate the fluent workflow to build software autonomously over extended periods. Interactive stages (brief, behaviors, approach, plan) run with the user. Autonomous execution loops writer → tester → parallel reviewers → Learner. A Merge Candidate becomes ready only after the Learner succeeds; retryable Learner failures resume with `fluent attempt run`, while non-relaunchable evidence failures stay blocked for human recovery. When a decision needs a human, Fluent sets `needs-user` and pauses, then resumes once the user resolves it.
+description: Operate Fluent, a self-improving software factory. Use when a user wants to review, build, fix, or improve software with Fluent. Invoke when they ask to install or initialize Fluent; capture an Observation; define a slice; create or refine a Brief, Behavior Specification, Technical Approach, Implementation Plan, or Work Item; run, queue, inspect, resume, or recover an Attempt; review a codebase through Fluent; manage or land a Merge Candidate; capture project Expertise; or configure Fluent's agents, scheduler, sandboxes, or remote execution.
 fluent-shim: true
 ---
 
@@ -33,6 +33,15 @@ Run the following to install the full fluent skill from the binary:
 ```sh
 fluent skills add
 ```
+
+The public `npx skills add` command may have created a project-local bootstrap
+under `.agents/skills`, `.claude/skills`, or `.codex/skills` and an entry in
+`skills-lock.json`. This command replaces only a Fluent-marked bootstrap,
+records Fluent ownership, and removes only Fluent's matching lock entry. It
+preserves other locked skills and any unrecognized or user-owned skill
+directory. It does not create an absent agent-specific skill root. A later
+coder profile selection controls Fluent's Writer and reviewers, not where this
+interactive skill is installed.
 
 ## Step 3 — Continue with the full skill
 

@@ -9,8 +9,12 @@ FLUENT_BIN="${FLUENT_BIN_OVERRIDE:-${PROJECT_DIR}/target/debug/fluent}"
 
 source "${PROJECT_DIR}/tests/lib/run_test.sh"
 LOG_DIR="${PROJECT_DIR}/tests/output/$(basename "$0" .sh)"
+HOLDER_PID=""
 
 setup_test_project() {
+  # Each case runs in the harness subshell. Register the cleanup there so a
+  # failing case reaps its lock holder before the harness records the result.
+  trap cleanup_test_project EXIT
   TEST_DIR="$(mktemp -d -t fluent-work-inspection-XXXXXX)"
   mkdir -p "$TEST_DIR/project"
   cd "$TEST_DIR/project"
@@ -23,9 +27,18 @@ setup_test_project() {
 }
 
 cleanup_test_project() {
+  if [ -n "${HOLDER_PID:-}" ]; then
+    kill "$HOLDER_PID" 2>/dev/null || true
+    wait "$HOLDER_PID" 2>/dev/null || true
+    HOLDER_PID=""
+  fi
   cd /
-  rm -rf "$TEST_DIR"
+  if [ -n "${TEST_DIR:-}" ]; then
+    rm -rf "$TEST_DIR"
+  fi
 }
+
+trap cleanup_test_project EXIT
 
 write_work_item() {
   ITEM_ID="$1"
@@ -231,11 +244,15 @@ test_work_show_outputs_pretty_json() {
 
   OUTPUT="$("$FLUENT_BIN" work-item show work-alpha 2>&1)"
   RESULT=0
-  assert_contains "$OUTPUT" '{' || RESULT=1
-  assert_contains "$OUTPUT" '  "id": "work-alpha",' || RESULT=1
-  assert_contains "$OUTPUT" '  "title": "Alpha title",' || RESULT=1
-  assert_contains "$OUTPUT" '  "attempts": []' || RESULT=1
-  assert_contains "$OUTPUT" '}' || RESULT=1
+  if ! jq -e '
+    .id == "work-alpha" and
+    .title == "Alpha title" and
+    .attempts == []
+  ' <<< "$OUTPUT" > /dev/null; then
+    printf '    FAIL: output is not the expected Work Item JSON\n'
+    printf '    Output:\n%s\n' "$OUTPUT"
+    RESULT=1
+  fi
 
   cleanup_test_project
   return $RESULT
@@ -377,9 +394,6 @@ time.sleep(60)
   ERROR_OUTPUT="$(cat "$TEST_DIR/stderr")"
   assert_contains "$ERROR_OUTPUT" "cannot be abandoned" || RESULT=1
   assert_not_contains "$(cat .fluent/work/items/work-active.json)" "abandonment" || RESULT=1
-
-  kill "$HOLDER_PID" 2>/dev/null || true
-  wait "$HOLDER_PID" 2>/dev/null || true
 
   cleanup_test_project
   return $RESULT

@@ -42,6 +42,9 @@ fn documented_work_item() -> WorkItem {
                     path: ".fluent/work/artifacts/write-review".to_string(),
                 }),
                 review_context: None,
+                writer_correction_assignment: None,
+                verification_context: None,
+                evidence_review_context: None,
                 input_artifacts: Vec::new(),
                 depends_on: None,
                 output: Some(TaskOutput {
@@ -50,6 +53,8 @@ fn documented_work_item() -> WorkItem {
                     source_branch: "main".to_string(),
                     base_commit: None,
                     commit: "abc123".to_string(),
+                    no_change: None,
+                    learner_canonicalization: None,
                 }),
                 created_at: None,
                 started_at: None,
@@ -202,11 +207,20 @@ fn reviewer_storage_writes_documented_deterministic_json() {
     let path = temp.path().join(".fluent/work/items/work-review.json");
     assert_eq!(
         fs::read_to_string(path).unwrap(),
-        r#"{
+        format!(
+            r#"{{
+  "schema_version": 12,
   "id": "work-review",
-  "title": "Review durable storage"
-}
-"#
+  "title": "Review durable storage",
+  "model_writer_version": {{
+    "format": "fluent-work-item-writer",
+    "schema_version": 10,
+    "version": "{version}"
+  }}
+}}
+"#,
+            version = env!("CARGO_PKG_VERSION")
+        )
     );
     let attempt = fs::read_to_string(
         temp.path()

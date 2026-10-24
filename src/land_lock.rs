@@ -8,6 +8,11 @@ pub fn lock_path(project_root: &Path) -> PathBuf {
     project_root.join(".fluent/work/locks/land.lock")
 }
 
+/// Serialize a recorded stop with the short target Git effect boundary.
+pub fn effect_lock_path(project_root: &Path) -> PathBuf {
+    project_root.join(".fluent/work/locks/landing-effect.lock")
+}
+
 pub struct LandLock {
     _file: File,
 }

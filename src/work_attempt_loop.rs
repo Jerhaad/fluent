@@ -1,8 +1,9 @@
 use anyhow::{Context, Result, bail};
+use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::fs;
-use std::io::{ErrorKind, Read, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -10,20 +11,921 @@ use std::thread;
 use crate::coder::CoderKind;
 use crate::content::ContentResolver;
 use crate::git;
+use crate::recovery_contracts::review_coverage::ordinary_review_tasks;
 use crate::review::{self, Verdict};
 use crate::review_diff_command;
 use crate::review_only_worktree;
+use crate::tester_evidence::{
+    baseline_tester_results_path, failed_command_recheck_correction_artifacts,
+    introduced_tester_failures, unexplained_failed_tester_commands,
+};
+#[cfg(test)]
+use crate::tester_evidence::{failing_ids, tester_failures};
 use crate::work_model::{
     ArtifactRef, Attempt, AttemptLearning, AttemptReviewState, AttemptStatus, CoderMappingInputs,
-    MergeCandidateMergeStatus, PauseKind, Task, TaskKind, TaskOutput, TaskStatus, WorkItem,
-    WorkModelStorageError, WorkModelStore, resolve_managed_sibling_workspace_path,
-    work_artifact_path,
+    DurableTransitionMetadata, DurableTransitionOrigin, EvidenceRecoveryState,
+    LearnerCommitCanonicalization, MergeCandidateMergeStatus, PauseKind, PauseRecovery,
+    RoundCapExtension, RoundCapExtensionRequest, RoundCapReviewArtifact, Task, TaskKind,
+    TaskOutput, TaskStatus, WorkItem, WorkModelError, WorkModelStorageError, WorkModelStore,
+    WriterOutcome, WriterRun, WriterRunKind, normalize_round_cap_resolution,
+    resolve_managed_sibling_workspace_path, round_cap_resolution_digest, work_artifact_path,
 };
 use crate::work_task_executor::{self, WorkTaskRunConfig};
 
 const DEFAULT_MAX_PARALLEL_REVIEWERS: usize = 5;
 const DEFAULT_MAX_TOTAL_WRITE_ROUNDS: usize = 10;
 const DEFAULT_MAX_NO_PROGRESS_ROUNDS: usize = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WriterHandoffCheckStatus {
+    Passed,
+    Failed,
+    NotVerifiable,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WriterHandoffCheck {
+    pub name: String,
+    pub status: WriterHandoffCheckStatus,
+    pub diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WriterHandoffReport {
+    pub candidate_commit: String,
+    pub overall: WriterHandoffCheckStatus,
+    pub checks: Vec<WriterHandoffCheck>,
+    #[serde(skip)]
+    gate_assessment: Option<WriterGateAssessment>,
+}
+
+#[derive(Debug, Clone)]
+struct WriterGateAssessment {
+    evidence: crate::candidate_gate::CandidateGateEvidence,
+    // The gate records the effective base, which may predate the base of a
+    // correction Writer's output. Keep the supplied base for exact handoff.
+    requested_base_commit: String,
+    logs: Vec<(usize, Vec<u8>)>,
+}
+
+fn handoff_check(
+    name: impl Into<String>,
+    status: WriterHandoffCheckStatus,
+    diagnostics: Vec<String>,
+) -> WriterHandoffCheck {
+    WriterHandoffCheck {
+        name: name.into(),
+        status,
+        diagnostics,
+    }
+}
+
+fn assess_writer_completion_for_handoff(
+    project_root: &Path,
+    attempt: &Attempt,
+    task: &Task,
+    candidate_commit: &str,
+    baseline: Option<&str>,
+) -> Vec<WriterHandoffCheck> {
+    let mut checks = Vec::new();
+    let mut prospective = attempt.clone();
+    if let Some(writer) = prospective
+        .tasks
+        .iter_mut()
+        .find(|writer| writer.id == task.id)
+    {
+        writer.status = TaskStatus::Complete;
+        if let Some(base) = baseline {
+            let workspace = &task.workspace_access.writes[0];
+            writer.output = Some(TaskOutput {
+                workspace_id: workspace.id.clone(),
+                workspace_path: workspace.path.clone(),
+                source_branch: git::run_stdout(
+                    project_root,
+                    &["branch", "--show-current"],
+                    "read source branch",
+                )
+                .unwrap_or_default(),
+                base_commit: Some(base.to_string()),
+                commit: candidate_commit.to_string(),
+                no_change: None,
+                learner_canonicalization: None,
+            });
+        }
+    }
+
+    let mut matrix = None;
+    let mut matrix_artifact = None;
+    if let Some(contract) = attempt.writer_completion_contract.as_ref() {
+        let result = (|| -> Result<(crate::work_model::WriterCompletionMatrix, ArtifactRef)> {
+            let artifact = writer_completion_artifact(task)
+                .context("Writer Task has no completion-matrix artifact area")?;
+            let path = project_root.join(&artifact.path);
+            let bytes = fs::read(&path)
+                .with_context(|| format!("read Writer completion matrix {}", path.display()))?;
+            anyhow::ensure!(
+                bytes.len() <= crate::work_model::WRITER_COMPLETION_MATRIX_MAX_BYTES,
+                "Writer completion matrix exceeds the size limit"
+            );
+            let source =
+                String::from_utf8(bytes).context("Writer completion matrix is not UTF-8")?;
+            let mut parsed = match serde_json::from_str(&source) {
+                Ok(matrix) => matrix,
+                Err(_) => recover_writer_completion_result_format(&source)
+                    .map(|(matrix, _)| matrix)
+                    .map_err(anyhow::Error::msg)
+                    .context("Writer completion matrix is malformed")?,
+            };
+            let findings = work_task_executor::writer_completion_findings(project_root, task)?;
+            parsed
+                .repair_writer_claims_against(contract, &task.id, &findings)
+                .map_err(anyhow::Error::msg)?;
+            crate::host_evidence::apply_completed_plan_host_evidence(
+                project_root,
+                &prospective,
+                &prospective.tasks[prospective
+                    .tasks
+                    .iter()
+                    .position(|writer| writer.id == task.id)
+                    .unwrap()],
+                &artifact,
+                &mut parsed,
+            );
+            crate::recovery_contracts::apply_accepted_carried_findings(
+                project_root,
+                &prospective,
+                &prospective.tasks[prospective
+                    .tasks
+                    .iter()
+                    .position(|writer| writer.id == task.id)
+                    .unwrap()],
+                &mut parsed,
+            )?;
+            let status = parsed
+                .status_against(contract, &task.id, &findings)
+                .map_err(anyhow::Error::msg)?;
+            if let Some(reason) = status.incomplete_reason {
+                anyhow::bail!("{reason}");
+            }
+            Ok((parsed, artifact))
+        })();
+        match result {
+            Ok((value, artifact)) => {
+                matrix = Some(value);
+                matrix_artifact = Some(artifact);
+                checks.push(handoff_check(
+                    "completion-matrix",
+                    WriterHandoffCheckStatus::Passed,
+                    Vec::new(),
+                ));
+            }
+            Err(error) => checks.push(handoff_check(
+                "completion-matrix",
+                WriterHandoffCheckStatus::Failed,
+                vec![format!("{error:#}")],
+            )),
+        }
+    } else {
+        checks.push(handoff_check(
+            "completion-matrix",
+            WriterHandoffCheckStatus::Passed,
+            vec!["Attempt has no completion-matrix contract".into()],
+        ));
+    }
+
+    if let Some(progress_contract) = attempt.progress_contract.as_ref() {
+        let artifact = required_progress_artifact(attempt);
+        let source = match fs::read_to_string(project_root.join(&artifact.path)) {
+            Ok(source) => Ok(source),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(String::new()),
+            Err(error) => Err(error),
+        };
+        let status = source.map_err(anyhow::Error::from).and_then(|source| {
+            if attempt.writer_completion_contract.is_some() {
+                let matrix = matrix.as_ref().context(
+                    "completion matrix must pass before required progress can be checked",
+                )?;
+                let matrix_artifact = matrix_artifact.as_ref().expect("matrix has artifact");
+                let status = progress_contract
+                    .status_against_writer_matrix(matrix)
+                    .map_err(anyhow::Error::msg)?;
+                if let Some(reason) = status.incomplete_reason {
+                    anyhow::bail!("{reason}");
+                }
+                progress_contract
+                    .project_completed_required_progress(&source, matrix, &matrix_artifact.path)
+                    .map_err(anyhow::Error::msg)?;
+                Ok(())
+            } else {
+                let status = attempt
+                    .required_progress_status(&source)
+                    .map_err(anyhow::Error::msg)?;
+                if let Some(reason) = status.incomplete_reason {
+                    anyhow::bail!("{reason}");
+                }
+                Ok(())
+            }
+        });
+        match status {
+            Ok(()) => checks.push(handoff_check(
+                "required-progress",
+                WriterHandoffCheckStatus::Passed,
+                Vec::new(),
+            )),
+            Err(error) => checks.push(handoff_check(
+                "required-progress",
+                WriterHandoffCheckStatus::Failed,
+                vec![format!("{error:#}")],
+            )),
+        }
+    } else {
+        checks.push(handoff_check(
+            "required-progress",
+            WriterHandoffCheckStatus::Passed,
+            vec!["Attempt has no required-progress contract".into()],
+        ));
+    }
+
+    if attempt
+        .writer_completion_contract
+        .as_ref()
+        .is_some_and(|contract| {
+            contract.requirements.iter().any(|row| {
+                row.responsibility == Some(crate::work_model::CompletionResponsibility::Host)
+            })
+        })
+    {
+        if let Some(matrix) = matrix.as_ref() {
+            let pending = matrix
+                .rows
+                .iter()
+                .filter(|row| {
+                    row.responsibility == Some(crate::work_model::CompletionResponsibility::Host)
+                        && row.state != crate::work_model::WriterCompletionState::Complete
+                })
+                .map(|row| row.id.clone())
+                .collect::<Vec<_>>();
+            if pending.is_empty() {
+                checks.push(handoff_check(
+                    "host-evidence",
+                    WriterHandoffCheckStatus::Passed,
+                    Vec::new(),
+                ));
+            } else {
+                checks.push(handoff_check("host-evidence", WriterHandoffCheckStatus::NotVerifiable,
+                    vec![format!("Required host evidence remains pending for {}; the trusted host must run and review the candidate-bound checks", pending.join(", "))]));
+            }
+        } else {
+            checks.push(handoff_check(
+                "host-evidence",
+                WriterHandoffCheckStatus::NotVerifiable,
+                vec![
+                    "Host evidence cannot be checked until the Writer completion matrix is valid"
+                        .into(),
+                ],
+            ));
+        }
+    } else {
+        checks.push(handoff_check(
+            "host-evidence",
+            WriterHandoffCheckStatus::Passed,
+            vec!["Attempt has no required host check".into()],
+        ));
+    }
+    checks
+}
+
+/// Assess the active Writer's current candidate without changing the Task or
+/// publishing authoritative handoff artifacts.
+fn active_writer_project_root(
+    caller_workspace: &Path,
+    work_item_id: &str,
+    attempt_id: &str,
+    task_id: &str,
+) -> Result<Option<PathBuf>> {
+    let worktrees = git::run_raw(caller_workspace, &["worktree", "list", "--porcelain"])?;
+    anyhow::ensure!(
+        worktrees.status.success(),
+        "Cannot list Git worktrees for Writer handoff: {}",
+        String::from_utf8_lossy(&worktrees.stderr)
+    );
+    let mut matches = Vec::new();
+    let mut inaccessible = false;
+    for line in String::from_utf8_lossy(&worktrees.stdout).lines() {
+        let Some(path) = line.strip_prefix("worktree ") else {
+            continue;
+        };
+        let root = fs::canonicalize(path)?;
+        let store = WorkModelStore::new(&root);
+        let item_path = store.work_item_path(work_item_id)?;
+        let item = match store.read_work_item_snapshot(work_item_id) {
+            Ok(item) => item,
+            Err(WorkModelStorageError::ReadFile { path, source })
+                if source.kind() == ErrorKind::NotFound && path == item_path =>
+            {
+                continue;
+            }
+            Err(WorkModelStorageError::InvalidWorkItemId { id }) => {
+                bail!("Invalid Writer handoff Work Item ID {id:?}");
+            }
+            Err(_) => {
+                inaccessible = true;
+                continue;
+            }
+        };
+        let Some(attempt) = item
+            .attempts
+            .iter()
+            .find(|attempt| attempt.id == attempt_id)
+        else {
+            continue;
+        };
+        let Some(task) = attempt.tasks.iter().find(|task| task.id == task_id) else {
+            continue;
+        };
+        if task.kind != TaskKind::Write
+            || task.status != TaskStatus::Executing
+            || attempt.status != AttemptStatus::Executing
+        {
+            continue;
+        }
+        anyhow::ensure!(
+            task.workspace_access.writes.len() == 1,
+            "Active Writer Task {task_id:?} has no unique candidate workspace"
+        );
+        let assigned = crate::work_model::resolve_expected_candidate_workspace_path(
+            &root,
+            &task.workspace_access.writes[0].path,
+            work_item_id,
+            attempt_id,
+            "Writer handoff workspace",
+        )?;
+        if fs::canonicalize(&assigned).is_ok_and(|assigned| assigned == caller_workspace) {
+            matches.push(root);
+        }
+    }
+    if let [root] = matches.as_slice() {
+        return Ok(Some(root.clone()));
+    }
+    if matches.is_empty() && inaccessible {
+        return Ok(None);
+    }
+    bail!(
+        "Writer handoff requires one active Task bound to this candidate workspace; found {} matching source checkouts",
+        matches.len()
+    )
+}
+
+fn unverified_writer_handoff(candidate_commit: String, reason: String) -> WriterHandoffReport {
+    let names = [
+        "candidate-identity",
+        "writer-output",
+        "candidate-gate/candidate-identity",
+        "candidate-gate/whitespace",
+        "candidate-gate/commit-metadata",
+        "candidate-gate/behavior-references",
+        "candidate-gate/tester-reference-evidence",
+        "candidate-gate/project-check",
+        "completion-matrix",
+        "required-progress",
+        "host-evidence",
+        "candidate-stability",
+    ];
+    WriterHandoffReport {
+        candidate_commit,
+        overall: WriterHandoffCheckStatus::NotVerifiable,
+        gate_assessment: None,
+        checks: names
+            .into_iter()
+            .map(|name| {
+                handoff_check(
+                    name,
+                    WriterHandoffCheckStatus::NotVerifiable,
+                    vec![reason.clone()],
+                )
+            })
+            .collect(),
+    }
+}
+
+pub fn check_writer_handoff(
+    caller_workspace: &Path,
+    work_item_id: &str,
+    attempt_id: &str,
+    task_id: &str,
+) -> Result<WriterHandoffReport> {
+    let caller_workspace = fs::canonicalize(caller_workspace)?;
+    let project_root =
+        active_writer_project_root(&caller_workspace, work_item_id, attempt_id, task_id)?;
+    let Some(project_root) = project_root else {
+        let candidate = git::run_stdout(
+            &caller_workspace,
+            &["rev-parse", "HEAD"],
+            "read candidate for unverifiable Writer handoff",
+        )?;
+        return Ok(unverified_writer_handoff(candidate,
+            "Host-owned Work Item bindings are not readable in this Writer sandbox; the trusted host must perform the final handoff".into()));
+    };
+    let project_root = project_root.as_path();
+    let store = WorkModelStore::new(project_root);
+    let item = match store.read_work_item_snapshot(work_item_id) {
+        Ok(item) => item,
+        Err(_) => {
+            let candidate = git::run_stdout(
+                &caller_workspace,
+                &["rev-parse", "HEAD"],
+                "read candidate for unverifiable Writer handoff",
+            )?;
+            return Ok(unverified_writer_handoff(
+                candidate,
+                "Host-owned Work Item bindings became unreadable during preflight".into(),
+            ));
+        }
+    };
+    let attempt_index = item
+        .attempts
+        .iter()
+        .position(|attempt| attempt.id == attempt_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!("Attempt {attempt_id:?} is not assigned to Work Item {work_item_id:?}")
+        })?;
+    let attempt = &item.attempts[attempt_index];
+    let write_index = attempt
+        .tasks
+        .iter()
+        .position(|task| task.id == task_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!("Task {task_id:?} is not assigned to Attempt {attempt_id:?}")
+        })?;
+    let task = &attempt.tasks[write_index];
+    anyhow::ensure!(
+        task.kind == TaskKind::Write && task.status == TaskStatus::Executing,
+        "Task {task_id:?} is not an active Writer Task"
+    );
+    anyhow::ensure!(
+        attempt.status == AttemptStatus::Executing,
+        "Attempt {attempt_id:?} is not executing"
+    );
+    anyhow::ensure!(
+        task.workspace_access.writes.len() == 1,
+        "Writer Task {task_id:?} does not own one candidate workspace"
+    );
+    let workspace = crate::work_model::resolve_expected_candidate_workspace_path(
+        project_root,
+        &task.workspace_access.writes[0].path,
+        work_item_id,
+        attempt_id,
+        "Writer handoff workspace",
+    )?;
+    anyhow::ensure!(
+        fs::canonicalize(&workspace)? == caller_workspace,
+        "Writer handoff must run from the assigned candidate workspace {}",
+        workspace.display()
+    );
+    crate::worktree::ensure_candidate_worktree(project_root, &workspace)?;
+
+    assess_writer_handoff_candidate(
+        project_root,
+        &store,
+        &item,
+        attempt_index,
+        write_index,
+        &workspace,
+    )
+}
+
+fn assess_writer_handoff_candidate(
+    project_root: &Path,
+    store: &WorkModelStore,
+    item: &WorkItem,
+    attempt_index: usize,
+    write_index: usize,
+    workspace: &Path,
+) -> Result<WriterHandoffReport> {
+    let attempt = &item.attempts[attempt_index];
+    let task = &attempt.tasks[write_index];
+    let work_item_id = item.id.as_str();
+    let attempt_id = attempt.id.as_str();
+    let task_id = task.id.as_str();
+
+    let before_head = git::run_stdout(
+        &workspace,
+        &["rev-parse", "HEAD"],
+        "read Writer candidate HEAD",
+    )?;
+    let before_status = git::run_stdout(
+        &workspace,
+        &["status", "--porcelain", "--untracked-files=all"],
+        "read Writer candidate status",
+    )?;
+    let identity = task.output.as_ref().map(|output| output.commit.as_str());
+    let mut gate_assessment = None;
+    let mut checks = vec![if identity.is_some_and(|commit| commit != before_head) {
+        handoff_check(
+            "candidate-identity",
+            WriterHandoffCheckStatus::Failed,
+            vec![format!(
+                "Candidate HEAD {before_head} differs from the completed Writer output {}",
+                identity.unwrap()
+            )],
+        )
+    } else {
+        handoff_check(
+            "candidate-identity",
+            WriterHandoffCheckStatus::Passed,
+            Vec::new(),
+        )
+    }];
+    let baseline = task
+        .output
+        .as_ref()
+        .and_then(|output| output.base_commit.clone())
+        .map(Ok)
+        .unwrap_or_else(|| -> Result<String> {
+            let host_path = work_task_executor::host_write_baseline_path(
+                store,
+                work_item_id,
+                attempt_id,
+                task_id,
+            )?;
+            let host = fs::read_to_string(&host_path).with_context(|| {
+                format!("read host-owned Writer baseline at {}", host_path.display())
+            })?;
+            let area = task
+                .artifact_area
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Writer Task {task_id:?} has no artifact area"))?;
+            let area =
+                work_task_executor::resolve_managed_artifact_area_path(project_root, &area.path)?;
+            let sidecar = fs::read_to_string(area.join("write-baseline-commit"))?;
+            anyhow::ensure!(
+                host.trim() == sidecar.trim(),
+                "Writer artifact baseline differs from the host-owned baseline"
+            );
+            Ok(host)
+        });
+    let baseline = match baseline {
+        Ok(value) if !value.trim().is_empty() => Some(value.trim().to_string()),
+        Ok(_) => {
+            checks.push(handoff_check(
+                "writer-output",
+                WriterHandoffCheckStatus::NotVerifiable,
+                vec!["Writer baseline is empty; the host-owned baseline must be restored".into()],
+            ));
+            None
+        }
+        Err(error) => {
+            checks.push(handoff_check(
+                "writer-output",
+                WriterHandoffCheckStatus::NotVerifiable,
+                vec![format!("Writer baseline cannot be read: {error:#}")],
+            ));
+            None
+        }
+    };
+    if let Some(base) = baseline.as_deref() {
+        let retired_admission = crate::lifecycle_recovery::inspect_retired_commit_style_admission(
+            project_root,
+            item,
+            attempt_id,
+            task,
+        )?
+        .is_some();
+        let resolver = ContentResolver::new(Some(project_root));
+        let config = WorkTaskRunConfig {
+            project_root,
+            store,
+            work_item_id,
+            attempt_id,
+            task_id,
+            resolver: &resolver,
+            extra_args: &[],
+            no_sandbox: false,
+            store_lock: None,
+        };
+        let check = match work_task_executor::writer_handoff_result(&config, &workspace, base) {
+            Ok(Ok(_)) => handoff_check(
+                "writer-output",
+                WriterHandoffCheckStatus::Passed,
+                Vec::new(),
+            ),
+            Ok(Err(error)) => handoff_check(
+                "writer-output",
+                WriterHandoffCheckStatus::Failed,
+                vec![format!("{error:#}")],
+            ),
+            Err(error) => handoff_check(
+                "writer-output",
+                WriterHandoffCheckStatus::NotVerifiable,
+                vec![format!("Writer output cannot be checked: {error:#}")],
+            ),
+        };
+        checks.push(check);
+        let prior_gate = select_prior_writer_candidate_gate(item, attempt_index, write_index)?;
+        let prior_path = prior_gate
+            .map(|artifact| {
+                work_task_executor::resolve_managed_artifact_area_path(project_root, &artifact.path)
+            })
+            .transpose()?;
+        let authorization =
+            crate::candidate_metadata_recovery::candidate_gate_authorization_context(
+                project_root,
+                attempt,
+                task,
+            )?;
+        let scratch = tempfile::tempdir().context("create private handoff hook area")?;
+        let private_workspace = scratch.path().join("candidate");
+        let gate_workspace = if !before_status.is_empty() {
+            checks.push(handoff_check("candidate-gate", WriterHandoffCheckStatus::NotVerifiable,
+                vec!["Commit or remove candidate worktree changes before checking the full candidate gate".into()]));
+            None
+        } else {
+            let clone_result = git::run(
+                project_root,
+                &[
+                    "clone",
+                    "--shared",
+                    "--quiet",
+                    "--no-checkout",
+                    workspace
+                        .to_str()
+                        .context("candidate workspace is not UTF-8")?,
+                    private_workspace
+                        .to_str()
+                        .context("private workspace is not UTF-8")?,
+                ],
+                "prepare private Writer handoff candidate",
+            )
+            .and_then(|()| {
+                git::run(
+                    &private_workspace,
+                    &["checkout", "--quiet", "--detach", &before_head],
+                    "check out private Writer candidate",
+                )
+            });
+            match clone_result {
+                Ok(()) => Some(private_workspace.as_path()),
+                Err(error) => {
+                    checks.push(handoff_check(
+                        "candidate-gate",
+                        WriterHandoffCheckStatus::NotVerifiable,
+                        vec![format!("Cannot prepare private hook candidate: {error:#}")],
+                    ));
+                    None
+                }
+            }
+        };
+        let artifact_path = scratch
+            .path()
+            .join(crate::candidate_gate::CANDIDATE_GATE_FILE);
+        let gate = gate_workspace.map(|gate_workspace| {
+            crate::candidate_gate::assess_candidate_gate_with_prior_and_role(
+                crate::candidate_gate::CandidateGateRequest {
+                    project_root,
+                    workspace: gate_workspace,
+                    work_item_id,
+                    attempt_id,
+                    task_id: Some(task_id),
+                    phase: crate::candidate_gate::CandidateGatePhase::Writer,
+                    base_commit: base,
+                    candidate_commit: &before_head,
+                    completion_contract: attempt.writer_completion_contract.as_ref(),
+                    allow_tree_identical_metadata_rewrite: task.input_artifacts.iter().any(
+                        |artifact| {
+                            artifact.producer_id == "writer-completion-repair"
+                                && artifact.path.ends_with("writer-completion.json")
+                        },
+                    ),
+                    metadata_rewrite_authorization: authorization.as_ref(),
+                    tester_results_path: None,
+                    accepted_tester_commands: &[],
+                    artifact_path: &artifact_path,
+                },
+                prior_path.as_deref(),
+                Some(task.role.as_str()),
+            )
+        });
+        if let Some(Ok(ref evidence)) = gate {
+            let logs = evidence
+                .checks
+                .iter()
+                .enumerate()
+                .filter_map(|(index, check)| check.log_path.as_ref().map(|path| (index, path)))
+                .map(|(index, path)| {
+                    fs::read(path)
+                        .map(|bytes| (index, bytes))
+                        .with_context(|| format!("read assessed Writer gate log {path}"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            gate_assessment = Some(WriterGateAssessment {
+                evidence: evidence.clone(),
+                requested_base_commit: base.to_string(),
+                logs,
+            });
+        }
+        match gate {
+            Some(Ok(evidence)) => {
+                for evidence in evidence.checks {
+                    let status = if retired_admission && evidence.name == "project-check" {
+                        // The validated admission replaces the retired presentation
+                        // policy's project check for this exact candidate.
+                        WriterHandoffCheckStatus::Passed
+                    } else {
+                        match evidence.status {
+                            crate::candidate_gate::CandidateCheckStatus::Passed
+                            | crate::candidate_gate::CandidateCheckStatus::Skipped => {
+                                WriterHandoffCheckStatus::Passed
+                            }
+                            crate::candidate_gate::CandidateCheckStatus::Failed => {
+                                WriterHandoffCheckStatus::Failed
+                            }
+                            crate::candidate_gate::CandidateCheckStatus::Error => {
+                                WriterHandoffCheckStatus::NotVerifiable
+                            }
+                        }
+                    };
+                    let mut diagnostics = if retired_admission && evidence.name == "project-check" {
+                        vec![
+                            "Validated retired commit-style admission applies to this candidate"
+                                .into(),
+                        ]
+                    } else {
+                        evidence.diagnostics
+                    };
+                    if let Some(path) = evidence.log_path {
+                        if let Ok(log) = fs::read_to_string(path) {
+                            if !log.trim().is_empty() && status != WriterHandoffCheckStatus::Passed
+                            {
+                                diagnostics.push(log.chars().take(4096).collect());
+                            }
+                        }
+                    }
+                    checks.push(handoff_check(
+                        format!("candidate-gate/{}", evidence.name),
+                        status,
+                        diagnostics,
+                    ));
+                }
+            }
+            Some(Err(error)) => checks.push(handoff_check(
+                "candidate-gate",
+                WriterHandoffCheckStatus::NotVerifiable,
+                vec![format!("Candidate gate cannot be checked: {error:#}")],
+            )),
+            None => {}
+        }
+    } else {
+        checks.push(handoff_check(
+            "candidate-gate",
+            WriterHandoffCheckStatus::NotVerifiable,
+            vec!["Candidate gate needs the Writer's stable baseline".into()],
+        ));
+    }
+    checks.extend(assess_writer_completion_for_handoff(
+        project_root,
+        attempt,
+        task,
+        &before_head,
+        baseline.as_deref(),
+    ));
+    let after_head = git::run_stdout(
+        &workspace,
+        &["rev-parse", "HEAD"],
+        "recheck Writer candidate HEAD",
+    )?;
+    let after_status = git::run_stdout(
+        &workspace,
+        &["status", "--porcelain", "--untracked-files=all"],
+        "recheck Writer candidate status",
+    )?;
+    if before_head != after_head || before_status != after_status {
+        checks.push(handoff_check("candidate-stability", WriterHandoffCheckStatus::Failed,
+            vec!["Candidate HEAD or worktree changed during handoff check; rerun against the final committed candidate".into()]));
+    } else {
+        checks.push(handoff_check(
+            "candidate-stability",
+            WriterHandoffCheckStatus::Passed,
+            Vec::new(),
+        ));
+    }
+    let overall = if checks
+        .iter()
+        .any(|check| check.status == WriterHandoffCheckStatus::Failed)
+    {
+        WriterHandoffCheckStatus::Failed
+    } else if checks
+        .iter()
+        .any(|check| check.status == WriterHandoffCheckStatus::NotVerifiable)
+    {
+        WriterHandoffCheckStatus::NotVerifiable
+    } else {
+        WriterHandoffCheckStatus::Passed
+    };
+    Ok(WriterHandoffReport {
+        candidate_commit: before_head,
+        overall,
+        checks,
+        gate_assessment,
+    })
+}
+
+fn assess_completed_writer_handoff_in_item(
+    project_root: &Path,
+    store: &WorkModelStore,
+    item: &WorkItem,
+    attempt_index: usize,
+    write_index: usize,
+) -> Result<WriterHandoffReport> {
+    let attempt = &item.attempts[attempt_index];
+    let task = &attempt.tasks[write_index];
+    anyhow::ensure!(
+        task.kind == TaskKind::Write && task.status == TaskStatus::Complete,
+        "Final handoff requires a completed Writer Task"
+    );
+    let output = task
+        .output
+        .as_ref()
+        .context("Completed Writer has no output")?;
+    let workspace = resolve_managed_sibling_workspace_path(
+        project_root,
+        &output.workspace_path,
+        "completed Writer handoff workspace",
+    )?;
+    crate::worktree::ensure_candidate_worktree(project_root, &workspace)?;
+    assess_writer_handoff_candidate(
+        project_root,
+        store,
+        item,
+        attempt_index,
+        write_index,
+        &workspace,
+    )
+}
+
+/// Read the completed Writer's current candidate through the same ordered
+/// checks used by active preflight. This never reuses a prior preflight result.
+pub fn check_completed_writer_handoff(
+    project_root: &Path,
+    work_item_id: &str,
+    attempt_id: &str,
+    task_id: &str,
+) -> Result<WriterHandoffReport> {
+    let store = WorkModelStore::new(project_root);
+    let item = store.read_work_item_snapshot(work_item_id)?;
+    let attempt_index = item
+        .attempts
+        .iter()
+        .position(|attempt| attempt.id == attempt_id)
+        .context("Completed Writer Attempt is missing")?;
+    let write_index = item.attempts[attempt_index]
+        .tasks
+        .iter()
+        .position(|task| task.id == task_id)
+        .context("Completed Writer Task is missing")?;
+    assess_completed_writer_handoff_in_item(project_root, &store, &item, attempt_index, write_index)
+}
+
+fn attempt_executor_transition() -> DurableTransitionMetadata {
+    DurableTransitionMetadata {
+        origin: DurableTransitionOrigin::AttemptExecutor,
+        reason: None,
+        evidence_ref: None,
+    }
+}
+
+fn write_attempt_work_item(
+    store: &WorkModelStore,
+    item: &mut WorkItem,
+) -> Result<(), WorkModelStorageError> {
+    crate::recovery_contracts::prepare_writer_correction_assignments(store.project_root(), item)
+        .map_err(|error| WorkModelStorageError::InvalidModel {
+            path: store.work_item_path(&item.id).unwrap_or_default(),
+            source: WorkModelError::InvalidWriterCorrectionAssignment {
+                task_id: item
+                    .attempts
+                    .iter()
+                    .flat_map(|attempt| &attempt.tasks)
+                    .find(|task| {
+                        task.kind == TaskKind::Write
+                            && task.status == TaskStatus::Planned
+                            && task.writer_correction_assignment.is_none()
+                    })
+                    .map(|task| task.id.clone())
+                    .unwrap_or_default(),
+                reason: error.to_string(),
+            },
+        })?;
+    store.write_work_item_with_transition(item, &attempt_executor_transition())
+}
+
+fn mutate_attempt_work_item<T>(
+    store: &WorkModelStore,
+    id: &str,
+    reducer: impl FnOnce(&mut WorkItem) -> Result<T, WorkModelError>,
+) -> Result<T, WorkModelStorageError> {
+    store.mutate_work_item_with_transition(id, &attempt_executor_transition(), reducer)
+}
 
 /// The reviewer-parallelism limit applied within a single Attempt. This is
 /// independent of the local scheduler's Work-Item concurrency: one scheduled
@@ -36,12 +938,193 @@ pub fn max_parallel_reviewers() -> usize {
         .max(1)
 }
 
-fn max_total_write_rounds() -> usize {
+pub(crate) fn max_total_write_rounds() -> usize {
     std::env::var("FLUENT_MAX_TOTAL_WRITE_ROUNDS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(DEFAULT_MAX_TOTAL_WRITE_ROUNDS)
         .max(1)
+}
+
+/// Verify the exact paused candidate and correction bytes, then append one bounded
+/// operator approval under the same land/model lock order used by execution.
+pub fn extend_round_cap(
+    project_root: &Path,
+    store: &WorkModelStore,
+    work_item_id: &str,
+    attempt_id: &str,
+    additional_write_rounds: usize,
+    human_resolution: &str,
+) -> Result<RoundCapExtension> {
+    let _land_lock = crate::land_lock::acquire(&crate::land_lock::lock_path(project_root))
+        .map_err(|error| anyhow::anyhow!("failed to acquire land lock: {error}"))?;
+    let base_cap = max_total_write_rounds();
+    let human_resolution = normalize_round_cap_resolution(human_resolution)?;
+    let human_resolution_digest = round_cap_resolution_digest(&human_resolution);
+    Ok(mutate_attempt_work_item(store, work_item_id, |item| {
+        let attempt_index = item
+            .attempts
+            .iter()
+            .position(|attempt| attempt.id == attempt_id)
+            .ok_or_else(|| WorkModelError::AttemptNotFound {
+                id: attempt_id.to_string(),
+            })?;
+        if item.merge_candidates.iter().any(|candidate| {
+            candidate.attempt_id == attempt_id
+                && matches!(
+                    candidate.merge_state.status,
+                    MergeCandidateMergeStatus::Executing
+                        | MergeCandidateMergeStatus::LandingPending
+                        | MergeCandidateMergeStatus::Pending
+                )
+        }) {
+            return Err(round_cap_ineligible("a landing owns this Attempt"));
+        }
+        let attempt = &item.attempts[attempt_index];
+        if attempt.has_round_cap_task_blocker() {
+            return Err(round_cap_ineligible(
+                "a live or failed Task owns this Attempt",
+            ));
+        }
+        if attempt.status != AttemptStatus::NeedsUser
+            || attempt.pause_kind != Some(PauseKind::RoundCap)
+            || attempt.review_state != Some(AttemptReviewState::Failed)
+        {
+            return Err(round_cap_ineligible(
+                "the Attempt is not paused at a failed-correction write-round cap",
+            ));
+        }
+        let failed_reviews =
+            round_cap_failure_frontier(project_root, attempt).map_err(|error| {
+                round_cap_ineligible(format!(
+                    "failed correction artifacts cannot be resolved: {error:#}"
+                ))
+            })?;
+        if failed_reviews.is_empty() {
+            return Err(round_cap_ineligible(
+                "the paused frontier has no failed correction artifacts",
+            ));
+        }
+        let write_output = attempt
+            .tasks
+            .iter()
+            .rev()
+            .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+            .and_then(|task| task.output.as_ref())
+            .ok_or_else(|| round_cap_ineligible("the Attempt has no completed Writer candidate"))?;
+        let workspace = resolve_managed_sibling_workspace_path(
+            project_root,
+            &write_output.workspace_path,
+            "round-cap candidate workspace",
+        )
+        .map_err(|error| {
+            round_cap_ineligible(format!("candidate workspace is unavailable: {error:#}"))
+        })?;
+        ensure_registered_worktree(project_root, &workspace).map_err(|error| {
+            round_cap_ineligible(format!("candidate workspace is unavailable: {error:#}"))
+        })?;
+        let status = git::run_stdout(
+            &workspace,
+            &["status", "--porcelain", "--untracked-files=all", "--", "."],
+            "check round-cap candidate cleanliness",
+        )
+        .map_err(|error| round_cap_ineligible(format!("candidate cannot be checked: {error:#}")))?;
+        if !status.is_empty() {
+            return Err(round_cap_ineligible("the candidate workspace is dirty"));
+        }
+        let head = git::run_stdout(&workspace, &["rev-parse", "HEAD"], "resolve candidate HEAD")
+            .map_err(|error| {
+                round_cap_ineligible(format!("candidate HEAD cannot be resolved: {error:#}"))
+            })?;
+        if head != write_output.commit {
+            return Err(round_cap_ineligible(
+                "the candidate HEAD no longer matches the reviewed commit",
+            ));
+        }
+        let effective_cap = attempt.effective_write_round_cap(base_cap);
+        let workspace_path = write_output.workspace_path.clone();
+        let failed_review_identity = failed_reviews
+            .iter()
+            .map(|review| format!("{}\0{}", review.artifact.path, review.digest))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let operation = crate::work_model::RecoveryOperationRequest::new(
+            "round-cap-extension",
+            work_item_id,
+            attempt_id,
+            Some(head.clone()),
+            None,
+            None,
+            Some(workspace_path),
+            Some(human_resolution.clone()),
+            Some(format!(
+                "sha256:{:x}",
+                Sha256::digest(
+                    format!("{effective_cap}\0{additional_write_rounds}\0{failed_review_identity}")
+                        .as_bytes()
+                )
+            )),
+        );
+        let _ = item
+            .validate_recovery_operation(project_root, &operation)
+            .map_err(|error| round_cap_ineligible(error.to_string()))?;
+        let existing_extension = attempt
+            .round_cap_extensions
+            .iter()
+            .find(|extension| {
+                extension.additional_write_rounds == additional_write_rounds
+                    && extension.candidate_commit == head
+                    && extension.failed_reviews == failed_reviews
+                    && extension.new_cap == effective_cap
+                    && extension.human_resolution == human_resolution
+                    && extension.human_resolution_digest == human_resolution_digest
+            })
+            .cloned();
+        if let Some(extension) = existing_extension {
+            let attempt = &mut item.attempts[attempt_index];
+            let next_action = crate::work_status::derive_attempt_recovery_next_action(
+                Some(attempt),
+                Some(project_root),
+            );
+            attempt
+                .record_recovery_operation(&operation, next_action)
+                .map_err(|error| round_cap_ineligible(error.to_string()))?;
+            return Ok(extension);
+        }
+        let write_rounds = attempt.materialized_write_rounds();
+        if write_rounds != effective_cap {
+            return Err(round_cap_ineligible(format!(
+                "the paused frontier has {write_rounds} Writer rounds, not its current cap {effective_cap}"
+            )));
+        }
+        let attempt = &mut item.attempts[attempt_index];
+        let extension = attempt
+            .record_round_cap_extension(
+                base_cap,
+                RoundCapExtensionRequest {
+                    old_cap: effective_cap,
+                    additional_write_rounds,
+                    candidate_commit: head,
+                    failed_reviews,
+                    human_resolution,
+                },
+            )
+            .cloned()?;
+        let next_action = crate::work_status::derive_attempt_recovery_next_action(
+            Some(attempt),
+            Some(project_root),
+        );
+        attempt
+            .record_recovery_operation(&operation, next_action)
+            .map_err(|error| round_cap_ineligible(error.to_string()))?;
+        Ok(extension)
+    })?)
+}
+
+fn round_cap_ineligible(reason: impl Into<String>) -> WorkModelError {
+    WorkModelError::RoundCapExtensionIneligible {
+        reason: reason.into(),
+    }
 }
 
 fn max_no_progress_rounds() -> usize {
@@ -60,6 +1143,13 @@ pub struct WorkAttemptRunConfig<'a> {
     pub resolver: &'a ContentResolver,
     pub extra_args: &'a [String],
     pub no_sandbox: bool,
+    /// One internal scheduler recovery capability. It is accepted only for an
+    /// Attempt currently paused at `tester-harness` and applies only to that
+    /// exact `NeedsUser` Tester Task.
+    pub tester_no_sandbox: bool,
+    /// Cancellation observed by an explicit run or recorded at queue resume
+    /// admission. Startup must never infer fresh recovery authorization.
+    pub resume_cancellation_requested_at: Option<&'a str>,
     /// Explicit CLI mapping fields for this invocation. Overlay them on the
     /// freshly locked Attempt mapping under the land lock.
     pub coder_mapping_inputs: Option<&'a CoderMappingInputs>,
@@ -78,6 +1168,12 @@ pub enum WorkAttemptRunOutcome {
     },
     PlannedReviews {
         task_ids: Vec<String>,
+    },
+    PlannedFinalTester {
+        task_id: String,
+    },
+    PlannedFailedCommandRecheck {
+        task_id: String,
     },
     MergeCandidateReady {
         candidate_id: String,
@@ -122,6 +1218,119 @@ pub struct WorkAttemptRunResult {
 }
 
 pub fn run_attempt(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunResult> {
+    run_attempt_inner(config)
+}
+
+fn run_attempt_inner(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunResult> {
+    let initial_item = read_work_item_or_not_found(config.store, config.work_item_id)?;
+    initial_item.ensure_mutation_compatible()?;
+    crate::recovery_contracts::context_retry::resume_ready(
+        config.project_root,
+        &initial_item,
+        config.attempt_id,
+    )?;
+    if let Some(attempt) = initial_item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == config.attempt_id)
+    {
+        crate::host_evidence::ensure_owned_host_resume_ready_for_item(
+            config.project_root,
+            &initial_item,
+            attempt,
+        )?;
+    }
+    if let Some(inputs) = config.coder_mapping_inputs {
+        if crate::lifecycle_recovery::usage_limit_writer_resume_ready(
+            config.project_root,
+            &initial_item,
+            config.attempt_id,
+        )? {
+            let attempt = initial_item
+                .attempts
+                .iter()
+                .find(|a| a.id == config.attempt_id)
+                .unwrap();
+            anyhow::ensure!(
+                attempt.coder_mapping.overlay_run_inputs(inputs)?.write
+                    == attempt.coder_mapping.write,
+                "usage-limit recovery must retain the saved Writer coder, model, and effort"
+            );
+        }
+    }
+    if !config.extra_args.is_empty()
+        && crate::lifecycle_recovery::usage_limit_writer_resume_ready(
+            config.project_root,
+            &initial_item,
+            config.attempt_id,
+        )?
+    {
+        bail!("usage-limit retry cannot introduce new provider arguments");
+    }
+    crate::writer_completion_recovery::resume_context_retry(
+        config.project_root,
+        config.store,
+        config.work_item_id,
+        config.attempt_id,
+    )?;
+    crate::usage_limit_recovery::resume(
+        config.project_root,
+        config.store,
+        config.work_item_id,
+        config.attempt_id,
+    )?;
+    resume_canceled_attempt(
+        config.project_root,
+        config.store,
+        config.work_item_id,
+        config.attempt_id,
+        config.resume_cancellation_requested_at,
+    )?;
+    let _ = crate::lifecycle_recovery::recover_legacy_writer_correction_assignment(
+        config.project_root,
+        config.store,
+        config.work_item_id,
+        config.attempt_id,
+    )?;
+    // Re-read after legacy publication so the protected assignment and any
+    // cancellation transition are both part of the launcher's fresh view.
+    let initial_item = read_work_item_or_not_found(config.store, config.work_item_id)?;
+    let tester_no_sandbox_task_id = if config.tester_no_sandbox {
+        let attempt = initial_item
+            .attempts
+            .iter()
+            .find(|attempt| attempt.id == config.attempt_id)
+            .ok_or_else(|| anyhow::anyhow!("Attempt {:?} not found", config.attempt_id))?;
+        if attempt.status != AttemptStatus::NeedsUser
+            || attempt.pause_kind != Some(PauseKind::TesterHarness)
+            || attempt.pause_recovery != Some(PauseRecovery::TesterNoSandbox)
+        {
+            bail!(
+                "Tester no-sandbox recovery requires Attempt {:?} to record that exact recovery",
+                config.attempt_id
+            );
+        }
+        let mut tasks = attempt
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Tester && task.status == TaskStatus::NeedsUser);
+        let task = tasks.next().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Attempt {:?} has no paused Tester Task for no-sandbox recovery",
+                config.attempt_id
+            )
+        })?;
+        if tasks.next().is_some() {
+            bail!(
+                "Attempt {:?} has more than one paused Tester Task; refusing ambiguous no-sandbox recovery",
+                config.attempt_id
+            );
+        }
+        eprintln!("  Tester recovery   approved exact paused Task {}", task.id);
+        Some(task.id.clone())
+    } else {
+        None
+    };
     if let Some(inputs) = config.coder_mapping_inputs {
         let _land_lock =
             crate::land_lock::acquire(&crate::land_lock::lock_path(config.project_root))?;
@@ -144,20 +1353,222 @@ pub fn run_attempt(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunRes
             .iter()
             .find(|attempt| attempt.id == config.attempt_id)
             .ok_or_else(|| anyhow::anyhow!("Attempt {:?} not found", config.attempt_id))?;
+        attempt.ensure_not_canceled()?;
+        crate::recovery_contracts::validate_planning_resume(config.project_root, &item, attempt)?;
+        if let Some(task) = attempt
+            .tasks
+            .iter()
+            .rev()
+            .find(|task| task.kind == TaskKind::Verification)
+        {
+            if task.status == TaskStatus::Complete
+                && !crate::verification::is_accepted(config.project_root, attempt, task)?
+            {
+                crate::verification::accept(
+                    config.project_root,
+                    config.store,
+                    task,
+                    config.resolver,
+                )?;
+                continue;
+            }
+        }
+        let candidate_gate_pause = attempt.is_candidate_gate_pause()
+            || is_rejected_gate_writer_completion_pause(config.project_root, attempt)?;
+        let uncertain_review_pause = attempt.is_uncertain_review_pause();
 
-        match reject_terminal_attempt(attempt)? {
-            TerminalCheck::Reopen => {
-                let mut item = item;
-                let attempt_mut = item
+        if attempt.status == AttemptStatus::NeedsUser
+            && attempt.pause_recovery == Some(PauseRecovery::TesterNoSandbox)
+            && !config.tester_no_sandbox
+        {
+            bail!(
+                "Attempt {:?} requires the recorded scheduler recovery: fluent queue resume {} --attempt {} --no-sandbox",
+                config.attempt_id,
+                config.work_item_id,
+                config.attempt_id
+            );
+        }
+
+        // Earlier versions recorded an exhausted provider outage as a RoundCap.
+        // Recover only the narrow, durable review-only shape before the normal
+        // terminal-state gate rejects it.
+        if attempt.status == AttemptStatus::NeedsUser
+            && attempt.pause_kind == Some(PauseKind::RoundCap)
+            && attempt.round_cap_extensions.is_empty()
+        {
+            if reclassify_codex_auth_pause(
+                config.store,
+                config.project_root,
+                config.work_item_id,
+                config.attempt_id,
+            )? {
+                continue;
+            }
+            if reclassify_codex_transport_pause(
+                config.store,
+                config.project_root,
+                config.work_item_id,
+                config.attempt_id,
+            )? {
+                continue;
+            }
+            match reclassify_legacy_provider_pause(
+                config.store,
+                config.project_root,
+                config.work_item_id,
+                config.attempt_id,
+            )? {
+                LegacyProviderPauseRecovery::Reclassified => continue,
+                LegacyProviderPauseRecovery::Ineligible(reason) => {
+                    bail!("Attempt cannot resume automatically: {reason}");
+                }
+                LegacyProviderPauseRecovery::NotLegacy => {}
+            }
+        }
+
+        // A prior Fluent build could persist a round-cap pause after the
+        // candidate-bound failed-command evidence Review had already passed.
+        // Restore that exact unsettled Review frontier before any round-cap
+        // admission check; no Writer capacity is granted.
+        if reopen_completed_recheck_evidence_review_round_cap_attempt(
+            config.project_root,
+            config.store,
+            config.work_item_id,
+            config.attempt_id,
+        )? {
+            continue;
+        }
+
+        // A prior Fluent build could leave this at the round cap even when an
+        // accepted focused host check already covered the exact command that
+        // the canonical Tester could not run in its local environment.
+        // Clear only that exact stale pause before asking for another Writer.
+        if reopen_review_evidence_covered_round_cap_attempt(
+            config.project_root,
+            config.store,
+            config.work_item_id,
+            config.attempt_id,
+        )? {
+            continue;
+        }
+        // A prior Fluent build could also pause after both the final Tester and
+        // its recheck were fully covered by the immutable Attempt baseline.
+        // Clear only that exact stale pause before the ordinary round-cap gate.
+        if reopen_baseline_covered_round_cap_attempt(
+            config.project_root,
+            config.store,
+            config.work_item_id,
+            config.attempt_id,
+        )? {
+            continue;
+        }
+
+        // Fluent 0.2.0 could let one Review Task's completion finalizer fail the
+        // Attempt while a parallel peer was still executing. Reconcile only the
+        // ledger-proven shape whose failed Task retained a real fail verdict and
+        // whose peer completed afterward, then interpret the settled round.
+        if reconcile_premature_parallel_review_failure(
+            config.project_root,
+            config.store,
+            config.work_item_id,
+            config.attempt_id,
+        )? {
+            continue;
+        }
+
+        // Factory's current project policy treats body presence and wrapping as
+        // advice. Reclassify only the exact legacy gate-backed pause before the
+        // generic Writer-completion resume would relaunch its output-free Writer.
+        if recover_retired_commit_style_pause(
+            config.project_root,
+            config.store,
+            config.work_item_id,
+            config.attempt_id,
+        )? {
+            continue;
+        }
+
+        if crate::recovery_contracts::validate_owned_plan_evidence_review(
+            config.project_root,
+            attempt,
+        )? {
+            mutate_attempt_work_item(config.store, config.work_item_id, |fresh| {
+                let attempt = fresh
                     .attempts
                     .iter_mut()
-                    .find(|a| a.id == config.attempt_id)
-                    .unwrap();
-                crate::work_model::reopen_attempt(attempt_mut);
-                config.store.write_work_item(&item)?;
+                    .find(|attempt| attempt.id == config.attempt_id)
+                    .ok_or_else(|| WorkModelError::AttemptNotFound {
+                        id: config.attempt_id.to_string(),
+                    })?;
+                crate::recovery_contracts::complete_owned_plan_evidence_review(
+                    config.project_root,
+                    attempt,
+                    false,
+                )
+                .map_err(|error| {
+                    WorkModelError::HostEvidenceRecoveryIneligible {
+                        attempt_id: config.attempt_id.to_string(),
+                        reason: format!("{error:#}"),
+                    }
+                })?;
+                Ok(())
+            })?;
+            continue;
+        }
+        crate::host_evidence::ensure_owned_host_resume_ready_for_item(
+            config.project_root,
+            &item,
+            attempt,
+        )?;
+        match reject_terminal_attempt(attempt)? {
+            TerminalCheck::Reopen => {
+                if candidate_gate_pause {
+                    reopen_candidate_gate_attempt(
+                        config.project_root,
+                        config.store,
+                        config.work_item_id,
+                        config.attempt_id,
+                    )?;
+                } else if attempt.pause_kind == Some(PauseKind::RoundCap) {
+                    reopen_approved_round_cap_attempt(
+                        config.project_root,
+                        config.store,
+                        config.work_item_id,
+                        config.attempt_id,
+                    )?;
+                } else if uncertain_review_pause {
+                    reopen_uncertain_review_attempt(
+                        config.project_root,
+                        config.store,
+                        config.work_item_id,
+                        config.attempt_id,
+                    )?;
+                } else {
+                    reopen_resumable_attempt(
+                        config.project_root,
+                        config.store,
+                        config.work_item_id,
+                        config.attempt_id,
+                    )?;
+                }
                 continue;
             }
             TerminalCheck::Continue => {}
+        }
+
+        // Fluent 0.1.5 first checked behavior-to-Tester references inside the
+        // Learner gate, after it had already completed the Attempt and created a
+        // Merge Candidate. Normalize only that exact retained failure shape back
+        // to the new final-Tester frontier; all other Learner failures keep their
+        // existing retry behavior.
+        if let Some(outcome) = recover_legacy_learner_tester_evidence_failure(
+            config.project_root,
+            config.store,
+            &item,
+            config.attempt_id,
+        )? {
+            outcomes.push(outcome);
+            continue;
         }
 
         if !worktree_ensured && attempt.kind.is_review_only_like() {
@@ -169,6 +1580,42 @@ pub fn run_attempt(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunRes
             )?;
             ensure_review_only_worktree_if_applicable(config.project_root, attempt)?;
             worktree_ensured = true;
+        }
+
+        if !attempt.kind.is_review_only_like()
+            && attempt.status == AttemptStatus::Complete
+            && attempt.review_state == Some(AttemptReviewState::Passed)
+            && attempt.learning.as_ref().is_none_or(|learning| {
+                !learning.is_succeeded()
+                    && learning.failure_stage
+                        != Some(crate::work_model::LearningFailureStage::HandoffPublication)
+            })
+            && !item.merge_candidates.iter().any(|candidate| {
+                candidate.attempt_id == attempt.id
+                    && candidate.merge_state.status == MergeCandidateMergeStatus::Merged
+            })
+        {
+            let ordinary = ordinary_review_tasks(config.project_root, attempt);
+            if !stale_review_roles_after_latest_write(config.project_root, attempt).is_empty()
+                || ordinary
+                    .iter()
+                    .any(|(_, verdict)| *verdict != Verdict::Pass)
+            {
+                // Saved completion may predate ordinary-coverage admission.
+                // Preserve its Tasks and evidence and return to native review.
+                let mut item = item;
+                item.retract_unready_merge_candidate_for_correction(config.attempt_id)?;
+                let attempt = item
+                    .attempts
+                    .iter_mut()
+                    .find(|attempt| attempt.id == config.attempt_id)
+                    .unwrap();
+                attempt.status = AttemptStatus::Reviewing;
+                attempt.review_state = Some(AttemptReviewState::NotReviewed);
+                attempt.completed_at = None;
+                write_attempt_work_item(config.store, &mut item)?;
+                continue;
+            }
         }
 
         if !attempt.kind.is_review_only_like()
@@ -228,6 +1675,17 @@ pub fn run_attempt(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunRes
                         config.attempt_id
                     );
                 }
+                if item.attempts[attempt_index]
+                    .learning
+                    .as_ref()
+                    .is_some_and(|learning| learning.is_failed())
+                {
+                    crate::lifecycle_recovery::inspect_learner_terminal_history(
+                        Some(config.project_root),
+                        &item.attempts[attempt_index],
+                        &item.id,
+                    )?;
+                }
                 let candidate = item
                     .merge_candidates
                     .iter()
@@ -271,6 +1729,9 @@ pub fn run_attempt(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunRes
                         &LearnerConfig {
                             run_coder: &run_coder,
                             codex_worker: None,
+                            #[cfg(not(test))]
+                            provider_readiness: None,
+                            no_sandbox: config.no_sandbox,
                         },
                     )?;
                     // A no-expertise Learner persists every terminal transition
@@ -279,7 +1740,7 @@ pub fn run_attempt(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunRes
                     // window the release correction closes. Other modes persist inside
                     // run_learner_step and this write is their durable refresh.
                     if !mode.is_pre_land_no_expertise() {
-                        config.store.write_work_item(&item)?;
+                        write_attempt_work_item(config.store, &mut item)?;
                     }
                     if handoff_only
                         && item.attempts[attempt_index]
@@ -340,7 +1801,7 @@ pub fn run_attempt(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunRes
                     }
                 }
             } else {
-                config.store.write_work_item(&item)?;
+                write_attempt_work_item(config.store, &mut item)?;
             }
             // Advancement gate: a non-succeeded Learner blocks readiness with the same
             // durable reason as Merge Candidate validation and landing, so a failed or
@@ -353,21 +1814,37 @@ pub fn run_attempt(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunRes
                 });
                 return Ok(WorkAttemptRunResult { outcomes });
             }
+            let candidate_id =
+                mutate_attempt_work_item(config.store, config.work_item_id, |fresh| {
+                    fresh.mark_merge_candidate_ready(config.attempt_id)
+                })?;
             outcomes.push(WorkAttemptRunOutcome::MergeCandidateReady { candidate_id });
             return Ok(WorkAttemptRunResult { outcomes });
         }
 
-        if let Some(task) = attempt
-            .tasks
-            .iter()
-            .find(|task| task.status == TaskStatus::Planned && is_task_ready(task, &attempt.tasks))
-        {
-            if is_review_phase_task(task) && supports_parallel_review_phase(attempt) {
+        let final_tester_needs_reviews = !attempt.kind.is_review_only_like()
+            && attempt.tasks.iter().any(|task| {
+                task.kind == TaskKind::Tester
+                    && !task.is_failed_command_recheck()
+                    && task.status == TaskStatus::Planned
+            })
+            && (!stale_review_roles_after_latest_write(config.project_root, attempt).is_empty()
+                || ordinary_review_tasks(config.project_root, attempt)
+                    .iter()
+                    .any(|(_, verdict)| *verdict != Verdict::Pass));
+        if let Some(task) = attempt.tasks.iter().find(|task| {
+            task.status == TaskStatus::Planned
+                && is_task_ready(task, &attempt.tasks)
+                && !(final_tester_needs_reviews
+                    && task.kind == TaskKind::Tester
+                    && !task.is_failed_command_recheck())
+        }) {
+            if task.kind == TaskKind::Review && supports_parallel_review_phase(attempt) {
                 let planned_review_ids: Vec<String> = attempt
                     .tasks
                     .iter()
                     .filter(|t| {
-                        is_review_phase_task(t)
+                        t.kind == TaskKind::Review
                             && t.status == TaskStatus::Planned
                             && is_task_ready(t, &attempt.tasks)
                     })
@@ -377,6 +1854,17 @@ pub fn run_attempt(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunRes
                 continue;
             }
 
+            let task_no_sandbox = task_uses_no_sandbox(
+                config.no_sandbox,
+                tester_no_sandbox_task_id.as_deref(),
+                &task.id,
+            );
+            if tester_no_sandbox_task_id.as_deref() == Some(task.id.as_str()) {
+                eprintln!(
+                    "  Tester recovery   disabling Fluent's sandbox for exact Task {}",
+                    task.id
+                );
+            }
             let result = work_task_executor::run_task(WorkTaskRunConfig {
                 project_root: config.project_root,
                 store: config.store,
@@ -385,7 +1873,7 @@ pub fn run_attempt(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunRes
                 task_id: &task.id,
                 resolver: config.resolver,
                 extra_args: config.extra_args,
-                no_sandbox: config.no_sandbox,
+                no_sandbox: task_no_sandbox,
                 store_lock: None,
             })?;
             outcomes.push(WorkAttemptRunOutcome::RanTask {
@@ -396,21 +1884,21 @@ pub fn run_attempt(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunRes
         }
 
         {
-            let executing_tasks: Vec<String> = attempt
+            let executing_tasks: Vec<crate::work_model::Task> = attempt
                 .tasks
                 .iter()
                 .filter(|task| task.status == TaskStatus::Executing)
-                .map(|task| task.id.clone())
+                .cloned()
                 .collect();
 
             if !executing_tasks.is_empty() {
                 let mut has_live = false;
                 let mut stale_ids = Vec::new();
-                for task_id in &executing_tasks {
-                    if executing_task_is_live(config.project_root, config.work_item_id, task_id) {
+                for task in &executing_tasks {
+                    if executing_task_is_live(config.project_root, config.work_item_id, task) {
                         has_live = true;
                     } else {
-                        stale_ids.push(task_id.clone());
+                        stale_ids.push(task.id.clone());
                     }
                 }
 
@@ -432,15 +1920,32 @@ pub fn run_attempt(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunRes
                         task.status = TaskStatus::Planned;
                     }
                 }
-                config.store.write_work_item(&item)?;
+                write_attempt_work_item(config.store, &mut item)?;
                 continue;
             }
         }
-        if let Some(task) = attempt
-            .tasks
-            .iter()
-            .find(|task| matches!(task.status, TaskStatus::Failed | TaskStatus::NeedsUser))
-        {
+        if let Some(task) = attempt.tasks.iter().find(|task| {
+            matches!(task.status, TaskStatus::Failed | TaskStatus::NeedsUser)
+                && !attempt.is_approach_revision_superseded_task(&task.id)
+                && !attempt.is_superseded_tester_harness_followup(&task.id)
+                && !attempt.has_tester_harness_repair_for(&task.id)
+                && !attempt.active_evidence_recovery().is_some_and(|recovery| {
+                    task.kind == TaskKind::Write
+                        || recovery.targets.iter().any(|target| {
+                            target.prior_review_artifact
+                                == task
+                                    .artifact_area
+                                    .as_ref()
+                                    .map(|area| format!("{}/review.md", area.path))
+                                    .unwrap_or_default()
+                        })
+                })
+                && !(task.kind == TaskKind::Write
+                    && attempt
+                        .evidence_recoveries
+                        .iter()
+                        .any(|recovery| recovery.state == EvidenceRecoveryState::CodeChange))
+        }) {
             bail!(
                 "Attempt {:?} cannot advance because Task {:?} is {}",
                 config.attempt_id,
@@ -451,22 +1956,32 @@ pub fn run_attempt(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunRes
 
         if !attempt.kind.is_review_only_like()
             && has_completed_write(attempt.tasks.as_slice())
-            && !has_review_after_latest_write(attempt.tasks.as_slice())
+            && !has_review_after_latest_write(attempt)
         {
-            let review_roles = next_review_roles(attempt);
-            let mut item = item;
-            let task_ids = item.add_next_review_tasks(config.attempt_id, &review_roles)?;
-            config.store.write_work_item(&item)?;
-            outcomes.push(WorkAttemptRunOutcome::PlannedReviews {
-                task_ids: task_ids.clone(),
-            });
+            let outcome = plan_after_completed_writer(
+                config.project_root,
+                config.store,
+                item,
+                config.attempt_id,
+            )?;
+            let needs_user = matches!(outcome, WorkAttemptRunOutcome::NeedsUser { .. });
+            outcomes.push(outcome);
+            if needs_user {
+                return Ok(WorkAttemptRunResult { outcomes });
+            }
             continue;
         }
 
-        if completed_review_tasks_after_latest_write(attempt.tasks.as_slice())
+        if (completed_review_tasks_after_latest_write(attempt)
             .next()
             .is_some()
-            && !has_open_review_round(attempt.tasks.as_slice())
+            || final_tester_needs_reviews)
+            && (!has_open_review_round(attempt.tasks.as_slice())
+                || (final_tester_needs_reviews
+                    && !attempt.tasks.iter().any(|task| {
+                        task.kind == TaskKind::Review
+                            && matches!(task.status, TaskStatus::Planned | TaskStatus::Executing)
+                    })))
         {
             let can_advance = can_advance_loop(config.project_root, attempt)?;
             let run_coder =
@@ -480,6 +1995,9 @@ pub fn run_attempt(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunRes
                 Some(LearnerConfig {
                     run_coder: &run_coder,
                     codex_worker: None,
+                    #[cfg(not(test))]
+                    provider_readiness: None,
+                    no_sandbox: config.no_sandbox,
                 }),
             )?;
             let should_stop = matches!(
@@ -505,6 +2023,14 @@ pub fn run_attempt(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunRes
     }
 }
 
+fn task_uses_no_sandbox(
+    all_tasks_no_sandbox: bool,
+    approved_tester_task_id: Option<&str>,
+    task_id: &str,
+) -> bool {
+    all_tasks_no_sandbox || approved_tester_task_id == Some(task_id)
+}
+
 /// Run the Learner with the run-level configuration, mapping a per-run
 /// `LearnerCoderRequest` onto the executor's `LearnerRunInputs`. Both Learner
 /// entry points in `run_attempt` — the retry fast-path and the normal
@@ -524,10 +2050,14 @@ fn default_learner_run_coder(
     // LearnerRunInputs; the public constructor never names the private pump config.
     let capture =
         crate::coder::TranscriptCapture::new(request.transcript_path, config.project_root);
+    #[cfg(not(test))]
+    let prepared_provider_readiness = request.provider_readiness;
+    #[cfg(test)]
+    let prepared_provider_readiness = None;
     // The public `handoff_only` Boolean only distinguishes capture from post-land;
     // the internal mode is passed explicitly so a pre-land no-expertise run selects
     // its confinement without a contradictory Boolean.
-    work_task_executor::run_learner_captured_in_mode_with_codex_worker(
+    work_task_executor::run_learner_captured_in_mode_with_provider_readiness(
         work_task_executor::LearnerRunInputs {
             workspace_path: request.workspace_path,
             resolver: config.resolver,
@@ -547,6 +2077,8 @@ fn default_learner_run_coder(
         request.mode,
         Some(capture),
         request.codex_worker,
+        prepared_provider_readiness,
+        request.prepared_sandbox,
     )
 }
 
@@ -634,8 +2166,58 @@ fn run_parallel_reviews(
     }
 
     if let Some(error) = first_error {
+        settle_parallel_review_task_failures(
+            config.store,
+            config.work_item_id,
+            config.attempt_id,
+            task_ids,
+        )?;
         return Err(error);
     }
+    Ok(())
+}
+
+/// Derive a hard parallel-review execution failure only after every Task launched
+/// for the round has settled. Individual Task finalizers may record their own
+/// failure while a peer is still running, but they must not terminalize the
+/// aggregate before the join boundary has observed the whole round.
+fn settle_parallel_review_task_failures(
+    store: &WorkModelStore,
+    work_item_id: &str,
+    attempt_id: &str,
+    task_ids: &[String],
+) -> Result<()> {
+    mutate_attempt_work_item(store, work_item_id, |item| {
+        let attempt = item
+            .attempts
+            .iter_mut()
+            .find(|attempt| attempt.id == attempt_id)
+            .ok_or_else(|| WorkModelError::AttemptNotFound {
+                id: attempt_id.to_string(),
+            })?;
+        let tasks = task_ids
+            .iter()
+            .map(|task_id| {
+                attempt
+                    .tasks
+                    .iter()
+                    .find(|task| task.id == *task_id)
+                    .ok_or_else(|| WorkModelError::TaskNotFound {
+                        id: task_id.clone(),
+                    })
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if tasks
+            .iter()
+            .any(|task| matches!(task.status, TaskStatus::Planned | TaskStatus::Executing))
+        {
+            return Ok(());
+        }
+        if tasks.iter().any(|task| task.status == TaskStatus::Failed) {
+            crate::work_model::set_attempt_terminal(attempt, AttemptStatus::Failed);
+        }
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -738,39 +2320,1339 @@ enum TerminalCheck {
 
 fn reject_terminal_attempt(attempt: &Attempt) -> Result<TerminalCheck> {
     match attempt.status {
+        AttemptStatus::Failed if attempt.is_failed_candidate_gate_correction() => {
+            attempt.ensure_resume_ready()?;
+            Ok(TerminalCheck::Reopen)
+        }
         AttemptStatus::Failed => bail!("Attempt is failed and cannot be advanced"),
-        AttemptStatus::NeedsUser => match attempt.pause_kind {
-            Some(PauseKind::Auth) | Some(PauseKind::TranscriptPump) => {
-                // Resume only a cleanly resumable Attempt: a hard-Failed or
-                // still-live peer Task means resuming could discard a hard
-                // failure or race a running Task. Such a mixed state needs the
-                // operator, not an automatic reopen.
-                if attempt
-                    .tasks
-                    .iter()
-                    .any(|t| matches!(t.status, TaskStatus::Failed | TaskStatus::Executing))
-                {
-                    bail!(
-                        "Attempt paused on recoverable infrastructure but also has a \
-                         hard-failed or still-running Task; resolve it before re-running."
-                    );
-                }
-                Ok(TerminalCheck::Reopen)
-            }
-            Some(PauseKind::Uncertain) => bail!(
-                "Attempt is paused with uncertain reviews. \
-                 Resolve the uncertain verdicts and re-run; \
-                 resuming this pause kind is not yet supported."
-            ),
-            Some(PauseKind::RoundCap) => bail!(
-                "Attempt is paused at the write-round cap. \
-                 Address the failing reviews and re-run; \
-                 resuming this pause kind is not yet supported."
-            ),
-            None => bail!("Attempt needs user input before it can advance"),
-        },
+        AttemptStatus::NeedsUser => {
+            attempt.ensure_resume_ready()?;
+            Ok(TerminalCheck::Reopen)
+        }
         _ => Ok(TerminalCheck::Continue),
     }
+}
+
+fn reconcile_premature_parallel_review_failure(
+    project_root: &Path,
+    store: &WorkModelStore,
+    work_item_id: &str,
+    attempt_id: &str,
+) -> Result<bool> {
+    let metadata = DurableTransitionMetadata {
+        origin: DurableTransitionOrigin::AttemptExecutor,
+        reason: Some("reconcile premature parallel review settlement".to_string()),
+        evidence_ref: None,
+    };
+    Ok(
+        store.mutate_work_item_with_transition(work_item_id, &metadata, |item| {
+            let Some(attempt_index) = item
+                .attempts
+                .iter()
+                .position(|attempt| attempt.id == attempt_id)
+            else {
+                return Ok(false);
+            };
+            let attempt = &item.attempts[attempt_index];
+            if attempt.status != AttemptStatus::Failed
+                || attempt.pause_kind.is_some()
+                || !matches!(
+                    attempt.review_state,
+                    None | Some(AttemptReviewState::NotReviewed)
+                )
+            {
+                return Ok(false);
+            }
+            let Some(write_index) = attempt.latest_materialized_write_index() else {
+                return Ok(false);
+            };
+            let Some(candidate_commit) = attempt.tasks[write_index]
+                .output
+                .as_ref()
+                .map(|output| output.commit.as_str())
+            else {
+                return Ok(false);
+            };
+            let round = &attempt.tasks[write_index + 1..];
+            if round.len() < 2
+                || round.iter().any(|task| {
+                    task.kind != TaskKind::Review
+                        || !matches!(task.status, TaskStatus::Complete | TaskStatus::Failed)
+                        || task
+                            .review_context
+                            .as_ref()
+                            .is_none_or(|context| context.candidate_commit != candidate_commit)
+                })
+            {
+                return Ok(false);
+            }
+            let failed = round
+                .iter()
+                .filter(|task| task.status == TaskStatus::Failed)
+                .collect::<Vec<_>>();
+            if failed.is_empty() || round.iter().all(|task| task.status == TaskStatus::Failed) {
+                return Ok(false);
+            }
+            let failed_ids = failed
+                .iter()
+                .map(|task| task.id.clone())
+                .collect::<Vec<_>>();
+            let mut review_artifacts = Vec::with_capacity(failed.len());
+            for task in failed {
+                let Some(area) = task.artifact_area.as_ref() else {
+                    return Ok(false);
+                };
+                let review_path = match work_task_executor::resolve_managed_artifact_area_path(
+                    project_root,
+                    &area.path,
+                ) {
+                    Ok(path) => path.join("review.md"),
+                    Err(_) => return Ok(false),
+                };
+                let content = match fs::read_to_string(&review_path) {
+                    Ok(content) => content,
+                    Err(_) => return Ok(false),
+                };
+                if review::extract_verdict(&content) != Verdict::Fail {
+                    return Ok(false);
+                }
+                review_artifacts.push(ArtifactRef {
+                    producer_id: task.id.clone(),
+                    path: format!("{}/review.md", area.path),
+                });
+            }
+
+            let Some(attempt_failure) = item.transitions.iter().rev().find(|transition| {
+                transition.object_kind == "attempt"
+                    && transition.object_id == attempt_id
+                    && transition.old_state.as_deref() == Some("reviewing")
+                    && transition.new_state == "failed"
+                    && transition.origin == DurableTransitionOrigin::TaskExecutor
+            }) else {
+                return Ok(false);
+            };
+            let failed_tasks_were_recorded = failed_ids.iter().all(|task_id| {
+                item.transitions.iter().any(|transition| {
+                    transition.object_kind == "task"
+                        && transition.object_id == *task_id
+                        && transition.old_state.as_deref() == Some("executing")
+                        && transition.new_state == "failed"
+                        && transition.origin == DurableTransitionOrigin::TaskExecutor
+                        && transition.sequence >= attempt_failure.sequence
+                })
+            });
+            let peer_completed_late = round.iter().any(|task| {
+                task.status == TaskStatus::Complete
+                    && item.transitions.iter().any(|transition| {
+                        transition.object_kind == "task"
+                            && transition.object_id == task.id
+                            && transition.old_state.as_deref() == Some("executing")
+                            && transition.new_state == "complete"
+                            && transition.origin == DurableTransitionOrigin::TaskExecutor
+                            && transition.sequence > attempt_failure.sequence
+                    })
+            });
+            if !failed_tasks_were_recorded || !peer_completed_late {
+                return Ok(false);
+            }
+
+            let attempt = &mut item.attempts[attempt_index];
+            for task in &mut attempt.tasks[write_index + 1..] {
+                if failed_ids.contains(&task.id) {
+                    crate::work_model::set_task_terminal(task, TaskStatus::Complete);
+                }
+            }
+            for artifact in review_artifacts {
+                if !attempt.artifacts.contains(&artifact) {
+                    attempt.artifacts.push(artifact);
+                }
+            }
+            attempt.status = AttemptStatus::Reviewing;
+            attempt.pause_kind = None;
+            attempt.pause_recovery = None;
+            attempt.completed_at = None;
+            Ok(true)
+        })?,
+    )
+}
+
+/// Reclassify one exact stored Factory presentation-only rejection without
+/// replacing its gate, changing its candidate, or launching another Writer.
+pub(crate) fn recover_retired_commit_style_pause(
+    project_root: &Path,
+    store: &WorkModelStore,
+    work_item_id: &str,
+    attempt_id: &str,
+) -> Result<bool> {
+    let item = store.read_work_item(work_item_id)?;
+    let Some(expected) = crate::lifecycle_recovery::inspect_retired_commit_style_recovery(
+        project_root,
+        &item,
+        attempt_id,
+    )?
+    else {
+        return Ok(false);
+    };
+    let artifact = crate::lifecycle_recovery::retired_commit_style_reclassification_artifact(
+        work_item_id,
+        attempt_id,
+        &expected.source_writer_task_id,
+    );
+    let transition = DurableTransitionMetadata {
+        origin: DurableTransitionOrigin::AttemptExecutor,
+        reason: Some("reclassify retired commit-message presentation finding".to_string()),
+        evidence_ref: Some(artifact.path.clone()),
+    };
+    let artifact_path = project_root.join(&artifact.path);
+    store.mutate_work_item_with_transition(work_item_id, &transition, |fresh| {
+        let current = crate::lifecycle_recovery::inspect_retired_commit_style_recovery(
+            project_root,
+            fresh,
+            attempt_id,
+        )
+        .map_err(|error| WorkModelError::AttemptResumeIneligible {
+            attempt_id: attempt_id.to_string(),
+            reason: format!("retired commit-style frontier changed: {error:#}"),
+        })?
+        .ok_or_else(|| WorkModelError::AttemptResumeIneligible {
+            attempt_id: attempt_id.to_string(),
+            reason: "retired commit-style frontier changed before recovery".to_string(),
+        })?;
+        if current != expected {
+            return Err(WorkModelError::AttemptResumeIneligible {
+                attempt_id: attempt_id.to_string(),
+                reason: "retired commit-style frontier changed before recovery".to_string(),
+            });
+        }
+        let _receipt = if artifact_path.exists() {
+            let existing = crate::lifecycle_recovery::read_retired_commit_style_reclassification(
+                &artifact_path,
+            )
+            .map_err(|error| WorkModelError::AttemptResumeIneligible {
+                attempt_id: attempt_id.to_string(),
+                reason: format!(
+                    "an unbound retired commit-style reclassification is invalid: {error:#}"
+                ),
+            })?;
+            crate::candidate_gate::validate_retired_commit_style_policy_replay(
+                project_root,
+                &existing.policy_commit,
+                &current.policy_commit,
+            )
+            .map_err(|error| WorkModelError::AttemptResumeIneligible {
+                attempt_id: attempt_id.to_string(),
+                reason: format!(
+                    "an unbound retired commit-style reclassification is invalid: {error:#}"
+                ),
+            })?;
+            let mut exact =
+                crate::lifecycle_recovery::RetiredCommitStyleReclassification::from_recovery(
+                    fresh, attempt_id, &current,
+                );
+            exact.recorded_at = existing.recorded_at.clone();
+            exact.policy_commit = existing.policy_commit.clone();
+            if existing.recorded_at.trim().is_empty() || existing != exact {
+                return Err(WorkModelError::AttemptResumeIneligible {
+                    attempt_id: attempt_id.to_string(),
+                    reason: "an unbound retired commit-style reclassification does not match the current frontier"
+                        .to_string(),
+                });
+            }
+            existing
+        } else {
+            let receipt = crate::lifecycle_recovery::RetiredCommitStyleReclassification::from_recovery(
+                fresh, attempt_id, &current,
+            );
+            let bytes = serde_json::to_vec_pretty(&receipt).map_err(|error| {
+                WorkModelError::AttemptResumeIneligible {
+                    attempt_id: attempt_id.to_string(),
+                    reason: format!("cannot serialize retired commit-style evidence: {error}"),
+                }
+            })?;
+            if let Some(parent) = artifact_path.parent() {
+                fs::create_dir_all(parent).map_err(|error| {
+                    WorkModelError::AttemptResumeIneligible {
+                        attempt_id: attempt_id.to_string(),
+                        reason: format!("cannot create retired commit-style evidence: {error}"),
+                    }
+                })?;
+            }
+            crate::atomic_write::atomic_write(&artifact_path, &bytes).map_err(|error| {
+                WorkModelError::AttemptResumeIneligible {
+                    attempt_id: attempt_id.to_string(),
+                    reason: format!("cannot record retired commit-style evidence: {error}"),
+                }
+            })?;
+            receipt
+        };
+        let attempt = fresh
+            .attempts
+            .iter_mut()
+            .find(|attempt| attempt.id == attempt_id)
+            .ok_or_else(|| WorkModelError::AttemptNotFound {
+                id: attempt_id.to_string(),
+            })?;
+        let correction = attempt
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == current.correction_writer_task_id)
+            .ok_or_else(|| WorkModelError::TaskNotFound {
+                id: current.correction_writer_task_id.clone(),
+            })?;
+        crate::work_model::set_task_terminal(correction, TaskStatus::Superseded);
+        if !attempt.artifacts.contains(&current.gate_artifact) {
+            attempt.artifacts.push(current.gate_artifact.clone());
+        }
+        if !attempt.artifacts.contains(&artifact) {
+            attempt.artifacts.push(artifact.clone());
+        }
+        attempt.status = AttemptStatus::Planned;
+        attempt.review_state = Some(AttemptReviewState::NotReviewed);
+        attempt.pause_kind = None;
+        attempt.pause_recovery = None;
+        attempt.completed_at = None;
+        Ok(())
+    })?;
+    Ok(true)
+}
+
+/// Reopen a supported pause from a fresh Work-model aggregate.
+///
+/// The Attempt loop initially reads the Work Item to inspect its next action,
+/// but a peer can complete between that read and a resume. Re-read and reopen
+/// under the model lock so the transition preserves that peer instead of
+/// attempting to write the stale aggregate back.
+fn reopen_resumable_attempt(
+    project_root: &Path,
+    store: &WorkModelStore,
+    work_item_id: &str,
+    attempt_id: &str,
+) -> Result<()> {
+    mutate_attempt_work_item(store, work_item_id, |item| {
+        let attempt_index = item
+            .attempts
+            .iter()
+            .position(|attempt| attempt.id == attempt_id)
+            .ok_or_else(|| crate::work_model::WorkModelError::AttemptNotFound {
+                id: attempt_id.to_string(),
+            })?;
+        let attempt = &item.attempts[attempt_index];
+        attempt.ensure_resume_ready()?;
+        if attempt.pause_kind == Some(PauseKind::RoundCap) {
+            return Err(round_cap_ineligible(
+                "the pause changed to round-cap before the recovery transaction",
+            ));
+        }
+        let repair_retry = attempt.pause_kind == Some(PauseKind::WriterCompletion)
+            && attempt.tasks.iter().rev().any(|task| {
+                task.kind == TaskKind::Write
+                    && task.role == crate::work_model::TESTER_HARNESS_REPAIR_ROLE
+                    && task.status == TaskStatus::NeedsUser
+            });
+        // A Writer that ended in NeedsUser without output is the same logical
+        // task that must be retried after its completion evidence is fixed.
+        // Do not append another Writer: the old task would remain first and be
+        // selected again, creating duplicate rounds on every resume. A
+        // completed no-change Writer likewise needs to pass through the normal
+        // candidate gate before Fluent decides whether another Writer is needed.
+        let retry_existing_writer = attempt.pause_kind == Some(PauseKind::WriterCompletion)
+            && attempt.tasks.iter().any(|task| {
+                task.kind == TaskKind::Write
+                    && task.status == TaskStatus::NeedsUser
+                    && task.output.is_none()
+            });
+        let latest_writer_is_no_change = attempt
+            .tasks
+            .iter()
+            .rev()
+            .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+            .and_then(|task| task.output.as_ref())
+            .is_some_and(|output| output.no_change.is_some());
+        let latest_writer_has_recoverable_format = attempt
+            .tasks
+            .iter()
+            .rev()
+            .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+            .and_then(|task| task.artifact_area.as_ref())
+            .map(|area| {
+                project_root
+                    .join(&area.path)
+                    .join(crate::work_task_executor::WRITER_COMPLETION_MATRIX_FILE)
+            })
+            .and_then(|path| fs::read_to_string(path).ok())
+            .is_some_and(|source| recover_writer_completion_result_format(&source).is_ok());
+        let latest_writer_has_legacy_assignment = attempt
+            .tasks
+            .iter()
+            .rev()
+            .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+            .and_then(|task| task.writer_correction_assignment.as_ref())
+            .is_some_and(|assignment| {
+                assignment.origin
+                    == crate::work_model::WriterCorrectionAssignmentOrigin::LegacyReconstructed
+            });
+        let writer_completion_artifacts = (attempt.pause_kind == Some(PauseKind::WriterCompletion)
+            && !repair_retry
+            && !retry_existing_writer
+            && !latest_writer_is_no_change
+            && !latest_writer_has_recoverable_format
+            && !latest_writer_has_legacy_assignment)
+            .then(|| writer_completion_resume_artifacts(attempt));
+        crate::work_model::reopen_attempt(&mut item.attempts[attempt_index]);
+        if let Some(artifacts) = writer_completion_artifacts {
+            item.add_next_write_round(attempt_id, artifacts)?;
+            let attempt = &mut item.attempts[attempt_index];
+            attempt.pause_kind = None;
+            attempt.pause_recovery = None;
+            attempt.completed_at = None;
+        }
+        Ok(())
+    })?;
+    Ok(())
+}
+
+fn writer_completion_resume_artifacts(attempt: &Attempt) -> Vec<ArtifactRef> {
+    let mut artifacts = Vec::new();
+    if attempt.progress_contract.is_some() {
+        artifacts.push(required_progress_artifact(attempt));
+    }
+
+    if let Some(writer) = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+    {
+        let repaired_fragment = format!(
+            "/writer-completion-repairs/{}/{}",
+            writer.id,
+            crate::work_task_executor::WRITER_COMPLETION_MATRIX_FILE
+        );
+        let matrix = attempt
+            .artifacts
+            .iter()
+            .rev()
+            .find(|artifact| {
+                artifact.producer_id == "writer-completion-repair"
+                    && artifact.path.ends_with(&repaired_fragment)
+            })
+            .cloned()
+            .or_else(|| writer_completion_artifact(writer));
+        if let Some(matrix) = matrix {
+            artifacts.push(matrix);
+        }
+    }
+
+    if let Some(handoff) = attempt.artifacts.iter().rev().find(|artifact| {
+        artifact.path.ends_with("required-progress-needs-user.md")
+            || artifact.path.ends_with("writer-completion-needs-user.md")
+    }) {
+        artifacts.push(handoff.clone());
+    }
+    artifacts
+}
+
+/// Reopen only the latest reviewer roles whose durable verdict is uncertain.
+/// Passing roles remain complete and continue to count at the unchanged
+/// candidate frontier.
+fn reopen_uncertain_review_attempt(
+    project_root: &Path,
+    store: &WorkModelStore,
+    work_item_id: &str,
+    attempt_id: &str,
+) -> Result<Vec<String>> {
+    let _land_lock = crate::land_lock::acquire(&crate::land_lock::lock_path(project_root))?;
+    let item = read_work_item_or_not_found(store, work_item_id)?;
+    let expected = crate::lifecycle_recovery::inspect_uncertain_review_recovery(
+        project_root,
+        &item,
+        attempt_id,
+    )?;
+
+    let task_ids = mutate_attempt_work_item(store, work_item_id, |fresh| {
+        let current = crate::lifecycle_recovery::inspect_uncertain_review_recovery(
+            project_root,
+            fresh,
+            attempt_id,
+        )
+        .map_err(|error| WorkModelError::AttemptResumeIneligible {
+            attempt_id: attempt_id.to_string(),
+            reason: format!("uncertain-review frontier cannot be recovered: {error:#}"),
+        })?;
+        if current != expected {
+            return Err(WorkModelError::AttemptResumeIneligible {
+                attempt_id: attempt_id.to_string(),
+                reason: "the uncertain-review frontier changed before recovery".to_string(),
+            });
+        }
+        let roles = current
+            .uncertain_roles
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let task_ids = fresh.add_next_review_tasks(attempt_id, &roles)?;
+        work_task_executor::prepare_ordinary_review_evidence(
+            project_root,
+            fresh,
+            attempt_id,
+            &task_ids,
+        )
+        .map_err(|error| WorkModelError::HostEvidenceRecoveryIneligible {
+            attempt_id: attempt_id.into(),
+            reason: format!("{error:#}"),
+        })?;
+        let attempt = fresh
+            .attempts
+            .iter_mut()
+            .find(|attempt| attempt.id == attempt_id)
+            .ok_or_else(|| WorkModelError::AttemptNotFound {
+                id: attempt_id.to_string(),
+            })?;
+        attempt.pause_kind = None;
+        attempt.completed_at = None;
+        Ok(task_ids)
+    })?;
+    Ok(task_ids)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CandidateGateResume {
+    Recheck,
+    PlannedWriter { task_id: String },
+}
+
+/// Recover a candidate-gate pause or a Writer-completion pause that retained a
+/// rejected gate. After the operator repairs that matrix, schedule one Writer
+/// with the saved gate evidence. A blocked gate reopens so the host rechecks
+/// the unchanged candidate after the operator repairs its environment.
+fn reopen_candidate_gate_attempt(
+    project_root: &Path,
+    store: &WorkModelStore,
+    work_item_id: &str,
+    attempt_id: &str,
+) -> Result<CandidateGateResume> {
+    let item = read_work_item_or_not_found(store, work_item_id)?;
+    let attempt = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == attempt_id)
+        .ok_or_else(|| anyhow::anyhow!("Attempt {attempt_id:?} not found"))?;
+    attempt.ensure_resume_ready()?;
+    let matrix_pause = is_rejected_gate_writer_completion_pause(project_root, attempt)?;
+    if !attempt.is_candidate_gate_pause() && !matrix_pause {
+        bail!("Attempt {attempt_id:?} is not paused at a candidate gate");
+    }
+    let latest_writer = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+        .ok_or_else(|| anyhow::anyhow!("candidate-gate pause has no completed Writer Task"))?;
+    let output = latest_writer
+        .output
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("candidate-gate Writer has no candidate output"))?;
+    let matrix_repairs = if matrix_pause {
+        let check = check_prior_writer_matrix_for_correction(
+            project_root,
+            work_item_id,
+            attempt_id,
+            attempt,
+            latest_writer,
+        )?;
+        if let Some((artifact, reason)) = check.issue {
+            bail!(
+                "Writer completion matrix {} remains malformed: {reason}",
+                artifact.path
+            );
+        }
+        check.repairs
+    } else {
+        Vec::new()
+    };
+    let gate = attempt
+        .artifacts
+        .iter()
+        .rev()
+        .find(|artifact| {
+            artifact.producer_id == latest_writer.id
+                && artifact
+                    .path
+                    .ends_with(crate::candidate_gate::CANDIDATE_GATE_FILE)
+        })
+        .cloned()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "candidate-gate pause has no gate evidence for {:?}",
+                latest_writer.id
+            )
+        })?;
+    let retry_task_id = attempt
+        .tasks
+        .last()
+        .filter(|task| {
+            task.kind == TaskKind::Write
+                && matches!(task.status, TaskStatus::Failed | TaskStatus::NeedsUser)
+                && task.output.is_none()
+                && task.input_artifacts.contains(&gate)
+        })
+        .map(|task| task.id.clone());
+    let gate_path =
+        crate::work_task_executor::resolve_managed_artifact_area_path(project_root, &gate.path)?;
+    let evidence = crate::candidate_gate::read_prior_writer_gate(&gate_path)
+        .map_err(|reason| anyhow::anyhow!(reason))?;
+    if evidence.schema_version == 0
+        || evidence.schema_version > crate::candidate_gate::CANDIDATE_GATE_SCHEMA_VERSION
+        || !matches!(
+            evidence.phase,
+            crate::candidate_gate::CandidateGatePhase::Writer
+                | crate::candidate_gate::CandidateGatePhase::FinalTester
+        )
+        || evidence.candidate_commit != output.commit
+    {
+        bail!(
+            "candidate-gate evidence does not match the latest Writer candidate {}",
+            output.commit
+        );
+    }
+    if evidence.disposition == crate::candidate_gate::CandidateGateDisposition::Passed {
+        bail!("candidate-gate pause points at passing evidence");
+    }
+    if evidence.phase == crate::candidate_gate::CandidateGatePhase::FinalTester
+        && evidence.disposition == crate::candidate_gate::CandidateGateDisposition::Rejected
+    {
+        let mut correction = latest_writer.clone();
+        correction.input_artifacts = vec![gate.clone()];
+        crate::recovery_contracts::validate_verification_writer_start(
+            project_root,
+            attempt,
+            &correction,
+        )?;
+    }
+    recover_completed_tester_mutation_at_explicit_resume(project_root, attempt, output, &evidence)?;
+    let correction_artifacts = if evidence.disposition
+        == crate::candidate_gate::CandidateGateDisposition::Rejected
+        && evidence.phase == crate::candidate_gate::CandidateGatePhase::FinalTester
+    {
+        let tester_results = latest_tester_results_path(project_root, attempt)
+            .ok_or_else(|| anyhow::anyhow!("final-Tester gate has no Tester evidence"))?;
+        final_tester_correction_artifacts(project_root, attempt, &gate, &tester_results)?
+    } else {
+        vec![gate.clone()]
+    };
+
+    let latest_writer_id = latest_writer.id.clone();
+    let latest_commit = output.commit.clone();
+    let disposition = evidence.disposition;
+    let outcome = mutate_attempt_work_item(store, work_item_id, |fresh| {
+        let attempt_index = fresh
+            .attempts
+            .iter()
+            .position(|attempt| attempt.id == attempt_id)
+            .ok_or_else(|| WorkModelError::AttemptNotFound {
+                id: attempt_id.to_string(),
+            })?;
+        {
+            let current = &fresh.attempts[attempt_index];
+            current.ensure_resume_ready()?;
+            if !current.is_candidate_gate_pause()
+                && !(matrix_pause
+                    && current.pause_kind == Some(PauseKind::WriterCompletion)
+                    && current.review_state == Some(AttemptReviewState::NotReviewed))
+            {
+                return Err(WorkModelError::AttemptResumeIneligible {
+                    attempt_id: attempt_id.to_string(),
+                    reason: "the candidate-gate pause changed before recovery".to_string(),
+                });
+            }
+            let current_writer = current
+                .tasks
+                .iter()
+                .rev()
+                .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+                .and_then(|task| task.output.as_ref().map(|output| (task, output)));
+            if !current_writer.is_some_and(|(task, output)| {
+                task.id == latest_writer_id && output.commit == latest_commit
+            }) || !current.artifacts.contains(&gate)
+            {
+                return Err(WorkModelError::AttemptResumeIneligible {
+                    attempt_id: attempt_id.to_string(),
+                    reason: "the candidate-gate frontier changed before recovery".to_string(),
+                });
+            }
+            if retry_task_id.as_deref().is_some_and(|task_id| {
+                current.tasks.last().is_none_or(|task| {
+                    task.id != task_id
+                        || task.kind != TaskKind::Write
+                        || !matches!(task.status, TaskStatus::Failed | TaskStatus::NeedsUser)
+                        || task.output.is_some()
+                        || !correction_artifacts
+                            .iter()
+                            .all(|artifact| task.input_artifacts.contains(artifact))
+                })
+            }) {
+                return Err(WorkModelError::AttemptResumeIneligible {
+                    attempt_id: attempt_id.to_string(),
+                    reason: "the failed candidate-gate correction changed before recovery"
+                        .to_string(),
+                });
+            }
+        }
+
+        match disposition {
+            crate::candidate_gate::CandidateGateDisposition::Rejected => {
+                for repair in &matrix_repairs {
+                    if !fresh.attempts[attempt_index].artifacts.contains(repair) {
+                        fresh.attempts[attempt_index].artifacts.push(repair.clone());
+                    }
+                }
+                let task_id = if let Some(task_id) = retry_task_id.clone() {
+                    let attempt = &mut fresh.attempts[attempt_index];
+                    let task = attempt
+                        .tasks
+                        .last_mut()
+                        .expect("retry frontier was validated above");
+                    task.status = TaskStatus::Planned;
+                    task.started_at = None;
+                    task.completed_at = None;
+                    task.output = None;
+                    attempt.status = AttemptStatus::Planned;
+                    attempt.pause_kind = None;
+                    attempt.completed_at = None;
+                    attempt.review_state = Some(AttemptReviewState::Failed);
+                    task_id
+                } else {
+                    let task_id =
+                        fresh.add_next_write_round(attempt_id, correction_artifacts.clone())?;
+                    let attempt = &mut fresh.attempts[attempt_index];
+                    attempt.pause_kind = None;
+                    attempt.completed_at = None;
+                    task_id
+                };
+                Ok(CandidateGateResume::PlannedWriter { task_id })
+            }
+            crate::candidate_gate::CandidateGateDisposition::Blocked => {
+                crate::work_model::reopen_attempt(&mut fresh.attempts[attempt_index]);
+                Ok(CandidateGateResume::Recheck)
+            }
+            crate::candidate_gate::CandidateGateDisposition::Passed => {
+                unreachable!("passing evidence was rejected before mutation")
+            }
+        }
+    })?;
+    Ok(outcome)
+}
+
+fn recover_completed_tester_mutation_at_explicit_resume(
+    project_root: &Path,
+    attempt: &Attempt,
+    writer_output: &TaskOutput,
+    evidence: &crate::candidate_gate::CandidateGateEvidence,
+) -> Result<()> {
+    if evidence.phase != crate::candidate_gate::CandidateGatePhase::FinalTester
+        || evidence.disposition != crate::candidate_gate::CandidateGateDisposition::Blocked
+    {
+        return Ok(());
+    }
+    let Some(identity) = evidence
+        .checks
+        .iter()
+        .find(|check| check.name == "candidate-identity")
+    else {
+        return Ok(());
+    };
+    let [diagnostic] = identity.diagnostics.as_slice() else {
+        return Ok(());
+    };
+    let Some(status) = diagnostic.strip_prefix("candidate workspace is dirty before admission:\n")
+    else {
+        return Ok(());
+    };
+    let expected_status = status.lines().map(str::to_string).collect::<Vec<_>>();
+    if expected_status.is_empty() || expected_status.iter().any(|entry| entry.starts_with("?? ")) {
+        return Ok(());
+    }
+
+    let tester = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Tester && task.status == TaskStatus::Complete)
+        .ok_or_else(|| anyhow::anyhow!("final-Tester mutation recovery has no completed Tester"))?;
+    let tester_artifact = tester.artifact_area.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("final-Tester mutation recovery has no Tester artifact area")
+    })?;
+    let artifact_dir = work_task_executor::resolve_managed_artifact_area_path(
+        project_root,
+        &tester_artifact.path,
+    )?;
+    let workspace = resolve_managed_sibling_workspace_path(
+        project_root,
+        &writer_output.workspace_path,
+        "final Tester mutation recovery workspace",
+    )?;
+    work_task_executor::recover_completed_tester_candidate_mutation(
+        &workspace,
+        &artifact_dir,
+        &writer_output.commit,
+        &expected_status,
+    )
+}
+
+fn reopen_approved_round_cap_attempt(
+    project_root: &Path,
+    store: &WorkModelStore,
+    work_item_id: &str,
+    attempt_id: &str,
+) -> Result<()> {
+    let _land_lock = crate::land_lock::acquire(&crate::land_lock::lock_path(project_root))?;
+    mutate_attempt_work_item(store, work_item_id, |item| {
+        let attempt = item
+            .attempts
+            .iter_mut()
+            .find(|attempt| attempt.id == attempt_id)
+            .ok_or_else(|| WorkModelError::AttemptNotFound {
+                id: attempt_id.to_string(),
+            })?;
+        if attempt.status != AttemptStatus::NeedsUser
+            || attempt.pause_kind != Some(PauseKind::RoundCap)
+            || attempt.review_state != Some(AttemptReviewState::Failed)
+        {
+            return Err(round_cap_ineligible(
+                "the approved round-cap pause is no longer current",
+            ));
+        }
+        if attempt.has_round_cap_task_blocker() {
+            return Err(round_cap_ineligible(
+                "a live or failed Task owns this Attempt",
+            ));
+        }
+        let extension = attempt
+            .round_cap_extensions
+            .last()
+            .ok_or_else(|| round_cap_ineligible("the pause has no approved extension"))?;
+        let write_rounds = attempt.materialized_write_rounds();
+        if extension.new_cap <= write_rounds {
+            return Err(round_cap_ineligible(
+                "the approved Writer-round cap is exhausted",
+            ));
+        }
+        validate_round_cap_frontier(project_root, attempt, extension)?;
+        crate::work_model::reopen_attempt(attempt);
+        Ok(())
+    })?;
+    Ok(())
+}
+
+fn reopen_baseline_covered_round_cap_attempt(
+    project_root: &Path,
+    store: &WorkModelStore,
+    work_item_id: &str,
+    attempt_id: &str,
+) -> Result<bool> {
+    let _land_lock = crate::land_lock::acquire(&crate::land_lock::lock_path(project_root))?;
+    Ok(mutate_attempt_work_item(store, work_item_id, |item| {
+        let attempt = item
+            .attempts
+            .iter_mut()
+            .find(|attempt| attempt.id == attempt_id)
+            .ok_or_else(|| WorkModelError::AttemptNotFound {
+                id: attempt_id.to_string(),
+            })?;
+        if attempt.status != AttemptStatus::NeedsUser
+            || attempt.pause_kind != Some(PauseKind::RoundCap)
+            || attempt.review_state != Some(AttemptReviewState::Failed)
+            || attempt
+                .tasks
+                .iter()
+                .any(|task| task.status != TaskStatus::Complete)
+        {
+            return Ok(false);
+        }
+        let Some(recheck) = attempt
+            .tasks
+            .last()
+            .filter(|task| task.kind == TaskKind::Tester && task.is_failed_command_recheck())
+        else {
+            return Ok(false);
+        };
+        let Some(recheck_area) = recheck.artifact_area.as_ref() else {
+            return Ok(false);
+        };
+        let recheck_path = work_task_executor::resolve_managed_artifact_area_path(
+            project_root,
+            &recheck_area.path,
+        )
+        .map_err(|error| {
+            round_cap_ineligible(format!(
+                "baseline-covered recheck evidence cannot be resolved: {error:#}"
+            ))
+        })?
+        .join("tester-results.json");
+        let Some(baseline_path) = baseline_tester_results_path(project_root, attempt) else {
+            return Ok(false);
+        };
+        failed_command_recheck_correction_artifacts(project_root, recheck).map_err(|error| {
+            round_cap_ineligible(format!(
+                "baseline-covered recheck lineage cannot be validated: {error:#}"
+            ))
+        })?;
+        let source_results = recheck.input_artifacts.first().ok_or_else(|| {
+            round_cap_ineligible("baseline-covered recheck has no source Tester result")
+        })?;
+        let final_tester_path = work_task_executor::resolve_managed_artifact_area_path(
+            project_root,
+            &source_results.path,
+        )
+        .map_err(|error| {
+            round_cap_ineligible(format!(
+                "baseline-covered source Tester evidence cannot be resolved: {error:#}"
+            ))
+        })?;
+        let final_results: crate::tester::TesterResults =
+            serde_json::from_slice(&fs::read(&final_tester_path).map_err(|error| {
+                round_cap_ineligible(format!(
+                    "baseline-covered source Tester evidence cannot be read: {error:#}"
+                ))
+            })?)
+            .map_err(|error| {
+                round_cap_ineligible(format!(
+                    "baseline-covered source Tester evidence is invalid: {error:#}"
+                ))
+            })?;
+        let expected_commit = recheck
+            .review_context
+            .as_ref()
+            .map(|context| context.candidate_commit.as_str());
+        // The source Tester is why the recheck exists: it may contain a new,
+        // transient failure. Require valid candidate-bound source evidence,
+        // then let the linked recheck supersede that failed command when its
+        // current structured failures are wholly covered by the baseline.
+        let evidence_is_covered = expected_commit.is_some()
+            && final_results.candidate_commit.as_deref() == expected_commit
+            && !tester_errored(&final_tester_path)
+            && recheck_path.is_file()
+            && !tester_errored(&recheck_path)
+            && introduced_tester_failures(&recheck_path, Some(&baseline_path)) == 0
+            && unexplained_failed_tester_commands(&recheck_path, Some(&baseline_path)) == 0;
+        let failed_frontier =
+            round_cap_failure_frontier(project_root, attempt).map_err(|error| {
+                round_cap_ineligible(format!(
+                    "baseline-covered correction frontier cannot be resolved: {error:#}"
+                ))
+            })?;
+        if !evidence_is_covered || !failed_frontier.is_empty() {
+            return Ok(false);
+        }
+        crate::work_model::reopen_attempt(attempt);
+        Ok(true)
+    })?)
+}
+
+fn reopen_review_evidence_covered_round_cap_attempt(
+    project_root: &Path,
+    store: &WorkModelStore,
+    work_item_id: &str,
+    attempt_id: &str,
+) -> Result<bool> {
+    let _land_lock = crate::land_lock::acquire(&crate::land_lock::lock_path(project_root))?;
+    Ok(mutate_attempt_work_item(store, work_item_id, |item| {
+        let attempt = item
+            .attempts
+            .iter_mut()
+            .find(|attempt| attempt.id == attempt_id)
+            .ok_or_else(|| WorkModelError::AttemptNotFound {
+                id: attempt_id.to_string(),
+            })?;
+        if !review_evidence_covered_round_cap_resume_is_eligible(project_root, attempt) {
+            return Ok(false);
+        }
+        crate::work_model::reopen_attempt(attempt);
+        Ok(true)
+    })?)
+}
+
+fn reopen_completed_recheck_evidence_review_round_cap_attempt(
+    project_root: &Path,
+    store: &WorkModelStore,
+    work_item_id: &str,
+    attempt_id: &str,
+) -> Result<bool> {
+    let _land_lock = crate::land_lock::acquire(&crate::land_lock::lock_path(project_root))?;
+    Ok(mutate_attempt_work_item(store, work_item_id, |item| {
+        let attempt = item
+            .attempts
+            .iter_mut()
+            .find(|attempt| attempt.id == attempt_id)
+            .ok_or_else(|| WorkModelError::AttemptNotFound {
+                id: attempt_id.to_string(),
+            })?;
+        if !completed_recheck_evidence_review_round_cap_is_eligible(project_root, attempt) {
+            return Ok(false);
+        }
+        attempt.status = AttemptStatus::Reviewing;
+        attempt.pause_kind = None;
+        attempt.pause_recovery = None;
+        attempt.review_state = Some(AttemptReviewState::NotReviewed);
+        attempt.completed_at = None;
+        Ok(true)
+    })?)
+}
+
+/// Recognize a legacy race where the exact failed-command evidence Review is
+/// durably complete but its recovery receipt and Attempt state were not
+/// settled before another finalizer recorded the round cap.
+pub(crate) fn completed_recheck_evidence_review_round_cap_is_eligible(
+    project_root: &Path,
+    attempt: &Attempt,
+) -> bool {
+    if attempt.status != AttemptStatus::NeedsUser
+        || attempt.pause_kind != Some(PauseKind::RoundCap)
+        || attempt.review_state != Some(AttemptReviewState::Failed)
+        || attempt.has_round_cap_task_blocker()
+    {
+        return false;
+    }
+    let Some(recovery) = attempt.active_evidence_recovery() else {
+        return false;
+    };
+    if recovery.state != EvidenceRecoveryState::Reviewing {
+        return false;
+    }
+
+    // Reuse the canonical immutable-binding validator by evaluating the state
+    // that the ordinary Review settlement would write. No persisted state is
+    // changed until every candidate, artifact, digest, command, and passing
+    // targeted Review check succeeds.
+    let mut settled = attempt.clone();
+    let Some(entry) = settled
+        .evidence_recoveries
+        .iter_mut()
+        .find(|entry| entry.id == recovery.id)
+    else {
+        return false;
+    };
+    entry.state = EvidenceRecoveryState::Complete;
+    crate::host_evidence::completed_recheck_evidence_source(project_root, &settled).is_some()
+}
+
+/// Recognize the exact legacy round-cap shape whose sole final Tester failure
+/// already has candidate-bound host evidence and a passing targeted Tests
+/// Review. Queue admission calls this read-only predicate; the Attempt loop
+/// repeats it under its mutation lock before reopening the Attempt.
+pub(crate) fn review_evidence_covered_round_cap_resume_is_eligible(
+    project_root: &Path,
+    attempt: &Attempt,
+) -> bool {
+    if attempt.status != AttemptStatus::NeedsUser
+        || attempt.pause_kind != Some(PauseKind::RoundCap)
+        || attempt.review_state != Some(AttemptReviewState::Failed)
+        || attempt
+            .tasks
+            .iter()
+            .any(|task| task.status != TaskStatus::Complete)
+    {
+        return false;
+    }
+    let Some(tester_results) = latest_tester_results_path(project_root, attempt) else {
+        return false;
+    };
+    let baseline = baseline_tester_results_path(project_root, attempt);
+    crate::host_evidence::completed_review_evidence_covers_tester_failure(
+        project_root,
+        attempt,
+        &tester_results,
+        baseline.as_deref(),
+    )
+}
+
+fn validate_round_cap_frontier(
+    project_root: &Path,
+    attempt: &Attempt,
+    extension: &RoundCapExtension,
+) -> Result<(), WorkModelError> {
+    attempt.validate_round_cap_extensions()?;
+    extension.validate_human_resolution()?;
+    let failed_reviews = round_cap_failure_frontier(project_root, attempt).map_err(|error| {
+        round_cap_ineligible(format!(
+            "failed correction artifacts cannot be resolved: {error:#}"
+        ))
+    })?;
+    if failed_reviews != extension.failed_reviews {
+        return Err(round_cap_ineligible(
+            "the failed-correction bytes no longer match the approval",
+        ));
+    }
+    let write_output = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+        .and_then(|task| task.output.as_ref())
+        .ok_or_else(|| round_cap_ineligible("the Attempt has no completed Writer candidate"))?;
+    if write_output.commit != extension.candidate_commit {
+        return Err(round_cap_ineligible(
+            "the reviewed candidate no longer matches the approval",
+        ));
+    }
+    let workspace = resolve_managed_sibling_workspace_path(
+        project_root,
+        &write_output.workspace_path,
+        "round-cap candidate workspace",
+    )
+    .map_err(|error| {
+        round_cap_ineligible(format!("candidate workspace is unavailable: {error:#}"))
+    })?;
+    ensure_registered_worktree(project_root, &workspace).map_err(|error| {
+        round_cap_ineligible(format!("candidate workspace is unavailable: {error:#}"))
+    })?;
+    let status = git::run_stdout(
+        &workspace,
+        &["status", "--porcelain", "--untracked-files=all", "--", "."],
+        "check round-cap candidate cleanliness",
+    )
+    .map_err(|error| round_cap_ineligible(format!("candidate cannot be checked: {error:#}")))?;
+    if !status.is_empty() {
+        return Err(round_cap_ineligible("the candidate workspace is dirty"));
+    }
+    let head = git::run_stdout(&workspace, &["rev-parse", "HEAD"], "resolve candidate HEAD")
+        .map_err(|error| {
+            round_cap_ineligible(format!("candidate HEAD cannot be resolved: {error:#}"))
+        })?;
+    if head != extension.candidate_commit {
+        return Err(round_cap_ineligible(
+            "the candidate HEAD no longer matches the approved commit",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_registered_worktree(project_root: &Path, workspace_path: &Path) -> Result<()> {
+    let expected = fs::canonicalize(workspace_path)?;
+    let output = git::run_raw(project_root, &["worktree", "list", "--porcelain"])?;
+    if !output.status.success() {
+        bail!(
+            "failed to list git worktrees: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    if String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+        line.strip_prefix("worktree ")
+            .is_some_and(|path| fs::canonicalize(path).is_ok_and(|actual| actual == expected))
+    }) {
+        return Ok(());
+    }
+    bail!(
+        "workspace {} is not a registered git worktree",
+        workspace_path.display()
+    )
+}
+
+/// Atomically migrate only legacy review failures whose single-file transcript
+/// matches the preserved Claude scheduler outage grammar. Any missing artifact,
+/// reviewer verdict, non-review failure, or mixed failure leaves state intact.
+#[derive(Debug, PartialEq, Eq)]
+enum LegacyProviderPauseRecovery {
+    Reclassified,
+    Ineligible(String),
+    NotLegacy,
+}
+
+/// Recover an older generic pause only when one failed Codex Task has an exact
+/// pre-progress authentication-failure transcript. This migration preserves
+/// real hard failures and retries the same Task without charging another
+/// Writer round.
+pub(crate) fn reclassify_codex_auth_pause(
+    store: &WorkModelStore,
+    project_root: &Path,
+    work_item_id: &str,
+    attempt_id: &str,
+) -> Result<bool> {
+    Ok(mutate_attempt_work_item(store, work_item_id, |item| {
+        let Some(attempt) = item
+            .attempts
+            .iter_mut()
+            .find(|attempt| attempt.id == attempt_id)
+        else {
+            return Ok(false);
+        };
+        if attempt.status != AttemptStatus::NeedsUser
+            || attempt.pause_kind != Some(PauseKind::RoundCap)
+            || !attempt.round_cap_extensions.is_empty()
+        {
+            return Ok(false);
+        }
+
+        let failed = attempt
+            .tasks
+            .iter()
+            .enumerate()
+            .filter(|(_, task)| task.status == TaskStatus::Failed)
+            .collect::<Vec<_>>();
+        if failed.len() != 1 {
+            return Ok(false);
+        }
+        let (task_index, task) = failed[0];
+        if !matches!(task.kind, TaskKind::Write | TaskKind::Review)
+            || task.output.is_some()
+            || attempt.coder_mapping.for_task_kind(task.kind).coder
+                != crate::coder::CoderKind::Codex
+        {
+            return Ok(false);
+        }
+        let Some(area) = task.artifact_area.as_ref() else {
+            return Ok(false);
+        };
+        let transcript = project_root.join(&area.path).join("transcript.jsonl");
+        if !crate::provider_evidence::classify_codex_auth_failure(&transcript) {
+            return Ok(false);
+        }
+
+        crate::work_model::set_task_terminal(&mut attempt.tasks[task_index], TaskStatus::NeedsUser);
+        attempt.pause_kind = Some(PauseKind::Auth);
+        attempt.pause_recovery = None;
+        Ok(true)
+    })?)
+}
+
+/// Recover an older generic pause only when one failed Codex Task has an exact
+/// no-progress transport-outage transcript. This migration preserves real hard
+/// failures and retries the same Task without charging another Writer round.
+fn reclassify_codex_transport_pause(
+    store: &WorkModelStore,
+    project_root: &Path,
+    work_item_id: &str,
+    attempt_id: &str,
+) -> Result<bool> {
+    Ok(mutate_attempt_work_item(store, work_item_id, |item| {
+        let Some(attempt) = item
+            .attempts
+            .iter_mut()
+            .find(|attempt| attempt.id == attempt_id)
+        else {
+            return Ok(false);
+        };
+        if attempt.status != AttemptStatus::NeedsUser
+            || attempt.pause_kind != Some(PauseKind::RoundCap)
+        {
+            return Ok(false);
+        }
+
+        let failed = attempt
+            .tasks
+            .iter()
+            .enumerate()
+            .filter(|(_, task)| task.status == TaskStatus::Failed)
+            .collect::<Vec<_>>();
+        if failed.len() != 1 {
+            return Ok(false);
+        }
+        let (task_index, task) = failed[0];
+        if !matches!(task.kind, TaskKind::Write | TaskKind::Review)
+            || task.output.is_some()
+            || attempt.coder_mapping.for_task_kind(task.kind).coder
+                != crate::coder::CoderKind::Codex
+        {
+            return Ok(false);
+        }
+        let Some(area) = task.artifact_area.as_ref() else {
+            return Ok(false);
+        };
+        let transcript = project_root.join(&area.path).join("transcript.jsonl");
+        if crate::provider_evidence::classify_codex_transport_unavailable(&transcript).is_none() {
+            return Ok(false);
+        }
+
+        crate::work_model::set_task_terminal(&mut attempt.tasks[task_index], TaskStatus::NeedsUser);
+        attempt.pause_kind = Some(PauseKind::ProviderUnavailable);
+        attempt.pause_recovery = None;
+        Ok(true)
+    })?)
+}
+
+fn reclassify_legacy_provider_pause(
+    store: &WorkModelStore,
+    project_root: &Path,
+    work_item_id: &str,
+    attempt_id: &str,
+) -> Result<LegacyProviderPauseRecovery> {
+    Ok(mutate_attempt_work_item(store, work_item_id, |item| {
+        let Some(attempt) = item
+            .attempts
+            .iter_mut()
+            .find(|attempt| attempt.id == attempt_id)
+        else {
+            return Ok(LegacyProviderPauseRecovery::NotLegacy);
+        };
+        if attempt.status != AttemptStatus::NeedsUser
+            || attempt.pause_kind != Some(PauseKind::RoundCap)
+        {
+            return Ok(LegacyProviderPauseRecovery::NotLegacy);
+        }
+        match can_advance_loop(project_root, attempt) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Ok(LegacyProviderPauseRecovery::Ineligible(
+                    "the Attempt reached a real write-round limit".to_string(),
+                ));
+            }
+            Err(error) => {
+                return Ok(LegacyProviderPauseRecovery::Ineligible(format!(
+                    "the Attempt's write-round limit cannot be verified: {error:#}"
+                )));
+            }
+        }
+        let failed: Vec<_> = attempt
+            .tasks
+            .iter()
+            .filter(|task| task.status == TaskStatus::Failed)
+            .collect();
+        if failed.is_empty() {
+            return Ok(LegacyProviderPauseRecovery::Ineligible(
+                "the round-cap pause has no failed review Tasks with provider evidence".to_string(),
+            ));
+        }
+        if failed
+            .iter()
+            .any(|task| task.kind != crate::work_model::TaskKind::Review)
+        {
+            return Ok(LegacyProviderPauseRecovery::Ineligible(
+                "a blocking failed Task is not a review Task".to_string(),
+            ));
+        }
+        for task in failed {
+            let Some(area) = task.artifact_area.as_ref() else {
+                return Ok(LegacyProviderPauseRecovery::Ineligible(format!(
+                    "review Task {:?} has no transcript artifact area",
+                    task.id
+                )));
+            };
+            // A review artifact is a real reviewer verdict, never an outage.
+            if project_root.join(&area.path).join("review.md").is_file() {
+                return Ok(LegacyProviderPauseRecovery::Ineligible(format!(
+                    "review Task {:?} has a reviewer verdict",
+                    task.id
+                )));
+            }
+            if crate::provider_evidence::classify_legacy_claude_scheduler_outage(
+                &project_root.join(&area.path).join("transcript.jsonl"),
+            )
+            .is_none()
+            {
+                return Ok(LegacyProviderPauseRecovery::Ineligible(format!(
+                    "review Task {:?} lacks conclusive provider-unavailable transcript evidence",
+                    task.id
+                )));
+            }
+        }
+        for task in &mut attempt.tasks {
+            if task.status == TaskStatus::Failed {
+                task.status = TaskStatus::NeedsUser;
+            }
+        }
+        attempt.pause_kind = Some(PauseKind::ProviderUnavailable);
+        Ok(LegacyProviderPauseRecovery::Reclassified)
+    })?)
 }
 
 /// Decide whether the Attempt loop may plan another write round.
@@ -785,12 +3667,8 @@ fn reject_terminal_attempt(attempt: &Attempt) -> Result<TerminalCheck> {
 ///   does NOT contribute to the no-progress streak — the rule is
 ///   lenient on purpose.
 fn can_advance_loop(project_root: &Path, attempt: &Attempt) -> Result<bool> {
-    let total_rounds = attempt
-        .tasks
-        .iter()
-        .filter(|task| task.kind == TaskKind::Write)
-        .count();
-    if total_rounds >= max_total_write_rounds() {
+    let total_rounds = attempt.materialized_write_rounds();
+    if total_rounds >= attempt.effective_write_round_cap(max_total_write_rounds()) {
         return Ok(false);
     }
     let streak = consecutive_no_progress_rounds(project_root, attempt)?;
@@ -844,10 +3722,8 @@ fn review_task_round_number(attempt_id: &str, task_id: &str) -> Option<usize> {
 }
 
 fn is_review_phase_task(task: &Task) -> bool {
-    matches!(
-        task.kind,
-        TaskKind::Review | TaskKind::BehaviorTests | TaskKind::Tester
-    )
+    task.kind == TaskKind::Review
+        || (task.kind == TaskKind::Tester && !task.is_failed_command_recheck())
 }
 
 fn is_task_ready(task: &Task, all_tasks: &[Task]) -> bool {
@@ -869,8 +3745,8 @@ fn has_open_review_round(tasks: &[Task]) -> bool {
     for task in tasks.iter().rev() {
         match task.kind {
             TaskKind::Write => return false,
-            TaskKind::Review | TaskKind::BehaviorTests | TaskKind::Tester
-                if task.status != TaskStatus::Complete =>
+            TaskKind::Review | TaskKind::Tester
+                if !matches!(task.status, TaskStatus::Complete | TaskStatus::Superseded) =>
             {
                 return true;
             }
@@ -880,13 +3756,25 @@ fn has_open_review_round(tasks: &[Task]) -> bool {
     false
 }
 
-fn has_review_after_latest_write(tasks: &[Task]) -> bool {
-    let Some(last_write_index) = tasks.iter().rposition(|task| task.kind == TaskKind::Write) else {
+fn has_review_after_latest_write(attempt: &Attempt) -> bool {
+    let Some(last_write_index) = attempt.latest_materialized_write_index() else {
         return false;
     };
-    tasks[last_write_index + 1..]
+    attempt.tasks[last_write_index + 1..]
         .iter()
-        .any(|task| is_review_phase_task(task))
+        .any(|task| is_review_phase_task(task) && !inactive_finding_review(attempt, task))
+}
+
+// Keep inactive finding Reviews as history, including failed or superseded
+// Reviews retained after replacement. The active recovery still owns its Review.
+fn inactive_finding_review(attempt: &Attempt, task: &Task) -> bool {
+    task.evidence_review_context
+        .as_ref()
+        .is_some_and(|context| {
+            attempt.evidence_recoveries.iter().any(|r| {
+                r.id == context.recovery_id && r.carried_finding.is_some() && !r.is_active()
+            })
+        })
 }
 
 fn next_review_roles(attempt: &Attempt) -> Vec<&'static str> {
@@ -928,6 +3816,36 @@ fn next_review_roles(attempt: &Attempt) -> Vec<&'static str> {
     }
 }
 
+fn merge_review_roles(requested: &[&str], invalidated: &[&str]) -> Vec<&'static str> {
+    let selected = requested
+        .iter()
+        .chain(invalidated.iter())
+        .copied()
+        .collect::<HashSet<_>>();
+    let merged = review::REVIEWERS
+        .iter()
+        .copied()
+        .filter(|role| selected.contains(role))
+        .collect::<Vec<_>>();
+    if merged.is_empty() {
+        review::REVIEWERS.to_vec()
+    } else {
+        merged
+    }
+}
+
+fn stale_review_roles_after_latest_write(
+    project_root: &Path,
+    attempt: &Attempt,
+) -> Vec<&'static str> {
+    let ordinary = ordinary_review_tasks(project_root, attempt);
+    review::REVIEWERS
+        .iter()
+        .copied()
+        .filter(|role| !ordinary.iter().any(|(task, _)| task.role == *role))
+        .collect()
+}
+
 /// Everything the Learner coder needs, assembled by the loop from the Attempt's
 /// completed change and every review round's artifacts.
 pub(crate) struct LearnerCoderRequest<'a> {
@@ -943,8 +3861,11 @@ pub(crate) struct LearnerCoderRequest<'a> {
     effort: Option<&'a str>,
     mode: work_task_executor::LearnerExecutionMode,
     codex_worker: Option<&'a crate::codex_worker::CodexWorkerEnvironment>,
+    #[cfg(not(test))]
+    provider_readiness: Option<&'a crate::provider_readiness::ProviderReadiness>,
     /// When set, a bounded schema repair rather than a fresh audit.
     repair: Option<work_task_executor::SchemaRepairInput<'a>>,
+    prepared_sandbox: Option<&'a work_task_executor::PreparedLearnerSandbox>,
 }
 
 /// The Learner's coder-run is injected so the orchestration around it — running
@@ -953,6 +3874,9 @@ pub(crate) struct LearnerCoderRequest<'a> {
 struct LearnerConfig<'a> {
     run_coder: &'a dyn Fn(&LearnerCoderRequest<'_>) -> Result<()>,
     codex_worker: Option<&'a crate::codex_worker::CodexWorkerEnvironment>,
+    #[cfg(not(test))]
+    provider_readiness: Option<&'a crate::provider_readiness::ProviderReadiness>,
+    no_sandbox: bool,
 }
 
 /// The verdict of a fresh, serialized Learner reservation.
@@ -980,7 +3904,7 @@ fn reserve_learner_run(
     attempt_id: &str,
     expected_coder: CoderKind,
 ) -> Result<LearnerReservation> {
-    let reservation = store.mutate_work_item(work_item_id, |fresh| {
+    let reservation = mutate_attempt_work_item(store, work_item_id, |fresh| {
         let attempt = fresh
             .attempts
             .iter_mut()
@@ -992,7 +3916,8 @@ fn reserve_learner_run(
         // Landing validation: only a Complete, review-Passed Attempt is a target for
         // a Learner run. A peer that paused or otherwise took the Attempt off this
         // path is honored rather than revived.
-        let landing_eligible = attempt.status == AttemptStatus::Complete
+        let landing_eligible = !attempt.cancellation_requested()
+            && attempt.status == AttemptStatus::Complete
             && attempt.review_state == Some(AttemptReviewState::Passed);
         if !landing_eligible {
             return Ok(LearnerReservation::Skip);
@@ -1054,20 +3979,63 @@ fn run_learner_step(
         }
     };
 
-    // Authenticate Codex before the reservation records an in-progress Learner
-    // run. The same guard is passed to the launch route and remains alive through
-    // process completion, so no second post-reservation preflight is possible.
+    // Verify the selected provider before the reservation records an in-progress
+    // Learner run. The Codex worker guard remains alive through process completion,
+    // so no second post-reservation readiness check is possible.
     let learner_coder = item.attempts[attempt_index]
         .coder_mapping
         .for_task_kind(TaskKind::Write)
         .coder;
-    let codex_worker = if learner_coder == CoderKind::Codex {
-        let worker =
-            crate::codex_worker::CodexWorkerEnvironment::prepare().map_err(anyhow::Error::new)?;
-        worker.preflight().map_err(anyhow::Error::new)?;
-        Some(worker)
-    } else {
-        None
+    let provider_readiness = crate::provider_readiness::ProviderReadiness::prepare_for_project(
+        learner_coder,
+        project_root,
+    )
+    .map_err(anyhow::Error::new)?;
+
+    // Probe the resolved Learner boundary before changing durable Learning state.
+    // Capture may genuinely run unsandboxed; the protected modes and Codex retain
+    // their confinement even when the caller requested `--no-sandbox`.
+    let prepared_run = match prepare_learner_run(
+        project_root,
+        item,
+        attempt_index,
+        candidate_id,
+        mode,
+        config.no_sandbox,
+        provider_readiness.codex_worker(),
+    ) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            if let Some(host) = error.downcast_ref::<crate::os::HostSandboxPreflightError>() {
+                mutate_attempt_work_item(store, &work_item_id, |fresh| {
+                    let index = attempt_index_by_id(fresh, &attempt_id)?;
+                    crate::work_model::transition_attempt(
+                        &mut fresh.attempts[index],
+                        AttemptStatus::NeedsUser,
+                        Some(PauseKind::HostSandbox),
+                    );
+                    Ok(())
+                })?;
+                *item = store.read_work_item(&work_item_id)?;
+                eprintln!("  Warning: {host}");
+                return Ok(());
+            }
+            return Err(error);
+        }
+    };
+
+    // Admit the complete logical Learner transaction, including bounded schema
+    // repairs, before recording an in-progress Learning run.
+    let Some(_provider_lease) = acquire_learner_provider_capacity(
+        store,
+        project_root,
+        &work_item_id,
+        &attempt_id,
+        learner_coder,
+    )?
+    else {
+        *item = store.read_work_item(&work_item_id)?;
+        return Ok(());
     };
 
     // A fresh, lock-held reservation with landing validation. It re-reads the durable
@@ -1077,6 +4045,46 @@ fn run_learner_step(
     // reservation, not this stale snapshot, is authoritative. A crash after it
     // reserves the in-progress state leaves a retryable record rather than an orphan
     // handoff with no durable learning state.
+    mutate_attempt_work_item(store, &work_item_id, |item| {
+        let attempt = item
+            .attempts
+            .iter_mut()
+            .find(|attempt| attempt.id == attempt_id)
+            .unwrap();
+        attempt.ensure_not_canceled()?;
+        for directory in std::iter::once(&prepared_run.run_dir)
+            .chain(prepared_run.repairs.iter().map(|repair| &repair.run_dir))
+        {
+            let record =
+                crate::execution::record_path_for_transcript(&directory.join("transcript.jsonl"));
+            crate::execution::prepare_launch(
+                &record,
+                Some(crate::execution::AttemptExecutionOwner {
+                    project_root: project_root.to_path_buf(),
+                    work_item_id: work_item_id.clone(),
+                    attempt_id: attempt_id.clone(),
+                }),
+            )
+            .map_err(|error| WorkModelError::AttemptResumeIneligible {
+                attempt_id: attempt_id.clone(),
+                reason: format!("publish Learner execution identity: {error:#}"),
+            })?;
+            let relative = record.strip_prefix(project_root).map_err(|error| {
+                WorkModelError::AttemptResumeIneligible {
+                    attempt_id: attempt_id.clone(),
+                    reason: format!("bind Learner execution: {error}"),
+                }
+            })?;
+            let reference = crate::work_model::ArtifactRef {
+                producer_id: "local-execution".into(),
+                path: relative.display().to_string(),
+            };
+            if !attempt.artifacts.contains(&reference) {
+                attempt.artifacts.push(reference);
+            }
+        }
+        Ok(())
+    })?;
     let runs = match reserve_learner_run(store, &work_item_id, &attempt_id, learner_coder)? {
         LearnerReservation::Skip => {
             *item = store.read_work_item(&work_item_id)?;
@@ -1089,7 +4097,10 @@ fn run_learner_step(
     *item = store.read_work_item(&work_item_id)?;
     let config = LearnerConfig {
         run_coder: config.run_coder,
-        codex_worker: codex_worker.as_ref(),
+        codex_worker: provider_readiness.codex_worker(),
+        #[cfg(not(test))]
+        provider_readiness: Some(&provider_readiness),
+        no_sandbox: config.no_sandbox,
     };
 
     // A pre-land no-expertise run must leave every candidate pointer at the reviewed
@@ -1110,6 +4121,7 @@ fn run_learner_step(
             mode,
             &config,
             runs,
+            &prepared_run,
         );
     }
 
@@ -1124,9 +4136,268 @@ fn run_learner_step(
         candidate_id,
         mode,
         &config,
+        &prepared_run,
     );
+    store
+        .read_work_item(&work_item_id)?
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == attempt_id)
+        .unwrap()
+        .ensure_not_canceled()?;
     finalize_learning(store, item, attempt_index, runs, learned, |handoff| {
         crate::learner::write_handoff(project_root, &work_item_id, &attempt_id, handoff)
+    })
+}
+
+fn acquire_learner_provider_capacity(
+    store: &WorkModelStore,
+    project_root: &Path,
+    work_item_id: &str,
+    attempt_id: &str,
+    coder: CoderKind,
+) -> Result<Option<crate::provider_admission::ProviderLease>> {
+    let provider = crate::provider_admission::provider_name(coder);
+    let limits = crate::config::resolve_provider_admission_config(project_root, provider)
+        .map_err(anyhow::Error::new)?;
+    let user_root = crate::provider_admission::effective_user_root(project_root)
+        .context("resolve user Fluent directory for Learner provider capacity")?;
+    let mut reported_wait = false;
+    loop {
+        let item = store.read_work_item(work_item_id)?;
+        let eligible = item
+            .attempts
+            .iter()
+            .find(|attempt| attempt.id == attempt_id)
+            .is_some_and(|attempt| {
+                !attempt.cancellation_requested()
+                    && attempt.status == AttemptStatus::Complete
+                    && attempt.review_state == Some(AttemptReviewState::Passed)
+                    && attempt.coder_mapping.for_task_kind(TaskKind::Write).coder == coder
+                    && attempt.learning.as_ref().is_none_or(|learning| {
+                        !learning.is_succeeded() && learning.is_relaunchable()
+                    })
+            });
+        if !eligible {
+            return Ok(None);
+        }
+        match crate::provider_admission::try_acquire(
+            &user_root,
+            project_root,
+            provider,
+            limits.shared_concurrency.value,
+            limits.project_concurrency.value,
+        )? {
+            crate::provider_admission::AdmissionAttempt::Acquired(lease) => {
+                if reported_wait {
+                    eprintln!("  Learner resumed with available {provider} capacity.");
+                }
+                return Ok(Some(lease));
+            }
+            crate::provider_admission::AdmissionAttempt::Contended => {
+                if !reported_wait {
+                    reported_wait = true;
+                    eprintln!("  Learner waiting for {provider} provider capacity.");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+    }
+}
+
+/// The exact initial Learner launch retained across host preflight, reservation,
+/// and execution. Its temporary isolated workspace and allocated evidence surface
+/// remain alive until the Learner finishes, so the profile Fluent preflights is the
+/// profile Fluent launches.
+struct PreparedLearnerRun {
+    sandbox: Option<work_task_executor::PreparedLearnerSandbox>,
+    workspace_path: PathBuf,
+    launch_workspace_path: PathBuf,
+    review_artifact_paths: Vec<PathBuf>,
+    tester_artifact_paths: Vec<PathBuf>,
+    handoff_dir: PathBuf,
+    denied_write_roots: Vec<PathBuf>,
+    run_dir: PathBuf,
+    repairs: Vec<PreparedLearnerRepairRun>,
+    isolated_workspace: Option<HandoffOnlyWorkspace>,
+}
+
+/// One bounded schema-repair launch prepared alongside the initial Learner run.
+/// Its run surface and sandbox profile remain stable from host preflight through
+/// the repair launch, so a repair cannot introduce a post-reservation probe.
+struct PreparedLearnerRepairRun {
+    sandbox: Option<work_task_executor::PreparedLearnerSandbox>,
+    run_dir: PathBuf,
+    handoff_dir: PathBuf,
+}
+
+/// Prepare and preflight the resolved Learner launch while the Learner lease is
+/// held but before `reserve_learner_run` writes an in-progress Learning record.
+fn prepare_learner_run(
+    project_root: &Path,
+    item: &WorkItem,
+    attempt_index: usize,
+    candidate_id: &str,
+    mode: work_task_executor::LearnerExecutionMode,
+    no_sandbox: bool,
+    codex_worker: Option<&crate::codex_worker::CodexWorkerEnvironment>,
+) -> Result<PreparedLearnerRun> {
+    let attempt = &item.attempts[attempt_index];
+    let write_output = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+        .and_then(|task| task.output.as_ref())
+        .ok_or_else(|| anyhow::anyhow!("no completed write task with output"))?;
+    let workspace_path = resolve_managed_sibling_workspace_path(
+        project_root,
+        &write_output.workspace_path,
+        "learner workspace",
+    )?;
+    let review_artifact_paths = all_review_artifact_paths(project_root, attempt)?;
+    let tester_artifact_paths = all_tester_artifact_paths(project_root, attempt)?;
+    let mapping = attempt.coder_mapping.for_task_kind(TaskKind::Write);
+    let handoff_only = mode.is_post_land();
+    let baseline_commit = if handoff_only {
+        item.merge_candidates
+            .iter()
+            .find(|candidate| candidate.id == candidate_id)
+            .filter(|candidate| candidate.merge_state.status == MergeCandidateMergeStatus::Merged)
+            .and_then(|candidate| candidate.merge_state.merged_commit.clone())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "handoff-only Learner retry has no persisted merged commit for {:?}",
+                    candidate_id
+                )
+            })?
+    } else {
+        write_output.commit.clone()
+    };
+    let bundle_source = if handoff_only {
+        project_root
+    } else {
+        workspace_path.as_path()
+    };
+    let isolated_workspace = (!mode.expertise_writable())
+        .then(|| {
+            HandoffOnlyWorkspace::create(
+                bundle_source,
+                project_root,
+                &item.id,
+                &attempt.id,
+                &baseline_commit,
+                &review_artifact_paths,
+                &tester_artifact_paths,
+            )
+        })
+        .transpose()?;
+    let launch_workspace_path = isolated_workspace
+        .as_ref()
+        .map(|isolated| isolated.workspace_path.clone())
+        .unwrap_or_else(|| workspace_path.clone());
+    let launch_review_artifact_paths = isolated_workspace
+        .as_ref()
+        .map(|isolated| isolated.review_artifact_paths.clone())
+        .unwrap_or_else(|| review_artifact_paths.clone());
+    let launch_tester_artifact_paths = isolated_workspace
+        .as_ref()
+        .map(|isolated| isolated.tester_artifact_paths.clone())
+        .unwrap_or_else(|| tester_artifact_paths.clone());
+    let real_handoff_dir =
+        project_root.join(crate::learner::handoff_dir_rel(&item.id, &attempt.id));
+    let run_dir = allocate_learner_run_dir(&real_handoff_dir.join("runs"))?;
+    let handoff_dir = isolated_workspace
+        .as_ref()
+        .map(|isolated| isolated.handoff_dir.clone())
+        .unwrap_or_else(|| run_dir.join("staging"));
+    let denied_write_roots = if mode.expertise_writable() {
+        Vec::new()
+    } else {
+        let mut roots = vec![project_root.to_path_buf(), workspace_path.clone()];
+        // A post-land retry is anchored to the durable merged commit in an
+        // isolated bundle. Its retained candidate may have malformed Git
+        // metadata, but it still belongs to the target repository whose common
+        // Git directory must remain denied. Resolve that boundary from the
+        // healthy target instead of consulting the retained candidate.
+        let git_boundary = if handoff_only {
+            project_root
+        } else {
+            workspace_path.as_path()
+        };
+        roots.push(crate::worktree::git_common_dir(git_boundary)?);
+        roots.sort();
+        roots.dedup();
+        roots
+    };
+    let sandbox = work_task_executor::prepare_learner_host_sandbox(
+        work_task_executor::LearnerRunInputs {
+            workspace_path: &launch_workspace_path,
+            resolver: &ContentResolver::new(Some(project_root)),
+            extra_args: &[],
+            coder_kind: mapping.coder,
+            no_sandbox,
+            model: None,
+            effort: None,
+            review_artifact_paths: &launch_review_artifact_paths,
+            tester_artifact_paths: &launch_tester_artifact_paths,
+            diff_command: "git diff",
+            handoff_dir: &handoff_dir,
+            denied_write_roots: &denied_write_roots,
+            handoff_only,
+            repair: None,
+        },
+        mode,
+        codex_worker,
+        &run_dir,
+    )?;
+    let repair_budget = crate::config::resolve_learner_schema_repair_budget(project_root)
+        .unwrap_or(crate::config::DEFAULT_LEARNER_SCHEMA_REPAIR_BUDGET);
+    let mut repairs = Vec::with_capacity(repair_budget as usize);
+    for _ in 0..repair_budget {
+        let run_dir = allocate_learner_run_dir(&real_handoff_dir.join("runs"))?;
+        let repair_handoff_dir = isolated_workspace
+            .as_ref()
+            .map(|isolated| isolated.handoff_dir.clone())
+            .unwrap_or_else(|| run_dir.join("staging"));
+        let sandbox = work_task_executor::prepare_learner_host_sandbox(
+            work_task_executor::LearnerRunInputs {
+                workspace_path: &launch_workspace_path,
+                resolver: &ContentResolver::new(Some(project_root)),
+                extra_args: &[],
+                coder_kind: mapping.coder,
+                no_sandbox,
+                model: None,
+                effort: None,
+                review_artifact_paths: &launch_review_artifact_paths,
+                tester_artifact_paths: &launch_tester_artifact_paths,
+                diff_command: "git diff",
+                handoff_dir: &repair_handoff_dir,
+                denied_write_roots: &denied_write_roots,
+                handoff_only,
+                repair: None,
+            },
+            mode,
+            codex_worker,
+            &run_dir,
+        )?;
+        repairs.push(PreparedLearnerRepairRun {
+            sandbox,
+            run_dir,
+            handoff_dir: repair_handoff_dir,
+        });
+    }
+    Ok(PreparedLearnerRun {
+        sandbox,
+        workspace_path,
+        launch_workspace_path,
+        review_artifact_paths: launch_review_artifact_paths,
+        tester_artifact_paths: launch_tester_artifact_paths,
+        handoff_dir,
+        denied_write_roots,
+        run_dir,
+        repairs,
+        isolated_workspace,
     })
 }
 
@@ -1165,6 +4436,7 @@ fn settle_no_expertise_learner(
     mode: work_task_executor::LearnerExecutionMode,
     config: &LearnerConfig<'_>,
     runs: u32,
+    prepared_run: &PreparedLearnerRun,
 ) -> Result<()> {
     let work_item_id = item.id.clone();
     let attempt_id = item.attempts[attempt_index].id.clone();
@@ -1199,6 +4471,7 @@ fn settle_no_expertise_learner(
         candidate_id,
         mode,
         config,
+        prepared_run,
     ) {
         Ok(handoff) => handoff,
         Err(run) => {
@@ -1207,6 +4480,29 @@ fn settle_no_expertise_learner(
             return Ok(());
         }
     };
+
+    let write_output = item.attempts[attempt_index]
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+        .and_then(|task| task.output.as_ref())
+        .ok_or_else(|| {
+            anyhow::anyhow!("no completed Writer output before Learner candidate gate")
+        })?;
+    if let Err(gate) = run_learner_candidate_gate(
+        project_root,
+        item,
+        attempt_index,
+        prepared_run.launch_workspace_path.as_path(),
+        &write_output.commit,
+        &write_output.commit,
+        &prepared_run.run_dir,
+    ) {
+        settle_no_expertise_failure(store, &work_item_id, &attempt_id, runs, gate)?;
+        *item = store.read_work_item(&work_item_id)?;
+        return Ok(());
+    }
 
     // Prepare: one fresh, lock-held mutation re-finds the Attempt, requires it still
     // owns this runner's exact `InProgress { runs }` reservation and stays
@@ -1276,10 +4572,11 @@ fn learning_frontier_is(
     runs: u32,
     status: crate::work_model::LearningStatus,
 ) -> bool {
-    matches!(
-        item.attempts[idx].learning.as_ref(),
-        Some(learning) if learning.status == status && learning.runs == runs
-    )
+    !item.attempts[idx].cancellation_requested()
+        && matches!(
+            item.attempts[idx].learning.as_ref(),
+            Some(learning) if learning.status == status && learning.runs == runs
+        )
 }
 
 /// Settle a pre-land no-expertise Learning to a terminal, typed `Failed` record
@@ -1306,7 +4603,7 @@ fn settle_no_expertise_failure(
 ) -> Result<()> {
     let kind = classify_learning_failure(&error);
     let diagnostic = format!("{error:#}");
-    if let Err(store_err) = store.mutate_work_item(work_item_id, |fresh| {
+    if let Err(store_err) = mutate_attempt_work_item(store, work_item_id, |fresh| {
         let idx = attempt_index_by_id(fresh, attempt_id)?;
         if !learning_frontier_is(
             fresh,
@@ -1385,7 +4682,7 @@ fn prepare_no_expertise_handoff(
     check_identity: &NoExpertiseIdentityChecker,
 ) -> Result<NoExpertisePreparation> {
     let triggering: RefCell<Option<anyhow::Error>> = RefCell::new(None);
-    let committed = store.mutate_work_item(work_item_id, |fresh| {
+    let committed = mutate_attempt_work_item(store, work_item_id, |fresh| {
         let idx = attempt_index_by_id(fresh, attempt_id)?;
         // Only this runner's exact in-progress reservation may advance; a peer that
         // already moved the frontier is honored rather than revived.
@@ -1463,7 +4760,7 @@ fn publish_no_expertise_handoff(
 ) -> Result<()> {
     let triggering: RefCell<Option<anyhow::Error>> = RefCell::new(None);
     let publish: RefCell<Option<_>> = RefCell::new(Some(publish));
-    let committed = store.mutate_work_item(work_item_id, |fresh| {
+    let committed = mutate_attempt_work_item(store, work_item_id, |fresh| {
         let idx = attempt_index_by_id(fresh, attempt_id)?;
         // Only this run's exact HandoffPending frontier may publish; a newer frontier
         // or a peer's terminal record is honored, not overwritten.
@@ -1576,12 +4873,12 @@ fn finalize_learning(
             // handoff with no learning state, and advancement stays blocked until the
             // terminal Succeeded is persisted afterward with its reference.
             item.attempts[attempt_index].learning = Some(AttemptLearning::handoff_pending(runs));
-            store.write_work_item(item)?;
+            write_attempt_work_item(store, item)?;
             match write_handoff(&handoff) {
                 Ok(handoff_ref) => {
                     item.attempts[attempt_index].learning =
                         Some(AttemptLearning::succeeded(runs, handoff_ref));
-                    store.write_work_item(item)?;
+                    write_attempt_work_item(store, item)?;
                 }
                 Err(err) => {
                     // The Learner produced a valid handoff, but writing the canonical
@@ -1593,12 +4890,12 @@ fn finalize_learning(
                     );
                     let kind = classify_learning_failure(&err);
                     item.attempts[attempt_index].learning =
-                        Some(AttemptLearning::failed_with_kind(
+                        Some(AttemptLearning::failed_after_handoff_publication(
                             runs,
                             format!("learner produced a handoff but persisting it failed: {err:#}"),
                             kind,
                         ));
-                    if let Err(store_err) = store.write_work_item(item) {
+                    if let Err(store_err) = write_attempt_work_item(store, item) {
                         // The handoff-write failure is the primary fault. The store
                         // failure is retained STRUCTURALLY as a secondary (still
                         // downcastable), not flattened to a string, so both typed
@@ -1621,7 +4918,7 @@ fn finalize_learning(
                 format!("{err:#}"),
                 kind,
             ));
-            if let Err(store_err) = store.write_work_item(item) {
+            if let Err(store_err) = write_attempt_work_item(store, item) {
                 // The coder/confinement/handoff failure is the PRIMARY. The store
                 // failure is retained STRUCTURALLY as a secondary (still downcastable),
                 // not flattened to a string, so the typed primary is never masked.
@@ -1667,12 +4964,12 @@ fn try_learn(
     candidate_id: &str,
     mode: work_task_executor::LearnerExecutionMode,
     config: &LearnerConfig<'_>,
+    prepared_run: &PreparedLearnerRun,
 ) -> Result<crate::follow_up::LearnerHandoffV1> {
     // A post-land handoff-only retry uses the merged commit as its baseline; a
     // pre-land capture or no-expertise run uses the reviewed Writer SHA. Both
     // non-capture modes run from an isolated snapshot with denied live roots.
     let handoff_only = mode.is_post_land();
-    let runs_isolated = !mode.expertise_writable();
     let work_item_id = item.id.clone();
     let attempt = &item.attempts[attempt_index];
     let attempt_id = attempt.id.clone();
@@ -1685,14 +4982,9 @@ fn try_learn(
         .and_then(|(i, task)| task.output.as_ref().map(|output| (i, output.clone())))
         .ok_or_else(|| anyhow::anyhow!("no completed write task with output"))?;
 
-    let workspace_path = resolve_managed_sibling_workspace_path(
-        project_root,
-        &write_output.workspace_path,
-        "learner workspace",
-    )?;
-
-    let review_artifact_paths = all_review_artifact_paths(project_root, attempt)?;
-    let tester_artifact_paths = all_tester_artifact_paths(project_root, attempt)?;
+    let workspace_path = &prepared_run.workspace_path;
+    let review_artifact_paths = &prepared_run.review_artifact_paths;
+    let tester_artifact_paths = &prepared_run.tester_artifact_paths;
 
     let mapping_pair = attempt.coder_mapping.for_task_kind(TaskKind::Write);
     let coder_kind = mapping_pair.coder;
@@ -1760,37 +5052,12 @@ fn try_learn(
     } else {
         write_output.commit.as_str()
     };
-    // The isolated snapshot bundles the repository that holds the baseline commit.
-    // A post-land run's merged commit lives in the live project checkout; a pre-
-    // land no-expertise run's reviewed Writer SHA lives in the candidate worktree.
-    let bundle_source = if handoff_only {
-        project_root
-    } else {
-        workspace_path.as_path()
-    };
-    let isolated_workspace = runs_isolated
-        .then(|| {
-            HandoffOnlyWorkspace::create(
-                bundle_source,
-                project_root,
-                &work_item_id,
-                &attempt_id,
-                &baseline_commit,
-                &review_artifact_paths,
-                &tester_artifact_paths,
-            )
-        })
-        .transpose()?;
-    let learner_workspace_path = isolated_workspace
-        .as_ref()
-        .map(|isolated| isolated.workspace_path.as_path())
-        .unwrap_or(workspace_path.as_path());
-    let real_handoff_dir =
-        project_root.join(crate::learner::handoff_dir_rel(&work_item_id, &attempt_id));
+    let isolated_workspace = prepared_run.isolated_workspace.as_ref();
+    let learner_workspace_path = prepared_run.launch_workspace_path.as_path();
     // Allocate a collision-safe, host-owned run directory from on-disk state. It
     // holds the transcript and submitted-draft evidence the coder cannot reach;
     // the coder-writable staging directory is a separate sibling beneath it.
-    let run_dir = allocate_learner_run_dir(&real_handoff_dir.join("runs"))?;
+    let run_dir = prepared_run.run_dir.clone();
     // The transcript lives on the host-owned run surface, outside every coder-
     // writable root: the host writes it, so it survives the disposable clone and
     // lets the one-refresh auth policy classify a 401.
@@ -1799,38 +5066,13 @@ fn try_learn(
     // surface; post-land it stages inside the isolated clone because the live
     // project root is denied. Either way the host-owned evidence stays a non-
     // writable sibling of the staging directory.
-    let pre_land_staging = run_dir.join("staging");
-    let handoff_dir = isolated_workspace
-        .as_ref()
-        .map(|isolated| isolated.handoff_dir.as_path())
-        .unwrap_or(pre_land_staging.as_path());
-    let learner_review_artifact_paths = isolated_workspace
-        .as_ref()
-        .map(|isolated| isolated.review_artifact_paths.as_slice())
-        .unwrap_or(review_artifact_paths.as_slice());
-    let learner_tester_artifact_paths = isolated_workspace
-        .as_ref()
-        .map(|isolated| isolated.tester_artifact_paths.as_slice())
-        .unwrap_or(tester_artifact_paths.as_slice());
+    let handoff_dir = prepared_run.handoff_dir.as_path();
+    let learner_review_artifact_paths = review_artifact_paths.as_slice();
+    let learner_tester_artifact_paths = tester_artifact_paths.as_slice();
     let diff_range = format!("{accepted_base}...{accepted_tip}");
     let diff_command =
         review_diff_command::render_review_diff_command(learner_workspace_path, &diff_range);
-    let denied_write_roots = if runs_isolated {
-        // Deny every live root for both isolated modes: the live project checkout,
-        // the candidate worktree, and shared Git metadata. A no-expertise run must
-        // never retarget the reviewed candidate; a post-land run must never mutate
-        // the merged branch.
-        let mut roots = vec![project_root.to_path_buf(), workspace_path.clone()];
-        // The candidate worktree shares the live repository's common Git dir, so
-        // resolve it from the worktree, which is always a real repository even when
-        // the live project checkout is not directly inspectable.
-        roots.push(crate::worktree::git_common_dir(&workspace_path)?);
-        roots.sort();
-        roots.dedup();
-        roots
-    } else {
-        Vec::new()
-    };
+    let denied_write_roots = &prepared_run.denied_write_roots;
 
     if mode.expertise_writable() {
         // Pre-land: one host-owned Git transaction spans the initial coder, every
@@ -1842,7 +5084,7 @@ fn try_learn(
         let mut transaction = LearnerGitTransaction::begin(&workspace_path, &baseline_commit)?;
         let result = run_pre_land_learner(
             project_root,
-            &workspace_path,
+            workspace_path,
             item,
             attempt_index,
             write_task_index,
@@ -1859,10 +5101,11 @@ fn try_learn(
                 handoff_dir,
                 transcript_path: &transcript_path,
                 run_dir,
-                real_handoff_dir: &real_handoff_dir,
                 coder_kind,
                 model: model.as_deref(),
                 effort: effort.as_deref(),
+                prepared_sandbox: prepared_run.sandbox.as_ref(),
+                repair_runs: &prepared_run.repairs,
             },
         );
         return match result {
@@ -1902,7 +5145,10 @@ fn try_learn(
         effort: effort.as_deref(),
         mode,
         codex_worker: config.codex_worker,
+        #[cfg(not(test))]
+        provider_readiness: config.provider_readiness,
         repair: None,
+        prepared_sandbox: prepared_run.sandbox.as_ref(),
     });
     // Account for this invocation's return before inspecting its result. A
     // no-expertise ledger pins the raw return (B10); a post-land run confines the
@@ -1963,8 +5209,7 @@ fn try_learn(
     // configured budget remains, re-invoke the coder with the rejected draft and
     // exact error as a schema repair — not a fresh audit — and accept a repair
     // only when it preserves every prior follow-up id and its content.
-    let mut repair_budget = crate::config::resolve_learner_schema_repair_budget(project_root)
-        .unwrap_or(crate::config::DEFAULT_LEARNER_SCHEMA_REPAIR_BUDGET);
+    let mut repairs = prepared_run.repairs.iter();
     let mut current_draft = draft;
     let mut current_run_dir = run_dir;
     let handoff = loop {
@@ -1982,20 +5227,15 @@ fn try_learn(
                 // recorded) and its full validation error as immutable run
                 // artifacts before any repair may publish another draft.
                 record_run_rejection(&current_run_dir, &error)?;
-                if repair_budget == 0 {
+                let Some(repair) = repairs.next() else {
                     return Err(error);
-                }
-                repair_budget -= 1;
+                };
 
-                // A fresh run identity keeps the repair's transcript and
-                // submitted-draft evidence immutable and distinct.
-                let repair_run_dir = allocate_learner_run_dir(&real_handoff_dir.join("runs"))?;
+                // The repair identity and sandbox were allocated and preflighted
+                // before this logical Learner reserved its durable run.
+                let repair_run_dir = repair.run_dir.clone();
                 let repair_transcript = repair_run_dir.join("transcript.jsonl");
-                let repair_staging_owned = repair_run_dir.join("staging");
-                let repair_staging = isolated_workspace
-                    .as_ref()
-                    .map(|isolated| isolated.handoff_dir.as_path())
-                    .unwrap_or(repair_staging_owned.as_path());
+                let repair_staging = repair.handoff_dir.as_path();
                 let rejected_draft = serde_json::to_string(&prior)?;
                 let validation_error = format!("{error:#}");
 
@@ -2012,10 +5252,13 @@ fn try_learn(
                     effort: effort.as_deref(),
                     mode,
                     codex_worker: config.codex_worker,
+                    #[cfg(not(test))]
+                    provider_readiness: config.provider_readiness,
                     repair: Some(work_task_executor::SchemaRepairInput {
                         rejected_draft: &rejected_draft,
                         validation_error: &validation_error,
                     }),
+                    prepared_sandbox: repair.sandbox.as_ref(),
                 });
                 // Pin this repair invocation's raw return before its draft is read,
                 // so a no-expertise repair that mutated Git cannot escape accounting
@@ -2077,10 +5320,11 @@ struct PreLandLearnerContext<'a> {
     handoff_dir: &'a Path,
     transcript_path: &'a Path,
     run_dir: PathBuf,
-    real_handoff_dir: &'a Path,
     coder_kind: CoderKind,
     model: Option<&'a str>,
     effort: Option<&'a str>,
+    prepared_sandbox: Option<&'a work_task_executor::PreparedLearnerSandbox>,
+    repair_runs: &'a [PreparedLearnerRepairRun],
 }
 
 /// Run the whole pre-land logical Learner: the initial coder, the bounded
@@ -2120,7 +5364,10 @@ fn run_pre_land_learner(
         effort: ctx.effort,
         mode: work_task_executor::LearnerExecutionMode::Capture,
         codex_worker: config.codex_worker,
+        #[cfg(not(test))]
+        provider_readiness: config.provider_readiness,
         repair: None,
+        prepared_sandbox: ctx.prepared_sandbox,
     });
     transaction.capture_return(workspace_path)?;
     coder_result?;
@@ -2136,8 +5383,7 @@ fn run_pre_land_learner(
     // references — only the accepted draft survives the loop; the canonical
     // expertise is folded in after accounting and normalization. Each repair coder
     // return is pinned to the transaction before its draft is read.
-    let mut repair_budget = crate::config::resolve_learner_schema_repair_budget(project_root)
-        .unwrap_or(crate::config::DEFAULT_LEARNER_SCHEMA_REPAIR_BUDGET);
+    let mut repairs = ctx.repair_runs.iter();
     let mut current_draft = draft;
     let mut current_run_dir = ctx.run_dir;
     let accepted_draft = loop {
@@ -2152,14 +5398,13 @@ fn run_pre_land_learner(
             Ok(_) => break current_draft,
             Err(error) => {
                 record_run_rejection(&current_run_dir, &error)?;
-                if repair_budget == 0 {
+                let Some(repair) = repairs.next() else {
                     return Err(error);
-                }
-                repair_budget -= 1;
+                };
 
-                let repair_run_dir = allocate_learner_run_dir(&ctx.real_handoff_dir.join("runs"))?;
+                let repair_run_dir = repair.run_dir.clone();
                 let repair_transcript = repair_run_dir.join("transcript.jsonl");
-                let repair_staging = repair_run_dir.join("staging");
+                let repair_staging = repair.handoff_dir.as_path();
                 let rejected_draft = serde_json::to_string(&prior)?;
                 let validation_error = format!("{error:#}");
 
@@ -2168,7 +5413,7 @@ fn run_pre_land_learner(
                     review_artifact_paths: ctx.review_artifact_paths,
                     tester_artifact_paths: ctx.tester_artifact_paths,
                     diff_command: ctx.diff_command,
-                    handoff_dir: &repair_staging,
+                    handoff_dir: repair_staging,
                     transcript_path: &repair_transcript,
                     denied_write_roots: &[],
                     coder_kind: ctx.coder_kind,
@@ -2176,10 +5421,13 @@ fn run_pre_land_learner(
                     effort: ctx.effort,
                     mode: work_task_executor::LearnerExecutionMode::Capture,
                     codex_worker: config.codex_worker,
+                    #[cfg(not(test))]
+                    provider_readiness: config.provider_readiness,
                     repair: Some(work_task_executor::SchemaRepairInput {
                         rejected_draft: &rejected_draft,
                         validation_error: &validation_error,
                     }),
+                    prepared_sandbox: repair.sandbox.as_ref(),
                 });
                 transaction.capture_return(workspace_path)?;
                 repair_result?;
@@ -2206,6 +5454,20 @@ fn run_pre_land_learner(
     transaction.inventory(workspace_path)?;
     let normalized = transaction.normalize(workspace_path)?;
 
+    let candidate_commit = normalized
+        .canonical_commit
+        .as_deref()
+        .unwrap_or(write_output.commit.as_str());
+    run_learner_candidate_gate(
+        project_root,
+        item,
+        attempt_index,
+        workspace_path,
+        &write_output.commit,
+        candidate_commit,
+        &current_run_dir,
+    )?;
+
     // Stamp the final handoff — a last validation of the accepted draft — with the
     // canonical expertise references. Only after BOTH the canonical result verified
     // clean and the handoff stamped do the Work-model pointers move, so no rejection
@@ -2219,8 +5481,22 @@ fn run_pre_land_learner(
         normalized.expertise,
     )?;
     if let Some(canonical) = normalized.canonical_commit {
+        let learner_canonicalization = if write_output.no_change.is_some() {
+            let from_commit = write_output.base_commit.clone().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no-change Writer output is missing its verified base commit before Learning"
+                )
+            })?;
+            Some(LearnerCommitCanonicalization {
+                from_commit,
+                to_commit: canonical.clone(),
+            })
+        } else {
+            None
+        };
         item.attempts[attempt_index].tasks[write_task_index].output = Some(TaskOutput {
             commit: canonical.clone(),
+            learner_canonicalization,
             ..write_output.clone()
         });
         if let Some(candidate) = item
@@ -2232,6 +5508,55 @@ fn run_pre_land_learner(
         }
     }
     Ok(handoff)
+}
+
+fn run_learner_candidate_gate(
+    project_root: &Path,
+    item: &WorkItem,
+    attempt_index: usize,
+    workspace: &Path,
+    base_commit: &str,
+    candidate_commit: &str,
+    run_dir: &Path,
+) -> Result<()> {
+    let attempt = &item.attempts[attempt_index];
+    let task_id = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+        .map(|task| task.id.as_str());
+    let artifact_path = run_dir.join(crate::candidate_gate::CANDIDATE_GATE_FILE);
+    let tester_results = latest_tester_results_path(project_root, attempt);
+    let accepted_tester_commands = accepted_external_tester_commands(project_root, attempt);
+    let evidence =
+        crate::candidate_gate::run_candidate_gate(crate::candidate_gate::CandidateGateRequest {
+            project_root,
+            workspace,
+            work_item_id: &item.id,
+            attempt_id: &attempt.id,
+            task_id,
+            phase: crate::candidate_gate::CandidateGatePhase::Learner,
+            base_commit,
+            candidate_commit,
+            completion_contract: attempt.writer_completion_contract.as_ref(),
+            allow_tree_identical_metadata_rewrite: false,
+            metadata_rewrite_authorization: None,
+            tester_results_path: tester_results.as_deref(),
+            accepted_tester_commands: &accepted_tester_commands,
+            artifact_path: &artifact_path,
+        })?;
+    match evidence.disposition {
+        crate::candidate_gate::CandidateGateDisposition::Passed => Ok(()),
+        crate::candidate_gate::CandidateGateDisposition::Rejected => bail!(
+            "Learner candidate gate rejected {candidate_commit}; evidence: {}",
+            artifact_path.display()
+        ),
+        crate::candidate_gate::CandidateGateDisposition::Blocked => bail!(
+            "Learner candidate gate could not verify {candidate_commit}; evidence: {}",
+            artifact_path.display()
+        ),
+    }
 }
 
 /// The review round a Tester or built-in reviewer Task belongs to. Round 1 uses
@@ -2383,9 +5708,247 @@ fn check_no_expertise_pointer_identity(
 /// process-held lease, never by transcript age or pump-status timestamps: those
 /// are diagnostics only and carry no authority to reclaim a Task. Recovery must
 /// not resurrect or abandon a Task on the strength of how old its transcript is.
-fn executing_task_is_live(project_root: &Path, work_item_id: &str, task_id: &str) -> bool {
-    let lock_path = crate::lease::task_lock_path(project_root, work_item_id, task_id);
-    crate::lease::is_leased(&lock_path)
+fn executing_task_is_live(
+    project_root: &Path,
+    work_item_id: &str,
+    task: &crate::work_model::Task,
+) -> bool {
+    let lock_path = crate::lease::task_lock_path(project_root, work_item_id, &task.id);
+    if crate::lease::is_leased(&lock_path) {
+        return true;
+    }
+    let Some(artifact_area) = task.artifact_area.as_ref() else {
+        return false;
+    };
+    let execution = crate::execution::record_path_for_artifact(project_root, &artifact_area.path);
+    // A corrupt or unreadable identity fails closed. Replanning while Fluent cannot
+    // prove the old process group dead is more dangerous than requiring cancellation.
+    crate::execution::execution_is_live(&execution).unwrap_or(true)
+}
+
+fn resume_canceled_attempt(
+    project: &Path,
+    store: &WorkModelStore,
+    work: &str,
+    id: &str,
+    authorized_stop: Option<&str>,
+) -> Result<()> {
+    mutate_attempt_work_item(store, work, |item| {
+        let has_pending_candidate = item.merge_candidates.iter().any(|candidate| {
+            candidate.attempt_id == id
+                && candidate.merge_state.status == MergeCandidateMergeStatus::Pending
+        });
+        let attempt = item
+            .attempts
+            .iter_mut()
+            .find(|attempt| attempt.id == id)
+            .ok_or_else(|| WorkModelError::AttemptNotFound { id: id.into() })?;
+        if !attempt.cancellation_requested() {
+            return Ok(());
+        }
+        if authorized_stop
+            != attempt
+                .cancellation
+                .as_ref()
+                .map(|stop| stop.requested_at.as_str())
+        {
+            return Err(WorkModelError::AttemptResumeIneligible {
+                attempt_id: id.into(),
+                reason: "this launch was not authorized to resume the current cancellation; explicitly resume the interrupted Attempt".into(),
+            });
+        }
+        let active_task = attempt.tasks.iter().any(|task| {
+            crate::lease::is_leased(&crate::lease::task_lock_path(project, work, &task.id))
+        });
+        if attempt.cancellation.as_ref().unwrap().settled_at.is_none()
+            || active_task
+            || crate::lease::is_leased(&crate::lease::learner_lock_path(project, work, id))
+        {
+            return Err(WorkModelError::AttemptResumeIneligible {
+                attempt_id: id.into(),
+                reason: "canceled local execution has not settled".into(),
+            });
+        }
+        attempt.cancellation.as_mut().unwrap().resumed_at = Some(crate::work_model::now_iso8601());
+        if has_pending_candidate {
+            // This reviewed Attempt stayed Complete while its typed stop was
+            // active. Resume Learning without changing Tasks or readiness history.
+            return Ok(());
+        }
+        let stopped_at = attempt
+            .cancellation
+            .as_ref()
+            .unwrap()
+            .requested_at
+            .replace(':', "-");
+        for task in &mut attempt.tasks {
+            if task.kind == TaskKind::Verification && task.status == TaskStatus::NeedsUser {
+                if let Some(area) = &mut task.artifact_area {
+                    // Keep every canceled run's logs and any published receipt intact.
+                    area.path = format!(
+                        "{}/retries/{stopped_at}",
+                        work_artifact_path(work, id, &task.id)
+                    );
+                }
+            }
+        }
+        crate::work_model::reopen_attempt(attempt);
+        if attempt.learning.is_some()
+            && attempt.review_state == Some(AttemptReviewState::Passed)
+            && attempt
+                .tasks
+                .iter()
+                .all(|task| task.status == TaskStatus::Complete)
+        {
+            attempt.status = AttemptStatus::Complete;
+        }
+        Ok(())
+    })?;
+    Ok(())
+}
+
+/// Stop every owned local worker for one Attempt, then pause unfinished work
+/// for an explicit same-Attempt resume. Persist the stop boundary before
+/// signaling and verify every registered execution before recording settlement.
+pub fn cancel_local_attempt(
+    project_root: &Path,
+    store: &WorkModelStore,
+    work_item_id: &str,
+    attempt_id: &str,
+) -> Result<usize> {
+    let _effect_lock = crate::land_lock::acquire(&crate::land_lock::effect_lock_path(project_root))
+        .map_err(|error| anyhow::anyhow!("failed to acquire landing effect lock: {error}"))?;
+    let attempt = mutate_attempt_work_item(store, work_item_id, |item| {
+        item.ensure_not_abandoned()?;
+        let has_pending_candidate = item.merge_candidates.iter().any(|candidate| {
+            candidate.attempt_id == attempt_id
+                && candidate.merge_state.status == MergeCandidateMergeStatus::Pending
+        });
+        let attempt = item
+            .attempts
+            .iter_mut()
+            .find(|attempt| attempt.id == attempt_id)
+            .ok_or_else(|| WorkModelError::AttemptNotFound {
+                id: attempt_id.into(),
+            })?;
+        if !attempt.cancellation_requested() {
+            attempt.cancellation = Some(crate::work_model::AttemptCancellation {
+                requested_at: crate::work_model::now_iso8601(),
+                settled_at: None,
+                resumed_at: None,
+            });
+            if has_pending_candidate {
+                // Preserve the reviewed candidate invariant. The cancellation
+                // record itself pauses Learning and blocks all advancement.
+                attempt.status = AttemptStatus::Complete;
+                attempt.pause_kind = None;
+            } else {
+                attempt.status = AttemptStatus::NeedsUser;
+                attempt.pause_kind = Some(PauseKind::Interrupted);
+                attempt
+                    .completed_at
+                    .get_or_insert_with(crate::work_model::now_iso8601);
+            }
+            attempt.pause_recovery = None;
+        }
+        Ok(attempt.clone())
+    })?;
+    drop(_effect_lock);
+    if attempt.cancellation.as_ref().unwrap().settled_at.is_some() {
+        return Ok(0);
+    }
+    let executing = attempt
+        .tasks
+        .iter()
+        .filter(|task| task.status == TaskStatus::Executing)
+        .map(|task| task.id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut records = attempt
+        .tasks
+        .iter()
+        .filter_map(|task| {
+            task.artifact_area
+                .as_ref()
+                .map(|area| crate::execution::record_path_for_artifact(project_root, &area.path))
+        })
+        .collect::<Vec<_>>();
+    records.extend(
+        attempt
+            .artifacts
+            .iter()
+            .filter(|artifact| artifact.producer_id == "local-execution")
+            .map(|artifact| project_root.join(&artifact.path)),
+    );
+    for execution in records {
+        match fs::symlink_metadata(&execution) {
+            Ok(_) => {
+                crate::execution::cancel(&execution)
+                    .with_context(|| format!("cancel local execution {}", execution.display()))?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    // Setup owns the Task lease before it has a child. Let that owner observe the
+    // durable gate and unwind before recording settled cancellation.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let tasks_live = executing.iter().any(|id| {
+            crate::lease::is_leased(&crate::lease::task_lock_path(
+                project_root,
+                work_item_id,
+                id,
+            ))
+        });
+        let learner_live = crate::lease::is_leased(&crate::lease::learner_lock_path(
+            project_root,
+            work_item_id,
+            attempt_id,
+        ));
+        if !tasks_live && !learner_live {
+            break;
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "cancellation is durable; local setup has not settled yet"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let canceled = mutate_attempt_work_item(store, work_item_id, |item| {
+        let has_pending_candidate = item.merge_candidates.iter().any(|candidate| {
+            candidate.attempt_id == attempt_id
+                && candidate.merge_state.status == MergeCandidateMergeStatus::Pending
+        });
+        let attempt = item
+            .attempts
+            .iter_mut()
+            .find(|attempt| attempt.id == attempt_id)
+            .unwrap();
+        let stop = attempt.cancellation.as_ref().unwrap();
+        if stop.settled_at.is_some() {
+            return Ok(0);
+        }
+        for task in &mut attempt.tasks {
+            if executing.contains(&task.id) && task.output.is_none() {
+                crate::work_model::set_task_terminal(task, TaskStatus::NeedsUser);
+            }
+        }
+        if let Some(learning) = &attempt.learning {
+            if !learning.is_succeeded() {
+                attempt.learning = Some(crate::work_model::AttemptLearning::failed(
+                    learning.runs,
+                    "operator canceled local execution",
+                ));
+            }
+        }
+        if !has_pending_candidate {
+            attempt.status = AttemptStatus::NeedsUser;
+            attempt.pause_kind = Some(PauseKind::Interrupted);
+        }
+        attempt.cancellation.as_mut().unwrap().settled_at = Some(crate::work_model::now_iso8601());
+        Ok(executing.len())
+    })?;
+    Ok(canceled)
 }
 
 /// Recover the immutable accepted base for an already-merged legacy Attempt
@@ -3154,7 +6717,13 @@ impl LearnerGitTransaction {
         }
         git::run(
             workspace,
-            &["commit", "--message", "Update expertise"],
+            &[
+                "commit",
+                "--message",
+                "Update expertise",
+                "--message",
+                "- Record durable project guidance from the accepted candidate.",
+            ],
             "author canonical expertise commit",
         )?;
         let head = git::run_stdout(workspace, &["rev-parse", "HEAD"], "resolve canonical HEAD")?;
@@ -3515,96 +7084,466 @@ fn all_tester_artifact_paths(
         .collect()
 }
 
-fn completed_review_tasks_after_latest_write(tasks: &[Task]) -> impl Iterator<Item = &Task> {
-    let start = tasks
-        .iter()
-        .rposition(|task| task.kind == TaskKind::Write)
+fn completed_review_tasks_after_latest_write(attempt: &Attempt) -> impl Iterator<Item = &Task> {
+    let start = attempt
+        .latest_materialized_write_index()
         .map(|index| index + 1)
         .unwrap_or(0);
-    tasks[start..]
+    attempt.tasks[start..]
         .iter()
         .filter(|task| task.kind == TaskKind::Review && task.status == TaskStatus::Complete)
-}
-
-fn tester_failures(tester_results_path: &Path) -> usize {
-    let content = match fs::read_to_string(tester_results_path) {
-        Ok(c) => c,
-        Err(_) => return 0,
-    };
-    let results: crate::tester::TesterResults = match serde_json::from_str(&content) {
-        Ok(r) => r,
-        Err(_) => return 0,
-    };
-    results.tests.iter().filter(|t| t.status == "fail").count()
-}
-
-fn failing_ids(path: &Path) -> HashSet<String> {
-    let content = match fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return HashSet::new(),
-    };
-    let results: crate::tester::TesterResults = match serde_json::from_str(&content) {
-        Ok(r) => r,
-        Err(_) => return HashSet::new(),
-    };
-    results
-        .tests
-        .iter()
-        .filter(|t| t.status == "fail")
-        .map(|t| t.id.clone())
-        .collect()
-}
-
-fn introduced_tester_failures(current_path: &Path, baseline_path: Option<&Path>) -> usize {
-    match baseline_path {
-        Some(bp) => {
-            let current = failing_ids(current_path);
-            let baseline = failing_ids(bp);
-            current.difference(&baseline).count()
-        }
-        None => tester_failures(current_path),
-    }
 }
 
 fn tester_errored(tester_results_path: &Path) -> bool {
     let content = match fs::read_to_string(tester_results_path) {
         Ok(c) => c,
-        Err(_) => return false,
+        Err(_) => return true,
     };
     let results: crate::tester::TesterResults = match serde_json::from_str(&content) {
         Ok(r) => r,
-        Err(_) => return false,
+        Err(_) => return true,
     };
     results.error.is_some()
 }
 
-fn baseline_tester_results_path(project_root: &Path, attempt: &Attempt) -> Option<PathBuf> {
-    let work_item_id = &attempt.work_item_id;
-    let attempt_id = &attempt.id;
-    let baseline_artifact = format!("{attempt_id}-baseline-tester");
-    let artifact_path = work_artifact_path(work_item_id, attempt_id, &baseline_artifact);
-    let path = project_root
-        .join(&artifact_path)
-        .join("tester-results.json");
-    if path.is_file() { Some(path) } else { None }
-}
-
 fn latest_tester_results_path(project_root: &Path, attempt: &Attempt) -> Option<PathBuf> {
-    let start = attempt
-        .tasks
+    if (attempt
+        .evidence_recoveries
         .iter()
-        .rposition(|task| task.kind == TaskKind::Write)
-        .map(|index| index + 1)
-        .unwrap_or(0);
+        .any(|recovery| recovery.required_check.as_ref().is_some())
+        || attempt.artifacts.iter().any(|artifact| {
+            artifact.producer_id == "plan-host-evidence" && artifact.path.ends_with("/binding.json")
+        }))
+        && let Ok(view) = crate::recovery_contracts::assess_canonical_checks(project_root, attempt)
+    {
+        return Some(view.results_path);
+    }
+    if let Some(source) =
+        crate::host_evidence::completed_recheck_evidence_source(project_root, attempt)
+    {
+        return Some(source);
+    }
+    let latest_write_index = attempt.latest_materialized_write_index();
+    let start = latest_write_index.map(|index| index + 1).unwrap_or(0);
     attempt.tasks[start..]
         .iter()
         .rev()
-        .find(|task| task.kind == TaskKind::Tester && task.status == TaskStatus::Complete)
+        .find(|task| {
+            task.kind == TaskKind::Tester
+                && task.status == TaskStatus::Complete
+                && !task.is_failed_command_recheck()
+        })
         .and_then(|task| task.artifact_area.as_ref())
         .and_then(|area| {
             work_task_executor::resolve_managed_artifact_area_path(project_root, &area.path).ok()
         })
         .map(|dir| dir.join("tester-results.json"))
+        .or_else(|| {
+            latest_write_index.and_then(|index| {
+                no_change_source_tester_results_path(project_root, attempt, index)
+            })
+        })
+}
+
+/// Resolve only commands whose immutable failed Tester result has been
+/// superseded by passing candidate-bound host evidence and a targeted Tests
+/// review. The candidate gate may credit those exact commands while retaining
+/// the original Tester result as history.
+fn accepted_external_tester_commands(project_root: &Path, attempt: &Attempt) -> Vec<String> {
+    let mut commands =
+        crate::host_evidence::completed_recheck_evidence_source(project_root, attempt)
+            .and_then(|source| fs::read(source).ok())
+            .and_then(|bytes| serde_json::from_slice::<crate::tester::TesterResults>(&bytes).ok())
+            .map(|results| {
+                results
+                    .commands
+                    .into_iter()
+                    .filter(|command| command.exit_code != 0)
+                    .map(|command| command.command)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+    commands.extend(crate::host_evidence::completed_review_evidence_commands(
+        project_root,
+        attempt,
+    ));
+    commands.extend(
+        crate::host_evidence::completed_candidate_gate_evidence_commands(project_root, attempt),
+    );
+    if let Ok(view) = crate::recovery_contracts::assess_canonical_checks(project_root, attempt) {
+        for index in &view.accepted {
+            let command = &view.checks[*index].command;
+            // The legacy gate accepts text selectors. Export a text selector
+            // only when every occurrence is satisfied by its own exact check.
+            if !view
+                .outstanding
+                .iter()
+                .any(|other| view.checks[*other].command == *command)
+            {
+                commands.push(command.clone());
+            }
+        }
+    }
+    commands.sort();
+    commands.dedup();
+    commands
+}
+
+fn no_change_source_tester_results_path(
+    project_root: &Path,
+    attempt: &Attempt,
+    latest_write_index: usize,
+) -> Option<PathBuf> {
+    let writer = &attempt.tasks[latest_write_index];
+    let output = writer.output.as_ref()?;
+    output.no_change.as_ref()?;
+    let sources = writer
+        .input_artifacts
+        .iter()
+        .filter(|artifact| artifact.path.ends_with("/tester-results.json"))
+        .collect::<Vec<_>>();
+    let [source] = sources.as_slice() else {
+        return None;
+    };
+    let source_task = attempt.tasks[..latest_write_index].iter().find(|task| {
+        task.id == source.producer_id
+            && task.kind == TaskKind::Tester
+            && task.status == TaskStatus::Complete
+            && !task.is_failed_command_recheck()
+    })?;
+    let expected = source_task
+        .artifact_area
+        .as_ref()
+        .map(|area| format!("{}/tester-results.json", area.path));
+    if expected.as_deref() != Some(source.path.as_str()) {
+        return None;
+    }
+    let path =
+        work_task_executor::resolve_managed_artifact_area_path(project_root, &source.path).ok()?;
+    let results: crate::tester::TesterResults =
+        serde_json::from_slice(&fs::read(&path).ok()?).ok()?;
+    if results.candidate_commit.as_deref() != Some(output.commit.as_str()) {
+        return None;
+    }
+    let baseline_path = baseline_tester_results_path(project_root, attempt);
+    (unexplained_failed_tester_commands(&path, baseline_path.as_deref()) == 0).then_some(path)
+}
+
+fn failed_command_recheck_source(
+    project_root: &Path,
+    attempt: &Attempt,
+    latest_write_index: usize,
+) -> Result<Option<ArtifactRef>> {
+    let writer = &attempt.tasks[latest_write_index];
+    let Some(output) = writer
+        .output
+        .as_ref()
+        .filter(|output| output.no_change.is_some())
+    else {
+        return Ok(None);
+    };
+    if !writer
+        .input_artifacts
+        .iter()
+        .any(|artifact| crate::tester::is_command_log_path(Path::new(&artifact.path)))
+    {
+        return Ok(None);
+    }
+    let sources = writer
+        .input_artifacts
+        .iter()
+        .filter(|artifact| artifact.path.ends_with("/tester-results.json"))
+        .collect::<Vec<_>>();
+    let [source] = sources.as_slice() else {
+        bail!(
+            "failed-Tester no-change Writer {:?} must have exactly one structured Tester result",
+            writer.id
+        );
+    };
+    let source_task = attempt.tasks[..latest_write_index]
+        .iter()
+        .find(|task| task.id == source.producer_id)
+        .filter(|task| task.kind == TaskKind::Tester && task.status == TaskStatus::Complete)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "failed-Tester no-change Writer {:?} references unknown source Tester {:?}",
+                writer.id,
+                source.producer_id
+            )
+        })?;
+    let expected = source_task
+        .artifact_area
+        .as_ref()
+        .map(|area| format!("{}/tester-results.json", area.path));
+    if expected.as_deref() != Some(source.path.as_str()) {
+        bail!(
+            "failed-Tester no-change Writer {:?} source result does not match Tester {:?}",
+            writer.id,
+            source_task.id
+        );
+    }
+    let path = work_task_executor::resolve_managed_artifact_area_path(project_root, &source.path)?;
+    let results: crate::tester::TesterResults = serde_json::from_slice(&fs::read(&path)?)?;
+    if results.candidate_commit.as_deref() != Some(output.commit.as_str()) {
+        bail!(
+            "failed-command recheck source is not bound to candidate {}",
+            output.commit
+        );
+    }
+    if !results
+        .commands
+        .iter()
+        .any(|command| command.exit_code != 0)
+    {
+        return Ok(None);
+    }
+    let baseline_path = baseline_tester_results_path(project_root, attempt);
+    if unexplained_failed_tester_commands(&path, baseline_path.as_deref()) == 0 {
+        return Ok(None);
+    }
+    Ok(Some((*source).clone()))
+}
+
+/// Build the bounded correction input set for a rejected final-Tester gate.
+///
+/// Tester log names are host-produced, but this boundary still requires the
+/// deterministic path for each failed command before exposing the file to a
+/// Writer. That keeps candidate-controlled paths out of sandbox grants and
+/// leaves unrelated Tester artifacts private.
+fn final_tester_correction_artifacts(
+    project_root: &Path,
+    attempt: &Attempt,
+    gate: &ArtifactRef,
+    tester_results_path: &Path,
+) -> Result<Vec<ArtifactRef>> {
+    let mut artifacts = vec![gate.clone()];
+    artifacts.extend(failed_tester_command_artifacts(
+        project_root,
+        attempt,
+        tester_results_path,
+    )?);
+    Ok(artifacts)
+}
+
+/// Return the exact structured result and logs for each nonzero configured
+/// command in the latest final Tester. The result remains attached when every
+/// command passed so final-Tester candidate-gate corrections retain their
+/// structured evidence.
+fn failed_tester_command_artifacts(
+    project_root: &Path,
+    attempt: &Attempt,
+    tester_results_path: &Path,
+) -> Result<Vec<ArtifactRef>> {
+    let last_write_index = attempt
+        .tasks
+        .iter()
+        .rposition(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+        .ok_or_else(|| anyhow::anyhow!("final-Tester correction has no completed Writer"))?;
+    let output = attempt.tasks[last_write_index]
+        .output
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("final-Tester correction Writer has no output"))?;
+    let tester = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| {
+            task.kind == TaskKind::Tester
+                && task.status == TaskStatus::Complete
+                && !task.is_failed_command_recheck()
+                && task.artifact_area.as_ref().is_some_and(|area| {
+                    work_task_executor::resolve_managed_artifact_area_path(project_root, &area.path)
+                        .is_ok_and(|dir| dir.join("tester-results.json") == tester_results_path)
+                })
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!("final-Tester correction has no matching completed Tester")
+        })?;
+    let area = tester
+        .artifact_area
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("final-Tester correction Tester has no artifact area"))?;
+    let artifact_dir =
+        work_task_executor::resolve_managed_artifact_area_path(project_root, &area.path)?;
+    let expected_results_path = artifact_dir.join("tester-results.json");
+    if tester_results_path != expected_results_path {
+        bail!(
+            "final-Tester correction results {} do not match Tester {}",
+            tester_results_path.display(),
+            tester.id
+        );
+    }
+    let bytes = fs::read(tester_results_path).with_context(|| {
+        format!(
+            "read final-Tester correction evidence {}",
+            tester_results_path.display()
+        )
+    })?;
+    let results: crate::tester::TesterResults =
+        serde_json::from_slice(&bytes).with_context(|| {
+            format!(
+                "parse final-Tester correction evidence {}",
+                tester_results_path.display()
+            )
+        })?;
+    if results.candidate_commit.as_deref() != Some(output.commit.as_str()) {
+        bail!(
+            "final-Tester correction evidence is not bound to candidate {}",
+            output.commit
+        );
+    }
+
+    let mut artifacts = vec![ArtifactRef {
+        producer_id: tester.id.clone(),
+        path: format!("{}/tester-results.json", area.path),
+    }];
+    for (index, command) in results
+        .commands
+        .iter()
+        .enumerate()
+        .filter(|(_, command)| command.exit_code != 0)
+    {
+        let expected = [
+            format!("commands/{index}-stdout.log"),
+            format!("commands/{index}-stderr.log"),
+        ];
+        let actual = [&command.stdout_log, &command.stderr_log];
+        for (actual, expected) in actual.into_iter().zip(expected) {
+            if actual != &expected {
+                bail!(
+                    "final-Tester command {index} log path {actual:?} does not match {expected:?}"
+                );
+            }
+            let path = artifact_dir.join(&expected);
+            if !path.is_file() {
+                bail!("final-Tester command log is missing: {}", path.display());
+            }
+            artifacts.push(ArtifactRef {
+                producer_id: tester.id.clone(),
+                path: format!("{}/{}", area.path, expected),
+            });
+        }
+    }
+    Ok(artifacts)
+}
+
+fn latest_completed_final_tester_after(attempt: &Attempt, write_index: usize) -> Option<&Task> {
+    attempt.tasks[write_index + 1..].iter().rev().find(|task| {
+        task.kind == TaskKind::Tester
+            && task.status == TaskStatus::Complete
+            && !task.is_failed_command_recheck()
+    })
+}
+
+/// Move one preserved 0.1.5 Learner evidence rejection back to the same
+/// Attempt's corrective Writer. The old Learner record stays as history; only a
+/// pending, unreviewed, never-approved Merge Candidate may be retracted.
+fn recover_legacy_learner_tester_evidence_failure(
+    project_root: &Path,
+    store: &WorkModelStore,
+    item: &WorkItem,
+    attempt_id: &str,
+) -> Result<Option<WorkAttemptRunOutcome>> {
+    if !crate::lifecycle_recovery::is_legacy_learner_tester_evidence_failure(
+        project_root,
+        item,
+        attempt_id,
+    )? {
+        return Ok(None);
+    }
+
+    let mut gate_item = item.clone();
+    let attempt_index = gate_item
+        .attempts
+        .iter()
+        .position(|attempt| attempt.id == attempt_id)
+        .ok_or_else(|| anyhow::anyhow!("Attempt {attempt_id:?} disappeared during recovery"))?;
+    let tester_results =
+        latest_tester_results_path(project_root, &gate_item.attempts[attempt_index]);
+    let Some((artifact, normalized)) = gate_candidate_after_final_tester(
+        project_root,
+        &mut gate_item,
+        attempt_index,
+        tester_results.as_deref(),
+    )?
+    else {
+        bail!("legacy Learner evidence recovery has no Writer completion contract");
+    };
+    let still_missing = normalized.checks.iter().any(|check| {
+        check.name == "tester-reference-evidence"
+            && check.status == crate::candidate_gate::CandidateCheckStatus::Failed
+            && !check.diagnostics.is_empty()
+    });
+    if normalized.disposition != crate::candidate_gate::CandidateGateDisposition::Rejected
+        || !still_missing
+    {
+        bail!(
+            "legacy Learner evidence could not be normalized to a rejected final-Tester gate; evidence: {}",
+            project_root.join(&artifact.path).display()
+        );
+    }
+
+    let needs_correction = crate::verification_assessment::assess_current_verification(
+        project_root,
+        &gate_item.attempts[attempt_index],
+    )
+    .is_ok_and(|view| !view.candidate_defects().is_empty());
+    let expected = item.clone();
+    let recovery_artifacts = final_tester_correction_artifacts(
+        project_root,
+        &gate_item.attempts[attempt_index],
+        &artifact,
+        tester_results
+            .as_deref()
+            .expect("the normalized gate required Tester evidence"),
+    )?;
+    let task_id = mutate_attempt_work_item(store, &item.id, |fresh| {
+        if fresh != &expected {
+            return Err(WorkModelError::LegacyLifecycleRecoveryConflict {
+                attempt_id: attempt_id.to_string(),
+            });
+        }
+        if !fresh.retract_unready_merge_candidate_for_correction(attempt_id)? {
+            return Err(WorkModelError::LegacyLifecycleRecoveryConflict {
+                attempt_id: attempt_id.to_string(),
+            });
+        }
+        let attempt = fresh
+            .attempts
+            .iter_mut()
+            .find(|attempt| attempt.id == attempt_id)
+            .ok_or_else(|| WorkModelError::AttemptNotFound {
+                id: attempt_id.to_string(),
+            })?;
+        for artifact in &recovery_artifacts {
+            if !attempt.artifacts.contains(artifact) {
+                attempt.artifacts.push(artifact.clone());
+            }
+        }
+        if needs_correction {
+            fresh
+                .add_next_write_round(attempt_id, recovery_artifacts.clone())
+                .map(Some)
+        } else {
+            crate::work_model::suspend_attempt(attempt, PauseKind::CandidateGate);
+            Ok(None)
+        }
+    })?;
+    if let Some(task_id) = task_id {
+        Ok(Some(WorkAttemptRunOutcome::PlannedWriteRound { task_id }))
+    } else {
+        let mut current = store.read_work_item(&item.id)?;
+        pause_candidate_gate_after_tester(
+            project_root,
+            store,
+            &mut current,
+            attempt_index,
+            attempt_id,
+            &artifact,
+            &normalized,
+        )
+        .map(Some)
+    }
 }
 
 /// When a marked Attempt's current required progress does not reconcile with its
@@ -3613,6 +7552,63 @@ fn latest_tester_results_path(project_root: &Path, attempt: &Attempt) -> Option<
 /// a reconciled one produces nothing, so a passing review advances normally.
 fn required_progress_finding(project_root: &Path, attempt: &Attempt) -> Option<ArtifactRef> {
     attempt.progress_contract.as_ref()?;
+    // Project accepted recovery evidence before checking durable progress. An
+    // approved ownership split uses its validated source matrix and projects
+    // only Writer rows; legacy host evidence uses its completed host matrix.
+    // Neither path needs another Writer to serialize the required section.
+    if let Some(writer) = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+        && let Some(matrix_artifact) =
+            crate::host_evidence::completed_plan_host_matrix_ref(project_root, attempt, writer)
+                .or_else(|| {
+                    crate::recovery_contracts::owned_host_completion_matrix(project_root, attempt)
+                        .ok()
+                        .flatten()
+                        .map(|(_, source, _)| source)
+                })
+        && let Ok(matrix_source) = fs::read_to_string(project_root.join(&matrix_artifact.path))
+        && let Ok(matrix) =
+            serde_json::from_str::<crate::work_model::WriterCompletionMatrix>(&matrix_source)
+        && let Some(progress_contract) = attempt.progress_contract.as_ref()
+        && let Ok(status) = progress_contract.status_against_writer_matrix(&matrix)
+        && status.is_complete()
+    {
+        let progress_rel = format!(
+            "{}/{}/{}/progress.md",
+            crate::work_model::WORK_PROGRESS_DIR,
+            attempt.work_item_id,
+            attempt.id
+        );
+        let progress_path = project_root.join(&progress_rel);
+        let source = fs::read_to_string(&progress_path).unwrap_or_default();
+        if let Ok(projected) = progress_contract.project_completed_required_progress(
+            &source,
+            &matrix,
+            &matrix_artifact.path,
+        ) {
+            if projected != source {
+                if let Some(parent) = progress_path.parent() {
+                    if fs::create_dir_all(parent).is_err() {
+                        return Some(ArtifactRef {
+                            producer_id: "required-progress".to_string(),
+                            path: progress_rel,
+                        });
+                    }
+                }
+                if crate::atomic_write::atomic_write(&progress_path, projected.as_bytes()).is_err()
+                {
+                    return Some(ArtifactRef {
+                        producer_id: "required-progress".to_string(),
+                        path: progress_rel,
+                    });
+                }
+            }
+            return None;
+        }
+    }
     let progress_rel = format!(
         "{}/{}/{}/progress.md",
         crate::work_model::WORK_PROGRESS_DIR,
@@ -3633,6 +7629,2341 @@ fn required_progress_finding(project_root: &Path, attempt: &Attempt) -> Option<A
             })
         }
     }
+}
+
+fn required_progress_artifact(attempt: &Attempt) -> ArtifactRef {
+    ArtifactRef {
+        producer_id: "required-progress".to_string(),
+        path: format!(
+            "{}/{}/{}/progress.md",
+            crate::work_model::WORK_PROGRESS_DIR,
+            attempt.work_item_id,
+            attempt.id
+        ),
+    }
+}
+
+fn writer_completion_artifact(task: &Task) -> Option<ArtifactRef> {
+    task.artifact_area.as_ref().map(|area| ArtifactRef {
+        producer_id: task.id.clone(),
+        path: format!(
+            "{}/{}",
+            area.path,
+            crate::work_task_executor::WRITER_COMPLETION_MATRIX_FILE
+        ),
+    })
+}
+
+struct PriorWriterMatrixCheck {
+    issue: Option<(ArtifactRef, String)>,
+    repairs: Vec<ArtifactRef>,
+}
+
+/// Publish accepted matrix repairs before correction setup reads the prior
+/// Writer's authoritative matrix. The caller records the repair references in
+/// the same Attempt transition that pauses or schedules correction.
+fn check_prior_writer_matrix_for_correction(
+    project_root: &Path,
+    work_item_id: &str,
+    attempt_id: &str,
+    attempt: &Attempt,
+    writer: &Task,
+) -> Result<PriorWriterMatrixCheck> {
+    let mut check = PriorWriterMatrixCheck {
+        issue: None,
+        repairs: Vec::new(),
+    };
+    let Some(contract) = attempt.writer_completion_contract.as_ref() else {
+        return Ok(check);
+    };
+    let artifact =
+        crate::host_evidence::writer_completion_matrix_ref(project_root, attempt, writer)
+            .or_else(|| writer_completion_artifact(writer))
+            .context("completed Writer has no completion matrix artifact")?;
+    let path = project_root.join(&artifact.path);
+    let source = match fs::read_to_string(&path) {
+        Ok(source) => source,
+        Err(error) => {
+            check.issue = Some((artifact, format!("read {}: {error}", path.display())));
+            return Ok(check);
+        }
+    };
+    let mut matrix: crate::work_model::WriterCompletionMatrix = match serde_json::from_str(&source)
+    {
+        Ok(matrix) => matrix,
+        Err(error) => match recover_writer_completion_result_format(&source) {
+            Ok((matrix, repairs)) => {
+                let (normalized, evidence) = write_writer_completion_format_repair(
+                    project_root,
+                    work_item_id,
+                    attempt_id,
+                    &writer.id,
+                    &artifact,
+                    &source,
+                    &matrix,
+                    &repairs,
+                )?;
+                check.repairs.extend([normalized, evidence]);
+                matrix
+            }
+            Err(_) => {
+                check.issue = Some((artifact, format!("parse {}: {error}", path.display())));
+                return Ok(check);
+            }
+        },
+    };
+    let findings = crate::work_task_executor::writer_completion_findings(project_root, writer)?;
+    let claim_repairs = match matrix.repair_writer_claims_against(contract, &writer.id, &findings) {
+        Ok(repairs) => repairs,
+        Err(reason) => {
+            check.issue = Some((artifact, reason));
+            return Ok(check);
+        }
+    };
+    if !claim_repairs.is_empty() {
+        let (normalized, evidence) = write_writer_completion_repair(
+            project_root,
+            work_item_id,
+            attempt_id,
+            &writer.id,
+            &artifact,
+            &source,
+            &matrix,
+            &claim_repairs,
+        )?;
+        check.repairs.extend([normalized, evidence]);
+    }
+    if let Err(reason) = matrix.status_against(contract, &writer.id, &findings) {
+        check.issue = Some((artifact, reason));
+    }
+    Ok(check)
+}
+
+fn is_rejected_gate_writer_completion_pause(
+    project_root: &Path,
+    attempt: &Attempt,
+) -> Result<bool> {
+    if attempt.status != AttemptStatus::NeedsUser
+        || attempt.pause_kind != Some(PauseKind::WriterCompletion)
+        || attempt.review_state != Some(AttemptReviewState::NotReviewed)
+    {
+        return Ok(false);
+    }
+    let Some(writer) = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+    else {
+        return Ok(false);
+    };
+    let Some(gate) = attempt.artifacts.iter().find(|artifact| {
+        artifact.producer_id == writer.id
+            && artifact
+                .path
+                .ends_with(crate::candidate_gate::CANDIDATE_GATE_FILE)
+    }) else {
+        return Ok(false);
+    };
+    let path =
+        crate::work_task_executor::resolve_managed_artifact_area_path(project_root, &gate.path)?;
+    let evidence = crate::candidate_gate::read_prior_writer_gate(&path)
+        .map_err(|reason| anyhow::anyhow!(reason))?;
+    Ok(
+        evidence.phase == crate::candidate_gate::CandidateGatePhase::Writer
+            && evidence.disposition == crate::candidate_gate::CandidateGateDisposition::Rejected
+            && writer
+                .output
+                .as_ref()
+                .is_some_and(|output| output.commit == evidence.candidate_commit),
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct WriterCompletionFormatRepair {
+    row_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verification_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    field: Option<String>,
+    original_result: String,
+    normalized_result: String,
+}
+
+/// Accept the harmless formatting mistake that model writers have made in
+/// completion evidence: appending a human-readable summary to the machine
+/// result (`pass: ...` or `pass (...)`). The summary is not part of the
+/// recorded result. Keep every other malformed value rejected so a real
+/// disagreement still pauses before review.
+fn recover_writer_completion_result_format(
+    source: &str,
+) -> Result<
+    (
+        crate::work_model::WriterCompletionMatrix,
+        Vec<WriterCompletionFormatRepair>,
+    ),
+    String,
+> {
+    let mut value: serde_json::Value = serde_json::from_str(source)
+        .map_err(|error| format!("parse Writer completion matrix JSON: {error}"))?;
+    let rows = value
+        .get_mut("rows")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| "Writer completion matrix has no rows array".to_string())?;
+    let mut repairs = Vec::new();
+    for (row_index, row) in rows.iter_mut().enumerate() {
+        let row_id = row
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("row-{row_index}"));
+        if row
+            .get("responsibility")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(|owner| owner == "writer")
+            && row.get("state").and_then(serde_json::Value::as_str) == Some("completed")
+        {
+            row["state"] = serde_json::Value::String("complete".to_string());
+            repairs.push(WriterCompletionFormatRepair {
+                row_id: row_id.clone(),
+                verification_index: None,
+                field: Some("state".to_string()),
+                original_result: "completed".to_string(),
+                normalized_result: "complete".to_string(),
+            });
+        }
+        let Some(verification) = row
+            .get_mut("verification")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            continue;
+        };
+        for (verification_index, claim) in verification.iter_mut().enumerate() {
+            // Some writers have emitted a compact human-readable claim such
+            // as `cargo test passed` instead of the recorded object shape.
+            // Accept only an explicitly successful claim with a non-empty
+            // command. A failed or otherwise ambiguous string remains a hard
+            // error so malformed evidence cannot be admitted as a pass.
+            if let Some(original_claim) = claim.as_str().map(str::to_string) {
+                let Some(command) = original_claim.strip_suffix(" passed") else {
+                    return Err(format!(
+                        "unsupported Writer completion verification claim {:?}",
+                        original_claim
+                    ));
+                };
+                let command = command.trim_end();
+                if command.is_empty() {
+                    return Err(format!(
+                        "Writer completion verification claim {:?} has no command",
+                        original_claim
+                    ));
+                }
+                *claim = serde_json::json!({
+                    "command": command,
+                    "result": "pass",
+                });
+                repairs.push(WriterCompletionFormatRepair {
+                    row_id: row_id.clone(),
+                    verification_index: Some(verification_index),
+                    field: None,
+                    original_result: original_claim,
+                    normalized_result: "pass".to_string(),
+                });
+                continue;
+            }
+            let Some(result) = claim.get_mut("result") else {
+                continue;
+            };
+            let Some(original_result) = result.as_str().map(str::to_string) else {
+                continue;
+            };
+            if original_result == "pass" {
+                continue;
+            }
+            let summary = if let Some(summary) = original_result.strip_prefix("pass:") {
+                summary
+            } else if let Some(summary) = original_result
+                .strip_prefix("pass (")
+                .and_then(|summary| summary.strip_suffix(')'))
+            {
+                summary
+            } else {
+                return Err(format!(
+                    "unsupported Writer completion result {:?}",
+                    original_result
+                ));
+            };
+            if summary.trim().is_empty() {
+                return Err(format!(
+                    "Writer completion result {:?} has no explanatory suffix",
+                    original_result
+                ));
+            }
+            *result = serde_json::Value::String("pass".to_string());
+            repairs.push(WriterCompletionFormatRepair {
+                row_id: row_id.clone(),
+                verification_index: Some(verification_index),
+                field: None,
+                original_result,
+                normalized_result: "pass".to_string(),
+            });
+        }
+    }
+    if repairs.is_empty() {
+        return Err("no supported Writer completion format repair found".to_string());
+    }
+    let matrix = serde_json::from_value(value)
+        .map_err(|error| format!("parse normalized Writer completion matrix: {error}"))?;
+    Ok((matrix, repairs))
+}
+
+pub(crate) fn plan_after_completed_writer(
+    project_root: &Path,
+    store: &WorkModelStore,
+    mut item: WorkItem,
+    attempt_id: &str,
+) -> Result<WorkAttemptRunOutcome> {
+    let attempt = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == attempt_id)
+        .ok_or_else(|| anyhow::anyhow!("Attempt {:?} not found", attempt_id))?;
+    let latest_write_index = attempt
+        .latest_materialized_write_index()
+        .ok_or_else(|| anyhow::anyhow!("Attempt {:?} has no Writer Task", attempt_id))?;
+    let latest_write = &attempt.tasks[latest_write_index];
+    if latest_write.status == TaskStatus::Planned {
+        return Ok(WorkAttemptRunOutcome::PlannedWriteRound {
+            task_id: latest_write.id.clone(),
+        });
+    }
+    let existing_review_ids = attempt.tasks[latest_write_index + 1..]
+        .iter()
+        .filter(|task| is_review_phase_task(task) && !inactive_finding_review(attempt, task))
+        .map(|task| task.id.clone())
+        .collect::<Vec<_>>();
+    if !existing_review_ids.is_empty() {
+        return Ok(WorkAttemptRunOutcome::PlannedReviews {
+            task_ids: existing_review_ids,
+        });
+    }
+    let handoff = if project_root.join(".git").exists()
+        && latest_write
+            .output
+            .as_ref()
+            .is_some_and(|output| output.base_commit.is_some())
+    {
+        let report = assess_completed_writer_handoff_in_item(
+            project_root,
+            store,
+            &item,
+            item.attempts
+                .iter()
+                .position(|attempt| attempt.id == attempt_id)
+                .unwrap(),
+            latest_write_index,
+        )?;
+        for check in &report.checks {
+            if matches!(
+                check.name.as_str(),
+                "candidate-identity" | "writer-output" | "candidate-stability"
+            ) && check.status != WriterHandoffCheckStatus::Passed
+            {
+                bail!(
+                    "Final Writer handoff {}: {}",
+                    check.name,
+                    check.diagnostics.join("; ")
+                );
+            }
+        }
+        Some(report)
+    } else {
+        None
+    };
+    if handoff
+        .as_ref()
+        .is_some_and(|report| report.gate_assessment.is_none())
+    {
+        let report = handoff.as_ref().unwrap();
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.status != WriterHandoffCheckStatus::Passed)
+            .context("Final Writer gate assessment is missing without a failing check")?;
+        bail!(
+            "Final Writer handoff {}: {}",
+            check.name,
+            check.diagnostics.join("; ")
+        );
+    }
+    if let Some(outcome) = gate_candidate_after_writer(
+        project_root,
+        store,
+        &mut item,
+        attempt_id,
+        latest_write_index,
+        handoff
+            .as_ref()
+            .and_then(|report| report.gate_assessment.as_ref()),
+    )? {
+        return Ok(outcome);
+    }
+    if let Some(outcome) =
+        gate_writer_completion_before_reviews(project_root, store, &mut item, attempt_id)?
+    {
+        return Ok(outcome);
+    }
+    if let Some(report) = handoff {
+        if let Some(check) = report
+            .checks
+            .iter()
+            .find(|check| check.status != WriterHandoffCheckStatus::Passed)
+        {
+            bail!(
+                "Final Writer handoff {}: {}",
+                check.name,
+                check.diagnostics.join("; ")
+            );
+        }
+    }
+    if let Some(outcome) = advance_failed_command_recheck(
+        project_root,
+        store,
+        &mut item,
+        attempt_id,
+        latest_write_index,
+    )? {
+        return Ok(outcome);
+    }
+    let attempt = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == attempt_id)
+        .ok_or_else(|| anyhow::anyhow!("Attempt {:?} not found", attempt_id))?;
+    let latest_write = attempt.tasks[latest_write_index].clone();
+    let requested_roles = next_review_roles(attempt);
+    let invalidated_roles = stale_review_roles_after_latest_write(project_root, attempt);
+    let review_roles = merge_review_roles(&requested_roles, &invalidated_roles);
+    let reclassification = crate::lifecycle_recovery::inspect_retired_commit_style_admission(
+        project_root,
+        &item,
+        attempt_id,
+        &latest_write,
+    )?;
+    let task_ids = item.add_next_review_tasks(attempt_id, &review_roles)?;
+    work_task_executor::prepare_ordinary_review_evidence(
+        project_root,
+        &mut item,
+        attempt_id,
+        &task_ids,
+    )?;
+    if let Some(reclassification) = reclassification {
+        let attempt = item
+            .attempts
+            .iter_mut()
+            .find(|attempt| attempt.id == attempt_id)
+            .expect("review-planning Attempt exists");
+        for task in attempt
+            .tasks
+            .iter_mut()
+            .filter(|task| task_ids.contains(&task.id))
+        {
+            if !task.input_artifacts.contains(&reclassification) {
+                task.input_artifacts.push(reclassification.clone());
+            }
+        }
+    }
+    write_attempt_work_item(store, &mut item)?;
+    Ok(WorkAttemptRunOutcome::PlannedReviews { task_ids })
+}
+
+fn advance_failed_command_recheck(
+    project_root: &Path,
+    store: &WorkModelStore,
+    item: &mut WorkItem,
+    attempt_id: &str,
+    latest_write_index: usize,
+) -> Result<Option<WorkAttemptRunOutcome>> {
+    let attempt_index = item
+        .attempts
+        .iter()
+        .position(|attempt| attempt.id == attempt_id)
+        .ok_or_else(|| anyhow::anyhow!("Attempt {:?} not found", attempt_id))?;
+    let Some(source_results) = failed_command_recheck_source(
+        project_root,
+        &item.attempts[attempt_index],
+        latest_write_index,
+    )?
+    else {
+        return Ok(None);
+    };
+
+    let source_is_failed_recheck = item.attempts[attempt_index].tasks[..latest_write_index]
+        .iter()
+        .find(|task| task.id == source_results.producer_id)
+        .is_some_and(|task| task.is_failed_command_recheck());
+    if source_is_failed_recheck {
+        let correction = item.attempts[attempt_index].tasks[..latest_write_index]
+            .iter()
+            .find(|task| task.id == source_results.producer_id)
+            .map(|task| failed_command_recheck_correction_artifacts(project_root, task))
+            .transpose()?
+            .unwrap_or_default();
+        if let Some(action) = crate::host_evidence::pending_failed_recheck_evidence_recovery_action(
+            project_root,
+            &item.attempts[attempt_index],
+        ) {
+            let work_item_id = item.id.clone();
+            return Ok(Some(settle_review_pause(
+                store,
+                project_root,
+                &work_item_id,
+                attempt_id,
+                AttemptReviewState::Failed,
+                PauseKind::HostEvidence,
+                &correction,
+                |root, work_item_id, attempt_id, findings| {
+                    write_failed_recheck_evidence_handoff(
+                        root,
+                        work_item_id,
+                        attempt_id,
+                        findings,
+                        &action,
+                    )
+                },
+                &|_| {},
+            )?));
+        }
+    }
+
+    let existing = item.attempts[attempt_index].tasks[latest_write_index + 1..]
+        .iter()
+        .find(|task| task.is_failed_command_recheck())
+        .cloned();
+    let Some(recheck) = existing else {
+        let task_id = item.add_failed_command_recheck_task(attempt_id, source_results.clone())?;
+        write_attempt_work_item(store, item)?;
+        return Ok(Some(WorkAttemptRunOutcome::PlannedFailedCommandRecheck {
+            task_id,
+        }));
+    };
+    if recheck.status != TaskStatus::Complete {
+        return Ok(Some(WorkAttemptRunOutcome::PlannedFailedCommandRecheck {
+            task_id: recheck.id,
+        }));
+    }
+
+    let correction = failed_command_recheck_correction_artifacts(project_root, &recheck)?;
+    let recheck_results_path = recheck
+        .artifact_area
+        .as_ref()
+        .and_then(|area| {
+            work_task_executor::resolve_managed_artifact_area_path(project_root, &area.path).ok()
+        })
+        .map(|area| area.join("tester-results.json"));
+    let baseline_path = baseline_tester_results_path(project_root, &item.attempts[attempt_index]);
+    if recheck_results_path.as_ref().is_some_and(|path| {
+        path.is_file()
+            && !tester_errored(path)
+            && introduced_tester_failures(path, baseline_path.as_deref()) == 0
+            && unexplained_failed_tester_commands(path, baseline_path.as_deref()) == 0
+    }) {
+        return Ok(None);
+    }
+    if recheck_results_path
+        .as_ref()
+        .and_then(|path| fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice::<crate::tester::TesterResults>(&bytes).ok())
+        .is_some_and(|results| results.needs_failure_diagnosis())
+    {
+        return Ok(Some(settle_review_pause(
+            store,
+            project_root,
+            &item.id,
+            attempt_id,
+            AttemptReviewState::Failed,
+            PauseKind::HostEvidence,
+            &correction,
+            |root, work, attempt, _| {
+                let handoff = work_artifact_path(work, attempt, "required-check-needs-user.md");
+                let reason = format!(
+                    "The failed-command recheck {} needs diagnosis. A nonzero exit does not establish a candidate defect. Preserve its result and logs; establish the missing prerequisite or code/harness cause before requesting source correction. Exact canonical host proof remains subject to its preserved check bindings and targeted Tests Review.\n",
+                    recheck.id
+                );
+                crate::atomic_write::atomic_write(&root.join(&handoff), reason.as_bytes())?;
+                Ok(handoff)
+            },
+            &|_| {},
+        )?));
+    }
+    if correction.is_empty() {
+        return Ok(None);
+    }
+
+    if can_advance_loop(project_root, &item.attempts[attempt_index])? {
+        item.attempts[attempt_index].status = AttemptStatus::Planned;
+        let task_id = item.add_next_write_round(attempt_id, correction)?;
+        write_attempt_work_item(store, item)?;
+        return Ok(Some(WorkAttemptRunOutcome::PlannedWriteRound { task_id }));
+    }
+
+    let work_item_id = item.id.clone();
+    let write_rounds = item.attempts[attempt_index].materialized_write_rounds();
+    let round_cap_reached = write_rounds
+        >= item.attempts[attempt_index].effective_write_round_cap(max_total_write_rounds());
+    if round_cap_reached {
+        if let Some(action) = crate::host_evidence::pending_failed_recheck_evidence_recovery_action(
+            project_root,
+            &item.attempts[attempt_index],
+        ) {
+            return Ok(Some(settle_review_pause(
+                store,
+                project_root,
+                &work_item_id,
+                attempt_id,
+                AttemptReviewState::Failed,
+                PauseKind::HostEvidence,
+                &correction,
+                |root, work_item_id, attempt_id, findings| {
+                    write_failed_recheck_evidence_handoff(
+                        root,
+                        work_item_id,
+                        attempt_id,
+                        findings,
+                        &action,
+                    )
+                },
+                &|_| {},
+            )?));
+        }
+    }
+    Ok(Some(settle_review_pause(
+        store,
+        project_root,
+        &work_item_id,
+        attempt_id,
+        AttemptReviewState::Failed,
+        PauseKind::RoundCap,
+        &correction,
+        |root, work_item_id, attempt_id, findings| {
+            write_budget_exhausted_handoff(
+                root,
+                work_item_id,
+                attempt_id,
+                findings,
+                round_cap_reached,
+            )
+        },
+        &|_| {},
+    )?))
+}
+
+/// Run cheap host checks against the exact Writer delta before the completion
+/// matrix or any model reviewer. Legacy outputs without a persisted base commit
+/// retain their prior route. Candidate defects become one focused Writer input;
+/// unverifiable Git or hook state pauses instead of asking a Writer to repair the
+/// host boundary.
+fn gate_candidate_after_writer(
+    project_root: &Path,
+    store: &WorkModelStore,
+    item: &mut WorkItem,
+    attempt_id: &str,
+    write_index: usize,
+    assessed: Option<&WriterGateAssessment>,
+) -> Result<Option<WorkAttemptRunOutcome>> {
+    let attempt_index = item
+        .attempts
+        .iter()
+        .position(|attempt| attempt.id == attempt_id)
+        .ok_or_else(|| anyhow::anyhow!("Attempt {:?} not found", attempt_id))?;
+    let task = &item.attempts[attempt_index].tasks[write_index];
+    let output = task
+        .output
+        .as_ref()
+        .expect("completed Writer has output before candidate admission");
+    let Some(base_commit) = output.base_commit.as_deref() else {
+        return Ok(None);
+    };
+    if crate::lifecycle_recovery::inspect_retired_commit_style_admission(
+        project_root,
+        item,
+        attempt_id,
+        task,
+    )?
+    .is_some()
+    {
+        return Ok(None);
+    }
+    let workspace = resolve_managed_sibling_workspace_path(
+        project_root,
+        &output.workspace_path,
+        "candidate gate workspace",
+    )?;
+    let artifact = ArtifactRef {
+        producer_id: task.id.clone(),
+        path: format!(
+            "{}/{}/{}",
+            work_artifact_path(&item.id, attempt_id, "candidate-gates"),
+            task.id,
+            crate::candidate_gate::CANDIDATE_GATE_FILE
+        ),
+    };
+    let prior_candidate_gate =
+        select_prior_writer_candidate_gate(item, attempt_index, write_index)?;
+    let repeated_rejection = prior_candidate_gate.is_some();
+    let prior_candidate_gate_path = prior_candidate_gate
+        .map(|input| {
+            crate::work_task_executor::resolve_managed_artifact_area_path(project_root, &input.path)
+        })
+        .transpose()?;
+    let metadata_rewrite_authorization =
+        crate::candidate_metadata_recovery::candidate_gate_authorization_context(
+            project_root,
+            &item.attempts[attempt_index],
+            task,
+        )?;
+    // Run the hook against the same detached candidate context used by the
+    // active Writer check. The authoritative gate still publishes its evidence
+    // under the managed artifact path below.
+    let gate_copy = if assessed.is_none()
+        && crate::hooks::find_hook(project_root, "check-pre-merge").is_some()
+    {
+        let scratch = tempfile::tempdir().context("create final Writer gate workspace")?;
+        let detached = scratch.path().join("candidate");
+        git::run(
+            project_root,
+            &[
+                "clone",
+                "--shared",
+                "--quiet",
+                "--no-checkout",
+                workspace
+                    .to_str()
+                    .context("candidate workspace is not UTF-8")?,
+                detached
+                    .to_str()
+                    .context("detached workspace is not UTF-8")?,
+            ],
+            "prepare final Writer gate candidate",
+        )?;
+        git::run(
+            &detached,
+            &["checkout", "--quiet", "--detach", &output.commit],
+            "check out final Writer gate candidate",
+        )?;
+        Some(scratch)
+    } else {
+        None
+    };
+    let gate_workspace = gate_copy
+        .as_ref()
+        .map(|scratch| scratch.path().join("candidate"))
+        .unwrap_or_else(|| workspace.clone());
+    let evidence = if let Some(assessed) = assessed {
+        let mut evidence = assessed.evidence.clone();
+        anyhow::ensure!(
+            evidence.candidate_commit == output.commit
+                && assessed.requested_base_commit == base_commit,
+            "Final Writer gate assessment does not match the completed Writer output"
+        );
+        let path = project_root.join(&artifact.path);
+        let log_dir = path
+            .parent()
+            .context("candidate gate artifact has no parent")?
+            .join("hooks");
+        fs::create_dir_all(&log_dir)?;
+        for (index, bytes) in &assessed.logs {
+            let log_path = log_dir.join(format!("assessed-check-{index}.log"));
+            crate::atomic_write::atomic_write(&log_path, bytes)?;
+            evidence.checks[*index].log_path = Some(log_path.to_string_lossy().into_owned());
+        }
+        fs::create_dir_all(path.parent().unwrap())?;
+        crate::atomic_write::atomic_write(&path, &serde_json::to_vec_pretty(&evidence)?)?;
+        evidence
+    } else {
+        crate::candidate_gate::run_candidate_gate_with_prior_and_role(
+            crate::candidate_gate::CandidateGateRequest {
+                project_root,
+                workspace: &gate_workspace,
+                work_item_id: &item.id,
+                attempt_id,
+                task_id: Some(&task.id),
+                phase: crate::candidate_gate::CandidateGatePhase::Writer,
+                base_commit,
+                candidate_commit: &output.commit,
+                completion_contract: item.attempts[attempt_index]
+                    .writer_completion_contract
+                    .as_ref(),
+                allow_tree_identical_metadata_rewrite: task.input_artifacts.iter().any(
+                    |artifact| {
+                        artifact.producer_id == "writer-completion-repair"
+                            && artifact.path.ends_with("writer-completion.json")
+                    },
+                ),
+                metadata_rewrite_authorization: metadata_rewrite_authorization.as_ref(),
+                tester_results_path: None,
+                accepted_tester_commands: &[],
+                artifact_path: &project_root.join(&artifact.path),
+            },
+            prior_candidate_gate_path.as_deref(),
+            Some(task.role.as_str()),
+        )?
+    };
+    match evidence.disposition {
+        crate::candidate_gate::CandidateGateDisposition::Passed => {
+            if !item.attempts[attempt_index].artifacts.contains(&artifact) {
+                item.attempts[attempt_index].artifacts.push(artifact);
+            }
+            Ok(None)
+        }
+        crate::candidate_gate::CandidateGateDisposition::Rejected => {
+            if repeated_rejection {
+                return pause_candidate_gate_before_reviews(
+                    project_root,
+                    store,
+                    item,
+                    attempt_index,
+                    attempt_id,
+                    &artifact,
+                    &evidence,
+                )
+                .map(Some);
+            }
+            if !item.attempts[attempt_index].artifacts.contains(&artifact) {
+                item.attempts[attempt_index]
+                    .artifacts
+                    .push(artifact.clone());
+            }
+            let check = check_prior_writer_matrix_for_correction(
+                project_root,
+                &item.id,
+                attempt_id,
+                &item.attempts[attempt_index],
+                &item.attempts[attempt_index].tasks[write_index],
+            )?;
+            for repair in check.repairs {
+                if !item.attempts[attempt_index].artifacts.contains(&repair) {
+                    item.attempts[attempt_index].artifacts.push(repair);
+                }
+            }
+            if let Some((matrix, reason)) = check.issue {
+                return pause_writer_completion_before_reviews(
+                    project_root,
+                    store,
+                    item,
+                    attempt_index,
+                    attempt_id,
+                    &matrix,
+                    &format!("Writer completion matrix is malformed: {reason}"),
+                    0,
+                    0,
+                )
+                .map(Some);
+            }
+            record_writer_run(
+                project_root,
+                item,
+                attempt_index,
+                WriterOutcome::Continue,
+                0,
+                0,
+            );
+            item.attempts[attempt_index].status = AttemptStatus::Planned;
+            item.attempts[attempt_index].pause_kind = None;
+            if !item.attempts[attempt_index].artifacts.contains(&artifact) {
+                item.attempts[attempt_index]
+                    .artifacts
+                    .push(artifact.clone());
+            }
+            let task_id = item.add_next_write_round(attempt_id, vec![artifact])?;
+            write_attempt_work_item(store, item)?;
+            Ok(Some(WorkAttemptRunOutcome::PlannedWriteRound { task_id }))
+        }
+        crate::candidate_gate::CandidateGateDisposition::Blocked => {
+            pause_candidate_gate_before_reviews(
+                project_root,
+                store,
+                item,
+                attempt_index,
+                attempt_id,
+                &artifact,
+                &evidence,
+            )
+            .map(Some)
+        }
+    }
+}
+
+/// Select the one prior candidate gate that this Writer may use as correction
+/// authority. Recorded Work Item snapshots and canonical final-Tester
+/// correction evidence remain non-authoritative context; every other
+/// gate-shaped input must bind an earlier completed Writer and that Writer's
+/// exact managed gate path.
+fn select_prior_writer_candidate_gate(
+    item: &WorkItem,
+    attempt_index: usize,
+    write_index: usize,
+) -> Result<Option<&ArtifactRef>> {
+    let attempt = item
+        .attempts
+        .get(attempt_index)
+        .ok_or_else(|| anyhow::anyhow!("Attempt index {attempt_index} is out of range"))?;
+    let task = attempt
+        .tasks
+        .get(write_index)
+        .ok_or_else(|| anyhow::anyhow!("Writer Task index {write_index} is out of range"))?;
+    let mut selected = None;
+
+    for input in task.input_artifacts.iter().filter(|input| {
+        input
+            .path
+            .ends_with(crate::candidate_gate::CANDIDATE_GATE_FILE)
+    }) {
+        if input.producer_id == "work-item" {
+            if item
+                .input_artifacts
+                .iter()
+                .any(|artifact| artifact.snapshot_path == input.path)
+            {
+                continue;
+            }
+            bail!(
+                "Writer Task {:?} gate-shaped Work Item input {:?} is not a recorded immutable snapshot",
+                task.id,
+                input.path
+            );
+        }
+        let Some((producer_index, producer)) = attempt.tasks[..write_index]
+            .iter()
+            .enumerate()
+            .find(|(_, candidate)| candidate.id == input.producer_id)
+        else {
+            bail!(
+                "Writer Task {:?} prior candidate gate names producer {:?}, which is not an earlier Task in Attempt {:?}",
+                task.id,
+                input.producer_id,
+                attempt.id
+            );
+        };
+        if producer.kind != TaskKind::Write
+            || producer.status != TaskStatus::Complete
+            || producer.output.is_none()
+            || producer.work_item_id != attempt.work_item_id
+            || producer.attempt_id.as_deref() != Some(attempt.id.as_str())
+        {
+            bail!(
+                "Writer Task {:?} prior candidate gate producer {:?} is not an earlier completed Writer in Work Item {:?} Attempt {:?}",
+                task.id,
+                input.producer_id,
+                attempt.work_item_id,
+                attempt.id
+            );
+        }
+        if is_canonical_final_tester_correction_gate(
+            attempt,
+            write_index,
+            producer_index,
+            producer,
+            input,
+        ) {
+            // The final Tester gate explains why this Writer was planned, but
+            // it cannot set a prior candidate base or metadata-rewrite scope.
+            continue;
+        }
+        let expected_writer_path = work_artifact_path(
+            &attempt.work_item_id,
+            &attempt.id,
+            &format!(
+                "candidate-gates/{}/{}",
+                producer.id,
+                crate::candidate_gate::CANDIDATE_GATE_FILE
+            ),
+        );
+        if input.path != expected_writer_path {
+            bail!(
+                "Writer Task {:?} prior candidate gate for producer {:?} must use its canonical Writer path {:?}, found {:?}",
+                task.id,
+                producer.id,
+                expected_writer_path,
+                input.path
+            );
+        }
+        if selected.replace(input).is_some() {
+            bail!(
+                "Writer Task {:?} has multiple prior Writer candidate gate artifacts",
+                task.id
+            );
+        }
+    }
+
+    Ok(selected)
+}
+
+fn is_canonical_final_tester_correction_gate(
+    attempt: &Attempt,
+    write_index: usize,
+    producer_index: usize,
+    producer: &Task,
+    input: &ArtifactRef,
+) -> bool {
+    let Some(output) = producer.output.as_ref() else {
+        return false;
+    };
+    attempt.tasks[producer_index + 1..write_index]
+        .iter()
+        .enumerate()
+        .any(|(offset, tester)| {
+            let tester_index = producer_index + 1 + offset;
+            let expected_gate_path = work_artifact_path(
+                &attempt.work_item_id,
+                &attempt.id,
+                &format!(
+                    "candidate-gates/{}/{}",
+                    tester.id,
+                    crate::candidate_gate::CANDIDATE_GATE_FILE
+                ),
+            );
+            let expected_artifact_area =
+                work_artifact_path(&attempt.work_item_id, &attempt.id, &tester.id);
+            let latest_writer_id = attempt.tasks[..tester_index]
+                .iter()
+                .rev()
+                .find(|task| {
+                    task.kind == TaskKind::Write
+                        && task.status == TaskStatus::Complete
+                        && task.output.is_some()
+                })
+                .map(|task| task.id.as_str());
+            let context_matches = tester.review_context.as_ref().is_some_and(|context| {
+                context.candidate_workspace_id == output.workspace_id
+                    && context.candidate_workspace_path == output.workspace_path
+                    && context.source_branch == output.source_branch
+                    && context.candidate_commit == output.commit
+                    && context.base_commit.is_none()
+            });
+
+            input.path == expected_gate_path
+                && tester.kind == TaskKind::Tester
+                && tester.role == "tester"
+                && tester.status == TaskStatus::Complete
+                && !tester.is_failed_command_recheck()
+                && tester.work_item_id == attempt.work_item_id
+                && tester.attempt_id.as_deref() == Some(attempt.id.as_str())
+                && tester
+                    .artifact_area
+                    .as_ref()
+                    .is_some_and(|area| area.path == expected_artifact_area)
+                && latest_writer_id == Some(producer.id.as_str())
+                && context_matches
+        })
+}
+
+/// Validate the exact final Tester identities before Fluent creates a Merge
+/// Candidate or launches the Learner. Attempts without a completion contract
+/// predate behavior-reference evidence and retain their legacy path.
+fn gate_candidate_after_final_tester(
+    project_root: &Path,
+    item: &mut WorkItem,
+    attempt_index: usize,
+    tester_results_path: Option<&Path>,
+) -> Result<Option<(ArtifactRef, crate::candidate_gate::CandidateGateEvidence)>> {
+    if item.attempts[attempt_index]
+        .writer_completion_contract
+        .is_none()
+    {
+        return Ok(None);
+    }
+    let attempt = &item.attempts[attempt_index];
+    let (write_task, output) = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+        .and_then(|task| task.output.as_ref().map(|output| (task, output)))
+        .ok_or_else(|| anyhow::anyhow!("final Tester gate has no completed Writer output"))?;
+    let tester_results_path = tester_results_path
+        .ok_or_else(|| anyhow::anyhow!("final Tester gate has no structured Tester evidence"))?;
+    let tester = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| {
+            task.kind == TaskKind::Tester
+                && task.status == TaskStatus::Complete
+                && task.artifact_area.as_ref().is_some_and(|area| {
+                    work_task_executor::resolve_managed_artifact_area_path(project_root, &area.path)
+                        .is_ok_and(|dir| dir.join("tester-results.json") == tester_results_path)
+                })
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!("final Tester gate has no matching completed Tester Task")
+        })?;
+    let workspace = resolve_managed_sibling_workspace_path(
+        project_root,
+        &output.workspace_path,
+        "final Tester candidate gate workspace",
+    )?;
+    let artifact = ArtifactRef {
+        // Candidate-gate recovery keys evidence to the completed Writer whose
+        // candidate it checked, even though the final Tester triggers this run.
+        producer_id: write_task.id.clone(),
+        path: format!(
+            "{}/{}/{}",
+            work_artifact_path(&item.id, &attempt.id, "candidate-gates"),
+            tester.id,
+            crate::candidate_gate::CANDIDATE_GATE_FILE
+        ),
+    };
+    let accepted_tester_commands =
+        accepted_external_tester_commands(project_root, &item.attempts[attempt_index]);
+    let evidence =
+        crate::candidate_gate::run_candidate_gate(crate::candidate_gate::CandidateGateRequest {
+            project_root,
+            workspace: &workspace,
+            work_item_id: &item.id,
+            attempt_id: &attempt.id,
+            task_id: Some(&tester.id),
+            phase: crate::candidate_gate::CandidateGatePhase::FinalTester,
+            // The Writer gate already admitted the source delta. This frontier
+            // checks the frozen candidate and its final Tester evidence.
+            base_commit: &output.commit,
+            candidate_commit: &output.commit,
+            completion_contract: attempt.writer_completion_contract.as_ref(),
+            allow_tree_identical_metadata_rewrite: false,
+            metadata_rewrite_authorization: None,
+            tester_results_path: Some(tester_results_path),
+            accepted_tester_commands: &accepted_tester_commands,
+            artifact_path: &project_root.join(&artifact.path),
+        })?;
+    if !item.attempts[attempt_index].artifacts.contains(&artifact) {
+        item.attempts[attempt_index]
+            .artifacts
+            .push(artifact.clone());
+    }
+    Ok(Some((artifact, evidence)))
+}
+
+fn pause_candidate_gate_after_tester(
+    project_root: &Path,
+    store: &WorkModelStore,
+    item: &mut WorkItem,
+    attempt_index: usize,
+    attempt_id: &str,
+    artifact: &ArtifactRef,
+    evidence: &crate::candidate_gate::CandidateGateEvidence,
+) -> Result<WorkAttemptRunOutcome> {
+    item.attempts[attempt_index].status = AttemptStatus::NeedsUser;
+    item.attempts[attempt_index].pause_kind = Some(PauseKind::CandidateGate);
+    item.attempts[attempt_index].review_state = Some(AttemptReviewState::NotReviewed);
+    write_attempt_work_item(store, item)?;
+    let handoff_path =
+        write_candidate_gate_handoff(project_root, &item.id, attempt_id, &artifact.path, evidence)?;
+    mutate_attempt_work_item(store, &item.id, |fresh| {
+        let attempt = fresh
+            .attempts
+            .iter_mut()
+            .find(|attempt| attempt.id == attempt_id)
+            .ok_or_else(|| crate::work_model::WorkModelError::AttemptNotFound {
+                id: attempt_id.to_string(),
+            })?;
+        let handoff = ArtifactRef {
+            producer_id: "candidate-gate".to_string(),
+            path: handoff_path.clone(),
+        };
+        if !attempt.artifacts.contains(&handoff) {
+            attempt.artifacts.push(handoff);
+        }
+        Ok(())
+    })?;
+    Ok(WorkAttemptRunOutcome::NeedsUser { handoff_path })
+}
+
+fn pause_candidate_gate_before_reviews(
+    project_root: &Path,
+    store: &WorkModelStore,
+    item: &mut WorkItem,
+    attempt_index: usize,
+    attempt_id: &str,
+    artifact: &ArtifactRef,
+    evidence: &crate::candidate_gate::CandidateGateEvidence,
+) -> Result<WorkAttemptRunOutcome> {
+    record_writer_run(
+        project_root,
+        item,
+        attempt_index,
+        WriterOutcome::Blocked,
+        0,
+        0,
+    );
+    item.attempts[attempt_index].status = AttemptStatus::NeedsUser;
+    item.attempts[attempt_index].pause_kind = Some(PauseKind::CandidateGate);
+    item.attempts[attempt_index].review_state = Some(AttemptReviewState::NotReviewed);
+    if !item.attempts[attempt_index].artifacts.contains(artifact) {
+        item.attempts[attempt_index]
+            .artifacts
+            .push(artifact.clone());
+    }
+    write_attempt_work_item(store, item)?;
+    let handoff_path =
+        write_candidate_gate_handoff(project_root, &item.id, attempt_id, &artifact.path, evidence)?;
+    mutate_attempt_work_item(store, &item.id, |fresh| {
+        let attempt = fresh
+            .attempts
+            .iter_mut()
+            .find(|attempt| attempt.id == attempt_id)
+            .ok_or_else(|| crate::work_model::WorkModelError::AttemptNotFound {
+                id: attempt_id.to_string(),
+            })?;
+        let handoff = ArtifactRef {
+            producer_id: "candidate-gate".to_string(),
+            path: handoff_path.clone(),
+        };
+        if !attempt.artifacts.contains(&handoff) {
+            attempt.artifacts.push(handoff);
+        }
+        Ok(())
+    })?;
+    Ok(WorkAttemptRunOutcome::NeedsUser { handoff_path })
+}
+
+fn write_candidate_gate_handoff(
+    project_root: &Path,
+    work_item_id: &str,
+    attempt_id: &str,
+    artifact_path: &str,
+    evidence: &crate::candidate_gate::CandidateGateEvidence,
+) -> Result<String> {
+    let relative_path =
+        work_artifact_path(work_item_id, attempt_id, "candidate-gate-needs-user.md");
+    let path = project_root.join(&relative_path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let diagnostics = evidence
+        .checks
+        .iter()
+        .filter(|check| {
+            matches!(
+                check.status,
+                crate::candidate_gate::CandidateCheckStatus::Error
+                    | crate::candidate_gate::CandidateCheckStatus::Failed
+            )
+        })
+        .flat_map(|check| {
+            check
+                .diagnostics
+                .iter()
+                .map(move |line| format!("- {}: {line}", check.name))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let ancestry_action = WorkModelStore::new(project_root)
+        .read_work_item(work_item_id)
+        .ok()
+        .and_then(|item| {
+            item.attempts
+                .iter()
+                .find(|attempt| attempt.id == attempt_id)
+                .and_then(|attempt| {
+                    crate::candidate_ancestry_recovery::recovery_action(project_root, attempt)
+                })
+        });
+    let metadata_action = WorkModelStore::new(project_root)
+        .read_work_item(work_item_id)
+        .ok()
+        .and_then(|item| {
+            item.attempts
+                .iter()
+                .find(|attempt| attempt.id == attempt_id)
+                .and_then(|attempt| {
+                    crate::candidate_metadata_recovery::recovery_action(project_root, attempt)
+                })
+        });
+    let recovery = metadata_action
+        .map(|action| {
+            format!(
+                "Fluent can authorize this exact tree-identical metadata correction through a public audited transition:\n\n`{action}`\n\nAfter authorization, queue this same planned Attempt through the scheduler:\n\n`fluent queue resume {work_item_id} --attempt {attempt_id}`"
+            )
+        })
+        .or_else(|| {
+            ancestry_action.map(|action| {
+                let scheduler_action = crate::candidate_ancestry_recovery::scheduler_action(
+                    work_item_id,
+                    attempt_id,
+                );
+                format!(
+                    "Fluent can repair this exact tree-identical ancestry failure through an audited host transition:\n\n`{action}`\n\nAfter the repair, queue this same planned Attempt through the scheduler:\n\n`{scheduler_action}`"
+                )
+            })
+        })
+        .unwrap_or_else(|| {
+            format!(
+                "After resolving the reported condition, resume this same Attempt through the scheduler:\n\n`fluent queue resume {work_item_id} --attempt {attempt_id}`"
+            )
+        });
+    let body = crate::work_status::append_pause_record_to_handoff(
+        project_root,
+        work_item_id,
+        attempt_id,
+        format!(
+            "# Candidate gate needs user input\n\nFluent stopped before review because host-owned candidate checks rejected the candidate again or could not establish trustworthy state.\n\nEvidence: `{artifact_path}`\n\n{diagnostics}\n\nInspect the named requirement, retained native identities, and command logs to establish the cause before requesting candidate correction.\n\n{recovery}\n\nThen run `fluent scheduler run`. To recover in the foreground instead, run `fluent attempt run {work_item_id} {attempt_id}`.\n"
+        ),
+    );
+    fs::write(&path, body)?;
+    Ok(relative_path)
+}
+
+/// Reconcile a completed Writer's structured completion matrix before any Tester
+/// or reviewer is planned. For matrix-backed Attempts, the host then projects
+/// required Plan completion into `progress.md`; Writers never serialize that
+/// immutable section. Ordinary incomplete claims create one Writer continuation.
+/// Structural corruption pauses with a durable diagnosis. Older Attempts without
+/// a matrix retain their required-progress gate.
+fn gate_writer_completion_before_reviews(
+    project_root: &Path,
+    store: &WorkModelStore,
+    item: &mut WorkItem,
+    attempt_id: &str,
+) -> Result<Option<WorkAttemptRunOutcome>> {
+    let attempt_index = item
+        .attempts
+        .iter()
+        .position(|attempt| attempt.id == attempt_id)
+        .ok_or_else(|| anyhow::anyhow!("Attempt {:?} not found", attempt_id))?;
+    if item.attempts[attempt_index].progress_contract.is_none()
+        && item.attempts[attempt_index]
+            .writer_completion_contract
+            .is_none()
+    {
+        record_writer_run(
+            project_root,
+            item,
+            attempt_index,
+            WriterOutcome::Complete,
+            0,
+            0,
+        );
+        return Ok(None);
+    }
+    let progress_artifact = required_progress_artifact(&item.attempts[attempt_index]);
+    let latest_writer = item.attempts[attempt_index]
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+        .cloned()
+        .expect("the completed Writer gate has a completed Writer");
+    let mut matrix_artifact = crate::host_evidence::completed_plan_host_matrix_ref(
+        project_root,
+        &item.attempts[attempt_index],
+        &latest_writer,
+    )
+    .or_else(|| {
+        crate::host_evidence::writer_completion_matrix_ref(
+            project_root,
+            &item.attempts[attempt_index],
+            &latest_writer,
+        )
+    })
+    .or_else(|| writer_completion_artifact(&latest_writer));
+    let mut validated_matrix = None;
+    let mut repaired_writer_claims = false;
+    let completion_contract = item.attempts[attempt_index]
+        .writer_completion_contract
+        .clone();
+    let matrix_status = if let Some(contract) = completion_contract.as_ref() {
+        let source_artifact = matrix_artifact
+            .clone()
+            .expect("a Writer Task has an artifact area");
+        let artifact = &source_artifact;
+        let path = project_root.join(&artifact.path);
+        match fs::metadata(&path) {
+            Ok(metadata)
+                if metadata.len()
+                    > crate::work_model::WRITER_COMPLETION_MATRIX_MAX_BYTES as u64 =>
+            {
+                return pause_writer_completion_before_reviews(
+                    project_root,
+                    store,
+                    item,
+                    attempt_index,
+                    attempt_id,
+                    artifact,
+                    &format!(
+                        "Writer completion matrix is {} bytes; maximum is {} bytes",
+                        metadata.len(),
+                        crate::work_model::WRITER_COMPLETION_MATRIX_MAX_BYTES
+                    ),
+                    0,
+                    0,
+                )
+                .map(Some);
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return pause_writer_completion_before_reviews(
+                    project_root,
+                    store,
+                    item,
+                    attempt_index,
+                    attempt_id,
+                    artifact,
+                    "Writer completion matrix is missing after host materialization",
+                    0,
+                    0,
+                )
+                .map(Some);
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "inspect Writer completion matrix before review planning: {}",
+                        path.display()
+                    )
+                });
+            }
+        }
+        let source = match fs::read_to_string(&path) {
+            Ok(source) => source,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "read Writer completion matrix before review planning: {}",
+                        path.display()
+                    )
+                });
+            }
+        };
+        let mut format_repairs = Vec::new();
+        let mut matrix =
+            match serde_json::from_str::<crate::work_model::WriterCompletionMatrix>(&source) {
+                Ok(matrix) => matrix,
+                Err(error) => match recover_writer_completion_result_format(&source) {
+                    Ok((matrix, repairs)) => {
+                        let (repaired_matrix, repair_evidence) =
+                            write_writer_completion_format_repair(
+                                project_root,
+                                &item.id,
+                                attempt_id,
+                                &latest_writer.id,
+                                artifact,
+                                &source,
+                                &matrix,
+                                &repairs,
+                            )?;
+                        matrix_artifact = Some(repaired_matrix.clone());
+                        for repair_artifact in [repaired_matrix, repair_evidence] {
+                            if !item.attempts[attempt_index]
+                                .artifacts
+                                .contains(&repair_artifact)
+                            {
+                                item.attempts[attempt_index].artifacts.push(repair_artifact);
+                            }
+                        }
+                        format_repairs = repairs;
+                        matrix
+                    }
+                    Err(_) => {
+                        return pause_writer_completion_before_reviews(
+                            project_root,
+                            store,
+                            item,
+                            attempt_index,
+                            attempt_id,
+                            artifact,
+                            &format!("Writer completion matrix is malformed: {error}"),
+                            0,
+                            0,
+                        )
+                        .map(Some);
+                    }
+                },
+            };
+        if !format_repairs.is_empty() {
+            // This normalization only converts a Writer's explanatory suffix
+            // on the one currently supported enum value (`pass: ...` or
+            // `pass (...)`) back to the recorded machine value (`pass`). The
+            // original bytes and the exact normalization are retained in
+            // immutable repair artifacts.
+            repaired_writer_claims = true;
+        }
+        let findings = match crate::work_task_executor::writer_completion_findings(
+            project_root,
+            &latest_writer,
+        ) {
+            Ok(findings) => findings,
+            Err(error) if latest_writer.writer_correction_assignment.is_some() => {
+                return pause_writer_completion_before_reviews(
+                    project_root,
+                    store,
+                    item,
+                    attempt_index,
+                    attempt_id,
+                    artifact,
+                    &format!("Writer correction assignment is unverifiable: {error:#}"),
+                    0,
+                    0,
+                )
+                .map(Some);
+            }
+            Err(error) => return Err(error),
+        };
+        let repairs =
+            match matrix.repair_writer_claims_against(contract, &latest_writer.id, &findings) {
+                Ok(repairs) => repairs,
+                Err(reason) => {
+                    return pause_writer_completion_before_reviews(
+                        project_root,
+                        store,
+                        item,
+                        attempt_index,
+                        attempt_id,
+                        artifact,
+                        &reason,
+                        0,
+                        0,
+                    )
+                    .map(Some);
+                }
+            };
+        if !repairs.is_empty() {
+            repaired_writer_claims = true;
+            let (repaired_matrix, repair_evidence) = write_writer_completion_repair(
+                project_root,
+                &item.id,
+                attempt_id,
+                &latest_writer.id,
+                artifact,
+                &source,
+                &matrix,
+                &repairs,
+            )?;
+            matrix_artifact = Some(repaired_matrix.clone());
+            for repair_artifact in [repaired_matrix, repair_evidence] {
+                if !item.attempts[attempt_index]
+                    .artifacts
+                    .contains(&repair_artifact)
+                {
+                    item.attempts[attempt_index].artifacts.push(repair_artifact);
+                }
+            }
+        }
+        crate::host_evidence::apply_completed_plan_host_evidence(
+            project_root,
+            &item.attempts[attempt_index],
+            &latest_writer,
+            artifact,
+            &mut matrix,
+        );
+        crate::recovery_contracts::apply_accepted_carried_findings(
+            project_root,
+            &item.attempts[attempt_index],
+            &latest_writer,
+            &mut matrix,
+        )?;
+        match matrix.status_against(contract, &latest_writer.id, &findings) {
+            Ok(status) => {
+                validated_matrix = Some(matrix);
+                status
+            }
+            Err(reason) => {
+                return pause_writer_completion_before_reviews(
+                    project_root,
+                    store,
+                    item,
+                    attempt_index,
+                    attempt_id,
+                    artifact,
+                    &reason,
+                    0,
+                    0,
+                )
+                .map(Some);
+            }
+        }
+    } else {
+        crate::work_model::WriterCompletionMatrixStatus {
+            complete: 0,
+            required: 0,
+            incomplete_reason: None,
+        }
+    };
+    let progress = if let Some(progress_contract) =
+        item.attempts[attempt_index].progress_contract.as_ref()
+    {
+        let path = project_root.join(&progress_artifact.path);
+        let source = match fs::read_to_string(&path) {
+            Ok(source) => source,
+            Err(error) if error.kind() == ErrorKind::NotFound => String::new(),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "read required progress before review planning: {}",
+                        path.display()
+                    )
+                });
+            }
+        };
+        if item.attempts[attempt_index]
+            .writer_completion_contract
+            .is_some()
+        {
+            let artifact = matrix_artifact
+                .as_ref()
+                .expect("a matrix-backed Writer has a matrix artifact");
+            let matrix = validated_matrix
+                .as_ref()
+                .expect("a matrix-backed Writer has a validated matrix");
+            let plan_status = match progress_contract.status_against_writer_matrix(matrix) {
+                Ok(status) => status,
+                Err(reason) => {
+                    return pause_writer_completion_before_reviews(
+                        project_root,
+                        store,
+                        item,
+                        attempt_index,
+                        attempt_id,
+                        &progress_artifact,
+                        &format!("host-owned required-progress projection is invalid: {reason}"),
+                        0,
+                        matrix_status.complete,
+                    )
+                    .map(Some);
+                }
+            };
+            if plan_status.is_complete() {
+                let projected = match progress_contract.project_completed_required_progress(
+                    &source,
+                    matrix,
+                    &artifact.path,
+                ) {
+                    Ok(projected) => projected,
+                    Err(reason) => {
+                        return pause_writer_completion_before_reviews(
+                            project_root,
+                            store,
+                            item,
+                            attempt_index,
+                            attempt_id,
+                            &progress_artifact,
+                            &reason,
+                            0,
+                            matrix_status.complete,
+                        )
+                        .map(Some);
+                    }
+                };
+                if projected != source {
+                    if let Some(parent) = path.parent() {
+                        fs::create_dir_all(parent).with_context(|| {
+                            format!(
+                                "create host-owned required-progress directory: {}",
+                                parent.display()
+                            )
+                        })?;
+                    }
+                    crate::atomic_write::atomic_write(&path, projected.as_bytes()).with_context(
+                        || {
+                            format!(
+                                "write host-owned required progress before review planning: {}",
+                                path.display()
+                            )
+                        },
+                    )?;
+                }
+                match item.attempts[attempt_index].required_progress_status(&projected) {
+                    Ok(progress) => progress,
+                    Err(reason) => {
+                        return pause_writer_completion_before_reviews(
+                            project_root,
+                            store,
+                            item,
+                            attempt_index,
+                            attempt_id,
+                            &progress_artifact,
+                            &format!(
+                                "host-owned required-progress projection is invalid: {reason}"
+                            ),
+                            0,
+                            matrix_status.complete,
+                        )
+                        .map(Some);
+                    }
+                }
+            } else {
+                // Review findings are task-specific and may be pending in a
+                // corrective round after every stable Plan row was completed.
+                // Derive Plan progress from those stable rows instead of
+                // zeroing it until the changing finding frontier is complete.
+                plan_status
+            }
+        } else {
+            // Attempts created before the matrix contract keep their established
+            // Writer-owned required-progress behavior.
+            match item.attempts[attempt_index].required_progress_status(&source) {
+                Ok(progress) => progress,
+                Err(reason) => {
+                    return pause_writer_completion_before_reviews(
+                        project_root,
+                        store,
+                        item,
+                        attempt_index,
+                        attempt_id,
+                        &progress_artifact,
+                        &reason,
+                        0,
+                        0,
+                    )
+                    .map(Some);
+                }
+            }
+        }
+    } else {
+        crate::work_model::RequiredProgressStatus {
+            checked: 0,
+            required: 0,
+            incomplete_reason: None,
+        }
+    };
+    if progress.is_complete() && matrix_status.is_complete() {
+        let host_check = crate::host_evidence::required_host_verification_pending(
+            project_root,
+            &item.attempts[attempt_index],
+        );
+        let reason = match host_check {
+            Ok(Some(action)) => Some(format!(
+                "candidate {} requires host verification for {}: {}; attach candidate-bound passing evidence and complete targeted Tests Review",
+                action.candidate_commit, action.plan_row, action.command
+            )),
+            Err(error) => Some(format!(
+                "cannot validate required host verification: {error:#}"
+            )),
+            Ok(None) => None,
+        };
+        if let Some(reason) = reason {
+            return pause_writer_completion_before_reviews(
+                project_root,
+                store,
+                item,
+                attempt_index,
+                attempt_id,
+                matrix_artifact.as_ref().unwrap_or(&progress_artifact),
+                &reason,
+                progress.checked,
+                matrix_status.complete,
+            )
+            .map(Some);
+        }
+        record_writer_run(
+            project_root,
+            item,
+            attempt_index,
+            WriterOutcome::Complete,
+            progress.checked,
+            matrix_status.complete,
+        );
+        return Ok(None);
+    }
+    let reason = progress
+        .incomplete_reason
+        .as_deref()
+        .or(matrix_status.incomplete_reason.as_deref())
+        .unwrap_or("Writer completion evidence is incomplete");
+    let attempt = &item.attempts[attempt_index];
+    let task = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+        .expect("the completed Writer gate has a completed Writer");
+    let changed_candidate = task
+        .output
+        .as_ref()
+        .is_some_and(|output| output.base_commit.as_deref() != Some(output.commit.as_str()));
+    let previous_completion = attempt
+        .writer_runs
+        .last()
+        .map(|run| (run.checked_required, run.completed_matrix));
+    let current_identity = writer_completion_identity(project_root, attempt, task)?;
+    let previous_identity = attempt
+        .writer_runs
+        .last()
+        .and_then(|run| attempt.tasks.iter().find(|task| task.id == run.task_id))
+        .map(|task| writer_completion_identity(project_root, attempt, task))
+        .transpose()?
+        .flatten();
+    let regressed = previous_completion.is_some_and(|(checked, completed)| {
+        progress.checked < checked
+            || match (&previous_identity, &current_identity) {
+                (Some(previous), Some(current)) => previous.iter().any(|old| {
+                    old.state == crate::work_model::WriterCompletionState::Complete
+                        && current.iter().any(|row| {
+                            row.id == old.id
+                                && row.state != crate::work_model::WriterCompletionState::Complete
+                        })
+                }),
+                _ => matrix_status.complete < completed,
+            }
+    });
+    let mut latest_task = task;
+    let mut latest_kind = writer_run_kind(attempt, task);
+    let mut latest_counts = (progress.checked, matrix_status.complete);
+    let mut latest_identity = current_identity;
+    let mut stagnant_continuations = 0;
+    for run in attempt.writer_runs.iter().rev() {
+        if latest_kind == WriterRunKind::Initial
+            || latest_counts != (run.checked_required, run.completed_matrix)
+        {
+            break;
+        }
+        let Some(previous_task) = attempt.tasks.iter().find(|task| task.id == run.task_id) else {
+            break;
+        };
+        let previous_identity = writer_completion_identity(project_root, attempt, previous_task)?;
+        let same_requirements = match (&latest_identity, &previous_identity) {
+            (Some(current), Some(previous)) => current == previous,
+            (None, None) => {
+                crate::recovery_contracts::writer_completion_findings(project_root, latest_task)?
+                    .iter()
+                    .map(|finding| &finding.id)
+                    .collect::<Vec<_>>()
+                    == crate::recovery_contracts::writer_completion_findings(
+                        project_root,
+                        previous_task,
+                    )?
+                    .iter()
+                    .map(|finding| &finding.id)
+                    .collect::<Vec<_>>()
+            }
+            _ => false,
+        };
+        if !same_requirements {
+            break;
+        }
+        stagnant_continuations += 1;
+        latest_task = previous_task;
+        latest_kind = run.kind;
+        latest_counts = (run.checked_required, run.completed_matrix);
+        latest_identity = previous_identity;
+    }
+    let blocked_reason = if !changed_candidate && !repaired_writer_claims {
+        Some(format!(
+            "Writer did not create a candidate commit while {reason}"
+        ))
+    } else if regressed && !repaired_writer_claims {
+        Some(format!(
+            "Writer completion regressed from {:?} to ({}, {})",
+            previous_completion.unwrap_or_default(),
+            progress.checked,
+            matrix_status.complete
+        ))
+    } else if stagnant_continuations >= 2 {
+        Some(format!(
+            "two Writer continuations made no completion progress; {reason}"
+        ))
+    } else {
+        None
+    };
+    if let Some(blocked_reason) = blocked_reason {
+        let blocking_artifact = if !progress.is_complete() {
+            &progress_artifact
+        } else {
+            matrix_artifact.as_ref().unwrap_or(&progress_artifact)
+        };
+        return pause_writer_completion_before_reviews(
+            project_root,
+            store,
+            item,
+            attempt_index,
+            attempt_id,
+            blocking_artifact,
+            &blocked_reason,
+            progress.checked,
+            matrix_status.complete,
+        )
+        .map(Some);
+    }
+
+    record_writer_run(
+        project_root,
+        item,
+        attempt_index,
+        WriterOutcome::Continue,
+        progress.checked,
+        matrix_status.complete,
+    );
+    item.attempts[attempt_index].status = AttemptStatus::Planned;
+    item.attempts[attempt_index].pause_kind = None;
+    let mut continuation_artifacts = Vec::new();
+    if item.attempts[attempt_index].progress_contract.is_some() {
+        continuation_artifacts.push(progress_artifact);
+    }
+    if let Some(artifact) = matrix_artifact {
+        continuation_artifacts.push(artifact);
+    }
+    let task_id = item.add_next_write_round(attempt_id, continuation_artifacts)?;
+    write_attempt_work_item(store, item)?;
+    Ok(Some(WorkAttemptRunOutcome::PlannedWriteRound { task_id }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pause_writer_completion_before_reviews(
+    project_root: &Path,
+    store: &WorkModelStore,
+    item: &mut WorkItem,
+    attempt_index: usize,
+    attempt_id: &str,
+    artifact: &ArtifactRef,
+    reason: &str,
+    checked_required: usize,
+    completed_matrix: usize,
+) -> Result<WorkAttemptRunOutcome> {
+    record_writer_run(
+        project_root,
+        item,
+        attempt_index,
+        WriterOutcome::Blocked,
+        checked_required,
+        completed_matrix,
+    );
+    item.attempts[attempt_index].status = AttemptStatus::NeedsUser;
+    item.attempts[attempt_index].pause_kind = Some(PauseKind::WriterCompletion);
+    item.attempts[attempt_index].review_state = Some(AttemptReviewState::NotReviewed);
+    write_attempt_work_item(store, item)?;
+    let handoff_path = write_writer_completion_handoff(
+        project_root,
+        &item.id,
+        attempt_id,
+        reason,
+        &artifact.path,
+        crate::host_evidence::pending_plan_host_evidence_action(
+            project_root,
+            &item.attempts[attempt_index],
+        )
+        .as_ref(),
+    )?;
+    mutate_attempt_work_item(store, &item.id, |fresh| {
+        let attempt = fresh
+            .attempts
+            .iter_mut()
+            .find(|attempt| attempt.id == attempt_id)
+            .ok_or_else(|| crate::work_model::WorkModelError::AttemptNotFound {
+                id: attempt_id.to_string(),
+            })?;
+        let handoff = ArtifactRef {
+            producer_id: "required-progress".to_string(),
+            path: handoff_path.clone(),
+        };
+        if !attempt.artifacts.contains(&handoff) {
+            attempt.artifacts.push(handoff);
+        }
+        Ok(())
+    })?;
+    Ok(WorkAttemptRunOutcome::NeedsUser { handoff_path })
+}
+
+fn record_writer_run(
+    project_root: &Path,
+    item: &mut WorkItem,
+    attempt_index: usize,
+    outcome: WriterOutcome,
+    checked_required: usize,
+    completed_matrix: usize,
+) {
+    let attempt = &mut item.attempts[attempt_index];
+    let Some(task) = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+    else {
+        return;
+    };
+    if attempt.writer_runs.iter().any(|run| run.task_id == task.id) {
+        return;
+    }
+    let session_id = task.artifact_area.as_ref().and_then(|area| {
+        writer_session_id(&project_root.join(&area.path).join("transcript.jsonl"))
+    });
+    let kind = writer_run_kind(attempt, task);
+    let continuation = match kind {
+        WriterRunKind::Initial => 0,
+        WriterRunKind::PreReviewContinuation => {
+            attempt
+                .writer_runs
+                .iter()
+                .filter(|run| run.kind == WriterRunKind::PreReviewContinuation)
+                .count() as u32
+                + 1
+        }
+        WriterRunKind::Corrective => {
+            attempt
+                .writer_runs
+                .iter()
+                .filter(|run| run.kind == WriterRunKind::Corrective)
+                .count() as u32
+                + 1
+        }
+    };
+    let candidate_commit = task
+        .output
+        .as_ref()
+        .map(|output| output.commit.clone())
+        .unwrap_or_default();
+    attempt.writer_runs.push(WriterRun {
+        task_id: task.id.clone(),
+        outcome,
+        kind,
+        provider: if task.role == crate::work_model::CANDIDATE_ANCESTRY_REPAIR_ROLE {
+            "fluent-host".to_string()
+        } else {
+            attempt.coder_mapping.write.coder.as_str().to_string()
+        },
+        session_id,
+        continuation,
+        checked_required,
+        completed_matrix,
+        candidate_commit,
+    });
+}
+
+fn writer_completion_identity(
+    project_root: &Path,
+    attempt: &Attempt,
+    task: &crate::work_model::Task,
+) -> Result<Option<Vec<crate::work_model::WriterCompletionRow>>> {
+    let Some(contract) = &attempt.writer_completion_contract else {
+        return Ok(None);
+    };
+    let Some(artifact) =
+        crate::recovery_contracts::writer_completion_matrix_ref(project_root, attempt, task)
+    else {
+        return Ok(None);
+    };
+    let bytes = match fs::read(project_root.join(&artifact.path)) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let matrix: crate::work_model::WriterCompletionMatrix = serde_json::from_slice(&bytes)?;
+    let findings = crate::recovery_contracts::writer_completion_findings(project_root, task)?;
+    if matrix
+        .status_against(contract, &task.id, &findings)
+        .is_err()
+    {
+        return Ok(None);
+    }
+    Ok(Some(matrix.completion_identity()))
+}
+
+fn writer_run_kind(attempt: &Attempt, task: &Task) -> WriterRunKind {
+    if crate::recovery_contracts::is_corrective_writer_task(task) {
+        WriterRunKind::Corrective
+    } else if attempt.writer_runs.is_empty() {
+        WriterRunKind::Initial
+    } else {
+        WriterRunKind::PreReviewContinuation
+    }
+}
+
+pub(crate) fn writer_session_id(path: &Path) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
+    BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .flat_map(|line| crate::transcript::parse_line(&line))
+        .find_map(|event| match event {
+            crate::transcript::Event::SessionInit { session_id, .. }
+                if !session_id.trim().is_empty() =>
+            {
+                Some(session_id)
+            }
+            _ => None,
+        })
+}
+
+fn write_writer_completion_handoff(
+    project_root: &Path,
+    work_item_id: &str,
+    attempt_id: &str,
+    reason: &str,
+    progress_path: &str,
+    host_action: Option<&crate::host_evidence::PlanHostEvidenceAction>,
+) -> Result<String> {
+    let matrix = progress_path.ends_with(crate::work_task_executor::WRITER_COMPLETION_MATRIX_FILE);
+    let file_name = if matrix {
+        "writer-completion-needs-user.md"
+    } else {
+        "required-progress-needs-user.md"
+    };
+    let relative_path = work_artifact_path(work_item_id, attempt_id, file_name);
+    let path = project_root.join(&relative_path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let (title, contract, repair) = if matrix {
+        (
+            "Writer completion needs user input",
+            "Writer completion matrix",
+            "restore its immutable rows from the host-generated planning manifest",
+        )
+    } else {
+        (
+            "Required progress needs user input",
+            "required-progress contract",
+            "restore its entries to the approved Plan",
+        )
+    };
+    let repair = if matrix && reason.contains("expected struct WriterVerificationClaim") {
+        format!(
+            "correct the malformed verification claim to a structured verification entry with `command` and `result`, preserve the host-generated row identities and requirements, then resume the Attempt with `fluent queue resume {work_item_id} --attempt {attempt_id}`"
+        )
+    } else {
+        repair.to_string()
+    };
+    let body = crate::work_status::append_pause_record_to_handoff(
+        project_root,
+        work_item_id,
+        attempt_id,
+        format!(
+            "# {title}\n\nFluent stopped before Tester and review planning because the {contract} cannot be repaired safely.\n\nReason: {reason}\n\nInspect `{progress_path}` and {repair}.\n"
+        ),
+    );
+    fs::write(&path, body)?;
+    if matrix {
+        // A pending Documentation finding can be a deliberate, tree-identical
+        // commit-metadata repair rather than a malformed completion matrix.
+        // Prefer that more specific audited transition so the handoff does not
+        // send the operator through a Writer retry that cannot change the
+        // candidate under the ordinary append-only rules.
+        let metadata_action = crate::work_model::WorkModelStore::new(project_root)
+            .read_work_item(work_item_id)
+            .ok()
+            .and_then(|item| {
+                item.attempts
+                    .iter()
+                    .find(|attempt| attempt.id == attempt_id)
+                    .and_then(|attempt| {
+                        crate::candidate_metadata_recovery::recovery_action(project_root, attempt)
+                    })
+            });
+        if let Some(action) = metadata_action.as_deref() {
+            let mut file = fs::OpenOptions::new().append(true).open(&path)?;
+            writeln!(
+                file,
+                "\n\nThis matrix's pending Documentation finding is a commit-metadata-only issue. Authorize the audited history repair instead of retrying the ordinary Writer:\n\n`{action}`\n\nThen run `fluent queue resume {work_item_id} --attempt {attempt_id}`."
+            )?;
+        }
+        // A retryable Writer-completion pause has one audited recovery that
+        // reuses the same Task. Include it only when the just-persisted state
+        // proves that command is eligible; malformed matrices and other
+        // completion failures retain the ordinary diagnostic below.
+        if metadata_action.is_none()
+            && let Ok(item) =
+                crate::work_model::WorkModelStore::new(project_root).read_work_item(work_item_id)
+            && let Some(attempt) = item
+                .attempts
+                .iter()
+                .find(|attempt| attempt.id == attempt_id)
+            && let Some(action) =
+                crate::writer_completion_recovery::recovery_action(project_root, attempt)
+        {
+            let mut file = fs::OpenOptions::new().append(true).open(&path)?;
+            writeln!(
+                file,
+                "\n\nTo retry the exact paused Writer without adding duplicate rounds, authorize this audited recovery:\n\n`{action}`\n\nThen run `fluent queue resume {work_item_id} --attempt {attempt_id}`."
+            )?;
+        }
+    }
+    if let Some(action) = host_action {
+        let mut file = fs::OpenOptions::new().append(true).open(&path)?;
+        writeln!(
+            file,
+            "\n\nThis pending Plan row is an authorized-host check and does not require a Writer commit.\n\nPlan row: {}\nExact command to run on an authorized host against candidate {}: {}\nEvidence working_directory: {} (use . for the candidate checkout root)\nCompletion matrix: {}\n\nWrite a schema-version-1 host evidence JSON document whose check and working_directory exactly match those values, then attach it with:\n\nfluent attempt evidence attach {} {} --candidate {} --evidence-file <PATH> --plan-row {}\n\nFluent will bind the evidence to this unchanged candidate and create a targeted Tests Review. After that Review settles, resume the Attempt with fluent queue resume {} --attempt {} (or fluent attempt run {} {}).",
+            action.plan_row,
+            action.candidate_commit,
+            action.command,
+            action.working_directory,
+            action.matrix_artifact,
+            work_item_id,
+            attempt_id,
+            action.candidate_commit,
+            action.plan_row,
+            work_item_id,
+            attempt_id,
+            work_item_id,
+            attempt_id,
+        )?;
+    }
+    Ok(relative_path)
+}
+
+fn write_writer_completion_repair(
+    project_root: &Path,
+    work_item_id: &str,
+    attempt_id: &str,
+    task_id: &str,
+    source_artifact: &ArtifactRef,
+    source: &str,
+    matrix: &crate::work_model::WriterCompletionMatrix,
+    repairs: &[crate::work_model::WriterCompletionRepair],
+) -> Result<(ArtifactRef, ArtifactRef)> {
+    let directory = format!("writer-completion-repairs/{task_id}");
+    let matrix_relative = work_artifact_path(
+        work_item_id,
+        attempt_id,
+        &format!("{directory}/writer-completion.json"),
+    );
+    let evidence_relative = work_artifact_path(
+        work_item_id,
+        attempt_id,
+        &format!("{directory}/repair.json"),
+    );
+    let matrix_bytes =
+        serde_json::to_vec_pretty(matrix).context("serialize repaired Writer completion matrix")?;
+    let source_digest = format!("{:x}", Sha256::digest(source.as_bytes()));
+    let repaired_digest = format!("{:x}", Sha256::digest(&matrix_bytes));
+    let evidence_bytes = serde_json::to_vec_pretty(&serde_json::json!({
+        "schema-version": 1,
+        "source-artifact": source_artifact.path,
+        "source-sha256": source_digest,
+        "repaired-artifact": matrix_relative,
+        "repaired-sha256": repaired_digest,
+        "repairs": repairs,
+    }))
+    .context("serialize Writer completion repair evidence")?;
+    for (relative, bytes) in [
+        (&matrix_relative, matrix_bytes.as_slice()),
+        (&evidence_relative, evidence_bytes.as_slice()),
+    ] {
+        let path = project_root.join(relative);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "create Writer completion repair directory: {}",
+                    parent.display()
+                )
+            })?;
+        }
+        match fs::read(&path) {
+            Ok(existing) if existing == bytes => {}
+            Ok(_) => bail!(
+                "Writer completion repair artifact already exists with different bytes: {}",
+                path.display()
+            ),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                crate::atomic_write::atomic_write(&path, bytes).with_context(|| {
+                    format!(
+                        "write Writer completion repair artifact: {}",
+                        path.display()
+                    )
+                })?;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "inspect Writer completion repair artifact: {}",
+                        path.display()
+                    )
+                });
+            }
+        }
+    }
+    Ok((
+        ArtifactRef {
+            producer_id: "writer-completion-repair".to_string(),
+            path: matrix_relative,
+        },
+        ArtifactRef {
+            producer_id: "writer-completion-repair".to_string(),
+            path: evidence_relative,
+        },
+    ))
+}
+
+fn write_writer_completion_format_repair(
+    project_root: &Path,
+    work_item_id: &str,
+    attempt_id: &str,
+    task_id: &str,
+    source_artifact: &ArtifactRef,
+    source: &str,
+    matrix: &crate::work_model::WriterCompletionMatrix,
+    repairs: &[WriterCompletionFormatRepair],
+) -> Result<(ArtifactRef, ArtifactRef)> {
+    let directory = format!("writer-completion-repairs/{task_id}/format");
+    let matrix_relative = work_artifact_path(
+        work_item_id,
+        attempt_id,
+        &format!("{directory}/writer-completion.json"),
+    );
+    let evidence_relative = work_artifact_path(
+        work_item_id,
+        attempt_id,
+        &format!("{directory}/format-repair.json"),
+    );
+    let matrix_bytes = serde_json::to_vec_pretty(matrix)
+        .context("serialize format-repaired Writer completion matrix")?;
+    let source_digest = format!("{:x}", Sha256::digest(source.as_bytes()));
+    let repaired_digest = format!("{:x}", Sha256::digest(&matrix_bytes));
+    let evidence_bytes = serde_json::to_vec_pretty(&serde_json::json!({
+        "schema-version": 1,
+        "kind": "writer-completion-format-normalization",
+        "source-artifact": source_artifact.path,
+        "source-sha256": source_digest,
+        "repaired-artifact": matrix_relative,
+        "repaired-sha256": repaired_digest,
+        "normalizations": repairs,
+    }))
+    .context("serialize Writer completion format repair evidence")?;
+    for (relative, bytes) in [
+        (&matrix_relative, matrix_bytes.as_slice()),
+        (&evidence_relative, evidence_bytes.as_slice()),
+    ] {
+        let path = project_root.join(relative);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "create Writer completion format repair directory: {}",
+                    parent.display()
+                )
+            })?;
+        }
+        match fs::read(&path) {
+            Ok(existing) if existing == bytes => {}
+            Ok(_) => bail!(
+                "Writer completion format repair artifact already exists with different bytes: {}",
+                path.display()
+            ),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                crate::atomic_write::atomic_write(&path, bytes).with_context(|| {
+                    format!(
+                        "write Writer completion format repair artifact: {}",
+                        path.display()
+                    )
+                })?;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "inspect Writer completion format repair artifact: {}",
+                        path.display()
+                    )
+                });
+            }
+        }
+    }
+    Ok((
+        ArtifactRef {
+            producer_id: "writer-completion-repair".to_string(),
+            path: matrix_relative,
+        },
+        ArtifactRef {
+            producer_id: "writer-completion-repair".to_string(),
+            path: evidence_relative,
+        },
+    ))
 }
 
 /// Settle a RoundCap or Uncertain review pause through a fresh, precedence-aware
@@ -3661,7 +9992,7 @@ fn settle_review_pause(
     //    by the RESULTING state — this frontier owns the pause when the attempt ends
     //    in exactly our pause. A crash-retry that finds the pause already ours still
     //    owns it (so the handoff attach can complete); a harder peer does not.
-    let owns_pause = store.mutate_work_item(work_item_id, |fresh| {
+    let owns_pause = mutate_attempt_work_item(store, work_item_id, |fresh| {
         let attempt = fresh
             .attempts
             .iter_mut()
@@ -3669,9 +10000,13 @@ fn settle_review_pause(
             .ok_or_else(|| crate::work_model::WorkModelError::AttemptNotFound {
                 id: attempt_id.to_string(),
             })?;
-        crate::work_model::transition_attempt(attempt, AttemptStatus::NeedsUser, Some(pause_kind));
-        let owns =
-            attempt.status == AttemptStatus::NeedsUser && attempt.pause_kind == Some(pause_kind);
+        crate::work_model::transition_attempt(
+            attempt,
+            AttemptStatus::NeedsUser,
+            Some(pause_kind.clone()),
+        );
+        let owns = attempt.status == AttemptStatus::NeedsUser
+            && attempt.pause_kind.as_ref() == Some(&pause_kind);
         if owns {
             attempt.review_state = Some(review_state);
         }
@@ -3694,7 +10029,7 @@ fn settle_review_pause(
     //    same frontier still owns the pause, and only once, so a repeated or
     //    interleaved settle attaches at most one reference and never overwrites a
     //    newer peer artifact from a stale snapshot.
-    store.mutate_work_item(work_item_id, |fresh| {
+    mutate_attempt_work_item(store, work_item_id, |fresh| {
         let attempt = fresh
             .attempts
             .iter_mut()
@@ -3702,8 +10037,8 @@ fn settle_review_pause(
             .ok_or_else(|| crate::work_model::WorkModelError::AttemptNotFound {
                 id: attempt_id.to_string(),
             })?;
-        let still_owns =
-            attempt.status == AttemptStatus::NeedsUser && attempt.pause_kind == Some(pause_kind);
+        let still_owns = attempt.status == AttemptStatus::NeedsUser
+            && attempt.pause_kind.as_ref() == Some(&pause_kind);
         if still_owns && !attempt.artifacts.iter().any(|a| a.path == handoff_path) {
             attempt.artifacts.push(ArtifactRef {
                 producer_id: "attempt-loop".to_string(),
@@ -3717,6 +10052,89 @@ fn settle_review_pause(
     notify(&handoff_path);
 
     Ok(WorkAttemptRunOutcome::NeedsUser { handoff_path })
+}
+
+/// Render retained bindings and failures without reading or executing commands.
+fn tester_diagnosis_details(
+    project_root: &Path,
+    attempt: &Attempt,
+    results_path: Option<&Path>,
+) -> String {
+    let candidate = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+        .and_then(|task| task.output.as_ref())
+        .map(|output| output.commit.as_str())
+        .unwrap_or("not recorded");
+    let tester = attempt.tasks.iter().rev().find(|task| {
+        task.kind == TaskKind::Tester
+            && task.artifact_area.as_ref().is_some_and(|area| {
+                results_path.is_some_and(|path| {
+                    project_root.join(&area.path).join("tester-results.json") == path
+                })
+            })
+    });
+    let mut details = format!(
+        "Candidate: `{candidate}`\nTester task: `{}`\nExpected Tester results: `{}`\n",
+        tester
+            .map(|task| task.id.as_str())
+            .unwrap_or("not recorded"),
+        results_path
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "not recorded".into())
+    );
+    let Some(path) = results_path else {
+        return details;
+    };
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            details.push_str(&format!(
+                "\nResult failure: cannot read Tester results: {error}\n"
+            ));
+            return details;
+        }
+    };
+    let results: crate::tester::TesterResults = match serde_json::from_slice(&bytes) {
+        Ok(results) => results,
+        Err(error) => {
+            details.push_str(&format!(
+                "\nResult failure: cannot parse Tester results: {error}\n"
+            ));
+            return details;
+        }
+    };
+    details.push_str(&format!(
+        "Result candidate: `{}`\n",
+        results
+            .candidate_commit
+            .as_deref()
+            .unwrap_or("not recorded")
+    ));
+    if let Some(error) = &results.error {
+        details.push_str(&format!(
+            "\nTester error `{}`: {}\n{}\n",
+            error.kind, error.message, error.details
+        ));
+    }
+    for (index, command) in results.commands.iter().enumerate() {
+        details.push_str(&format!(
+            "\nCommand {index}: `{}` (exit {})\nstdout: `{}`\nstderr: `{}`\n",
+            command.command,
+            command.exit_code,
+            path.parent()
+                .unwrap_or(project_root)
+                .join(&command.stdout_log)
+                .display(),
+            path.parent()
+                .unwrap_or(project_root)
+                .join(&command.stderr_log)
+                .display()
+        ));
+    }
+    details
 }
 
 fn interpret_reviews(
@@ -3733,42 +10151,338 @@ fn interpret_reviews(
         .position(|attempt| attempt.id == attempt_id)
         .ok_or_else(|| anyhow::anyhow!("Attempt {:?} not found", attempt_id))?;
 
-    let review_artifacts = latest_review_artifacts(project_root, &item.attempts[attempt_index])?;
+    if let Some(recovery) = item.attempts[attempt_index]
+        .active_evidence_recovery()
+        .cloned()
+    {
+        let targeted = item.attempts[attempt_index]
+            .tasks
+            .iter()
+            .filter(|task| {
+                task.evidence_review_context
+                    .as_ref()
+                    .is_some_and(|context| context.recovery_id == recovery.id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if targeted
+            .iter()
+            .all(|task| task.status == TaskStatus::Complete)
+        {
+            let failed = targeted.iter().find(|task| {
+                let path = task
+                    .artifact_area
+                    .as_ref()
+                    .map(|area| project_root.join(&area.path).join("review.md"));
+                path.as_ref().is_some_and(|path| {
+                    fs::read_to_string(path)
+                        .map(|text| review::extract_verdict(&text) == Verdict::Fail)
+                        .unwrap_or(false)
+                })
+            });
+            if let Some(task) = failed {
+                let path = task
+                    .artifact_area
+                    .as_ref()
+                    .map(|area| project_root.join(&area.path).join("review.md"))
+                    .unwrap();
+                let content = fs::read_to_string(&path).unwrap_or_default();
+                let review_digest = format!("sha256:{:x}", Sha256::digest(content.as_bytes()));
+                let disposition = review::extract_evidence_disposition(&content);
+                match disposition {
+                    Some(review::EvidenceDisposition::EvidenceNeeded) => {
+                        let review_path = path
+                            .strip_prefix(project_root)
+                            .ok()
+                            .and_then(|path| path.to_str())
+                            .unwrap_or_default();
+                        let handoff_path = {
+                            let recovery = item.attempts[attempt_index]
+                                .evidence_recoveries
+                                .iter_mut()
+                                .find(|entry| entry.id == recovery.id)
+                                .unwrap();
+                            recovery.state = EvidenceRecoveryState::NeedsEvidence;
+                            if let Some(target) = recovery.targets.iter_mut().find(|target| {
+                                target.review_task_id.as_deref() == Some(task.id.as_str())
+                                    || target.prior_review_artifact == review_path
+                            }) {
+                                target.review_digest = Some(review_digest);
+                            }
+                            recovery.attachment.snapshot_path.clone()
+                        };
+                        item.attempts[attempt_index].status = AttemptStatus::NeedsUser;
+                        item.attempts[attempt_index].pause_kind = Some(PauseKind::Uncertain);
+                        item.attempts[attempt_index].review_state =
+                            Some(AttemptReviewState::Failed);
+                        write_attempt_work_item(store, &mut item)?;
+                        return Ok(WorkAttemptRunOutcome::NeedsUser { handoff_path });
+                    }
+                    Some(review::EvidenceDisposition::CodeChange) => {
+                        item.attempts[attempt_index]
+                            .evidence_recoveries
+                            .iter_mut()
+                            .find(|entry| entry.id == recovery.id)
+                            .unwrap()
+                            .state = EvidenceRecoveryState::CodeChange;
+                        let artifact = ArtifactRef {
+                            producer_id: task.id.clone(),
+                            path: format!(
+                                "{}/review.md",
+                                task.artifact_area.as_ref().unwrap().path
+                            ),
+                        };
+                        item.attempts[attempt_index].status = AttemptStatus::Planned;
+                        item.attempts[attempt_index].pause_kind = None;
+                        let task_id = item.add_next_write_round(attempt_id, vec![artifact])?;
+                        write_attempt_work_item(store, &mut item)?;
+                        return Ok(WorkAttemptRunOutcome::PlannedWriteRound { task_id });
+                    }
+                    None => {
+                        item.attempts[attempt_index].status = AttemptStatus::NeedsUser;
+                        item.attempts[attempt_index].pause_kind = Some(PauseKind::Uncertain);
+                        write_attempt_work_item(store, &mut item)?;
+                        return Ok(WorkAttemptRunOutcome::NeedsUser {
+                            handoff_path: recovery.attachment.snapshot_path,
+                        });
+                    }
+                }
+            }
+            if !targeted.is_empty()
+                && targeted.len() == recovery.targets.len()
+                && targeted.iter().all(|task| {
+                    task.artifact_area.as_ref().is_some_and(|area| {
+                        fs::read_to_string(project_root.join(&area.path).join("review.md"))
+                            .is_ok_and(|source| review::extract_verdict(&source) == Verdict::Pass)
+                    })
+                })
+            {
+                // Persist acceptance before any later pause or advancement. A
+                // fresh mutation cannot lose a peer's stop or Task settlement.
+                store.mutate_work_item(&item.id, |fresh| {
+                    let attempt = fresh
+                        .attempts
+                        .iter_mut()
+                        .find(|attempt| attempt.id == attempt_id)
+                        .ok_or_else(|| WorkModelError::AttemptNotFound {
+                            id: attempt_id.into(),
+                        })?;
+                    attempt.ensure_not_canceled()?;
+                    let rejected =
+                        |reason: String| WorkModelError::HostEvidenceRecoveryIneligible {
+                            attempt_id: attempt_id.into(),
+                            reason,
+                        };
+                    if recovery.carried_finding.is_some()
+                        && !crate::recovery_contracts::carried_finding_review_passes(
+                            project_root,
+                            attempt,
+                            &recovery,
+                        )
+                        .map_err(|e| rejected(format!("{e:#}")))?
+                    {
+                        return Err(rejected(
+                            "failed host proof cannot satisfy a carried finding".into(),
+                        ));
+                    }
+                    if let Some(check) = &recovery.required_check {
+                        crate::recovery_contracts::validate_required_check_binding(
+                            project_root,
+                            attempt,
+                            check,
+                        )
+                        .map_err(|error| rejected(format!("{error:#}")))?;
+                    }
+                    let (attachment, _) = crate::recovery_contracts::bound_recovery_artifact(
+                        project_root,
+                        &recovery.attachment.snapshot_path,
+                    )
+                    .map_err(|error| rejected(format!("{error:#}")))?;
+                    if attachment.digest != recovery.attachment.digest {
+                        return Err(rejected("host evidence changed before acceptance".into()));
+                    }
+                    for expected in &targeted {
+                        if !attempt.tasks.iter().any(|task| task == expected) {
+                            return Err(rejected(
+                                "targeted review changed before acceptance".into(),
+                            ));
+                        }
+                    }
+                    let current = attempt
+                        .evidence_recoveries
+                        .iter_mut()
+                        .find(|entry| entry.id == recovery.id)
+                        .ok_or_else(|| rejected("evidence recovery disappeared".into()))?;
+                    if *current != recovery {
+                        return Err(rejected(
+                            "evidence recovery changed before acceptance".into(),
+                        ));
+                    }
+                    for target in &mut current.targets {
+                        let task = targeted
+                            .iter()
+                            .find(|task| Some(task.id.as_str()) == target.review_task_id.as_deref())
+                            .unwrap();
+                        let path =
+                            format!("{}/review.md", task.artifact_area.as_ref().unwrap().path);
+                        let (artifact, bytes) =
+                            crate::recovery_contracts::bound_recovery_artifact(project_root, &path)
+                                .map_err(|error| rejected(format!("{error:#}")))?;
+                        if review::extract_verdict(&String::from_utf8_lossy(&bytes))
+                            != Verdict::Pass
+                        {
+                            return Err(rejected("targeted review no longer passes".into()));
+                        }
+                        target.review_digest = Some(artifact.digest);
+                    }
+                    current.state = EvidenceRecoveryState::Complete;
+                    Ok(())
+                })?;
+                item = store.read_work_item(&item.id)?;
+            } else {
+                if recovery.carried_finding.is_some() {
+                    item.attempts[attempt_index].status = AttemptStatus::NeedsUser;
+                    item.attempts[attempt_index].pause_kind = Some(PauseKind::Uncertain);
+                    write_attempt_work_item(store, &mut item)?;
+                    return Ok(WorkAttemptRunOutcome::NeedsUser {
+                        handoff_path: recovery.attachment.snapshot_path,
+                    });
+                }
+                item.attempts[attempt_index]
+                    .evidence_recoveries
+                    .iter_mut()
+                    .find(|entry| entry.id == recovery.id)
+                    .unwrap()
+                    .state = EvidenceRecoveryState::Complete;
+            }
+        }
+    }
+    if !item.attempts[attempt_index].kind.is_review_only_like() {
+        let stale_roles =
+            stale_review_roles_after_latest_write(project_root, &item.attempts[attempt_index]);
+        if !stale_roles.is_empty()
+            && ordinary_review_tasks(project_root, &item.attempts[attempt_index])
+                .iter()
+                .all(|(_, verdict)| *verdict == Verdict::Pass)
+        {
+            let task_ids = item.add_next_review_tasks(attempt_id, &stale_roles)?;
+            work_task_executor::prepare_ordinary_review_evidence(
+                project_root,
+                &mut item,
+                attempt_id,
+                &task_ids,
+            )?;
+            write_attempt_work_item(store, &mut item)?;
+            return Ok(WorkAttemptRunOutcome::PlannedReviews { task_ids });
+        }
+    }
+    let attempt = &item.attempts[attempt_index];
+    let review_artifacts = if attempt.kind.is_review_only_like() {
+        latest_review_artifacts(project_root, attempt)?
+    } else {
+        ordinary_review_tasks(project_root, attempt)
+            .into_iter()
+            .map(|(task, _)| task)
+            .filter_map(|task| task.artifact_area.as_ref().map(|area| (task, area)))
+            .map(|(task, area)| {
+                Ok(ReviewArtifact {
+                    artifact: ArtifactRef {
+                        producer_id: task.id.clone(),
+                        path: format!("{}/review.md", area.path),
+                    },
+                    review_path: work_task_executor::resolve_managed_artifact_area_path(
+                        project_root,
+                        &area.path,
+                    )?
+                    .join("review.md"),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
     if review_artifacts.is_empty() {
         bail!("Attempt {:?} has no completed review artifacts", attempt_id);
     }
 
     let mut failed = Vec::new();
     let mut uncertain = Vec::new();
+    let mut focused_evidence_requests = Vec::new();
     for review_artifact in &review_artifacts {
         let content = fs::read_to_string(&review_artifact.review_path).unwrap_or_default();
         match review::extract_verdict(&content) {
             Verdict::Pass => {}
-            Verdict::Fail => failed.push(review_artifact.artifact.clone()),
+            Verdict::Fail => {
+                failed.push(review_artifact.artifact.clone());
+                let is_tests_review = item.attempts[attempt_index].tasks.iter().any(|task| {
+                    task.kind == TaskKind::Review
+                        && task.role == "tests"
+                        && task.artifact_area.as_ref().is_some_and(|area| {
+                            format!("{}/review.md", area.path) == review_artifact.artifact.path
+                        })
+                });
+                if is_tests_review && review::extract_focused_evidence_request(&content).is_some() {
+                    focused_evidence_requests.push(review_artifact.artifact.clone());
+                }
+            }
             Verdict::Uncertain => uncertain.push(review_artifact.artifact.clone()),
         }
     }
 
-    let tester_result_path =
-        latest_tester_results_path(project_root, &item.attempts[attempt_index]);
-    let baseline_path = baseline_tester_results_path(project_root, &item.attempts[attempt_index]);
-    let tester_fail_count = tester_result_path
-        .as_ref()
-        .map(|p| introduced_tester_failures(p, baseline_path.as_deref()))
-        .unwrap_or(0);
-    let tester_has_error = tester_result_path
-        .as_ref()
-        .map(|p| tester_errored(p))
-        .unwrap_or(false);
+    // One exact focused evidence request is an operator decision, not source
+    // correction work. Pause before planning a Writer so an explicit host run
+    // can reuse the unchanged candidate and rerun only the Tests Reviewer.
+    if failed.len() == 1
+        && focused_evidence_requests.len() == 1
+        && uncertain.is_empty()
+        && !item.attempts[attempt_index].kind.is_review_only_like()
+    {
+        return settle_review_pause(
+            store,
+            project_root,
+            &item.id,
+            attempt_id,
+            AttemptReviewState::Failed,
+            crate::work_model::PauseKind::Uncertain,
+            &focused_evidence_requests,
+            write_focused_evidence_handoff,
+            &|_| {},
+        );
+    }
 
-    // Advancement gate B2: when reviews and the tester would otherwise pass, a marked
-    // Attempt must not pass over incomplete or mismatched required progress. A
-    // violation is surfaced as a synthetic finding so a follow-up Writer materializes
-    // checked current-progress evidence before a later pass — never an ad hoc bypass.
+    // Advancement gate B2: when reviews would otherwise pass, a marked Attempt must
+    // not start the expensive final Tester over incomplete or mismatched required
+    // progress. A violation is surfaced as a synthetic finding so a follow-up Writer
+    // materializes checked current-progress evidence before a later pass.
     // An unmarked (legacy) Attempt has no contract, so this never scans its prose.
-    let reviews_would_pass =
-        failed.is_empty() && uncertain.is_empty() && tester_fail_count == 0 && !tester_has_error;
+    let reviews_would_pass = failed.is_empty() && uncertain.is_empty();
     if reviews_would_pass {
+        let host_check = crate::host_evidence::required_host_verification_pending(
+            project_root,
+            &item.attempts[attempt_index],
+        );
+        let reason = match host_check {
+            Ok(Some(action)) => Some(format!(
+                "candidate {} requires host verification for {}: {}; attach candidate-bound passing evidence and complete targeted Tests Review",
+                action.candidate_commit, action.plan_row, action.command
+            )),
+            Err(error) => Some(format!(
+                "cannot validate required host verification: {error:#}"
+            )),
+            Ok(None) => None,
+        };
+        if let Some(reason) = reason {
+            let artifact = required_progress_artifact(&item.attempts[attempt_index]);
+            return pause_writer_completion_before_reviews(
+                project_root,
+                store,
+                &mut item,
+                attempt_index,
+                attempt_id,
+                &artifact,
+                &reason,
+                0,
+                0,
+            );
+        }
         if let Some(finding) =
             required_progress_finding(project_root, &item.attempts[attempt_index])
         {
@@ -3776,10 +10490,173 @@ fn interpret_reviews(
         }
     }
 
-    let has_failures = !failed.is_empty() || tester_fail_count > 0 || tester_has_error;
+    // Code-producing Attempts run the canonical suite once, after every reviewer has
+    // passed. A legacy Attempt that already owns a round Tester resumes through that
+    // existing Task; review-only Attempts retain their Tester-first contract.
+    if failed.is_empty()
+        && uncertain.is_empty()
+        && !item.attempts[attempt_index].kind.is_review_only_like()
+        && latest_tester_results_path(project_root, &item.attempts[attempt_index]).is_none()
+    {
+        let task_id = item.add_final_tester_task(attempt_id)?;
+        write_attempt_work_item(store, &mut item)?;
+        return Ok(WorkAttemptRunOutcome::PlannedFinalTester { task_id });
+    }
+
+    let tester_gate_applicable = failed.is_empty() && uncertain.is_empty();
+    let tester_result_path =
+        latest_tester_results_path(project_root, &item.attempts[attempt_index]);
+    // A completed Tester remains authoritative even when its legacy artifact
+    // cannot be reconstructed. Only the neutral assessor classifies its facts.
+    let canonical_assessment = tester_result_path
+        .as_ref()
+        .filter(|_| tester_gate_applicable)
+        .map(|_| {
+            crate::verification_assessment::assess_canonical_checks(
+                project_root,
+                &item.attempts[attempt_index],
+            )
+        });
+    if tester_gate_applicable
+        && canonical_assessment.as_ref().is_some_and(|assessment| {
+            assessment.as_ref().map_or(true, |view| {
+                !view.blockers.is_empty() || (!view.is_satisfied() && view.defects.is_empty())
+            })
+        })
+    {
+        let reason = match canonical_assessment.as_ref().unwrap() {
+            Ok(view) => view.blockers.iter().chain(view.diagnoses.iter()).cloned().chain(view.outstanding.iter().map(|index| {
+                let check = &view.checks[*index];
+                format!("Required check {} remains unresolved: `{}`. Attach exact host proof with `fluent attempt evidence attach {} {} --candidate {} --required-check {} --evidence-file <path>`.", check.id, check.command, item.id, attempt_id, check.candidate_commit, check.id)
+            })).collect::<Vec<_>>().join("\n\n"),
+            Err(error) => format!("Required canonical check needs diagnosis; its bindings cannot be verified: {error:#}. Restore the named immutable proof before retrying."),
+        };
+        let reason = format!(
+            "{}\n\n{reason}",
+            tester_diagnosis_details(
+                project_root,
+                &item.attempts[attempt_index],
+                tester_result_path.as_deref()
+            )
+        );
+        return settle_review_pause(
+            store,
+            project_root,
+            &item.id,
+            attempt_id,
+            AttemptReviewState::Failed,
+            PauseKind::HostEvidence,
+            &[],
+            |root, work, attempt, _| {
+                let handoff = work_artifact_path(work, attempt, "required-check-needs-user.md");
+                crate::atomic_write::atomic_write(&root.join(&handoff), reason.as_bytes())?;
+                Ok(handoff)
+            },
+            &|_| {},
+        );
+    }
+    let (tester_fail_count, tester_failed_command_count) = match &canonical_assessment {
+        Some(Ok(view)) => (view.defects.len(), view.outstanding.len()),
+        // Unverifiable completed evidence already paused above. No evidence
+        // here means this review round does not consume a Tester result.
+        None => (0, 0),
+        Some(Err(_)) => unreachable!("canonical assessment errors pause before correction"),
+    };
+
+    if tester_gate_applicable && tester_fail_count == 0 {
+        if let Some((artifact, evidence)) = gate_candidate_after_final_tester(
+            project_root,
+            &mut item,
+            attempt_index,
+            tester_result_path.as_deref(),
+        )? {
+            match evidence.disposition {
+                crate::candidate_gate::CandidateGateDisposition::Passed => {}
+                crate::candidate_gate::CandidateGateDisposition::Rejected => {
+                    let verification = crate::verification_assessment::assess_current_verification(
+                        project_root,
+                        &item.attempts[attempt_index],
+                    );
+                    if verification
+                        .as_ref()
+                        .map_or(true, |view| view.candidate_defects().is_empty())
+                    {
+                        item.attempts[attempt_index].review_state =
+                            Some(AttemptReviewState::Failed);
+                        if let Some(action) =
+                            crate::host_evidence::pending_candidate_gate_evidence_recovery_action(
+                                project_root,
+                                &item.attempts[attempt_index],
+                            )
+                        {
+                            write_attempt_work_item(store, &mut item)?;
+                            return settle_review_pause(
+                                store,
+                                project_root,
+                                &item.id,
+                                attempt_id,
+                                AttemptReviewState::Failed,
+                                PauseKind::HostEvidence,
+                                std::slice::from_ref(&artifact),
+                                |root, work, attempt, _| {
+                                    write_candidate_gate_evidence_handoff(
+                                        root, work, attempt, &action,
+                                    )
+                                },
+                                &|_| {},
+                            );
+                        }
+                        return pause_candidate_gate_after_tester(
+                            project_root,
+                            store,
+                            &mut item,
+                            attempt_index,
+                            attempt_id,
+                            &artifact,
+                            &evidence,
+                        );
+                    }
+                    failed.extend(final_tester_correction_artifacts(
+                        project_root,
+                        &item.attempts[attempt_index],
+                        &artifact,
+                        tester_result_path
+                            .as_deref()
+                            .expect("the final-Tester gate required structured evidence"),
+                    )?);
+                }
+                crate::candidate_gate::CandidateGateDisposition::Blocked => {
+                    return pause_candidate_gate_after_tester(
+                        project_root,
+                        store,
+                        &mut item,
+                        attempt_index,
+                        attempt_id,
+                        &artifact,
+                        &evidence,
+                    );
+                }
+            }
+        }
+    }
+
+    let has_failures =
+        !failed.is_empty() || tester_fail_count > 0 || tester_failed_command_count > 0;
 
     if has_failures {
-        if tester_fail_count > 0 || tester_has_error {
+        if tester_failed_command_count > 0 {
+            if let Some(ref path) = tester_result_path {
+                for artifact in failed_tester_command_artifacts(
+                    project_root,
+                    &item.attempts[attempt_index],
+                    path,
+                )? {
+                    if !failed.contains(&artifact) {
+                        failed.push(artifact);
+                    }
+                }
+            }
+        } else if tester_fail_count > 0 {
             if let Some(ref path) = tester_result_path {
                 if let Ok(relative) = path.strip_prefix(project_root) {
                     failed.push(ArtifactRef {
@@ -3791,15 +10668,43 @@ fn interpret_reviews(
         }
 
         item.attempts[attempt_index].review_state = Some(AttemptReviewState::Failed);
+        if let Some(action) = crate::host_evidence::pending_candidate_gate_evidence_recovery_action(
+            project_root,
+            &item.attempts[attempt_index],
+        ) {
+            let gate = ArtifactRef {
+                producer_id: "candidate-gate".to_string(),
+                path: action.gate_artifact.clone(),
+            };
+            // Persist the gate reference before the pause so the public attach
+            // command can revalidate the exact frontier under the land lock.
+            write_attempt_work_item(store, &mut item)?;
+            return settle_review_pause(
+                store,
+                project_root,
+                &item.id,
+                attempt_id,
+                AttemptReviewState::Failed,
+                crate::work_model::PauseKind::HostEvidence,
+                std::slice::from_ref(&gate),
+                |root, work_item_id, attempt_id, _| {
+                    write_candidate_gate_evidence_handoff(root, work_item_id, attempt_id, &action)
+                },
+                &|_| {},
+            );
+        }
         if item.attempts[attempt_index].kind.is_review_only_like() {
             crate::work_model::set_attempt_terminal(
                 &mut item.attempts[attempt_index],
                 AttemptStatus::Failed,
             );
-            store.write_work_item(&item)?;
+            write_attempt_work_item(store, &mut item)?;
             return Ok(WorkAttemptRunOutcome::ReviewOnlyFailed);
         }
         if !followup_budget_available {
+            let write_rounds = item.attempts[attempt_index].materialized_write_rounds();
+            let round_cap_reached = write_rounds
+                >= item.attempts[attempt_index].effective_write_round_cap(max_total_write_rounds());
             // Settle the RoundCap pause through the fresh, precedence-aware reducer:
             // it persists the pause first (preserving a harder peer transition), then
             // writes and attaches the handoff only while this frontier owns the pause,
@@ -3812,13 +10717,21 @@ fn interpret_reviews(
                 AttemptReviewState::Failed,
                 crate::work_model::PauseKind::RoundCap,
                 &failed,
-                write_budget_exhausted_handoff,
+                |root, work_item_id, attempt_id, findings| {
+                    write_budget_exhausted_handoff(
+                        root,
+                        work_item_id,
+                        attempt_id,
+                        findings,
+                        round_cap_reached,
+                    )
+                },
                 &|_| {},
             );
         }
         item.attempts[attempt_index].status = AttemptStatus::Planned;
         let task_id = item.add_next_write_round(attempt_id, failed)?;
-        store.write_work_item(&item)?;
+        write_attempt_work_item(store, &mut item)?;
         return Ok(WorkAttemptRunOutcome::PlannedWriteRound { task_id });
     }
 
@@ -3841,13 +10754,20 @@ fn interpret_reviews(
     }
 
     item.attempts[attempt_index].review_state = Some(AttemptReviewState::Passed);
+    supersede_classified_source_writer(&mut item.attempts[attempt_index]);
     crate::work_model::set_attempt_terminal(
         &mut item.attempts[attempt_index],
         AttemptStatus::Complete,
     );
     if item.attempts[attempt_index].kind.is_review_only_like() {
-        store.write_work_item(&item)?;
+        write_attempt_work_item(store, &mut item)?;
         return Ok(WorkAttemptRunOutcome::ReviewOnlyComplete);
+    }
+    // A production code-producing Attempt is structurally Complete after reviews,
+    // but its end-to-end completion time is the later instant when Learning
+    // succeeds. Tests may deliberately omit the Learner boundary.
+    if learner_config.is_some() {
+        item.attempts[attempt_index].completed_at = None;
     }
     // Allocate the Merge Candidate identity before the Learner runs, so the
     // handoff can reference it and a confined expertise commit can update its
@@ -3856,15 +10776,12 @@ fn interpret_reviews(
     // Persist the terminal Passed/Complete state and the Merge Candidate identity
     // BEFORE the Learner runs, so the Learner's fresh, landing-validated reservation
     // reads an eligible durable target rather than this pre-terminal snapshot.
-    store.write_work_item(&item)?;
+    write_attempt_work_item(store, &mut item)?;
     // Run the Learner for every code-producing Attempt, whether or not a
     // reviewer raised a finding.
-    // A no-expertise Learner settles every terminal transition through its own
-    // fresh, field-level mutations and refreshes `item` from the durable store, so a
-    // post-Learner whole-aggregate write here would reopen the stale-write window the
-    // release correction closes. Skip it for that mode; capture persists its
-    // canonical result inside `run_learner_step`.
-    let mut skip_post_learner_aggregate_write = false;
+    // Each Learner mode persists its own outcome. The final readiness stamp below
+    // uses one fresh field-level mutation so no-expertise execution does not reopen
+    // its stale whole-aggregate write window.
     if let Some(ref learner_config) = learner_config {
         // The Learner runs before land here, so it is never post-land handoff-only.
         // The Work Item's stored policy selects capture or pre-land no-expertise.
@@ -3878,7 +10795,6 @@ fn interpret_reviews(
             mode,
             learner_config,
         )?;
-        skip_post_learner_aggregate_write = mode.is_pre_land_no_expertise();
         // Advancement gate: a Learner ran in this path, so its result gates
         // readiness. A non-succeeded Learner blocks MergeCandidateReady with the same
         // durable reason surfaced by Merge Candidate validation and landing, rather
@@ -3890,11 +10806,57 @@ fn interpret_reviews(
                 relaunchable: learner_relaunchable(&item, attempt_id),
             });
         }
+        let candidate_id = mutate_attempt_work_item(store, &item.id, |fresh| {
+            fresh.mark_merge_candidate_ready(attempt_id)
+        })?;
+        return Ok(WorkAttemptRunOutcome::MergeCandidateReady { candidate_id });
     }
-    if !skip_post_learner_aggregate_write {
-        store.write_work_item(&item)?;
-    }
+    write_attempt_work_item(store, &mut item)?;
     Ok(WorkAttemptRunOutcome::MergeCandidateReady { candidate_id })
+}
+
+/// Release the unresolved frontier held by the failed Writer that a classified
+/// recovery replaced, while retaining that Writer as immutable Attempt history.
+/// Run this only at the terminal completion boundary after the corrective Writer,
+/// reviews, and final Tester have all succeeded.
+fn supersede_classified_source_writer(attempt: &mut Attempt) {
+    let classified_writer_indices = attempt
+        .evidence_recoveries
+        .iter()
+        .filter_map(|entry| {
+            (entry.state == EvidenceRecoveryState::CodeChange)
+                .then(|| entry.code_change_classification.as_ref())
+                .flatten()
+        })
+        .filter_map(|classification| {
+            attempt
+                .tasks
+                .iter()
+                .position(|task| task.id == classification.writer_task_id)
+        })
+        .collect::<Vec<_>>();
+    let mut failed_source_writer_indices = classified_writer_indices
+        .iter()
+        .flat_map(|writer_index| {
+            attempt
+                .tasks
+                .iter()
+                .enumerate()
+                .take(*writer_index)
+                .filter_map(|(index, task)| {
+                    (task.kind == TaskKind::Write
+                        && task.status == TaskStatus::Failed
+                        && task.output.is_none())
+                    .then_some(index)
+                })
+        })
+        .collect::<Vec<_>>();
+    failed_source_writer_indices.sort_unstable();
+    failed_source_writer_indices.dedup();
+    if failed_source_writer_indices.len() == 1 {
+        let task = &mut attempt.tasks[failed_source_writer_indices[0]];
+        crate::work_model::set_task_terminal(task, TaskStatus::Superseded);
+    }
 }
 
 #[derive(Debug)]
@@ -3903,25 +10865,321 @@ struct ReviewArtifact {
     review_path: PathBuf,
 }
 
+fn round_cap_failure_frontier(
+    project_root: &Path,
+    attempt: &Attempt,
+) -> Result<Vec<RoundCapReviewArtifact>> {
+    let mut failed = Vec::new();
+    for artifact in latest_review_artifacts(project_root, attempt)? {
+        let bytes = fs::read(&artifact.review_path).with_context(|| {
+            format!(
+                "read latest review artifact {}",
+                artifact.review_path.display()
+            )
+        })?;
+        if review::extract_verdict(&String::from_utf8_lossy(&bytes)) == Verdict::Fail {
+            failed.push(RoundCapReviewArtifact {
+                artifact: artifact.artifact,
+                digest: format!("sha256:{:x}", Sha256::digest(&bytes)),
+            });
+        }
+    }
+    failed.extend(failed_command_recheck_round_cap_frontier(
+        project_root,
+        attempt,
+    )?);
+    let gated_tester = rejected_final_tester_gate_frontier(project_root, attempt)?;
+    if gated_tester.is_empty() {
+        failed.extend(failed_final_tester_without_gate_frontier(
+            project_root,
+            attempt,
+        )?);
+    } else {
+        failed.extend(gated_tester);
+    }
+    Ok(failed)
+}
+
+fn failed_command_recheck_round_cap_frontier(
+    project_root: &Path,
+    attempt: &Attempt,
+) -> Result<Vec<RoundCapReviewArtifact>> {
+    let Some(recheck) = attempt.tasks.last().filter(|task| {
+        task.kind == TaskKind::Tester
+            && task.status == TaskStatus::Complete
+            && task.is_failed_command_recheck()
+    }) else {
+        return Ok(Vec::new());
+    };
+    let Some(area) = recheck.artifact_area.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let results_path =
+        work_task_executor::resolve_managed_artifact_area_path(project_root, &area.path)?
+            .join("tester-results.json");
+    if !results_path.is_file()
+        || tester_errored(&results_path)
+        || (introduced_tester_failures(
+            &results_path,
+            baseline_tester_results_path(project_root, attempt).as_deref(),
+        ) == 0
+            && unexplained_failed_tester_commands(
+                &results_path,
+                baseline_tester_results_path(project_root, attempt).as_deref(),
+            ) == 0)
+    {
+        return Ok(Vec::new());
+    }
+    failed_command_recheck_correction_artifacts(project_root, recheck)?
+        .into_iter()
+        .map(|artifact| {
+            let bytes = fs::read(project_root.join(&artifact.path))?;
+            Ok(RoundCapReviewArtifact {
+                artifact,
+                digest: format!("sha256:{:x}", Sha256::digest(&bytes)),
+            })
+        })
+        .collect()
+}
+
+/// Bind an exhausted round-cap approval to the latest failed final Tester when
+/// a structured failure or harness error prevented the candidate gate from running.
+/// A present gate always owns this frontier; the fallback is only for the
+/// no-gate path produced by `interpret_reviews`.
+fn failed_final_tester_without_gate_frontier(
+    project_root: &Path,
+    attempt: &Attempt,
+) -> Result<Vec<RoundCapReviewArtifact>> {
+    let Some(last_write_index) = attempt
+        .tasks
+        .iter()
+        .rposition(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+    else {
+        return Ok(Vec::new());
+    };
+    let write_task = &attempt.tasks[last_write_index];
+    let Some(output) = write_task.output.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let Some(tester) = latest_completed_final_tester_after(attempt, last_write_index) else {
+        return Ok(Vec::new());
+    };
+    let gate_path = project_root.join(format!(
+        "{}/{}/{}",
+        work_artifact_path(&attempt.work_item_id, &attempt.id, "candidate-gates"),
+        tester.id,
+        crate::candidate_gate::CANDIDATE_GATE_FILE
+    ));
+    if gate_path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let Some(area) = tester.artifact_area.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let artifact_dir =
+        work_task_executor::resolve_managed_artifact_area_path(project_root, &area.path)?;
+    let tester_results_path = artifact_dir.join("tester-results.json");
+    if !tester_results_path.is_file() {
+        return Ok(Vec::new());
+    }
+    let bytes = fs::read(&tester_results_path).with_context(|| {
+        format!(
+            "read failed final-Tester evidence {}",
+            tester_results_path.display()
+        )
+    })?;
+    let results: crate::tester::TesterResults =
+        serde_json::from_slice(&bytes).with_context(|| {
+            format!(
+                "parse failed final-Tester evidence {}",
+                tester_results_path.display()
+            )
+        })?;
+    if results.candidate_commit.as_deref() != Some(output.commit.as_str()) {
+        bail!(
+            "failed final-Tester evidence is not bound to candidate {}",
+            output.commit
+        );
+    }
+    let failed = results.summary.fail > 0
+        || results.error.is_some()
+        || results.commands.iter().any(|command| {
+            command.exit_code != 0
+                || command
+                    .process_settlement
+                    .as_ref()
+                    .is_some_and(|evidence| !evidence.leaks.is_empty())
+        });
+    if !failed {
+        return Ok(Vec::new());
+    }
+
+    failed_tester_command_artifacts(project_root, attempt, &tester_results_path)?
+        .into_iter()
+        .map(|artifact| {
+            let path = work_task_executor::resolve_managed_artifact_area_path(
+                project_root,
+                &artifact.path,
+            )?;
+            let bytes = fs::read(&path)
+                .with_context(|| format!("read failed correction artifact {}", path.display()))?;
+            Ok(RoundCapReviewArtifact {
+                artifact,
+                digest: format!("sha256:{:x}", Sha256::digest(&bytes)),
+            })
+        })
+        .collect()
+}
+
+fn rejected_final_tester_gate_frontier(
+    project_root: &Path,
+    attempt: &Attempt,
+) -> Result<Vec<RoundCapReviewArtifact>> {
+    let Some(last_write_index) = attempt
+        .tasks
+        .iter()
+        .rposition(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+    else {
+        return Ok(Vec::new());
+    };
+    let write_task = &attempt.tasks[last_write_index];
+    let Some(output) = write_task.output.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let tester = attempt.tasks.iter().rev().find(|task| {
+        if task.kind != TaskKind::Tester
+            || task.status != TaskStatus::Complete
+            || task.is_failed_command_recheck()
+        {
+            return false;
+        }
+        let Some(area) = task.artifact_area.as_ref() else {
+            return false;
+        };
+        let results_path = match work_task_executor::resolve_managed_artifact_area_path(
+            project_root,
+            &area.path,
+        ) {
+            Ok(path) => path.join("tester-results.json"),
+            Err(_) => return false,
+        };
+        let candidate_matches = fs::read(&results_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<crate::tester::TesterResults>(&bytes).ok())
+            .and_then(|results| results.candidate_commit)
+            .as_deref()
+            == Some(output.commit.as_str());
+        let gate_path = project_root.join(format!(
+            "{}/{}/{}",
+            work_artifact_path(&attempt.work_item_id, &attempt.id, "candidate-gates"),
+            task.id,
+            crate::candidate_gate::CANDIDATE_GATE_FILE
+        ));
+        candidate_matches && gate_path.is_file()
+    });
+    let Some(tester) = tester else {
+        return Ok(Vec::new());
+    };
+    let artifact = ArtifactRef {
+        producer_id: write_task.id.clone(),
+        path: format!(
+            "{}/{}/{}",
+            work_artifact_path(&attempt.work_item_id, &attempt.id, "candidate-gates"),
+            tester.id,
+            crate::candidate_gate::CANDIDATE_GATE_FILE
+        ),
+    };
+    let gate_path = project_root.join(&artifact.path);
+    if !gate_path.is_file() {
+        return Ok(Vec::new());
+    }
+    let bytes = fs::read(&gate_path)
+        .with_context(|| format!("read final-Tester gate {}", gate_path.display()))?;
+    let evidence: crate::candidate_gate::CandidateGateEvidence = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse final-Tester gate {}", gate_path.display()))?;
+    if evidence.phase != crate::candidate_gate::CandidateGatePhase::FinalTester
+        || evidence.disposition != crate::candidate_gate::CandidateGateDisposition::Rejected
+    {
+        return Ok(Vec::new());
+    }
+    let expected_tester_path = tester
+        .artifact_area
+        .as_ref()
+        .map(|area| format!("{}/tester-results.json", area.path));
+    if evidence.schema_version == 0
+        || evidence.schema_version > crate::candidate_gate::CANDIDATE_GATE_SCHEMA_VERSION
+        || evidence.base_commit != output.commit
+        || evidence.candidate_commit != output.commit
+        || evidence.tester_results_path != expected_tester_path
+    {
+        bail!(
+            "final-Tester gate {} does not match the current candidate frontier",
+            gate_path.display()
+        );
+    }
+    let tester_results_path = tester
+        .artifact_area
+        .as_ref()
+        .map(|area| {
+            work_task_executor::resolve_managed_artifact_area_path(project_root, &area.path)
+                .map(|dir| dir.join("tester-results.json"))
+        })
+        .transpose()?
+        .ok_or_else(|| anyhow::anyhow!("final-Tester correction has no artifact area"))?;
+    final_tester_correction_artifacts(project_root, attempt, &artifact, &tester_results_path)?
+        .into_iter()
+        .map(|artifact| {
+            let path = work_task_executor::resolve_managed_artifact_area_path(
+                project_root,
+                &artifact.path,
+            )?;
+            let bytes = fs::read(&path)
+                .with_context(|| format!("read failed correction artifact {}", path.display()))?;
+            Ok(RoundCapReviewArtifact {
+                artifact,
+                digest: format!("sha256:{:x}", Sha256::digest(&bytes)),
+            })
+        })
+        .collect()
+}
+
 fn latest_review_artifacts(
     project_root: &Path,
     attempt: &crate::work_model::Attempt,
 ) -> Result<Vec<ReviewArtifact>> {
-    let start = if attempt.kind.is_review_only_like() {
-        0
-    } else {
-        let Some(last_write_index) = attempt
-            .tasks
-            .iter()
-            .rposition(|task| task.kind == TaskKind::Write)
-        else {
-            return Ok(Vec::new());
+    let start =
+        if attempt.kind.is_review_only_like() {
+            0
+        } else {
+            let Some(last_write_index) = attempt.tasks.iter().rposition(|task| {
+                task.kind == TaskKind::Write && task.status == TaskStatus::Complete
+            }) else {
+                return Ok(Vec::new());
+            };
+            last_write_index + 1
         };
-        last_write_index + 1
-    };
-    attempt.tasks[start..]
-        .iter()
-        .filter(|task| task.kind == TaskKind::Review && task.status == TaskStatus::Complete)
+    // Keep the established review-role order while replacing each role with its
+    // latest result. Evidence-targeted reviews append a replacement for one role;
+    // sorting roles here would change the ordinary Writer's corrective inputs.
+    let mut latest_by_role = Vec::new();
+    for task in attempt.tasks[start..].iter().filter(|task| {
+        task.kind == TaskKind::Review
+            && task.status == TaskStatus::Complete
+            && !inactive_finding_review(attempt, task)
+    }) {
+        if let Some((_, latest)) = latest_by_role
+            .iter_mut()
+            .find(|(role, _)| role == &task.role)
+        {
+            *latest = task;
+        } else {
+            latest_by_role.push((task.role.clone(), task));
+        }
+    }
+    latest_by_role
+        .into_iter()
+        .map(|(_, task)| task)
         .filter_map(|task| task.artifact_area.as_ref().map(|area| (task, area)))
         .map(|(task, area)| {
             let artifact_dir =
@@ -3989,12 +11247,66 @@ fn write_needs_user_handoff(
         .map(|artifact| format!("- {}", artifact.path))
         .collect::<Vec<_>>()
         .join("\n");
-    fs::write(
-        &path,
+    let body = crate::work_status::append_pause_record_to_handoff(
+        project_root,
+        work_item_id,
+        attempt_id,
         format!(
             "# Attempt needs user input\n\nThe Attempt loop found uncertain or missing review verdicts.\n\n{artifacts}\n"
         ),
-    )?;
+    );
+    crate::atomic_write::atomic_write(&path, body.as_bytes())?;
+    Ok(relative_path)
+}
+
+fn write_focused_evidence_handoff(
+    project_root: &Path,
+    work_item_id: &str,
+    attempt_id: &str,
+    reviews: &[ArtifactRef],
+) -> Result<String> {
+    let review = reviews
+        .first()
+        .context("focused evidence pause requires one failed Tests Review")?;
+    let relative_path = work_artifact_path(work_item_id, attempt_id, "needs-user.md");
+    let path = project_root.join(&relative_path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let body = crate::work_status::append_pause_record_to_handoff(
+        project_root,
+        work_item_id,
+        attempt_id,
+        format!(
+            "# Attempt needs focused test evidence\n\nThe failed Tests Review requested one focused check against the unchanged candidate. Fluent did not plan another Writer.\n\nReview: `{}`\n\nTo authorize the exact command recorded in that review, run:\n\n`fluent attempt evidence run {} {} --review-artifact {}`\n",
+            review.path, work_item_id, attempt_id, review.path
+        ),
+    );
+    crate::atomic_write::atomic_write(&path, body.as_bytes())?;
+    Ok(relative_path)
+}
+
+fn write_candidate_gate_evidence_handoff(
+    project_root: &Path,
+    work_item_id: &str,
+    attempt_id: &str,
+    action: &crate::host_evidence::CandidateGateEvidenceAction,
+) -> Result<String> {
+    let relative_path = work_artifact_path(work_item_id, attempt_id, "needs-user.md");
+    let path = project_root.join(&relative_path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let body = crate::work_status::append_pause_record_to_handoff(
+        project_root,
+        work_item_id,
+        attempt_id,
+        format!(
+            "# Attempt needs candidate-gate host evidence\n\nThe final candidate gate requires one command-shaped Test reference that did not run inside canonical Tester. Run this exact command on an authorized host against the unchanged candidate:\n\n`{}`\n\nRecord its result as a schema-version-1 evidence document whose `check` is that exact command and whose `working_directory` is `.`. Use `result: pass` when the command succeeds or `result: fail` when it exposes a candidate defect, then attach it to the immutable rejected gate:\n\n`{}`\n\nFluent sends either result to a targeted Tests Review. An accepted passing result can satisfy the gate; a reviewed failing result can request a corrective Writer without discarding the candidate or review history. Then run `fluent queue resume {work_item_id} --attempt {attempt_id}` to return that Review to the scheduler, or `fluent attempt run {work_item_id} {attempt_id}` to resume it directly.\n\nRejected gate: `{}`\n",
+            action.command, action.attach_command, action.gate_artifact
+        ),
+    );
+    crate::atomic_write::atomic_write(&path, body.as_bytes())?;
     Ok(relative_path)
 }
 
@@ -4003,6 +11315,7 @@ fn write_budget_exhausted_handoff(
     work_item_id: &str,
     attempt_id: &str,
     failed: &[ArtifactRef],
+    round_cap_reached: bool,
 ) -> Result<String> {
     let relative_path = work_artifact_path(work_item_id, attempt_id, "needs-user.md");
     let path = project_root.join(&relative_path);
@@ -4014,14 +11327,54 @@ fn write_budget_exhausted_handoff(
         .map(|artifact| format!("- {}", artifact.path))
         .collect::<Vec<_>>()
         .join("\n");
-    fs::write(
-        &path,
+    let recovery = if round_cap_reached {
         format!(
-            "# Attempt needs user input\n\nThe Attempt loop stopped advancing: reviewers reported `Progress: no` for {} consecutive rounds, or the total write-round ceiling of {} was reached.\n\nFailed review artifacts still need attention:\n\n{artifacts}\n",
-            max_no_progress_rounds(),
-            max_total_write_rounds()
+            "The current write-round ceiling was reached. To approve one to three additional Writer rounds for this exact candidate and failed-correction content, run:\n\n`fluent attempt extend {work_item_id} {attempt_id} --additional-write-rounds 1 --resolution \"<decision for the corrective Writer>\"`\n\nThen run `fluent queue resume {work_item_id} --attempt {attempt_id}` to return it to the scheduler, or `fluent attempt run {work_item_id} {attempt_id}` to resume it directly."
+        )
+    } else {
+        format!(
+            "Reviewers reported `Progress: no` for {} consecutive rounds. A cap extension cannot resume this pause; resolve the stalled approach before starting new work.",
+            max_no_progress_rounds()
+        )
+    };
+    let body = crate::work_status::append_pause_record_to_handoff(
+        project_root,
+        work_item_id,
+        attempt_id,
+        format!(
+            "# Attempt needs user input\n\nThe Attempt loop stopped advancing. The candidate commit and review history remain unchanged.\n\n{recovery}\n\nFailed correction artifacts still need attention:\n\n{artifacts}\n"
         ),
-    )?;
+    );
+    crate::atomic_write::atomic_write(&path, body.as_bytes())?;
+    Ok(relative_path)
+}
+
+fn write_failed_recheck_evidence_handoff(
+    project_root: &Path,
+    work_item_id: &str,
+    attempt_id: &str,
+    failed: &[ArtifactRef],
+    action: &str,
+) -> Result<String> {
+    let relative_path = work_artifact_path(work_item_id, attempt_id, "needs-user.md");
+    let path = project_root.join(&relative_path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let artifacts = failed
+        .iter()
+        .map(|artifact| format!("- {}", artifact.path))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let body = crate::work_status::append_pause_record_to_handoff(
+        project_root,
+        work_item_id,
+        attempt_id,
+        format!(
+            "# Attempt needs external test evidence\n\nThe unchanged candidate stopped after one failed-command recheck. Run the exact command on an authorized host and attach a schema-version-1 evidence document with `result: pass` when it succeeds. If a related direct public command exposes a candidate defect before the exact command can run, you may attach a `result: fail` diagnostic; Fluent will route it to a targeted Tests Review but will never treat that different command as a passing recheck.\n\n`{action}`\n\nFluent binds the evidence to the unchanged candidate and immutable recheck. Accepted passing evidence can supersede the host-only failure; reviewed failing evidence can request a corrective Writer.\n\nThen run `fluent queue resume {work_item_id} --attempt {attempt_id}` to return the targeted Tests Review to the scheduler, or `fluent attempt run {work_item_id} {attempt_id}` to resume it directly.\n\nThe evidence must address these immutable recheck artifacts:\n\n{artifacts}\n"
+        ),
+    );
+    crate::atomic_write::atomic_write(&path, body.as_bytes())?;
     Ok(relative_path)
 }
 
@@ -4040,12 +11393,244 @@ fn read_work_item_or_not_found(store: &WorkModelStore, id: &str) -> Result<WorkI
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::candidate_gate::{
+        CandidateCheckEvidence, CandidateCheckStatus, CandidateGateDisposition,
+        CandidateGateEvidence, CandidateGatePhase,
+    };
     use crate::content::ContentResolver;
+    use crate::follow_up::{ArtifactRef as LearnerArtifactRef, FollowUpDraftV1, LearnerDraftV1};
     use crate::work_model::AttemptKind;
     use crate::work_model::WorkItemAbandonment;
     use crate::work_model::{
         Attempt, CoderMapping, LearningFailureKind, TaskArtifactArea, WorkspaceAccess,
     };
+
+    #[cfg(feature = "test-support")]
+    fn assert_compact_verification_context(
+        context: &serde_json::Value,
+        full: &crate::verification_assessment::VerificationAssessment,
+    ) {
+        let compact = &context["verification"];
+        assert_eq!(compact["candidate_commit"], full.candidate_commit);
+        assert_eq!(
+            compact["satisfied_references"],
+            full.references.iter().filter(|row| row.satisfied).count()
+        );
+        assert_eq!(
+            compact["satisfied_commands"],
+            full.commands.iter().filter(|row| row.satisfied).count()
+        );
+        assert_eq!(
+            compact["references"],
+            serde_json::to_value(
+                full.references
+                    .iter()
+                    .filter(|row| !row.satisfied)
+                    .collect::<Vec<_>>()
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            compact["commands"],
+            serde_json::to_value(
+                full.commands
+                    .iter()
+                    .filter(|row| !row.satisfied)
+                    .collect::<Vec<_>>()
+            )
+            .unwrap()
+        );
+        let saved = fs::read(compact["full_assessment"]["path"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            compact["full_assessment"]["digest"],
+            format!("sha256:{:x}", Sha256::digest(&saved))
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&saved).unwrap(),
+            serde_json::to_value(full).unwrap()
+        );
+    }
+
+    #[test]
+    fn final_writer_handoff_rechecks_after_preflight() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("main");
+        fs::create_dir_all(&project).unwrap();
+        git::run(
+            &project,
+            &["init", "-b", "main"],
+            "initialize handoff fixture",
+        )
+        .unwrap();
+        git::run(
+            &project,
+            &["config", "user.name", "Test Author"],
+            "set author",
+        )
+        .unwrap();
+        git::run(
+            &project,
+            &["config", "user.email", "test@example.com"],
+            "set email",
+        )
+        .unwrap();
+        fs::write(project.join("README.md"), "source\n").unwrap();
+        git::run(&project, &["add", "README.md"], "stage source").unwrap();
+        git::run(&project, &["commit", "-m", "Add source"], "commit source").unwrap();
+        let base = git::run_stdout(&project, &["rev-parse", "HEAD"], "read base").unwrap();
+        let candidate_path =
+            crate::work_model::initial_candidate_workspace_path("handoff-1", "attempt-1");
+        let candidate = project.join(&candidate_path);
+        git::run(
+            &project,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "work/handoff-1/attempt-1/attempt-1-write-1",
+                &candidate_path,
+            ],
+            "create Writer worktree",
+        )
+        .unwrap();
+        fs::write(candidate.join("change.txt"), "change\n").unwrap();
+        git::run(&candidate, &["add", "change.txt"], "stage change").unwrap();
+        git::run(&candidate, &["commit", "-m", "Add change"], "commit change").unwrap();
+        let commit = git::run_stdout(&candidate, &["rev-parse", "HEAD"], "read candidate").unwrap();
+        let store = WorkModelStore::new(&project);
+        let mut item = WorkItem::planned("handoff-1", "Check final handoff");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let task = &mut item.attempts[0].tasks[0];
+        task.status = TaskStatus::Executing;
+        let area = project.join(&task.artifact_area.as_ref().unwrap().path);
+        fs::create_dir_all(&area).unwrap();
+        fs::write(area.join("write-baseline-commit"), &base).unwrap();
+        item.attempts[0].status = AttemptStatus::Executing;
+        store.create_work_item(&item).unwrap();
+        let preflight =
+            check_writer_handoff(&candidate, "handoff-1", "attempt-1", "attempt-1-write-1")
+                .unwrap();
+        assert_eq!(preflight.candidate_commit, commit);
+        let task = &mut item.attempts[0].tasks[0];
+        task.status = TaskStatus::Complete;
+        task.output = Some(TaskOutput {
+            workspace_id: "candidate".into(),
+            workspace_path: candidate_path,
+            source_branch: "main".into(),
+            base_commit: Some(base),
+            commit,
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        item.attempts[0].status = AttemptStatus::Complete;
+        store.write_work_item(&item).unwrap();
+        fs::write(candidate.join("late.txt"), "late\n").unwrap();
+        let final_report =
+            check_completed_writer_handoff(&project, "handoff-1", "attempt-1", "attempt-1-write-1")
+                .unwrap();
+        assert_eq!(final_report.overall, WriterHandoffCheckStatus::Failed);
+        assert!(
+            final_report
+                .checks
+                .iter()
+                .any(|check| check.name == "writer-output"
+                    && check.status == WriterHandoffCheckStatus::Failed)
+        );
+        assert!(plan_after_completed_writer(&project, &store, item, "attempt-1").is_err());
+    }
+
+    #[test]
+    fn attempt_executor_mutations_record_the_owned_origin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let mut item = WorkItem {
+            id: "work-origin".to_string(),
+            title: "Track Attempt origin".to_string(),
+            ..Default::default()
+        };
+        item.add_initial_attempt("attempt-origin").unwrap();
+        store.create_work_item(&item).unwrap();
+
+        mutate_attempt_work_item(&store, "work-origin", |item| {
+            item.attempts[0].status = AttemptStatus::NeedsUser;
+            item.attempts[0].pause_kind = Some(PauseKind::ProviderUnavailable);
+            Ok(())
+        })
+        .unwrap();
+
+        let transition = store
+            .read_work_item("work-origin")
+            .unwrap()
+            .transitions
+            .last()
+            .cloned()
+            .unwrap();
+        assert_eq!(transition.object_kind, "attempt");
+        assert_eq!(transition.origin, DurableTransitionOrigin::AttemptExecutor);
+        assert_eq!(transition.reason.as_deref(), Some("provider-unavailable"));
+    }
+
+    #[test]
+    fn tester_only_no_sandbox_capability_does_not_apply_to_other_tasks() {
+        assert!(task_uses_no_sandbox(
+            false,
+            Some("attempt-1-tester-8"),
+            "attempt-1-tester-8"
+        ));
+        assert!(!task_uses_no_sandbox(
+            false,
+            Some("attempt-1-tester-8"),
+            "attempt-1-review-tests-9"
+        ));
+        assert!(task_uses_no_sandbox(
+            true,
+            Some("attempt-1-tester-8"),
+            "attempt-1-review-tests-9"
+        ));
+    }
+
+    #[test]
+    fn learner_normalization_notes_are_persisted() {
+        let draft = LearnerDraftV1 {
+            learning_summary: String::new(),
+            follow_ups: vec![
+                FollowUpDraftV1 {
+                    id: "fu-1".to_string(),
+                    summary: "Consider tightening the retry cap".to_string(),
+                    corrective: false,
+                    evidence: vec![LearnerArtifactRef {
+                        path: "/absolute/eviction.log".to_string(),
+                        digest: "sha256:abc".to_string(),
+                    }],
+                    ..Default::default()
+                },
+                FollowUpDraftV1 {
+                    id: "fu-2".to_string(),
+                    summary: "Consider checking retry telemetry".to_string(),
+                    corrective: false,
+                    evidence: vec![LearnerArtifactRef {
+                        path: "notes.md".to_string(),
+                        digest: "not-a-digest".to_string(),
+                    }],
+                    ..Default::default()
+                },
+            ],
+        };
+        let (_normalized, notes) = crate::learner::normalize_draft(draft);
+        assert!(
+            notes.len() >= 2,
+            "ordered malformed optional evidence produces multiple normalization notes"
+        );
+
+        let run_dir = tempfile::tempdir().unwrap();
+        record_run_normalizations(run_dir.path(), &notes).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(run_dir.path().join("normalizations.txt")).unwrap(),
+            format!("{}\n", notes.join("\n")),
+            "the host-owned artifact preserves every note in order with a final newline"
+        );
+    }
 
     #[test]
     fn learner_preserves_typed_pump_failure() {
@@ -4101,6 +11686,7 @@ mod tests {
                                 message: None,
                             },
                         ),
+                        provider_liveness: None,
                     }],
                 },
             };
@@ -4121,15 +11707,21 @@ mod tests {
     }
 
     #[test]
-    fn learning_record_without_failure_kind_deserializes_backward_compatibly() {
-        // The new typed failure_kind is backward-compatible: a record persisted
-        // before it existed (no `failure_kind` field) still deserializes, with the
-        // kind absent.
+    fn learning_record_without_optional_failure_fields_deserializes() {
+        // The optional typed failure fields are backward-compatible: a record
+        // persisted before they existed still deserializes with both absent.
         let legacy = r#"{"status":"failed","runs":2,"last_failure":"old failure"}"#;
         let learning: crate::work_model::AttemptLearning = serde_json::from_str(legacy).unwrap();
         assert!(learning.is_failed());
         assert_eq!(learning.runs, 2);
         assert_eq!(learning.failure_kind, None, "absent on legacy records");
+        assert_eq!(learning.failure_stage, None, "absent on legacy records");
+        assert!(
+            !serde_json::to_string(&learning)
+                .unwrap()
+                .contains("failure_stage"),
+            "an absent failure stage preserves the legacy serialized shape"
+        );
     }
 
     /// Acquire a Task lease, retrying to absorb macOS flock release-visibility
@@ -4158,12 +11750,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         let work = "work-1";
-        let task = "attempt-1-write-1";
+        let task_id = "attempt-1-write-1";
+        let task = write_task(task_id, Vec::new());
 
         // A leased Task is live even though no transcript or pump status exists.
-        let lease = acquire_task_lease_eventually(root, work, task);
+        let lease = acquire_task_lease_eventually(root, work, task_id);
         assert!(
-            executing_task_is_live(root, work, task),
+            executing_task_is_live(root, work, &task),
             "a leased Task is live regardless of transcript presence or age"
         );
         drop(lease);
@@ -4175,7 +11768,7 @@ mod tests {
             .join(".fluent/work/artifacts")
             .join(work)
             .join("attempt-1")
-            .join(task);
+            .join(task_id);
         fs::create_dir_all(&artifact_dir).unwrap();
         fs::write(
             artifact_dir.join("transcript.jsonl"),
@@ -4191,7 +11784,7 @@ mod tests {
         // Freed direction: bounded retry to absorb flock release-visibility.
         let mut stale = false;
         for _ in 0..50 {
-            if !executing_task_is_live(root, work, task) {
+            if !executing_task_is_live(root, work, &task) {
                 stale = true;
                 break;
             }
@@ -4201,6 +11794,292 @@ mod tests {
             stale,
             "a released lease makes the Task stale even with a freshly written transcript"
         );
+    }
+
+    #[test]
+    fn canceled_attempt_startup_requires_resume_authorization() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let mut item = WorkItem::planned("work-1", "Cancel before startup");
+        item.add_initial_attempt("attempt-1").unwrap();
+        store.create_work_item(&item).unwrap();
+        cancel_local_attempt(tmp.path(), &store, "work-1", "attempt-1").unwrap();
+        let stopped = store.read_work_item("work-1").unwrap();
+        let resolver = ContentResolver::new(Some(tmp.path()));
+        let result = run_attempt(WorkAttemptRunConfig {
+            project_root: tmp.path(),
+            store: &store,
+            work_item_id: "work-1",
+            attempt_id: "attempt-1",
+            resolver: &resolver,
+            extra_args: &[],
+            no_sandbox: true,
+            tester_no_sandbox: false,
+            resume_cancellation_requested_at: None,
+            coder_mapping_inputs: None,
+            learner_run_coder: None,
+        });
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("this launch was not authorized to resume the current cancellation")
+        );
+        assert_eq!(
+            store.read_work_item("work-1").unwrap(),
+            stopped,
+            "startup must not authorize resuming a cancellation it did not observe at admission"
+        );
+    }
+
+    #[test]
+    fn cancellation_resume_authority_rejects_a_later_stop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let mut item = WorkItem::planned("work-1", "Require current cancellation authority");
+        item.add_initial_attempt("attempt-1").unwrap();
+        store.create_work_item(&item).unwrap();
+        cancel_local_attempt(tmp.path(), &store, "work-1", "attempt-1").unwrap();
+        let first = store.read_work_item("work-1").unwrap();
+        let first_stop = &first.attempts[0]
+            .cancellation
+            .as_ref()
+            .unwrap()
+            .requested_at;
+        resume_canceled_attempt(tmp.path(), &store, "work-1", "attempt-1", Some(first_stop))
+            .unwrap();
+        cancel_local_attempt(tmp.path(), &store, "work-1", "attempt-1").unwrap();
+        let second = store.read_work_item("work-1").unwrap();
+        let second_stop = &second.attempts[0]
+            .cancellation
+            .as_ref()
+            .unwrap()
+            .requested_at;
+        assert_ne!(first_stop, second_stop);
+        assert!(
+            resume_canceled_attempt(tmp.path(), &store, "work-1", "attempt-1", Some(first_stop))
+                .is_err()
+        );
+        assert_eq!(store.read_work_item("work-1").unwrap(), second);
+        resume_canceled_attempt(tmp.path(), &store, "work-1", "attempt-1", Some(second_stop))
+            .unwrap();
+        let resumed = store.read_work_item("work-1").unwrap();
+        assert!(!resumed.attempts[0].cancellation_requested());
+        assert_eq!(resumed.attempts[0].status, AttemptStatus::Planned);
+    }
+
+    #[test]
+    fn canceled_pending_candidate_resumes_reviewed_state() {
+        use crate::work_model::{AttemptLearning, TaskOutput, WorkspaceRef};
+
+        for learning in [
+            None,
+            Some(AttemptLearning::in_progress(1)),
+            Some(AttemptLearning::succeeded(
+                1,
+                crate::follow_up::ArtifactRef {
+                    path: "handoff.json".into(),
+                    digest: "sha256:x".into(),
+                },
+            )),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let store = WorkModelStore::new(tmp.path());
+            let mut writer = write_task("attempt-1-write-1", Vec::new());
+            writer.workspace_access.writes.push(WorkspaceRef {
+                id: "candidate".into(),
+                path: "../candidate".into(),
+            });
+            writer.output = Some(TaskOutput {
+                workspace_id: "candidate".into(),
+                workspace_path: "../candidate".into(),
+                source_branch: "main".into(),
+                base_commit: None,
+                commit: "reviewed".into(),
+                no_change: None,
+                learner_canonicalization: None,
+            });
+            let mut item = WorkItem {
+                id: "work-1".into(),
+                title: "Resume the reviewed candidate".into(),
+                attempts: vec![attempt_with_tasks(vec![writer])],
+                ..Default::default()
+            };
+            item.attempts[0].status = AttemptStatus::Complete;
+            item.attempts[0].review_state = Some(AttemptReviewState::Passed);
+            item.attempts[0].learning = learning;
+            item.create_or_get_merge_candidate("attempt-1").unwrap();
+            if item.attempts[0].learning_advancement_readiness().is_ok() {
+                item.mark_merge_candidate_ready("attempt-1").unwrap();
+            }
+            store.create_work_item(&item).unwrap();
+            let candidate_path = store
+                .work_merge_candidate_path("work-1", &item.merge_candidates[0].id)
+                .unwrap();
+            let candidate_bytes = fs::read(&candidate_path).unwrap();
+            cancel_local_attempt(tmp.path(), &store, "work-1", "attempt-1").unwrap();
+            let stopped = store.read_work_item("work-1").unwrap();
+            assert_eq!(stopped.attempts[0].status, AttemptStatus::Complete);
+            assert_eq!(stopped.attempts[0].pause_kind, None);
+            assert_eq!(
+                stopped.attempts[0].completed_at,
+                item.attempts[0].completed_at
+            );
+            assert_eq!(fs::read(&candidate_path).unwrap(), candidate_bytes);
+            assert_eq!(stopped.merge_candidates, item.merge_candidates);
+            let mut stale = stopped.clone();
+            stale.attempts[0].completed_at = Some("later".into());
+            stale.merge_candidates[0].ready_at = Some("later".into());
+            assert!(
+                store.write_work_item(&stale).is_err(),
+                "active stop rejects a stale readiness write"
+            );
+            assert!(
+                stopped.merge_candidates[0]
+                    .validate_advancement(&stopped)
+                    .is_err()
+            );
+            assert_eq!(
+                cancel_local_attempt(tmp.path(), &store, "work-1", "attempt-1").unwrap(),
+                0
+            );
+            assert_eq!(store.read_work_item("work-1").unwrap(), stopped);
+            let stop = &stopped.attempts[0]
+                .cancellation
+                .as_ref()
+                .unwrap()
+                .requested_at;
+            for authority in [None, Some("older-cancellation")] {
+                assert!(
+                    resume_canceled_attempt(tmp.path(), &store, "work-1", "attempt-1", authority)
+                        .is_err()
+                );
+                assert_eq!(store.read_work_item("work-1").unwrap(), stopped);
+            }
+            resume_canceled_attempt(tmp.path(), &store, "work-1", "attempt-1", Some(stop)).unwrap();
+            let resumed = store.read_work_item("work-1").unwrap();
+            assert_eq!(resumed.merge_candidates, item.merge_candidates);
+            assert_eq!(resumed.attempts[0].tasks, item.attempts[0].tasks);
+            assert_eq!(fs::read(&candidate_path).unwrap(), candidate_bytes);
+            assert_eq!(resumed.attempts[0].status, AttemptStatus::Complete);
+            assert_eq!(
+                resumed.attempts[0].completed_at,
+                item.merge_candidates[0].ready_at
+            );
+            assert!(!resumed.attempts[0].cancellation_requested());
+            assert_eq!(
+                resumed.merge_candidates[0]
+                    .validate_advancement(&resumed)
+                    .is_ok(),
+                item.merge_candidates[0].ready_at.is_some(),
+                "resume preserves existing readiness only"
+            );
+        }
+    }
+
+    #[test]
+    fn canceled_verification_resume_preserves_prior_artifacts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let mut item = WorkItem::planned("work-1", "Retry a canceled check");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let task = &mut item.attempts[0].tasks[0];
+        task.kind = TaskKind::Verification;
+        task.status = TaskStatus::Executing;
+        let area = tmp.path().join(&task.artifact_area.as_ref().unwrap().path);
+        fs::create_dir_all(&area).unwrap();
+        fs::write(area.join("stdout.log"), b"interrupted output").unwrap();
+        item.attempts[0].status = AttemptStatus::Reviewing;
+        store.create_work_item(&item).unwrap();
+        cancel_local_attempt(tmp.path(), &store, "work-1", "attempt-1").unwrap();
+        let stopped = store.read_work_item("work-1").unwrap();
+        let stop = &stopped.attempts[0]
+            .cancellation
+            .as_ref()
+            .unwrap()
+            .requested_at;
+        resume_canceled_attempt(tmp.path(), &store, "work-1", "attempt-1", Some(stop)).unwrap();
+        let resumed = store.read_work_item("work-1").unwrap();
+        let retry_area = tmp.path().join(
+            &resumed.attempts[0].tasks[0]
+                .artifact_area
+                .as_ref()
+                .unwrap()
+                .path,
+        );
+        assert_ne!(
+            retry_area, area,
+            "a resumed worker must not overwrite an immutable prior run"
+        );
+        assert_eq!(
+            fs::read(area.join("stdout.log")).unwrap(),
+            b"interrupted output"
+        );
+        assert_eq!(resumed.attempts[0].tasks[0].status, TaskStatus::Planned);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancel_local_attempt_stops_owned_group_and_replans_once() {
+        use std::os::unix::process::CommandExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let artifact_path = work_artifact_path("work-1", "attempt-1", "attempt-1-write-1");
+        let transcript = tmp.path().join(&artifact_path).join("transcript.jsonl");
+        let mut task = write_task("attempt-1-write-1", Vec::new());
+        task.status = TaskStatus::Executing;
+        task.artifact_area = Some(crate::work_model::TaskArtifactArea {
+            path: artifact_path,
+        });
+        task.started_at = Some(crate::work_model::now_iso8601());
+
+        let mut item = WorkItem {
+            id: "work-1".to_string(),
+            title: "Cancel local execution".to_string(),
+            ..Default::default()
+        };
+        item.attempts.push(attempt_with_tasks(vec![task]));
+        item.attempts[0].status = AttemptStatus::Executing;
+        store.create_work_item(&item).unwrap();
+
+        let mut command = std::process::Command::new("/bin/sh");
+        command.arg("-c").arg("sleep 30");
+        command.process_group(0);
+        crate::execution::configure_identity_lock(&mut command, &transcript).unwrap();
+        let mut child = command.spawn().unwrap();
+        let _heartbeat =
+            crate::execution::ExecutionHeartbeat::start(&transcript, child.id()).unwrap();
+
+        assert_eq!(
+            cancel_local_attempt(tmp.path(), &store, "work-1", "attempt-1").unwrap(),
+            1
+        );
+        let _ = child.wait();
+        let suspended = store.read_work_item("work-1").unwrap();
+        assert_eq!(suspended.attempts[0].status, AttemptStatus::NeedsUser);
+        assert_eq!(
+            suspended.attempts[0].pause_kind,
+            Some(PauseKind::Interrupted)
+        );
+        assert_eq!(suspended.attempts[0].tasks[0].status, TaskStatus::NeedsUser);
+        assert_eq!(
+            cancel_local_attempt(tmp.path(), &store, "work-1", "attempt-1").unwrap(),
+            0,
+            "repeated cancellation must be idempotent"
+        );
+
+        let stopped = store.read_work_item("work-1").unwrap();
+        let stop = &stopped.attempts[0]
+            .cancellation
+            .as_ref()
+            .unwrap()
+            .requested_at;
+        resume_canceled_attempt(tmp.path(), &store, "work-1", "attempt-1", Some(stop)).unwrap();
+        let resumed = store.read_work_item("work-1").unwrap();
+        assert_eq!(resumed.attempts[0].status, AttemptStatus::Planned);
+        assert_eq!(resumed.attempts[0].pause_kind, None);
+        assert_eq!(resumed.attempts[0].tasks[0].status, TaskStatus::Planned);
     }
 
     fn walk_files(root: &Path) -> Vec<PathBuf> {
@@ -4637,6 +12516,8 @@ mod tests {
             resolver: &resolver,
             extra_args: &[],
             no_sandbox: true,
+            tester_no_sandbox: false,
+            resume_cancellation_requested_at: None,
             coder_mapping_inputs: None,
             learner_run_coder: None,
         }) {
@@ -4645,7 +12526,7 @@ mod tests {
         };
 
         assert!(error.to_string().contains("is abandoned"));
-        let stored = store.read_work_item("work-1").unwrap();
+        let mut stored = store.read_work_item("work-1").unwrap();
         assert!(stored.abandonment.is_some());
         assert_eq!(stored.attempts[0].status, AttemptStatus::Planned);
         assert_eq!(stored.attempts[0].tasks[0].status, TaskStatus::Planned);
@@ -4668,6 +12549,9 @@ mod tests {
                 },
                 artifact_area: None,
                 review_context: None,
+                writer_correction_assignment: None,
+                verification_context: None,
+                evidence_review_context: None,
                 input_artifacts: Vec::new(),
                 depends_on: None,
                 output: None,
@@ -4689,6 +12573,9 @@ mod tests {
                 },
                 artifact_area: None,
                 review_context: None,
+                writer_correction_assignment: None,
+                verification_context: None,
+                evidence_review_context: None,
                 input_artifacts: Vec::new(),
                 depends_on: None,
                 output: None,
@@ -4718,6 +12605,9 @@ mod tests {
                 },
                 artifact_area: None,
                 review_context: None,
+                writer_correction_assignment: None,
+                verification_context: None,
+                evidence_review_context: None,
                 input_artifacts: Vec::new(),
                 depends_on: None,
                 output: None,
@@ -4741,6 +12631,9 @@ mod tests {
                     path: "../outside-review-artifacts".to_string(),
                 }),
                 review_context: None,
+                writer_correction_assignment: None,
+                verification_context: None,
+                evidence_review_context: None,
                 input_artifacts: Vec::new(),
                 depends_on: None,
                 output: None,
@@ -4771,6 +12664,47 @@ mod tests {
             error
                 .to_string()
                 .contains("Task artifact area path must stay under .fluent/work/artifacts")
+        );
+    }
+
+    #[test]
+    fn latest_review_artifacts_retains_non_targeted_legacy_reviews() {
+        let writer = write_task("attempt-1-write-1", Vec::new());
+        let tests = review_task_with_artifact(
+            "attempt-1-review-tests",
+            "tests",
+            ".fluent/work/artifacts/work-1/attempt-1/review-tests",
+        );
+        let architecture = review_task_with_artifact(
+            "attempt-1-review-architecture",
+            "architecture",
+            ".fluent/work/artifacts/work-1/attempt-1/review-architecture",
+        );
+        let mut failed_writer = write_task("attempt-1-write-2", Vec::new());
+        failed_writer.status = TaskStatus::Failed;
+        failed_writer.output = None;
+        let replacement = review_task_with_artifact(
+            "attempt-1-evidence-tests",
+            "tests",
+            ".fluent/work/artifacts/work-1/attempt-1/evidence-tests",
+        );
+        let attempt = attempt_with_tasks(vec![
+            writer,
+            tests,
+            architecture,
+            failed_writer,
+            replacement,
+        ]);
+
+        let artifacts = latest_review_artifacts(Path::new("/tmp/project"), &attempt).unwrap();
+        assert_eq!(artifacts.len(), 2);
+        assert_eq!(
+            artifacts[0].artifact.producer_id,
+            "attempt-1-evidence-tests"
+        );
+        assert_eq!(
+            artifacts[1].artifact.producer_id,
+            "attempt-1-review-architecture"
         );
     }
 
@@ -4824,6 +12758,18 @@ mod tests {
         ]);
 
         assert_eq!(next_review_roles(&attempt), vec!["documentation", "tests"]);
+    }
+
+    #[test]
+    fn corrective_review_roles_include_changed_domains_in_default_order() {
+        assert_eq!(
+            merge_review_roles(&["tests"], &["documentation", "architecture", "tests"],),
+            vec!["documentation", "architecture", "tests"]
+        );
+        assert_eq!(
+            merge_review_roles(&["documentation"], crate::review::REVIEWERS),
+            crate::review::REVIEWERS
+        );
     }
 
     #[test]
@@ -4987,6 +12933,9 @@ mod tests {
             },
             artifact_area: None,
             review_context: None,
+            writer_correction_assignment: None,
+            verification_context: None,
+            evidence_review_context: None,
             input_artifacts,
             depends_on: None,
             output: None,
@@ -4994,6 +12943,103 @@ mod tests {
             started_at: None,
             completed_at: None,
         }
+    }
+
+    fn completed_initial_writer_run() -> WriterRun {
+        WriterRun {
+            task_id: "attempt-1-write-1".to_string(),
+            outcome: WriterOutcome::Continue,
+            kind: WriterRunKind::Initial,
+            provider: "codex".to_string(),
+            session_id: Some("writer-session-1".to_string()),
+            continuation: 0,
+            checked_required: 0,
+            completed_matrix: 0,
+            candidate_commit: "candidate-1".to_string(),
+        }
+    }
+
+    #[test]
+    fn correction_artifacts_record_corrective_writer_runs_before_reviews() {
+        for (producer_id, path) in [
+            (
+                "attempt-1-write-1",
+                ".fluent/work/artifacts/work-1/attempt-1/candidate-gates/attempt-1-write-1/candidate-gate.json",
+            ),
+            (
+                "attempt-1-tester",
+                ".fluent/work/artifacts/work-1/attempt-1/attempt-1-tester/tester-results.json",
+            ),
+            (
+                "attempt-1-review-tests",
+                ".fluent/work/artifacts/work-1/attempt-1/attempt-1-review-tests/review.md",
+            ),
+        ] {
+            let first = write_task("attempt-1-write-1", Vec::new());
+            let mut correction = write_task(
+                "attempt-1-write-2",
+                vec![ArtifactRef {
+                    producer_id: producer_id.to_string(),
+                    path: path.to_string(),
+                }],
+            );
+            correction.output = Some(TaskOutput {
+                workspace_id: "candidate".to_string(),
+                workspace_path: "candidate".to_string(),
+                source_branch: "work/attempt-1".to_string(),
+                base_commit: Some("candidate-1".to_string()),
+                commit: "candidate-2".to_string(),
+                no_change: None,
+                learner_canonicalization: None,
+            });
+            let mut attempt = attempt_with_tasks(vec![first, correction]);
+            attempt.writer_runs.push(completed_initial_writer_run());
+            let mut item = WorkItem::planned("work-1", "Account for correction evidence");
+            item.attempts = vec![attempt];
+
+            record_writer_run(Path::new("."), &mut item, 0, WriterOutcome::Complete, 2, 4);
+
+            let run = item.attempts[0].writer_runs.last().unwrap();
+            assert_eq!(run.kind, WriterRunKind::Corrective, "artifact: {path}");
+            assert_eq!(run.continuation, 1, "artifact: {path}");
+        }
+    }
+
+    #[test]
+    fn progress_and_matrix_only_follow_up_records_a_pre_review_continuation() {
+        let first = write_task("attempt-1-write-1", Vec::new());
+        let mut continuation = write_task(
+            "attempt-1-write-2",
+            vec![
+                ArtifactRef {
+                    producer_id: "required-progress".to_string(),
+                    path: ".fluent/work/progress/work-1/attempt-1/progress.md".to_string(),
+                },
+                ArtifactRef {
+                    producer_id: "attempt-1-write-1".to_string(),
+                    path: ".fluent/work/artifacts/work-1/attempt-1/attempt-1-write-1/writer-completion.json".to_string(),
+                },
+            ],
+        );
+        continuation.output = Some(TaskOutput {
+            workspace_id: "candidate".to_string(),
+            workspace_path: "candidate".to_string(),
+            source_branch: "work/attempt-1".to_string(),
+            base_commit: Some("candidate-1".to_string()),
+            commit: "candidate-2".to_string(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        let mut attempt = attempt_with_tasks(vec![first, continuation]);
+        attempt.writer_runs.push(completed_initial_writer_run());
+        let mut item = WorkItem::planned("work-1", "Continue required progress");
+        item.attempts = vec![attempt];
+
+        record_writer_run(Path::new("."), &mut item, 0, WriterOutcome::Complete, 2, 4);
+
+        let run = item.attempts[0].writer_runs.last().unwrap();
+        assert_eq!(run.kind, WriterRunKind::PreReviewContinuation);
+        assert_eq!(run.continuation, 1);
     }
 
     #[test]
@@ -5022,6 +13068,9 @@ mod tests {
             },
             artifact_area: None,
             review_context: None,
+            writer_correction_assignment: None,
+            verification_context: None,
+            evidence_review_context: None,
             input_artifacts: Vec::new(),
             depends_on: None,
             output: None,
@@ -5069,6 +13118,9 @@ mod tests {
             },
             artifact_area: None,
             review_context: None,
+            writer_correction_assignment: None,
+            verification_context: None,
+            evidence_review_context: None,
             input_artifacts: Vec::new(),
             depends_on: None,
             output: None,
@@ -5112,6 +13164,9 @@ mod tests {
             },
             artifact_area: None,
             review_context: None,
+            writer_correction_assignment: None,
+            verification_context: None,
+            evidence_review_context: None,
             input_artifacts: Vec::new(),
             depends_on: None,
             output: None,
@@ -5119,6 +13174,37 @@ mod tests {
             started_at: None,
             completed_at: None,
         };
+        assert!(is_review_phase_task(&tester));
+    }
+
+    #[test]
+    fn failed_command_recheck_is_serial_not_a_parallel_review_phase() {
+        let mut tester = Task {
+            id: "tester-recheck".to_string(),
+            kind: TaskKind::Tester,
+            status: TaskStatus::Planned,
+            role: crate::work_model::FAILED_COMMAND_RECHECK_ROLE.to_string(),
+            instructions: None,
+            work_item_id: "w".to_string(),
+            attempt_id: None,
+            workspace_access: WorkspaceAccess {
+                reads: Vec::new(),
+                writes: Vec::new(),
+            },
+            artifact_area: None,
+            review_context: None,
+            writer_correction_assignment: None,
+            verification_context: None,
+            evidence_review_context: None,
+            input_artifacts: Vec::new(),
+            depends_on: None,
+            output: None,
+            created_at: None,
+            started_at: None,
+            completed_at: None,
+        };
+        assert!(!is_review_phase_task(&tester));
+        tester.role = "tester".to_string();
         assert!(is_review_phase_task(&tester));
     }
 
@@ -5137,6 +13223,9 @@ mod tests {
             },
             artifact_area: None,
             review_context: None,
+            writer_correction_assignment: None,
+            verification_context: None,
+            evidence_review_context: None,
             input_artifacts: Vec::new(),
             depends_on: None,
             output: None,
@@ -5163,6 +13252,9 @@ mod tests {
                 path: artifact_path.to_string(),
             }),
             review_context: None,
+            writer_correction_assignment: None,
+            verification_context: None,
+            evidence_review_context: None,
             input_artifacts: Vec::new(),
             depends_on: None,
             output: None,
@@ -5198,6 +13290,110 @@ mod tests {
         }
     }
 
+    fn write_provider_outage(artifact_dir: &Path, coder: crate::coder::CoderKind) {
+        let (event, terminal) = match coder {
+            crate::coder::CoderKind::Claude => (
+                "{\"type\":\"rate_limit_event\",\"retry_after\":1}\n",
+                "{\"type\":\"rate_limit_event\",\"retry_after\":1}\n",
+            ),
+            crate::coder::CoderKind::Codex => (
+                "{\"type\":\"error\",\"code\":\"rate_limit\",\"retry_after\":1}\n",
+                "{\"type\":\"error\",\"code\":\"rate_limit\",\"retry_after\":1}\n",
+            ),
+            crate::coder::CoderKind::Pi => unreachable!("Pi has no provider outage contract"),
+        };
+        fs::create_dir_all(artifact_dir).unwrap();
+        for phase in 0..crate::coder::RATE_LIMIT_MAX_RETRIES {
+            fs::write(
+                artifact_dir.join(format!("transcript.{phase}.jsonl")),
+                event,
+            )
+            .unwrap();
+        }
+        fs::write(artifact_dir.join("transcript.jsonl"), terminal).unwrap();
+    }
+
+    fn legacy_provider_pause_fixture(
+        project_root: &Path,
+        coder: crate::coder::CoderKind,
+    ) -> WorkModelStore {
+        legacy_provider_pause_fixture_with_ids(project_root, coder, "work-1", "attempt-1")
+    }
+
+    fn legacy_provider_pause_fixture_with_ids(
+        project_root: &Path,
+        coder: crate::coder::CoderKind,
+        work_item_id: &str,
+        attempt_id: &str,
+    ) -> WorkModelStore {
+        let store = WorkModelStore::new(project_root);
+        let mut item = WorkItem {
+            id: work_item_id.to_string(),
+            title: "Legacy provider pause".to_string(),
+            ..Default::default()
+        };
+        item.add_initial_attempt(attempt_id).unwrap();
+        let attempt = &mut item.attempts[0];
+        attempt.tasks[0].status = TaskStatus::Complete;
+        attempt.tasks[0].output = Some(TaskOutput {
+            workspace_id: "candidate".to_string(),
+            workspace_path: format!(
+                ".fluent/work/workspaces/{work_item_id}/{attempt_id}/candidate"
+            ),
+            source_branch: format!("work/{attempt_id}"),
+            base_commit: None,
+            commit: "abc123".to_string(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        let artifact_path = work_artifact_path(work_item_id, attempt_id, "review-provider");
+        let mut review =
+            review_task_with_artifact("review-provider", "architecture", &artifact_path);
+        review.status = TaskStatus::Failed;
+        review.work_item_id = work_item_id.to_string();
+        review.attempt_id = Some(attempt_id.to_string());
+        attempt.tasks.push(review);
+        attempt.status = AttemptStatus::NeedsUser;
+        attempt.pause_kind = Some(PauseKind::RoundCap);
+        attempt.coder_mapping.review.coder = coder;
+        store.create_work_item(&item).unwrap();
+        write_provider_outage(&project_root.join(artifact_path), coder);
+        if coder == crate::coder::CoderKind::Claude {
+            replace_provider_evidence_with_legacy_scheduler_fixture(
+                project_root,
+                work_item_id,
+                attempt_id,
+                "review-provider",
+                "claude-scheduler-outage-a.jsonl",
+            );
+        }
+        store
+    }
+
+    fn replace_provider_evidence_with_legacy_scheduler_fixture(
+        project_root: &Path,
+        work_item_id: &str,
+        attempt_id: &str,
+        artifact_name: &str,
+        fixture_name: &str,
+    ) {
+        let artifact_dir =
+            project_root.join(work_artifact_path(work_item_id, attempt_id, artifact_name));
+        for phase in 0..crate::coder::RATE_LIMIT_MAX_RETRIES {
+            let path = artifact_dir.join(format!("transcript.{phase}.jsonl"));
+            if path.is_file() {
+                fs::remove_file(path).unwrap();
+            }
+        }
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/provider-transcripts")
+                .join(fixture_name),
+            artifact_dir.join("transcript.jsonl"),
+        )
+        .unwrap();
+    }
+
     use crate::work_model::TaskOutput;
 
     fn make_interpret_reviews_fixture(
@@ -5219,14 +13415,60 @@ mod tests {
         };
         item.add_initial_attempt("attempt-1").unwrap();
 
+        let workspace_rel = ".fluent/work/workspaces/work-1/attempt-1/candidate";
+        let workspace = project_root.join(workspace_rel);
+        fs::create_dir_all(workspace.join(".fluent")).unwrap();
+        init_learner_repo(&workspace);
+        let mut results =
+            tester_json.and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok());
+        if let Some(results) = &mut results {
+            if results["commands"].as_array().unwrap().is_empty() {
+                results["commands"] = serde_json::json!([{
+                    "command":"true", "test_harness":"shell-harness", "exit_code":0,
+                    "duration_ms":1, "stdout_log":"commands/0-stdout.log", "stderr_log":"commands/0-stderr.log"
+                }]);
+            }
+        }
+        let definitions = results.as_ref().map(|results| {
+            results["commands"].as_array().unwrap().iter().map(|command| {
+                serde_json::json!({"command":command["command"], "test_harness":command["test_harness"]})
+            }).collect::<Vec<_>>()
+        }).unwrap_or_else(|| vec![serde_json::json!({"command":"true", "test_harness":"shell-harness"})]);
+        fs::write(
+            workspace.join(".fluent/tester.yaml"),
+            serde_yaml::to_string(&serde_json::json!({"commands":definitions})).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            workspace.join(".fluent/extract-tester-results"),
+            "#!/bin/sh\necho '[]'\n",
+        )
+        .unwrap();
+        crate::git::run(
+            &workspace,
+            &["add", "."],
+            "stage canonical fixture configuration",
+        )
+        .unwrap();
+        crate::git::run(
+            &workspace,
+            &["commit", "-q", "-m", "Add verification fixture"],
+            "commit canonical fixture configuration",
+        )
+        .unwrap();
+        let candidate =
+            crate::git::run_stdout(&workspace, &["rev-parse", "HEAD"], "read fixture candidate")
+                .unwrap();
         let attempt = &mut item.attempts[0];
         attempt.tasks[0].status = TaskStatus::Complete;
         attempt.tasks[0].output = Some(TaskOutput {
             workspace_id: "candidate".to_string(),
-            workspace_path: ".fluent/work/workspaces/work-1/attempt-1/candidate".to_string(),
+            workspace_path: workspace_rel.to_string(),
             source_branch: "work/attempt-1".to_string(),
             base_commit: None,
-            commit: "abc123".to_string(),
+            commit: candidate.clone(),
+            no_change: None,
+            learner_canonicalization: None,
         });
 
         let tester_artifact_path = work_artifact_path("work-1", "attempt-1", "attempt-1-tester");
@@ -5237,7 +13479,23 @@ mod tests {
         if let Some(json) = tester_json {
             let tester_dir = project_root.join(&tester_artifact_path);
             fs::create_dir_all(&tester_dir).unwrap();
-            fs::write(tester_dir.join("tester-results.json"), json).unwrap();
+            if let Some(results) = &mut results {
+                results["candidate_commit"] = serde_json::json!(candidate);
+                for command in results["commands"].as_array().unwrap() {
+                    for key in ["stdout_log", "stderr_log"] {
+                        let path = tester_dir.join(command[key].as_str().unwrap());
+                        fs::create_dir_all(path.parent().unwrap()).unwrap();
+                        fs::write(path, "retained command output\n").unwrap();
+                    }
+                }
+                fs::write(
+                    tester_dir.join("tester-results.json"),
+                    serde_json::to_vec_pretty(results).unwrap(),
+                )
+                .unwrap();
+            } else {
+                fs::write(tester_dir.join("tester-results.json"), json).unwrap();
+            }
         }
 
         let review_artifact_path =
@@ -5256,8 +13514,5623 @@ mod tests {
         )
         .unwrap();
 
+        for role in review::REVIEWERS
+            .iter()
+            .copied()
+            .filter(|role| *role != "behaviors")
+        {
+            let id = format!("attempt-1-review-{role}");
+            let path = work_artifact_path("work-1", "attempt-1", &id);
+            let dir = project_root.join(&path);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("review.md"), "Verdict: pass\n").unwrap();
+            item.attempts[0]
+                .tasks
+                .push(review_task_with_artifact(&id, role, &path));
+        }
+
+        for task in &mut item.attempts[0].tasks {
+            if matches!(task.kind, TaskKind::Review | TaskKind::Tester) {
+                task.review_context = Some(crate::work_model::ReviewContext {
+                    candidate_workspace_id: "candidate".into(),
+                    candidate_workspace_path: workspace_rel.into(),
+                    source_branch: "work/attempt-1".into(),
+                    candidate_commit: candidate.clone(),
+                    base_commit: None,
+                });
+            }
+        }
         store.create_work_item(&item).unwrap();
         (store, item)
+    }
+
+    fn remove_round_tester(project_root: &Path, store: &WorkModelStore) -> WorkItem {
+        store
+            .mutate_work_item("work-1", |item| {
+                item.attempts[0]
+                    .tasks
+                    .retain(|task| task.kind != TaskKind::Tester);
+                Ok(())
+            })
+            .unwrap();
+        let tester_dir = project_root.join(work_artifact_path(
+            "work-1",
+            "attempt-1",
+            "attempt-1-tester",
+        ));
+        if tester_dir.exists() {
+            fs::remove_dir_all(tester_dir).unwrap();
+        }
+        store.read_work_item("work-1").unwrap()
+    }
+
+    #[test]
+    fn passing_code_reviews_plan_one_final_tester_before_candidate_creation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (store, _) =
+            make_interpret_reviews_fixture(tmp.path(), "PASS", Some(passing_tester_json()));
+        let item = remove_round_tester(tmp.path(), &store);
+
+        let outcome = interpret_reviews(tmp.path(), &store, item, "attempt-1", true, None).unwrap();
+
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedFinalTester { ref task_id }
+                if task_id == "attempt-1-tester"
+        ));
+        let stored = store.read_work_item("work-1").unwrap();
+        assert!(stored.merge_candidates.is_empty());
+        let testers = stored.attempts[0]
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Tester)
+            .collect::<Vec<_>>();
+        assert_eq!(testers.len(), 1);
+        assert_eq!(testers[0].status, TaskStatus::Planned);
+        assert_eq!(
+            testers[0]
+                .review_context
+                .as_ref()
+                .map(|context| context.candidate_commit.as_str()),
+            stored.attempts[0].tasks[0]
+                .output
+                .as_ref()
+                .map(|output| output.commit.as_str())
+        );
+    }
+
+    #[test]
+    fn failed_code_review_returns_to_writer_without_running_final_tester() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (store, _) =
+            make_interpret_reviews_fixture(tmp.path(), "FAIL", Some(passing_tester_json()));
+        let item = remove_round_tester(tmp.path(), &store);
+
+        let outcome = interpret_reviews(tmp.path(), &store, item, "attempt-1", true, None).unwrap();
+
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedWriteRound { .. }
+        ));
+        let stored = store.read_work_item("work-1").unwrap();
+        assert!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .all(|task| task.kind != TaskKind::Tester)
+        );
+    }
+
+    #[test]
+    fn public_resume_reconciles_failure_recorded_before_parallel_peer_settled() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let mut item = WorkItem::planned("work-1", "Recover parallel review settlement");
+        item.add_initial_attempt("attempt-1").unwrap();
+        store.create_work_item(&item).unwrap();
+        let attempt_metadata = DurableTransitionMetadata {
+            origin: DurableTransitionOrigin::AttemptExecutor,
+            reason: None,
+            evidence_ref: None,
+        };
+        let task_metadata = DurableTransitionMetadata {
+            origin: DurableTransitionOrigin::TaskExecutor,
+            reason: None,
+            evidence_ref: None,
+        };
+
+        store
+            .mutate_work_item_with_transition("work-1", &attempt_metadata, |item| {
+                let writer = &mut item.attempts[0].tasks[0];
+                crate::work_model::set_task_terminal(writer, TaskStatus::Complete);
+                writer.output = Some(TaskOutput {
+                    workspace_id: "candidate".to_string(),
+                    workspace_path: ".fluent/work/workspaces/work-1/attempt-1/candidate"
+                        .to_string(),
+                    source_branch: "main".to_string(),
+                    base_commit: Some("base123".to_string()),
+                    commit: "candidate123".to_string(),
+                    no_change: None,
+                    learner_canonicalization: None,
+                });
+                item.add_next_review_tasks("attempt-1", &["behaviors", "tests"])?;
+                Ok(())
+            })
+            .unwrap();
+        store
+            .mutate_work_item_with_transition("work-1", &task_metadata, |item| {
+                for task in &mut item.attempts[0].tasks[1..] {
+                    task.status = TaskStatus::Executing;
+                    crate::work_model::mark_task_started(task);
+                }
+                Ok(())
+            })
+            .unwrap();
+        store
+            .mutate_work_item_with_transition("work-1", &task_metadata, |item| {
+                crate::work_model::set_attempt_terminal(
+                    &mut item.attempts[0],
+                    AttemptStatus::Failed,
+                );
+                crate::work_model::set_task_terminal(
+                    &mut item.attempts[0].tasks[1],
+                    TaskStatus::Failed,
+                );
+                Ok(())
+            })
+            .unwrap();
+        store
+            .mutate_work_item_with_transition("work-1", &task_metadata, |item| {
+                crate::work_model::set_task_terminal(
+                    &mut item.attempts[0].tasks[2],
+                    TaskStatus::Complete,
+                );
+                Ok(())
+            })
+            .unwrap();
+
+        for task in &store.read_work_item("work-1").unwrap().attempts[0].tasks[1..] {
+            let area = task.artifact_area.as_ref().unwrap();
+            let dir = tmp.path().join(&area.path);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(
+                dir.join("review.md"),
+                format!("Verdict: fail\n\n- [ ] {} correction\n", task.role),
+            )
+            .unwrap();
+        }
+
+        assert!(
+            reconcile_premature_parallel_review_failure(tmp.path(), &store, "work-1", "attempt-1",)
+                .unwrap()
+        );
+        let reconciled = store.read_work_item("work-1").unwrap();
+        assert_eq!(reconciled.attempts[0].status, AttemptStatus::Reviewing);
+        assert!(reconciled.attempts[0].completed_at.is_none());
+        assert!(
+            reconciled.attempts[0].tasks[1..]
+                .iter()
+                .all(|task| task.status == TaskStatus::Complete)
+        );
+        assert!(reconciled.transitions.iter().any(|transition| {
+            transition.object_id == "attempt-1"
+                && transition.old_state.as_deref() == Some("reviewing")
+                && transition.new_state == "failed"
+        }));
+        assert!(!reconcile_premature_parallel_review_failure(
+            tmp.path(),
+            &store,
+            "work-1",
+            "attempt-1",
+        )
+        .unwrap());
+
+        let outcome =
+            interpret_reviews(tmp.path(), &store, reconciled, "attempt-1", true, None).unwrap();
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedWriteRound { .. }
+        ));
+        let stored = store.read_work_item("work-1").unwrap();
+        let writer = stored.attempts[0].tasks.last().unwrap();
+        assert_eq!(writer.kind, TaskKind::Write);
+        assert!(
+            writer
+                .input_artifacts
+                .iter()
+                .any(|artifact| { artifact.producer_id == "attempt-1-review-behaviors" })
+        );
+        assert!(
+            writer
+                .input_artifacts
+                .iter()
+                .any(|artifact| artifact.producer_id == "attempt-1-review-tests")
+        );
+    }
+
+    #[test]
+    fn parallel_review_failure_terminalizes_only_at_join_boundary() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let mut item = WorkItem::planned("work-1", "Settle parallel failure");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let writer = &mut item.attempts[0].tasks[0];
+        crate::work_model::set_task_terminal(writer, TaskStatus::Complete);
+        writer.output = Some(TaskOutput {
+            workspace_id: "candidate".to_string(),
+            workspace_path: ".fluent/work/workspaces/work-1/attempt-1/candidate".to_string(),
+            source_branch: "main".to_string(),
+            base_commit: Some("base".to_string()),
+            commit: "candidate".to_string(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        let task_ids = item
+            .add_next_review_tasks("attempt-1", &["behaviors", "tests"])
+            .unwrap();
+        crate::work_model::set_task_terminal(&mut item.attempts[0].tasks[1], TaskStatus::Failed);
+        crate::work_model::set_task_terminal(&mut item.attempts[0].tasks[2], TaskStatus::Complete);
+        item.attempts[0].status = AttemptStatus::Reviewing;
+        item.attempts[0].completed_at = None;
+        store.create_work_item(&item).unwrap();
+
+        settle_parallel_review_task_failures(&store, "work-1", "attempt-1", &task_ids).unwrap();
+        let settled = store.read_work_item("work-1").unwrap();
+        assert_eq!(settled.attempts[0].status, AttemptStatus::Failed);
+        let completed_at = settled.attempts[0].completed_at.clone();
+
+        settle_parallel_review_task_failures(&store, "work-1", "attempt-1", &task_ids).unwrap();
+        let repeated = store.read_work_item("work-1").unwrap();
+        assert_eq!(repeated.attempts[0].status, AttemptStatus::Failed);
+        assert_eq!(repeated.attempts[0].completed_at, completed_at);
+    }
+
+    #[test]
+    fn passing_final_tester_advances_the_exact_reviewed_candidate() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (store, _) =
+            make_interpret_reviews_fixture(tmp.path(), "PASS", Some(passing_tester_json()));
+        let prior = store.read_work_item("work-1").unwrap();
+        let candidate = prior.attempts[0].tasks[0]
+            .output
+            .as_ref()
+            .unwrap()
+            .commit
+            .clone();
+        let evidence_dir = latest_tester_results_path(tmp.path(), &prior.attempts[0])
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let results = fs::read(evidence_dir.join("tester-results.json")).unwrap();
+        let log = fs::read(evidence_dir.join("commands/0-stdout.log")).unwrap();
+        let item = remove_round_tester(tmp.path(), &store);
+        interpret_reviews(tmp.path(), &store, item, "attempt-1", true, None).unwrap();
+
+        store
+            .mutate_work_item("work-1", |item| {
+                let tester = item.attempts[0]
+                    .tasks
+                    .iter_mut()
+                    .find(|task| task.kind == TaskKind::Tester)
+                    .unwrap();
+                crate::work_model::set_task_terminal(tester, TaskStatus::Complete);
+                Ok(())
+            })
+            .unwrap();
+        let tester_dir = tmp.path().join(work_artifact_path(
+            "work-1",
+            "attempt-1",
+            "attempt-1-tester",
+        ));
+        fs::create_dir_all(&tester_dir).unwrap();
+        fs::write(tester_dir.join("tester-results.json"), results).unwrap();
+
+        fs::create_dir_all(tester_dir.join("commands")).unwrap();
+        fs::write(tester_dir.join("commands/0-stdout.log"), &log).unwrap();
+        fs::write(tester_dir.join("commands/0-stderr.log"), &log).unwrap();
+        let item = store.read_work_item("work-1").unwrap();
+        let outcome = interpret_reviews(tmp.path(), &store, item, "attempt-1", true, None).unwrap();
+
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::MergeCandidateReady { .. }
+        ));
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(stored.attempts[0].status, AttemptStatus::Complete);
+        assert_eq!(
+            stored.attempts[0].review_state,
+            Some(AttemptReviewState::Passed)
+        );
+        assert_eq!(stored.merge_candidates.len(), 1);
+        assert_eq!(stored.merge_candidates[0].candidate_commit, candidate);
+    }
+
+    #[test]
+    fn unclassified_verification_failure_pauses_for_diagnosis() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tester_json = r#"{
+            "candidate_commit": "abc123",
+            "commands": [{
+                "command": "xcodebuild test",
+                "test_harness": "xcodebuild",
+                "exit_code": 70,
+                "duration_ms": 10,
+                "stdout_log": "commands/0-stdout.log",
+                "stderr_log": "commands/0-stderr.log"
+            }],
+            "tests": [
+                {"id": "test_a", "test_harness": "xcodebuild", "status": "pass", "duration_ms": 10, "failure_excerpt": null}
+            ],
+            "summary": {"total": 1, "pass": 1, "fail": 0, "skipped": 0},
+            "error": null
+        }"#;
+        let (store, _) = make_interpret_reviews_fixture(tmp.path(), "PASS", Some(tester_json));
+        let tester_dir = tmp.path().join(work_artifact_path(
+            "work-1",
+            "attempt-1",
+            "attempt-1-tester",
+        ));
+        fs::create_dir_all(tester_dir.join("commands")).unwrap();
+        fs::write(tester_dir.join("commands/0-stdout.log"), "build output").unwrap();
+        fs::write(
+            tester_dir.join("commands/0-stderr.log"),
+            "test host missing",
+        )
+        .unwrap();
+
+        let retained = fs::read_to_string(tester_dir.join("tester-results.json")).unwrap();
+        let outcome = interpret_reviews(
+            tmp.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+            true,
+            None,
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, WorkAttemptRunOutcome::NeedsUser { .. }));
+        let stored = store.read_work_item("work-1").unwrap();
+        assert!(stored.merge_candidates.is_empty());
+        assert_eq!(stored.attempts[0].pause_kind, Some(PauseKind::HostEvidence));
+        assert_eq!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            1
+        );
+        assert_eq!(
+            fs::read_to_string(tester_dir.join("tester-results.json")).unwrap(),
+            retained
+        );
+        assert_eq!(
+            fs::read_to_string(tester_dir.join("commands/0-stderr.log")).unwrap(),
+            "test host missing"
+        );
+    }
+
+    fn final_tester_evidence_fixture(
+        project_root: &Path,
+    ) -> (WorkModelStore, tempfile::TempDir, String) {
+        let (store, workspace) =
+            make_candidate_gate_fixture(project_root, "pub fn value() {}\n", None);
+        fs::create_dir_all(workspace.path().join("tests")).unwrap();
+        fs::write(
+            workspace.path().join("tests/behavior.rs"),
+            "#[test]\nfn required_behavior() {}\n",
+        )
+        .unwrap();
+        fs::create_dir_all(workspace.path().join(".fluent")).unwrap();
+        fs::write(
+            workspace.path().join(".fluent/tester.yaml"),
+            "commands:\n  - command: xcodebuild test\n    test_harness: xcodebuild\n",
+        )
+        .unwrap();
+        fs::write(
+            workspace.path().join(".fluent/extract-tester-results"),
+            "#!/bin/sh\necho '[]'\n",
+        )
+        .unwrap();
+        crate::git::run(
+            workspace.path(),
+            &[
+                "add",
+                "tests/behavior.rs",
+                ".fluent/tester.yaml",
+                ".fluent/extract-tester-results",
+            ],
+            "stage behavior test",
+        )
+        .unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["commit", "-q", "-m", "Add behavior test"],
+            "commit behavior test",
+        )
+        .unwrap();
+        let candidate = crate::git::run_stdout(
+            workspace.path(),
+            &["rev-parse", "HEAD"],
+            "read behavior candidate",
+        )
+        .unwrap();
+        let context = crate::work_model::PlanningContext {
+            behaviors: Some(
+                "### B1\n\nWHEN the feature runs, THE SYSTEM SHALL preserve it.\n\
+                 Test: tests/behavior.rs::required_behavior\n"
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+        let mut item = store.read_work_item("work-1").unwrap();
+        item.attempts[0].tasks[0].output.as_mut().unwrap().commit = candidate.clone();
+        item.attempts[0].writer_completion_contract =
+            crate::work_model::WriterCompletionContract::from_planning_context(&context);
+        item.add_review_tasks("attempt-1", review::REVIEWERS)
+            .unwrap();
+        for review in item.attempts[0]
+            .tasks
+            .iter_mut()
+            .filter(|task| task.kind == TaskKind::Review)
+        {
+            review.status = TaskStatus::Complete;
+            let dir = project_root.join(&review.artifact_area.as_ref().unwrap().path);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("review.md"), "Verdict: pass\n").unwrap();
+        }
+        store.write_work_item(&item).unwrap();
+
+        let outcome = interpret_reviews(
+            project_root,
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+            true,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedFinalTester { .. }
+        ));
+        store
+            .mutate_work_item("work-1", |item| {
+                let tester = item.attempts[0]
+                    .tasks
+                    .iter_mut()
+                    .find(|task| task.kind == TaskKind::Tester)
+                    .unwrap();
+                crate::work_model::set_task_terminal(tester, TaskStatus::Complete);
+                Ok(())
+            })
+            .unwrap();
+        let tester = store.read_work_item("work-1").unwrap().attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Tester)
+            .unwrap()
+            .clone();
+        let tester_dir = project_root.join(&tester.artifact_area.unwrap().path);
+        fs::create_dir_all(tester_dir.join("commands")).unwrap();
+        fs::write(
+            tester_dir.join("commands/0-stdout.log"),
+            "retained successful run",
+        )
+        .unwrap();
+        fs::write(tester_dir.join("commands/0-stderr.log"), "").unwrap();
+        let results = serde_json::json!({
+            "candidate_commit": candidate,
+            "commands": [{"command":"xcodebuild test","test_harness":"xcodebuild","exit_code":0,"duration_ms":1,"stdout_log":"commands/0-stdout.log","stderr_log":"commands/0-stderr.log"}],
+            "tests": [{
+                "id": "another_test",
+                "test_harness": "cargo-nextest",
+                "status": "pass",
+                "duration_ms": 1,
+                "failure_excerpt": null
+            }],
+            "summary": {"total": 1, "pass": 1, "fail": 0, "skipped": 0},
+            "error": null
+        });
+        fs::write(
+            tester_dir.join("tester-results.json"),
+            serde_json::to_vec_pretty(&results).unwrap(),
+        )
+        .unwrap();
+        (store, workspace, candidate)
+    }
+
+    fn add_failed_final_tester_command(project_root: &Path, store: &WorkModelStore) {
+        let item = store.read_work_item("work-1").unwrap();
+        let tester = item.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Tester)
+            .unwrap();
+        let tester_dir = project_root.join(&tester.artifact_area.as_ref().unwrap().path);
+        fs::create_dir_all(tester_dir.join("commands")).unwrap();
+        fs::write(tester_dir.join("commands/0-stdout.log"), "resolve stdout\n").unwrap();
+        fs::write(
+            tester_dir.join("commands/0-stderr.log"),
+            "missing package\n",
+        )
+        .unwrap();
+        let results_path = tester_dir.join("tester-results.json");
+        let mut results: serde_json::Value =
+            serde_json::from_slice(&fs::read(&results_path).unwrap()).unwrap();
+        results["commands"] = serde_json::json!([{
+            "command": "xcodebuild test",
+            "test_harness": "xcodebuild",
+            "exit_code": 65,
+            "duration_ms": 10,
+            "stdout_log": "commands/0-stdout.log",
+            "stderr_log": "commands/0-stderr.log"
+        }]);
+        fs::write(&results_path, serde_json::to_vec_pretty(&results).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn historical_writer_completion_ignores_later_tester_finding() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, _) = final_tester_evidence_fixture(project.path());
+        let item = store.read_work_item("work-1").unwrap();
+        let writer = &item.attempts[0].tasks[0];
+        let assigned =
+            crate::recovery_contracts::writer_completion_findings(project.path(), writer).unwrap();
+        assert!(assigned.is_empty());
+        let mut matrix = crate::work_model::WriterCompletionMatrix::skeleton(
+            item.attempts[0]
+                .writer_completion_contract
+                .as_ref()
+                .unwrap(),
+            &writer.id,
+            &assigned,
+            None,
+        )
+        .unwrap();
+        for row in &mut matrix.rows {
+            if row.responsibility == Some(crate::work_model::CompletionResponsibility::Host) {
+                continue;
+            }
+            row.state = crate::work_model::WriterCompletionState::Complete;
+            row.implementation_evidence = vec!["src/lib.rs".into()];
+            row.verification = vec![crate::work_model::WriterVerificationClaim {
+                command: "cargo test focused".into(),
+                result: crate::work_model::WriterVerificationResult::Pass,
+            }];
+        }
+
+        let tester = item.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Tester)
+            .unwrap();
+        let results_path = project
+            .path()
+            .join(&tester.artifact_area.as_ref().unwrap().path)
+            .join("tester-results.json");
+        let mut results: serde_json::Value =
+            serde_json::from_slice(&fs::read(&results_path).unwrap()).unwrap();
+        results["tests"][0]["id"] = serde_json::json!("required_behavior");
+        results["tests"][0]["status"] = serde_json::json!("fail");
+        results["summary"] = serde_json::json!({"total":1,"pass":0,"fail":1,"skipped":0});
+        fs::write(&results_path, serde_json::to_vec(&results).unwrap()).unwrap();
+        let current = crate::verification_assessment::assess_current_verification(
+            project.path(),
+            &item.attempts[0],
+        )
+        .unwrap();
+        assert!(!current.candidate_defects().is_empty());
+
+        let historical =
+            crate::recovery_contracts::writer_completion_findings(project.path(), writer).unwrap();
+        assert_eq!(historical, assigned);
+        assert!(
+            matrix
+                .status_against(
+                    item.attempts[0]
+                        .writer_completion_contract
+                        .as_ref()
+                        .unwrap(),
+                    &writer.id,
+                    &historical,
+                )
+                .unwrap()
+                .is_complete()
+        );
+    }
+
+    #[test]
+    fn host_evidence_survives_later_tester_finding() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, candidate) = final_tester_evidence_fixture(project.path());
+        add_completed_focused_tests_evidence(project.path(), &store, "xcodebuild test");
+        let before = store.read_work_item("work-1").unwrap();
+        let accepted = before.attempts[0].evidence_recoveries[0].clone();
+        let evidence_bytes =
+            fs::read(project.path().join(&accepted.attachment.snapshot_path)).unwrap();
+        let tester = before.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Tester)
+            .unwrap();
+        let results_path = project
+            .path()
+            .join(&tester.artifact_area.as_ref().unwrap().path)
+            .join("tester-results.json");
+        let mut results: serde_json::Value =
+            serde_json::from_slice(&fs::read(&results_path).unwrap()).unwrap();
+        results["tests"][0]["id"] = serde_json::json!("required_behavior");
+        results["tests"][0]["status"] = serde_json::json!("fail");
+        results["summary"] = serde_json::json!({"total":1,"pass":0,"fail":1,"skipped":0});
+        fs::write(&results_path, serde_json::to_vec(&results).unwrap()).unwrap();
+
+        let outcome =
+            interpret_reviews(project.path(), &store, before, "attempt-1", true, None).unwrap();
+        let WorkAttemptRunOutcome::PlannedReviews { task_ids } = outcome else {
+            panic!("expected fresh Tests Review: {outcome:?}");
+        };
+        store
+            .mutate_work_item("work-1", |item| {
+                for task in item.attempts[0]
+                    .tasks
+                    .iter_mut()
+                    .filter(|task| task_ids.contains(&task.id))
+                {
+                    task.status = TaskStatus::Complete;
+                    let area = project
+                        .path()
+                        .join(&task.artifact_area.as_ref().unwrap().path);
+                    fs::create_dir_all(&area).unwrap();
+                    fs::write(area.join("review.md"), "Verdict: pass\n").unwrap();
+                }
+                Ok(())
+            })
+            .unwrap();
+        let outcome = interpret_reviews(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+            true,
+            None,
+        )
+        .unwrap();
+        assert!(
+            matches!(outcome, WorkAttemptRunOutcome::PlannedWriteRound { .. }),
+            "{outcome:?}"
+        );
+        let after = store.read_work_item("work-1").unwrap();
+        assert_eq!(after.attempts[0].evidence_recoveries[0], accepted);
+        assert_eq!(
+            fs::read(project.path().join(&accepted.attachment.snapshot_path)).unwrap(),
+            evidence_bytes
+        );
+        assert_eq!(
+            after.attempts[0].tasks[0].output.as_ref().unwrap().commit,
+            candidate
+        );
+        let correction = after.attempts[0].tasks.last().unwrap();
+        assert_eq!(correction.kind, TaskKind::Write);
+        assert_eq!(correction.status, TaskStatus::Planned);
+        assert!(
+            !correction
+                .writer_correction_assignment
+                .as_ref()
+                .unwrap()
+                .findings
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn reference_assessment_controls_writer_admission() {
+        for (reference, source_defect) in [
+            (None, false),
+            (Some(r#"{"kind":"unknown","path":"src/lib.rs"}"#), false),
+            (Some("src/missing.rs::required_behavior"), true),
+        ] {
+            let project = tempfile::tempdir().unwrap();
+            let (store, _workspace) = make_candidate_gate_fixture(
+                project.path(),
+                "#[test]\nfn required_behavior() {}\n",
+                None,
+            );
+            let mut item = store.read_work_item("work-1").unwrap();
+            let marker = reference
+                .map(|text| format!("Test: {text}\n"))
+                .unwrap_or_default();
+            item.attempts[0].writer_completion_contract =
+                crate::work_model::WriterCompletionContract::from_planning_context(
+                    &crate::work_model::PlanningContext {
+                        behaviors: Some(format!(
+                            "### B1\n\nWHEN checks run, THE SYSTEM SHALL verify them.\n{marker}"
+                        )),
+                        ..Default::default()
+                    },
+                );
+            crate::work_task_executor::materialize_writer_completion_before_writer(
+                project.path(),
+                &item,
+                "attempt-1",
+                "attempt-1-write-1",
+            )
+            .unwrap();
+            store.write_work_item(&item).unwrap();
+            let view = crate::verification_assessment::assess_current_verification(
+                project.path(),
+                &item.attempts[0],
+            )
+            .unwrap();
+            assert_eq!(
+                view.references.len(),
+                1,
+                "a behavior without a marker remains unresolved"
+            );
+            assert_eq!(view.unresolved().count(), 1);
+            assert_eq!(!view.candidate_defects().is_empty(), source_defect);
+            assert_eq!(
+                view.references[0].cause,
+                Some(if source_defect {
+                    crate::verification_assessment::VerificationCause::CandidateDefect
+                } else {
+                    crate::verification_assessment::VerificationCause::UninterpretableEvidence
+                })
+            );
+            if reference.is_none() {
+                assert!(view.references[0].diagnostics[0].contains("neither a Test:"));
+                assert_eq!(
+                    view.references[0].owner,
+                    crate::work_model::CompletionResponsibility::Tester
+                );
+            }
+            let outcome = gate_candidate_after_writer(
+                project.path(),
+                &store,
+                &mut item,
+                "attempt-1",
+                0,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+            if source_defect {
+                let WorkAttemptRunOutcome::PlannedWriteRound { task_id } = outcome else {
+                    panic!("committed-source defects must retain correction: {outcome:?}");
+                };
+                crate::recovery_contracts::validate_code_change_writer_start(
+                    project.path(),
+                    &item,
+                    "attempt-1",
+                    &task_id,
+                )
+                .unwrap();
+            } else {
+                let WorkAttemptRunOutcome::NeedsUser { handoff_path } = outcome else {
+                    panic!("unsupported meaning must pause without a Writer: {outcome:?}");
+                };
+                let saved = store.read_work_item("work-1").unwrap();
+                assert_eq!(saved.attempts[0].tasks.len(), 1);
+                assert_eq!(saved.attempts[0].status, AttemptStatus::NeedsUser);
+                assert!(saved.merge_candidates.is_empty());
+                let handoff = fs::read_to_string(project.path().join(handoff_path)).unwrap();
+                assert!(handoff.contains(&view.references[0].id), "{handoff}");
+                assert!(
+                    handoff.contains(view.references[0].next_action.as_deref().unwrap()),
+                    "{handoff}"
+                );
+                assert!(handoff.contains(&view.candidate_commit), "{handoff}");
+            }
+            let saved = store.read_work_item("work-1").unwrap();
+            let status = crate::work_status::summarize_work_item(&saved, Some(project.path()));
+            assert_eq!(status.verification.as_ref(), Some(&view));
+            let task = saved.attempts[0]
+                .tasks
+                .iter()
+                .rev()
+                .find(|task| task.kind == TaskKind::Write)
+                .unwrap();
+            let findings =
+                crate::recovery_contracts::writer_completion_findings(project.path(), task)
+                    .unwrap();
+            assert_eq!(findings.len(), usize::from(source_defect), "{findings:?}");
+            #[cfg(feature = "test-support")]
+            {
+                let (context_findings, context) =
+                    crate::work_task_executor::verification_views_for_test(
+                        project.path(),
+                        &saved.attempts[0],
+                        _workspace.path(),
+                    );
+                assert_eq!(context_findings, findings);
+                assert_compact_verification_context(&context, &view);
+                assert_eq!(
+                    context["current-findings"].as_array().unwrap().len(),
+                    findings.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_reference_cannot_admit_saved_writer() {
+        for (reference, source_defect) in [
+            (r#"{"kind":"unknown","path":"src/lib.rs"}"#, false),
+            ("src/missing.rs::required_behavior", true),
+        ] {
+            for unrelated_review in [false, true] {
+                let project = tempfile::tempdir().unwrap();
+                let (store, _workspace) = make_candidate_gate_fixture(
+                    project.path(),
+                    "#[test]\nfn required_behavior() {}\n",
+                    None,
+                );
+                let mut item = store.read_work_item("work-1").unwrap();
+                item.attempts[0].writer_completion_contract =
+                    crate::work_model::WriterCompletionContract::from_planning_context(
+                        &crate::work_model::PlanningContext {
+                            behaviors: Some(format!(
+                                "### B1\n\nWHEN checks run, THE SYSTEM SHALL verify them.\nTest: {reference}\n"
+                            )),
+                            ..Default::default()
+                        },
+                    );
+                let output = item.attempts[0].tasks[0].output.as_ref().unwrap();
+                let artifact = ArtifactRef {
+                    producer_id: item.attempts[0].tasks[0].id.clone(),
+                    path: work_artifact_path(
+                        "work-1",
+                        "attempt-1",
+                        "candidate-gates/attempt-1-write-1/candidate-gate.json",
+                    ),
+                };
+                // Preserve a saved gate from the implementation that classified
+                // every unsupported reference as a source defect.
+                let gate = crate::candidate_gate::CandidateGateEvidence {
+                    schema_version: crate::candidate_gate::CANDIDATE_GATE_SCHEMA_VERSION,
+                    phase: crate::candidate_gate::CandidateGatePhase::Writer,
+                    disposition: crate::candidate_gate::CandidateGateDisposition::Rejected,
+                    base_commit: output.base_commit.clone().unwrap(),
+                    candidate_commit: output.commit.clone(),
+                    tester_results_path: None,
+                    metadata_rewrite: None,
+                    checks: vec![crate::candidate_gate::CandidateCheckEvidence {
+                        name: "behavior-references".into(),
+                        status: crate::candidate_gate::CandidateCheckStatus::Failed,
+                        diagnostics: vec!["unresolved Test reference".into()],
+                        log_path: None,
+                    }],
+                };
+                let path = project.path().join(&artifact.path);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                let bytes = serde_json::to_vec_pretty(&gate).unwrap();
+                fs::write(&path, &bytes).unwrap();
+                let mut inputs = vec![artifact];
+                if unrelated_review {
+                    item.add_review_tasks("attempt-1", &["tests"]).unwrap();
+                    let review = item.attempts[0]
+                        .tasks
+                        .iter_mut()
+                        .find(|task| task.kind == TaskKind::Review)
+                        .unwrap();
+                    review.status = TaskStatus::Complete;
+                    let path = format!("{}/review.md", review.artifact_area.as_ref().unwrap().path);
+                    fs::create_dir_all(project.path().join(&path).parent().unwrap()).unwrap();
+                    fs::write(
+                        project.path().join(&path),
+                        "Verdict: fail\n\n- [ ] Repair unrelated source handling\n",
+                    )
+                    .unwrap();
+                    inputs.push(ArtifactRef {
+                        producer_id: review.id.clone(),
+                        path,
+                    });
+                }
+                let writer = item.add_next_write_round("attempt-1", inputs).unwrap();
+                store.write_work_item(&item).unwrap();
+                assert!(
+                    !item.attempts[0]
+                        .tasks
+                        .iter()
+                        .any(|task| task.kind == TaskKind::Tester)
+                );
+                let admission = crate::recovery_contracts::validate_code_change_writer_start(
+                    project.path(),
+                    &item,
+                    "attempt-1",
+                    &writer,
+                );
+                assert_eq!(
+                    admission.is_ok(),
+                    source_defect || unrelated_review,
+                    "{admission:?}"
+                );
+                let view = crate::verification_assessment::assess_current_verification(
+                    project.path(),
+                    &item.attempts[0],
+                )
+                .unwrap();
+                assert_eq!(view.unresolved().count(), 1);
+                let row = &view.references[0];
+                assert_eq!(!view.candidate_defects().is_empty(), source_defect);
+                assert!(row.next_action.is_some());
+                let task = item.attempts[0]
+                    .tasks
+                    .iter()
+                    .find(|task| task.id == writer)
+                    .unwrap();
+                let findings =
+                    crate::recovery_contracts::writer_completion_findings(project.path(), task)
+                        .unwrap();
+                assert_eq!(
+                    findings.len(),
+                    usize::from(source_defect) + usize::from(unrelated_review),
+                    "only current correction belongs in Writer requirements: {findings:?}"
+                );
+                assert_eq!(
+                    findings
+                        .iter()
+                        .any(|finding| finding.id == format!("finding:verification:{}", row.id)),
+                    source_defect
+                );
+                assert_eq!(
+                    findings
+                        .iter()
+                        .any(|finding| finding.requirement.contains("unrelated source handling")),
+                    unrelated_review
+                );
+                let status = crate::work_status::summarize_work_item(&item, Some(project.path()));
+                assert_eq!(status.verification.as_ref(), Some(&view));
+                #[cfg(feature = "test-support")]
+                {
+                    let (context_findings, context) =
+                        crate::work_task_executor::verification_views_for_test(
+                            project.path(),
+                            &item.attempts[0],
+                            _workspace.path(),
+                        );
+                    assert_eq!(context_findings, findings);
+                    assert_compact_verification_context(&context, &view);
+                    assert_eq!(
+                        context["current-findings"].as_array().unwrap().len(),
+                        findings.len()
+                    );
+                    assert!(
+                        context["historical-artifacts"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|value| value.as_str().unwrap().ends_with("candidate-gate.json"))
+                    );
+                }
+                assert_eq!(fs::read(path).unwrap(), bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_tester_binding_errors_remain_authoritative() {
+        for has_contract in [false, true] {
+            for binding in [None, Some("different-candidate")] {
+                let project = tempfile::tempdir().unwrap();
+                let (store, workspace, candidate) = final_tester_evidence_fixture(project.path());
+                let mut item = store.read_work_item("work-1").unwrap();
+                if !has_contract {
+                    item.attempts[0].writer_completion_contract = None;
+                }
+                store.write_work_item(&item).unwrap();
+                let results =
+                    latest_tester_results_path(project.path(), &item.attempts[0]).unwrap();
+                assert!(
+                    !results
+                        .parent()
+                        .unwrap()
+                        .join("canonical-run.json")
+                        .exists()
+                );
+                assert!(
+                    crate::verification_assessment::assess_canonical_checks(
+                        project.path(),
+                        &item.attempts[0],
+                    )
+                    .unwrap()
+                    .is_satisfied(),
+                    "valid legacy command coverage must reconstruct"
+                );
+                let mut document: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&results).unwrap()).unwrap();
+                document["candidate_commit"] = serde_json::json!(binding);
+                let bytes = serde_json::to_vec_pretty(&document).unwrap();
+                fs::write(&results, &bytes).unwrap();
+                let diagnosis = crate::verification_assessment::assess_current_verification(
+                    project.path(),
+                    &item.attempts[0],
+                )
+                .err()
+                .expect("unbound legacy evidence cannot satisfy current verification")
+                .to_string();
+                assert!(diagnosis.contains("candidate binding"), "{diagnosis}");
+                let status =
+                    crate::work_status::work_item_show_value(&item, project.path()).unwrap();
+                assert_eq!(status["evidence-recovery"]["can-resume"], false, "{status}");
+                assert!(
+                    status["evidence-recovery"]["reason"]
+                        .as_str()
+                        .unwrap()
+                        .contains(&diagnosis),
+                    "{status}"
+                );
+                let gate = crate::candidate_gate::run_candidate_gate(
+                    crate::candidate_gate::CandidateGateRequest {
+                        project_root: project.path(),
+                        workspace: workspace.path(),
+                        work_item_id: "work-1",
+                        attempt_id: "attempt-1",
+                        task_id: None,
+                        phase: crate::candidate_gate::CandidateGatePhase::FinalTester,
+                        base_commit: item.attempts[0].tasks[0]
+                            .output
+                            .as_ref()
+                            .unwrap()
+                            .base_commit
+                            .as_deref()
+                            .unwrap(),
+                        candidate_commit: &candidate,
+                        completion_contract: item.attempts[0].writer_completion_contract.as_ref(),
+                        allow_tree_identical_metadata_rewrite: false,
+                        metadata_rewrite_authorization: None,
+                        tester_results_path: Some(&results),
+                        accepted_tester_commands: &[],
+                        artifact_path: &project.path().join("comparison-gate.json"),
+                    },
+                )
+                .unwrap();
+                assert_eq!(
+                    gate.disposition,
+                    crate::candidate_gate::CandidateGateDisposition::Blocked
+                );
+                let outcome =
+                    interpret_reviews(project.path(), &store, item, "attempt-1", true, None)
+                        .unwrap();
+                let WorkAttemptRunOutcome::NeedsUser { handoff_path } = outcome else {
+                    panic!("a shared binding error must pause legacy routing: {outcome:?}");
+                };
+                let saved = store.read_work_item("work-1").unwrap();
+                assert_eq!(saved.attempts[0].status, AttemptStatus::NeedsUser);
+                assert_eq!(saved.attempts[0].pause_kind, Some(PauseKind::HostEvidence));
+                assert!(saved.merge_candidates.is_empty());
+                assert!(saved.attempts[0].learning.is_none());
+                assert_eq!(
+                    saved.attempts[0]
+                        .tasks
+                        .iter()
+                        .filter(|task| task.kind == TaskKind::Write)
+                        .count(),
+                    1
+                );
+                let handoff = fs::read_to_string(project.path().join(handoff_path)).unwrap();
+                assert!(handoff.contains(&diagnosis), "{handoff}");
+                assert!(handoff.contains(&candidate), "{handoff}");
+                let status =
+                    crate::work_status::work_item_show_value(&saved, project.path()).unwrap();
+                assert_eq!(status["evidence-recovery"]["can-resume"], false, "{status}");
+                assert!(
+                    status["evidence-recovery"]["reason"]
+                        .as_str()
+                        .unwrap()
+                        .contains(&diagnosis),
+                    "{status}"
+                );
+                assert_eq!(fs::read(&results).unwrap(), bytes);
+                assert!(
+                    !results
+                        .parent()
+                        .unwrap()
+                        .join("canonical-run.json")
+                        .exists()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn missing_evidence_does_not_authorize_writer() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, candidate) = final_tester_evidence_fixture(project.path());
+        let outcome = interpret_reviews(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+            true,
+            None,
+        )
+        .unwrap();
+        let WorkAttemptRunOutcome::NeedsUser { handoff_path } = outcome else {
+            panic!("missing evidence must pause for verification recovery");
+        };
+        let stored = store.read_work_item("work-1").unwrap();
+        assert!(stored.merge_candidates.is_empty() && stored.attempts[0].learning.is_none());
+        assert_eq!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            1
+        );
+        let handoff = fs::read_to_string(project.path().join(handoff_path)).unwrap();
+        assert!(handoff.contains(&candidate));
+        assert!(
+            handoff.contains("required_behavior"),
+            "the handoff must identify the unmet reference: {handoff}"
+        );
+        assert!(handoff.contains("diagnos") || handoff.contains("Inspect"));
+        let (root, mut history) = crate::recovery_contracts::verification_tests::fixture(false);
+        let source = history.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Tester)
+            .unwrap();
+        let artifact = ArtifactRef {
+            producer_id: source.id.clone(),
+            path: format!(
+                "{}/tester-results.json",
+                source.artifact_area.as_ref().unwrap().path
+            ),
+        };
+        let task = history
+            .add_next_write_round("attempt-1", vec![artifact])
+            .unwrap();
+        let reason = crate::recovery_contracts::validate_code_change_writer_start(
+            root.path(),
+            &history,
+            "attempt-1",
+            &task,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(reason.contains("verification recovery"), "{reason}");
+    }
+
+    #[test]
+    fn writer_receives_only_unresolved_candidate_defects() {
+        let (project, mut item) = crate::recovery_contracts::verification_tests::fixture(true);
+        crate::recovery_contracts::verification_tests::accept_first_check(
+            project.path(),
+            &mut item,
+        );
+        for task in item.attempts[0]
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Review)
+        {
+            let area = project
+                .path()
+                .join(&task.artifact_area.as_ref().unwrap().path);
+            fs::create_dir_all(&area).unwrap();
+            fs::write(area.join("review.md"), "Verdict: pass\n").unwrap();
+        }
+        let store = WorkModelStore::new(project.path());
+        store.create_work_item(&item).unwrap();
+        let outcome = interpret_reviews(
+            project.path(),
+            &store,
+            store.read_work_item(&item.id).unwrap(),
+            "attempt-1",
+            true,
+            None,
+        )
+        .unwrap();
+        let WorkAttemptRunOutcome::PlannedWriteRound { task_id } = outcome else {
+            panic!("the established assertion defect requires source correction: {outcome:?}");
+        };
+        let saved = store.read_work_item(&item.id).unwrap();
+        let writer = saved.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.id == task_id)
+            .unwrap();
+        let findings =
+            crate::recovery_contracts::writer_completion_findings(project.path(), writer).unwrap();
+        assert_eq!(
+            findings.len(),
+            1,
+            "only the unresolved assertion belongs to the Writer: {findings:?}"
+        );
+        assert!(findings[0].requirement.contains("tests/native.sh::broken"));
+        assert!(!findings[0].requirement.contains("sh -c false"));
+    }
+
+    #[test]
+    fn missing_command_reference_pauses_for_exact_host_evidence_before_writer() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, candidate) = final_tester_evidence_fixture(project.path());
+        store
+            .mutate_work_item("work-1", |item| {
+                let mut tests_review = item.attempts[0]
+                    .tasks
+                    .iter()
+                    .find(|task| task.kind == TaskKind::Review)
+                    .cloned()
+                    .unwrap();
+                tests_review.id = "attempt-1-review-tests".to_string();
+                tests_review.role = "tests".to_string();
+                tests_review.artifact_area = Some(crate::work_model::TaskArtifactArea {
+                    path: work_artifact_path("work-1", "attempt-1", "attempt-1-review-tests"),
+                });
+                let tests_review_dir = project
+                    .path()
+                    .join(&tests_review.artifact_area.as_ref().unwrap().path);
+                fs::create_dir_all(&tests_review_dir).unwrap();
+                fs::write(tests_review_dir.join("review.md"), "Verdict: pass\n").unwrap();
+                item.attempts[0].tasks.push(tests_review);
+                let context = crate::work_model::PlanningContext {
+                    behaviors: Some(
+                        "### B1\n\nWHEN the feature runs, THE SYSTEM SHALL preserve it.\n\
+                         Test: python3 tests/behavior.rs\n"
+                            .to_string(),
+                    ),
+                    ..Default::default()
+                };
+                item.attempts[0].writer_completion_contract =
+                    crate::work_model::WriterCompletionContract::from_planning_context(&context);
+                Ok(())
+            })
+            .unwrap();
+
+        let outcome = interpret_reviews(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+            true,
+            None,
+        )
+        .unwrap();
+
+        let WorkAttemptRunOutcome::NeedsUser { handoff_path } = outcome else {
+            panic!("a command outside canonical Tester must request exact host evidence")
+        };
+        let stored = store.read_work_item("work-1").unwrap();
+        let attempt = &stored.attempts[0];
+        assert_eq!(attempt.status, AttemptStatus::NeedsUser);
+        assert_eq!(attempt.pause_kind, Some(PauseKind::HostEvidence));
+        assert_eq!(
+            attempt
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            1,
+            "host-only verification must not spend a corrective Writer round"
+        );
+        let handoff = fs::read_to_string(project.path().join(handoff_path)).unwrap();
+        assert!(handoff.contains("python3 tests/behavior.rs"));
+        assert!(handoff.contains("`working_directory` is `.`"));
+        assert!(handoff.contains(&format!("--candidate {candidate}")));
+        assert!(handoff.contains("--review-artifact"));
+        let action = crate::host_evidence::pending_candidate_gate_evidence_recovery_action(
+            project.path(),
+            attempt,
+        )
+        .expect("the handoff's public recovery remains eligible");
+        assert_eq!(action.command, "python3 tests/behavior.rs");
+    }
+
+    #[test]
+    fn unclassified_final_tester_logs_remain_diagnosis_inputs() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, _candidate) = final_tester_evidence_fixture(project.path());
+        add_failed_final_tester_command(project.path(), &store);
+
+        let outcome = interpret_reviews(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+            true,
+            None,
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, WorkAttemptRunOutcome::NeedsUser { .. }));
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(stored.attempts[0].pause_kind, Some(PauseKind::HostEvidence));
+        assert_eq!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            1
+        );
+        let results = latest_tester_results_path(project.path(), &stored.attempts[0]).unwrap();
+        let evidence =
+            failed_tester_command_artifacts(project.path(), &stored.attempts[0], &results).unwrap();
+        assert_eq!(evidence.len(), 3);
+        assert!(
+            evidence
+                .iter()
+                .all(|artifact| project.path().join(&artifact.path).is_file())
+        );
+    }
+
+    fn complete_failed_tester_no_change_writer(
+        project_root: &Path,
+        store: &WorkModelStore,
+        candidate: &str,
+    ) -> String {
+        // Preserve an older, explicitly authorized correction history. Current
+        // admission no longer treats an unexplained exit as a source defect.
+        let mut item = store.read_work_item("work-1").unwrap();
+        let results = latest_tester_results_path(project_root, &item.attempts[0]).unwrap();
+        let gate = if introduced_tester_failures(&results, None) == 0 && !tester_errored(&results) {
+            gate_candidate_after_final_tester(project_root, &mut item, 0, Some(&results)).unwrap()
+        } else {
+            None
+        };
+        let findings = if let Some((gate, _)) = gate {
+            final_tester_correction_artifacts(project_root, &item.attempts[0], &gate, &results)
+                .unwrap()
+        } else {
+            failed_tester_command_artifacts(project_root, &item.attempts[0], &results).unwrap()
+        };
+        let task_id = item.add_next_write_round("attempt-1", findings).unwrap();
+        store.write_work_item(&item).unwrap();
+        complete_planned_no_change_writer(project_root, store, candidate, &task_id);
+        task_id
+    }
+
+    fn complete_planned_no_change_writer(
+        project_root: &Path,
+        store: &WorkModelStore,
+        candidate: &str,
+        task_id: &str,
+    ) {
+        let item = store.read_work_item("work-1").unwrap();
+        crate::work_task_executor::materialize_writer_completion_before_writer(
+            project_root,
+            &item,
+            "attempt-1",
+            "attempt-1-write-1",
+        )
+        .unwrap();
+        crate::work_task_executor::materialize_writer_completion_before_writer(
+            project_root,
+            &item,
+            "attempt-1",
+            task_id,
+        )
+        .unwrap();
+        let matrix_path = project_root.join(work_artifact_path("work-1", "attempt-1", task_id));
+        let matrix_path =
+            matrix_path.join(crate::work_task_executor::WRITER_COMPLETION_MATRIX_FILE);
+        let mut matrix: crate::work_model::WriterCompletionMatrix =
+            serde_json::from_slice(&fs::read(&matrix_path).unwrap()).unwrap();
+        for row in &mut matrix.rows {
+            row.state = crate::work_model::WriterCompletionState::Complete;
+            row.implementation_evidence = vec!["tests/behavior.rs".to_string()];
+            row.verification = vec![crate::work_model::WriterVerificationClaim {
+                command: "xcodegen generate".to_string(),
+                result: crate::work_model::WriterVerificationResult::Pass,
+            }];
+            if row.kind == crate::work_model::WriterCompletionRequirementKind::Finding {
+                row.applicable_constraints = vec![
+                    "none: fixture command failure is independent of the behavior contract"
+                        .to_string(),
+                ];
+            }
+        }
+        fs::write(&matrix_path, serde_json::to_vec_pretty(&matrix).unwrap()).unwrap();
+        store
+            .mutate_work_item("work-1", |item| {
+                let workspace_path = item.attempts[0].tasks[0]
+                    .output
+                    .as_ref()
+                    .unwrap()
+                    .workspace_path
+                    .clone();
+                let writer = item.attempts[0]
+                    .tasks
+                    .iter_mut()
+                    .find(|task| task.id == *task_id)
+                    .unwrap();
+                crate::work_model::set_task_terminal(writer, TaskStatus::Complete);
+                writer.output = Some(TaskOutput {
+                    workspace_id: "candidate".to_string(),
+                    workspace_path,
+                    source_branch: "work/attempt-1".to_string(),
+                    base_commit: Some(candidate.to_string()),
+                    commit: candidate.to_string(),
+                    no_change: Some(crate::work_model::NoChangeOutput {
+                        schema_version: 1,
+                        declaration_path: format!(
+                            "{}/no-change.json",
+                            work_artifact_path("work-1", "attempt-1", task_id)
+                        ),
+                        reason: "The candidate already contains the correction.".to_string(),
+                        verification: vec![crate::work_model::NoChangeVerification {
+                            command: "xcodegen generate".to_string(),
+                            result: crate::work_model::NoChangeVerificationResult::Pass,
+                        }],
+                    }),
+                    learner_canonicalization: None,
+                });
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn write_recheck_result(project_root: &Path, task: &Task, candidate: &str, exit_code: i32) {
+        let artifact_dir = project_root.join(&task.artifact_area.as_ref().unwrap().path);
+        fs::create_dir_all(artifact_dir.join("commands")).unwrap();
+        let source_results = task.input_artifacts[0].path.clone();
+        fs::write(
+            artifact_dir.join("failed-command-recheck.json"),
+            serde_json::to_vec_pretty(&crate::tester::FailedCommandRecheckManifest {
+                schema_version: crate::tester::FAILED_COMMAND_RECHECK_SCHEMA_VERSION,
+                candidate_commit: candidate.to_string(),
+                source_results,
+                failed_command_indexes: vec![0],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(artifact_dir.join("commands/0-stdout.log"), "stdout\n").unwrap();
+        fs::write(artifact_dir.join("commands/0-stderr.log"), "stderr\n").unwrap();
+        let status = if exit_code == 0 { "pass" } else { "fail" };
+        let results = serde_json::json!({
+            "candidate_commit": candidate,
+            "commands": [{
+                "command": "xcodebuild test",
+                "test_harness": "xcodebuild",
+                "exit_code": exit_code,
+                "duration_ms": 10,
+                "stdout_log": "commands/0-stdout.log",
+                "stderr_log": "commands/0-stderr.log"
+            }],
+            "tests": [{
+                "id": "command-0:xcodebuild test",
+                "test_harness": "xcodebuild",
+                "status": status,
+                "duration_ms": 10,
+                "failure_excerpt": if exit_code == 0 { None } else { Some("command failed") }
+            }],
+            "summary": {
+                "total": 1,
+                "pass": if exit_code == 0 { 1 } else { 0 },
+                "fail": if exit_code == 0 { 0 } else { 1 },
+                "skipped": 0
+            },
+            "error": null
+        });
+        fs::write(
+            artifact_dir.join("tester-results.json"),
+            serde_json::to_vec_pretty(&results).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn unchanged_failed_tester_correction_plans_recheck_before_reviews() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, candidate) = final_tester_evidence_fixture(project.path());
+        add_failed_final_tester_command(project.path(), &store);
+        complete_failed_tester_no_change_writer(project.path(), &store, &candidate);
+
+        let outcome = plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+
+        let WorkAttemptRunOutcome::PlannedFailedCommandRecheck { task_id } = outcome else {
+            panic!("unchanged failed-Tester correction must recheck before review")
+        };
+        let stored = store.read_work_item("work-1").unwrap();
+        let recheck = stored.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.id == task_id)
+            .unwrap();
+        assert_eq!(recheck.role, crate::work_model::FAILED_COMMAND_RECHECK_ROLE);
+        assert_eq!(recheck.input_artifacts.len(), 1);
+        assert!(
+            recheck.input_artifacts[0]
+                .path
+                .ends_with("/tester-results.json")
+        );
+        assert!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .rev()
+                .take_while(|task| { task.kind != TaskKind::Write })
+                .all(|task| task.kind != TaskKind::Review)
+        );
+    }
+
+    #[test]
+    fn final_tester_gate_selection_requires_exact_tester_binding() {
+        #[derive(Clone, Copy, Debug)]
+        enum InvalidBinding {
+            GatePath,
+            ProducerStatus,
+            ProducerOutput,
+            TesterKind,
+            TesterRole,
+            FailedCommandRecheck,
+            TesterStatus,
+            WorkItem,
+            Attempt,
+            ArtifactArea,
+            LatestWriter,
+            MissingReviewContext,
+            CandidateWorkspaceId,
+            CandidateWorkspacePath,
+            SourceBranch,
+            CandidateCommit,
+            BaseCommit,
+        }
+
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, candidate) = final_tester_evidence_fixture(project.path());
+        add_failed_final_tester_command(project.path(), &store);
+
+        // Seed the rejected gate and correction saved by older Fluent. Current
+        // admission pauses unexplained command exits before planning a Writer.
+        let task_id = complete_failed_tester_no_change_writer(project.path(), &store, &candidate);
+        let item = store.read_work_item("work-1").unwrap();
+        let write_index = item.attempts[0]
+            .tasks
+            .iter()
+            .position(|task| task.id == task_id)
+            .unwrap();
+        let final_gate = item.attempts[0].tasks[write_index]
+            .input_artifacts
+            .iter()
+            .find(|artifact| {
+                artifact
+                    .path
+                    .ends_with(crate::candidate_gate::CANDIDATE_GATE_FILE)
+            })
+            .unwrap();
+
+        assert_eq!(
+            select_prior_writer_candidate_gate(&item, 0, write_index).unwrap(),
+            None
+        );
+
+        let tester_index = item.attempts[0]
+            .tasks
+            .iter()
+            .position(|task| task.kind == TaskKind::Tester)
+            .unwrap();
+        let producer_index = item.attempts[0]
+            .tasks
+            .iter()
+            .position(|task| task.id == final_gate.producer_id)
+            .unwrap();
+        let invalid_bindings = [
+            InvalidBinding::GatePath,
+            InvalidBinding::ProducerStatus,
+            InvalidBinding::ProducerOutput,
+            InvalidBinding::TesterKind,
+            InvalidBinding::TesterRole,
+            InvalidBinding::FailedCommandRecheck,
+            InvalidBinding::TesterStatus,
+            InvalidBinding::WorkItem,
+            InvalidBinding::Attempt,
+            InvalidBinding::ArtifactArea,
+            InvalidBinding::LatestWriter,
+            InvalidBinding::MissingReviewContext,
+            InvalidBinding::CandidateWorkspaceId,
+            InvalidBinding::CandidateWorkspacePath,
+            InvalidBinding::SourceBranch,
+            InvalidBinding::CandidateCommit,
+            InvalidBinding::BaseCommit,
+        ];
+        for invalid_binding in invalid_bindings {
+            let mut invalid = item.clone();
+            let tasks = &mut invalid.attempts[0].tasks;
+            match invalid_binding {
+                InvalidBinding::GatePath => {
+                    let gate = tasks[write_index]
+                        .input_artifacts
+                        .iter_mut()
+                        .find(|artifact| {
+                            artifact.producer_id == final_gate.producer_id
+                                && artifact.path == final_gate.path
+                        })
+                        .unwrap();
+                    gate.path = work_artifact_path(
+                        "work-1",
+                        "attempt-1",
+                        "candidate-gates/other-tester/candidate-gate.json",
+                    );
+                }
+                InvalidBinding::ProducerStatus => {
+                    tasks[producer_index].status = TaskStatus::Failed;
+                }
+                InvalidBinding::ProducerOutput => {
+                    tasks[producer_index].output = None;
+                }
+                InvalidBinding::TesterKind => {
+                    tasks[tester_index].kind = TaskKind::Review;
+                }
+                InvalidBinding::TesterRole => {
+                    tasks[tester_index].role = "other-tester".to_string();
+                }
+                InvalidBinding::FailedCommandRecheck => {
+                    tasks[tester_index].role =
+                        crate::work_model::FAILED_COMMAND_RECHECK_ROLE.to_string();
+                }
+                InvalidBinding::TesterStatus => {
+                    tasks[tester_index].status = TaskStatus::Failed;
+                }
+                InvalidBinding::WorkItem => {
+                    tasks[tester_index].work_item_id = "other-work".to_string();
+                }
+                InvalidBinding::Attempt => {
+                    tasks[tester_index].attempt_id = Some("other-attempt".to_string());
+                }
+                InvalidBinding::ArtifactArea => {
+                    tasks[tester_index]
+                        .artifact_area
+                        .as_mut()
+                        .unwrap()
+                        .path
+                        .push_str("-other");
+                }
+                InvalidBinding::LatestWriter => {
+                    let output = tasks[producer_index].output.clone().unwrap();
+                    let reassigned = tasks[producer_index + 1..tester_index]
+                        .iter_mut()
+                        .find(|task| task.kind == TaskKind::Review)
+                        .unwrap();
+                    reassigned.kind = TaskKind::Write;
+                    reassigned.status = TaskStatus::Complete;
+                    reassigned.output = Some(output);
+                }
+                InvalidBinding::MissingReviewContext => {
+                    tasks[tester_index].review_context = None;
+                }
+                InvalidBinding::CandidateWorkspaceId => {
+                    tasks[tester_index]
+                        .review_context
+                        .as_mut()
+                        .unwrap()
+                        .candidate_workspace_id
+                        .push_str("-other");
+                }
+                InvalidBinding::CandidateWorkspacePath => {
+                    tasks[tester_index]
+                        .review_context
+                        .as_mut()
+                        .unwrap()
+                        .candidate_workspace_path
+                        .push_str("-other");
+                }
+                InvalidBinding::SourceBranch => {
+                    tasks[tester_index]
+                        .review_context
+                        .as_mut()
+                        .unwrap()
+                        .source_branch
+                        .push_str("-other");
+                }
+                InvalidBinding::CandidateCommit => {
+                    tasks[tester_index]
+                        .review_context
+                        .as_mut()
+                        .unwrap()
+                        .candidate_commit
+                        .push_str("-other");
+                }
+                InvalidBinding::BaseCommit => {
+                    tasks[tester_index]
+                        .review_context
+                        .as_mut()
+                        .unwrap()
+                        .base_commit = Some("unexpected-base".to_string());
+                }
+            }
+
+            assert!(
+                select_prior_writer_candidate_gate(&invalid, 0, write_index).is_err(),
+                "{invalid_binding:?} must not grant prior-gate authority"
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_failed_command_skips_reviews_and_returns_to_writer() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, candidate) = final_tester_evidence_fixture(project.path());
+        add_failed_final_tester_command(project.path(), &store);
+        complete_failed_tester_no_change_writer(project.path(), &store, &candidate);
+        plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+        let mut item = store.read_work_item("work-1").unwrap();
+        let recheck = item.attempts[0]
+            .tasks
+            .iter_mut()
+            .find(|task| task.role == crate::work_model::FAILED_COMMAND_RECHECK_ROLE)
+            .unwrap();
+        crate::work_model::set_task_terminal(recheck, TaskStatus::Complete);
+        write_recheck_result(project.path(), recheck, &candidate, 65);
+        store.write_work_item(&item).unwrap();
+
+        let outcome = plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+
+        let WorkAttemptRunOutcome::PlannedWriteRound { task_id } = outcome else {
+            panic!("same host failure must return directly to Writer")
+        };
+        let stored = store.read_work_item("work-1").unwrap();
+        let writer = stored.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.id == task_id)
+            .unwrap();
+        assert!(
+            writer
+                .input_artifacts
+                .iter()
+                .any(|artifact| artifact.path.ends_with("/failed-command-recheck.json"))
+        );
+        let new_writer_index = stored.attempts[0]
+            .tasks
+            .iter()
+            .position(|task| task.id == writer.id)
+            .unwrap();
+        let prior_writer_index = stored.attempts[0].tasks[..new_writer_index]
+            .iter()
+            .rposition(|task| task.kind == TaskKind::Write)
+            .unwrap();
+        assert!(
+            stored.attempts[0].tasks[prior_writer_index + 1..new_writer_index]
+                .iter()
+                .all(|task| task.kind != TaskKind::Review)
+        );
+    }
+
+    #[test]
+    fn repeated_unclassified_command_pauses_without_writer() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, candidate) = final_tester_evidence_fixture(project.path());
+        add_failed_final_tester_command(project.path(), &store);
+        complete_failed_tester_no_change_writer(project.path(), &store, &candidate);
+        plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+        let mut item = store.read_work_item("work-1").unwrap();
+        let recheck = item.attempts[0]
+            .tasks
+            .iter_mut()
+            .find(|task| task.role == crate::work_model::FAILED_COMMAND_RECHECK_ROLE)
+            .unwrap();
+        crate::work_model::set_task_terminal(recheck, TaskStatus::Complete);
+        write_recheck_result(project.path(), recheck, &candidate, 65);
+        let path = project
+            .path()
+            .join(&recheck.artifact_area.as_ref().unwrap().path)
+            .join("tester-results.json");
+        let mut unclassified: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        unclassified["tests"] = serde_json::json!([]);
+        unclassified["summary"] = serde_json::json!({"total":0,"pass":0,"fail":0,"skipped":0});
+        fs::write(&path, serde_json::to_vec(&unclassified).unwrap()).unwrap();
+        store.write_work_item(&item).unwrap();
+
+        let outcome = plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, WorkAttemptRunOutcome::NeedsUser { .. }));
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(stored.attempts[0].pause_kind, Some(PauseKind::HostEvidence));
+        assert_eq!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            2
+        );
+        assert!(
+            stored.attempts[0]
+                .tasks
+                .last()
+                .unwrap()
+                .is_failed_command_recheck()
+        );
+    }
+
+    fn failed_recheck_no_change_fixture(
+        project: &tempfile::TempDir,
+    ) -> (WorkModelStore, tempfile::TempDir, String) {
+        let (store, _workspace, candidate) = final_tester_evidence_fixture(project.path());
+        add_failed_final_tester_command(project.path(), &store);
+        complete_failed_tester_no_change_writer(project.path(), &store, &candidate);
+        plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+        let mut item = store.read_work_item("work-1").unwrap();
+        let recheck = item.attempts[0]
+            .tasks
+            .iter_mut()
+            .find(|task| task.is_failed_command_recheck())
+            .unwrap();
+        crate::work_model::set_task_terminal(recheck, TaskStatus::Complete);
+        write_recheck_result(project.path(), recheck, &candidate, 65);
+        store.write_work_item(&item).unwrap();
+
+        let outcome = plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+        let WorkAttemptRunOutcome::PlannedWriteRound { task_id } = outcome else {
+            panic!("the first failed recheck may request one corrective Writer")
+        };
+        complete_planned_no_change_writer(project.path(), &store, &candidate, &task_id);
+        (store, _workspace, candidate)
+    }
+
+    #[test]
+    fn no_change_after_failed_recheck_requests_host_evidence_with_capacity_remaining() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, _candidate) = failed_recheck_no_change_fixture(&project);
+        let before = store.read_work_item("work-1").unwrap();
+        assert!(
+            before.attempts[0].materialized_write_rounds()
+                < before.attempts[0].effective_write_round_cap(max_total_write_rounds()),
+            "the regression requires Writer capacity to remain"
+        );
+        let tester_count = before.attempts[0]
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Tester)
+            .count();
+
+        let outcome =
+            plan_after_completed_writer(project.path(), &store, before, "attempt-1").unwrap();
+        let WorkAttemptRunOutcome::NeedsUser { handoff_path } = outcome else {
+            panic!("an unchanged candidate must request compatible-host evidence, got {outcome:?}")
+        };
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(stored.attempts[0].status, AttemptStatus::NeedsUser);
+        assert_eq!(stored.attempts[0].pause_kind, Some(PauseKind::HostEvidence));
+        assert_eq!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Tester)
+                .count(),
+            tester_count,
+            "the no-change declaration must not schedule another focused recheck"
+        );
+        let handoff = fs::read_to_string(project.path().join(handoff_path)).unwrap();
+        assert!(handoff.contains("--recheck-artifact"));
+        assert!(handoff.contains("`result: fail`"));
+        assert!(
+            crate::work_status::attempt_recovery_next_action(
+                Some(&stored.attempts[0]),
+                Some(project.path()),
+            )
+            .is_some_and(|action| action.contains("--recheck-artifact"))
+        );
+        assert_eq!(
+            crate::work_status::summarize_work_item(&stored, Some(project.path())).action,
+            "evidence-needed"
+        );
+    }
+
+    #[test]
+    fn failed_recheck_host_evidence_can_request_corrective_writer() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, candidate) = failed_recheck_no_change_fixture(&project);
+        let outcome = plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+        assert!(matches!(outcome, WorkAttemptRunOutcome::NeedsUser { .. }));
+
+        let paused = store.read_work_item("work-1").unwrap();
+        let recheck = paused.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.is_failed_command_recheck())
+            .unwrap();
+        let manifest = format!(
+            "{}/failed-command-recheck.json",
+            recheck.artifact_area.as_ref().unwrap().path
+        );
+        let evidence_path = project.path().join("failed-host-evidence.json");
+        fs::write(
+            &evidence_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "producer": "authorized DGX host",
+                "check": "xcodebuild test",
+                "working_directory": ".",
+                "result": "fail",
+                "run_at": "2026-08-26T18:00:00Z",
+                "output": "candidate cleanup failed on the authorized host"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let recovery = crate::host_evidence::attach(
+            project.path(),
+            &store,
+            "work-1",
+            "attempt-1",
+            &candidate,
+            &evidence_path,
+            &[],
+            Some(&manifest),
+        )
+        .expect("failed exact host evidence must reach targeted Tests review");
+        let repeated = crate::host_evidence::attach(
+            project.path(),
+            &store,
+            "work-1",
+            "attempt-1",
+            &candidate,
+            &evidence_path,
+            &[],
+            Some(&manifest),
+        )
+        .expect("repeating the same failed evidence attachment must be idempotent");
+        assert_eq!(repeated, recovery);
+
+        let reviewing = store.read_work_item("work-1").unwrap();
+        let attempt = &reviewing.attempts[0];
+        assert_eq!(attempt.status, AttemptStatus::Reviewing);
+        assert_eq!(attempt.pause_kind, None);
+        assert_eq!(recovery.state, EvidenceRecoveryState::Reviewing);
+        let review_task_id = recovery.targets[0].review_task_id.as_ref().unwrap();
+        let review = attempt
+            .tasks
+            .iter()
+            .find(|task| task.id == *review_task_id)
+            .unwrap()
+            .clone();
+        assert_eq!(review.kind, TaskKind::Review);
+        assert_eq!(review.role, "tests");
+        assert_eq!(review.status, TaskStatus::Planned);
+        assert_eq!(
+            review
+                .evidence_review_context
+                .as_ref()
+                .unwrap()
+                .candidate_commit,
+            candidate
+        );
+        assert!(
+            crate::host_evidence::completed_recheck_evidence_source(project.path(), attempt,)
+                .is_none(),
+            "failed evidence must not supersede the failed Tester command"
+        );
+
+        store
+            .mutate_work_item("work-1", |item| {
+                let review = item.attempts[0]
+                    .tasks
+                    .iter_mut()
+                    .find(|task| task.id == *review_task_id)
+                    .unwrap();
+                crate::work_model::set_task_terminal(review, TaskStatus::Complete);
+                Ok(())
+            })
+            .unwrap();
+        let review_dir = project
+            .path()
+            .join(&review.artifact_area.as_ref().unwrap().path);
+        fs::create_dir_all(&review_dir).unwrap();
+        fs::write(
+            review_dir.join("review.md"),
+            "Verdict: fail\nDisposition: code-change\n",
+        )
+        .unwrap();
+
+        let writer_count = reviewing.attempts[0]
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Write)
+            .count();
+        let outcome = interpret_reviews(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+            false,
+            None,
+        )
+        .unwrap();
+        let WorkAttemptRunOutcome::PlannedWriteRound { task_id } = outcome else {
+            panic!("reviewed failed host evidence must plan a corrective Writer")
+        };
+        let corrected = store.read_work_item("work-1").unwrap();
+        let attempt = &corrected.attempts[0];
+        assert_eq!(attempt.status, AttemptStatus::Planned);
+        assert_eq!(attempt.pause_kind, None);
+        assert_eq!(
+            attempt
+                .evidence_recoveries
+                .iter()
+                .find(|entry| entry.id == recovery.id)
+                .unwrap()
+                .state,
+            EvidenceRecoveryState::CodeChange
+        );
+        assert_eq!(
+            attempt
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            writer_count + 1
+        );
+        let writer = attempt
+            .tasks
+            .iter()
+            .find(|task| task.id == task_id)
+            .unwrap();
+        assert_eq!(writer.status, TaskStatus::Planned);
+        assert_eq!(writer.input_artifacts.len(), 1);
+        assert_eq!(writer.input_artifacts[0].producer_id, *review_task_id);
+    }
+
+    #[test]
+    fn failed_related_host_diagnostic_preserves_recheck_identity() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, candidate) = failed_recheck_no_change_fixture(&project);
+        let outcome = plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+        assert!(matches!(outcome, WorkAttemptRunOutcome::NeedsUser { .. }));
+
+        let paused = store.read_work_item("work-1").unwrap();
+        let recheck = paused.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.is_failed_command_recheck())
+            .unwrap();
+        let manifest = format!(
+            "{}/failed-command-recheck.json",
+            recheck.artifact_area.as_ref().unwrap().path
+        );
+        let diagnostic_check = "models/experiments/qwen3_8_27b/spark.sh start dflash-correctness";
+        let evidence_path = project.path().join("failed-host-diagnostic.json");
+        fs::write(
+            &evidence_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "producer": "authorized DGX host",
+                "check": diagnostic_check,
+                "working_directory": ".",
+                "result": "fail",
+                "run_at": "2026-08-26T18:00:00Z",
+                "output": "Docker inspection metadata was not attested"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let recovery = crate::host_evidence::attach(
+            project.path(),
+            &store,
+            "work-1",
+            "attempt-1",
+            &candidate,
+            &evidence_path,
+            &[],
+            Some(&manifest),
+        )
+        .expect("a failed related command must reach targeted Tests review");
+        let repeated = crate::host_evidence::attach(
+            project.path(),
+            &store,
+            "work-1",
+            "attempt-1",
+            &candidate,
+            &evidence_path,
+            &[],
+            Some(&manifest),
+        )
+        .expect("repeating diagnostic attachment must be idempotent");
+        assert_eq!(repeated, recovery);
+
+        let reviewing = store.read_work_item("work-1").unwrap();
+        let attempt = &reviewing.attempts[0];
+        assert_eq!(attempt.status, AttemptStatus::Reviewing);
+        assert_eq!(attempt.pause_kind, None);
+        assert!(
+            crate::host_evidence::completed_recheck_evidence_source(project.path(), attempt)
+                .is_none(),
+            "a different failed command must remain diagnostic until the exact recheck passes"
+        );
+        let review_task_id = recovery.targets[0].review_task_id.as_ref().unwrap();
+        let review = attempt
+            .tasks
+            .iter()
+            .find(|task| task.id == *review_task_id)
+            .unwrap();
+        let binding_path = review
+            .evidence_review_context
+            .as_ref()
+            .unwrap()
+            .prior_review_artifact
+            .clone();
+        let binding: serde_json::Value =
+            serde_json::from_slice(&fs::read(project.path().join(binding_path)).unwrap()).unwrap();
+        assert_eq!(binding["command"], "xcodebuild test");
+        assert_eq!(binding["evidence_check"], diagnostic_check);
+    }
+
+    #[test]
+    fn passing_related_host_diagnostic_is_rejected_with_exact_command_guidance() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, candidate) = failed_recheck_no_change_fixture(&project);
+        let outcome = plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+        assert!(matches!(outcome, WorkAttemptRunOutcome::NeedsUser { .. }));
+
+        let paused = store.read_work_item("work-1").unwrap();
+        let recheck = paused.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.is_failed_command_recheck())
+            .unwrap();
+        let manifest = format!(
+            "{}/failed-command-recheck.json",
+            recheck.artifact_area.as_ref().unwrap().path
+        );
+        let evidence_path = project.path().join("passing-related-host-check.json");
+        fs::write(
+            &evidence_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "producer": "authorized DGX host",
+                "check": "models/experiments/qwen3_8_27b/spark.sh start dflash-correctness",
+                "working_directory": ".",
+                "result": "pass",
+                "run_at": "2026-08-26T18:00:00Z",
+                "output": "Docker inspection metadata was accepted"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let error = crate::host_evidence::attach(
+            project.path(),
+            &store,
+            "work-1",
+            "attempt-1",
+            &candidate,
+            &evidence_path,
+            &[],
+            Some(&manifest),
+        )
+        .expect_err("a related command must not satisfy the exact recheck");
+        let message = error.to_string();
+        assert!(message.contains("does not match the failed-command recheck"));
+        assert!(message.contains("xcodebuild test"));
+        assert!(message.contains("spark.sh start dflash-correctness"));
+        let unchanged = store.read_work_item("work-1").unwrap();
+        assert_eq!(unchanged.attempts[0].status, AttemptStatus::NeedsUser);
+        assert!(unchanged.attempts[0].evidence_recoveries.is_empty());
+        assert!(
+            !project
+                .path()
+                .join(".fluent/work/artifacts/work-1/attempt-1/host-evidence")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn terminalized_recheck_no_change_accepts_reused_evidence_idempotently() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, candidate) = failed_recheck_no_change_fixture(&project);
+        let evidence_bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "producer": "Linux ARM64 host",
+            "check": "xcodebuild test",
+            "working_directory": ".",
+            "result": "pass",
+            "run_at": "2026-08-23T12:00:00Z",
+            "output": "passed on the compatible host"
+        }))
+        .unwrap();
+        let evidence_path = project.path().join("external-evidence.json");
+        fs::write(&evidence_path, &evidence_bytes).unwrap();
+        let digest = format!("sha256:{:x}", Sha256::digest(&evidence_bytes));
+        let snapshot_path = format!(
+            ".fluent/work/artifacts/work-1/attempt-1/host-evidence/{}.json",
+            &digest[7..]
+        );
+        fs::create_dir_all(
+            project
+                .path()
+                .join(".fluent/work/artifacts/work-1/attempt-1/host-evidence"),
+        )
+        .unwrap();
+        fs::write(project.path().join(&snapshot_path), &evidence_bytes).unwrap();
+        store
+            .mutate_work_item("work-1", |item| {
+                let attempt = &mut item.attempts[0];
+                attempt
+                    .evidence_recoveries
+                    .push(crate::work_model::EvidenceRecovery {
+                        carried_finding: None,
+                        required_check: None,
+                        id: format!("host-evidence-{}", &digest[7..19]),
+                        candidate_commit: candidate.clone(),
+                        attachment: crate::work_model::EvidenceAttachment {
+                            snapshot_path: snapshot_path.clone(),
+                            digest: digest.clone(),
+                        },
+                        targets: vec![crate::work_model::EvidenceReviewTarget {
+                            role: "tests".to_string(),
+                            prior_review_artifact:
+                                ".fluent/work/artifacts/work-1/attempt-1/prior-tests/review.md"
+                                    .to_string(),
+                            review_task_id: Some("attempt-1-prior-evidence-tests".to_string()),
+                            review_digest: None,
+                        }],
+                        state: EvidenceRecoveryState::Complete,
+                        created_at: "2026-08-23T11:00:00Z".to_string(),
+                        code_change_classification: None,
+                    });
+                attempt.status = AttemptStatus::Complete;
+                attempt.pause_kind = None;
+                attempt.review_state = Some(AttemptReviewState::Failed);
+                Ok(())
+            })
+            .unwrap();
+        let legacy = store.read_work_item("work-1").unwrap();
+        assert!(
+            crate::work_status::attempt_recovery_next_action(
+                Some(&legacy.attempts[0]),
+                Some(project.path()),
+            )
+            .is_some_and(|action| action.contains("--recheck-artifact")),
+            "the public recovery command must be visible for the terminalized legacy shape"
+        );
+        let recheck = legacy.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.is_failed_command_recheck())
+            .unwrap();
+        let manifest = format!(
+            "{}/failed-command-recheck.json",
+            recheck.artifact_area.as_ref().unwrap().path
+        );
+        assert!(
+            crate::host_evidence::attach(
+                project.path(),
+                &store,
+                "work-1",
+                "attempt-1",
+                "stale-candidate",
+                &evidence_path,
+                &[],
+                Some(&manifest),
+            )
+            .is_err(),
+            "legacy recovery must remain candidate-bound"
+        );
+        assert!(
+            crate::host_evidence::attach(
+                project.path(),
+                &store,
+                "work-1",
+                "attempt-1",
+                &candidate,
+                &evidence_path,
+                &[],
+                Some(".fluent/work/artifacts/work-1/attempt-1/unrelated.json"),
+            )
+            .is_err(),
+            "legacy recovery must reject unrelated artifacts"
+        );
+        let dirty_path = _workspace.path().join("untracked-recovery-input");
+        fs::write(&dirty_path, "dirty\n").unwrap();
+        assert!(
+            crate::host_evidence::attach(
+                project.path(),
+                &store,
+                "work-1",
+                "attempt-1",
+                &candidate,
+                &evidence_path,
+                &[],
+                Some(&manifest),
+            )
+            .is_err(),
+            "legacy recovery must preserve clean-worktree enforcement"
+        );
+        fs::remove_file(&dirty_path).unwrap();
+        let recovery = crate::host_evidence::attach(
+            project.path(),
+            &store,
+            "work-1",
+            "attempt-1",
+            &candidate,
+            &evidence_path,
+            &[],
+            Some(&manifest),
+        )
+        .unwrap();
+        assert_ne!(
+            recovery.id,
+            format!("host-evidence-{}", &digest[7..19]),
+            "reusing immutable bytes for a distinct frontier needs a distinct audit identity"
+        );
+        let recovered = store.read_work_item("work-1").unwrap();
+        assert_eq!(recovered.attempts[0].status, AttemptStatus::Reviewing);
+        assert_eq!(
+            recovered.attempts[0].review_state,
+            Some(AttemptReviewState::NotReviewed)
+        );
+        assert_eq!(recovered.attempts[0].evidence_recoveries.len(), 2);
+        assert_eq!(
+            crate::host_evidence::attach(
+                project.path(),
+                &store,
+                "work-1",
+                "attempt-1",
+                &candidate,
+                &evidence_path,
+                &[],
+                Some(&manifest),
+            )
+            .unwrap()
+            .id,
+            recovery.id,
+            "retrying the public recovery command must be idempotent"
+        );
+    }
+
+    #[test]
+    fn failed_recheck_is_a_round_cap_extension_frontier() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, candidate) = final_tester_evidence_fixture(project.path());
+        add_failed_final_tester_command(project.path(), &store);
+        complete_failed_tester_no_change_writer(project.path(), &store, &candidate);
+        store
+            .mutate_work_item("work-1", |item| {
+                let latest = item.attempts[0]
+                    .tasks
+                    .iter()
+                    .rposition(|task| task.kind == TaskKind::Write)
+                    .unwrap();
+                let template = item.attempts[0].tasks[latest].clone();
+                let fillers = (3..=10).map(|round| {
+                    let mut filler = template.clone();
+                    filler.id = format!("attempt-1-write-{round}");
+                    filler.output.as_mut().unwrap().no_change = None;
+                    filler.artifact_area.as_mut().unwrap().path =
+                        work_artifact_path("work-1", "attempt-1", &filler.id);
+                    filler
+                });
+                item.attempts[0].tasks.splice(latest..latest, fillers);
+                Ok(())
+            })
+            .unwrap();
+        plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+        let mut item = store.read_work_item("work-1").unwrap();
+        let recheck = item.attempts[0]
+            .tasks
+            .iter_mut()
+            .find(|task| task.is_failed_command_recheck())
+            .unwrap();
+        crate::work_model::set_task_terminal(recheck, TaskStatus::Complete);
+        write_recheck_result(project.path(), recheck, &candidate, 65);
+        // Exercise the source-correction cap with an established assertion defect.
+        // An unexplained command exit instead requests compatible host evidence.
+        let path = project
+            .path()
+            .join(&recheck.artifact_area.as_ref().unwrap().path)
+            .join("tester-results.json");
+        let mut results: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        results["tests"][0]["id"] = serde_json::json!("required_behavior");
+        results["tests"][0]["failure_excerpt"] =
+            serde_json::json!("assertion failed: required behavior");
+        fs::write(&path, serde_json::to_vec(&results).unwrap()).unwrap();
+        store.write_work_item(&item).unwrap();
+
+        let outcome = plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, WorkAttemptRunOutcome::NeedsUser { .. }));
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(stored.attempts[0].pause_kind, Some(PauseKind::RoundCap));
+        assert_eq!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            10
+        );
+        let frontier = round_cap_failure_frontier(project.path(), &stored.attempts[0])
+            .expect("the failed recheck must remain an extension frontier");
+        assert!(frontier.iter().any(|artifact| {
+            artifact
+                .artifact
+                .path
+                .ends_with("/failed-command-recheck.json")
+        }));
+        assert!(
+            frontier
+                .iter()
+                .any(|artifact| { artifact.artifact.path.ends_with("/tester-results.json") })
+        );
+
+        assert!(frontier.iter().all(|artifact| {
+            artifact.digest.starts_with("sha256:")
+                && project.path().join(&artifact.artifact.path).is_file()
+        }));
+    }
+
+    #[test]
+    fn real_corrective_commit_sends_failed_tester_evidence_to_tests_review() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, workspace, candidate) = final_tester_evidence_fixture(project.path());
+        add_failed_final_tester_command(project.path(), &store);
+        let task_id = complete_failed_tester_no_change_writer(project.path(), &store, &candidate);
+        fs::write(
+            workspace.path().join("src/lib.rs"),
+            "pub fn value() {}\npub fn corrected() {}\n",
+        )
+        .unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["add", "src/lib.rs"],
+            "stage corrective commit",
+        )
+        .unwrap();
+        crate::git::run(
+            workspace.path(),
+            &[
+                "commit",
+                "-q",
+                "-m",
+                "Correct candidate\n\n- Add the corrected value",
+            ],
+            "commit correction",
+        )
+        .unwrap();
+        let corrected = crate::git::run_stdout(
+            workspace.path(),
+            &["rev-parse", "HEAD"],
+            "read corrected candidate",
+        )
+        .unwrap();
+        store
+            .mutate_work_item("work-1", |item| {
+                let writer = item.attempts[0]
+                    .tasks
+                    .iter_mut()
+                    .find(|task| task.id == task_id)
+                    .unwrap();
+                writer.output.as_mut().unwrap().no_change = None;
+                writer.output.as_mut().unwrap().commit = corrected.clone();
+                writer.output.as_mut().unwrap().base_commit = Some(candidate.clone());
+                Ok(())
+            })
+            .unwrap();
+
+        let outcome = plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedReviews { .. }
+        ));
+        let stored = store.read_work_item("work-1").unwrap();
+        assert!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .all(|task| { task.role != crate::work_model::FAILED_COMMAND_RECHECK_ROLE })
+        );
+        let tests_review = stored.attempts[0]
+            .tasks
+            .iter()
+            .rev()
+            .find(|task| task.kind == TaskKind::Review && task.role == "tests")
+            .unwrap();
+        assert!(
+            tests_review
+                .input_artifacts
+                .iter()
+                .any(|artifact| artifact.path.ends_with("/tester-results.json"))
+        );
+        assert!(
+            tests_review
+                .input_artifacts
+                .iter()
+                .any(|artifact| artifact.path.ends_with("/commands/0-stdout.log"))
+        );
+        assert!(
+            tests_review
+                .input_artifacts
+                .iter()
+                .any(|artifact| artifact.path.ends_with("/commands/0-stderr.log"))
+        );
+    }
+
+    #[test]
+    fn passing_failed_command_recheck_allows_normal_reviews() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, candidate) = final_tester_evidence_fixture(project.path());
+        add_failed_final_tester_command(project.path(), &store);
+        complete_failed_tester_no_change_writer(project.path(), &store, &candidate);
+        plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+        let mut item = store.read_work_item("work-1").unwrap();
+        let recheck = item.attempts[0]
+            .tasks
+            .iter_mut()
+            .find(|task| task.role == crate::work_model::FAILED_COMMAND_RECHECK_ROLE)
+            .unwrap();
+        crate::work_model::set_task_terminal(recheck, TaskStatus::Complete);
+        write_recheck_result(project.path(), recheck, &candidate, 0);
+        store.write_work_item(&item).unwrap();
+
+        let outcome = plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedReviews { .. }
+        ));
+        let stored = store.read_work_item("work-1").unwrap();
+        let recheck = stored.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.is_failed_command_recheck())
+            .unwrap();
+        let tests_review = stored.attempts[0]
+            .tasks
+            .iter()
+            .rev()
+            .find(|task| {
+                task.kind == TaskKind::Review
+                    && task.role == "tests"
+                    && task.status == TaskStatus::Planned
+            })
+            .unwrap();
+        assert!(tests_review.input_artifacts.iter().any(|artifact| {
+            artifact.producer_id == recheck.id && artifact.path.ends_with("/tester-results.json")
+        }));
+        assert!(!tests_review.input_artifacts.iter().any(|artifact| {
+            artifact.producer_id != recheck.id
+                && (artifact.path.ends_with("/tester-results.json")
+                    || crate::tester::is_command_log_path(Path::new(&artifact.path)))
+        }));
+    }
+
+    #[test]
+    fn baseline_explained_no_change_skips_failed_command_recheck() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, candidate) = final_tester_evidence_fixture(project.path());
+        add_failed_final_tester_command(project.path(), &store);
+        let tester = store.read_work_item("work-1").unwrap().attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Tester)
+            .unwrap()
+            .clone();
+        let results_path = project
+            .path()
+            .join(&tester.artifact_area.as_ref().unwrap().path)
+            .join("tester-results.json");
+        let mut results: serde_json::Value =
+            serde_json::from_slice(&fs::read(&results_path).unwrap()).unwrap();
+        results["tests"] = serde_json::json!([{
+            "id": "baseline_test",
+            "test_harness": "xcodebuild",
+            "status": "fail",
+            "duration_ms": 1,
+            "failure_excerpt": "known baseline failure"
+        }]);
+        results["summary"] = serde_json::json!({"total": 1, "pass": 0, "fail": 1, "skipped": 0});
+        fs::write(&results_path, serde_json::to_vec_pretty(&results).unwrap()).unwrap();
+
+        let item = store.read_work_item("work-1").unwrap();
+        let tester = item.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Tester)
+            .unwrap();
+        let source = project
+            .path()
+            .join(&tester.artifact_area.as_ref().unwrap().path)
+            .join("tester-results.json");
+        let baseline = project.path().join(work_artifact_path(
+            "work-1",
+            "attempt-1",
+            "attempt-1-baseline-tester",
+        ));
+        fs::create_dir_all(&baseline).unwrap();
+        fs::copy(&source, baseline.join("tester-results.json")).unwrap();
+        // Baseline evidence predates the Writer and its completion matrix.
+        complete_failed_tester_no_change_writer(project.path(), &store, &candidate);
+
+        let outcome = plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+
+        assert!(
+            matches!(outcome, WorkAttemptRunOutcome::PlannedReviews { .. }),
+            "baseline-explained no-change should plan reviews, got {outcome:?}"
+        );
+        let stored = store.read_work_item("work-1").unwrap();
+        assert!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .all(|task| !task.is_failed_command_recheck()),
+            "baseline-equivalent Tester evidence must not be rerun"
+        );
+        assert_eq!(
+            latest_tester_results_path(project.path(), &stored.attempts[0]).as_deref(),
+            Some(source.as_path()),
+            "the no-change Writer preserves the candidate-bound final Tester"
+        );
+    }
+
+    #[test]
+    fn final_tester_correction_preserves_source_before_no_change_writer() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, candidate) = final_tester_evidence_fixture(project.path());
+        add_failed_final_tester_command(project.path(), &store);
+        complete_failed_tester_no_change_writer(project.path(), &store, &candidate);
+        let item = store.read_work_item("work-1").unwrap();
+        let attempt = &item.attempts[0];
+        let tester = attempt
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Tester && !task.is_failed_command_recheck())
+            .unwrap();
+        let results_path = project
+            .path()
+            .join(&tester.artifact_area.as_ref().unwrap().path)
+            .join("tester-results.json");
+
+        let artifacts =
+            failed_tester_command_artifacts(project.path(), attempt, &results_path).unwrap();
+
+        assert!(artifacts.iter().any(|artifact| {
+            artifact.producer_id == tester.id && artifact.path.ends_with("/tester-results.json")
+        }));
+        assert!(
+            artifacts
+                .iter()
+                .any(|artifact| crate::tester::is_command_log_path(Path::new(&artifact.path)))
+        );
+    }
+
+    #[test]
+    fn rejected_final_tester_gate_remains_round_cap_frontier_after_no_change_writer() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, candidate) = final_tester_evidence_fixture(project.path());
+        add_failed_final_tester_command(project.path(), &store);
+        // Seed the rejected gate and correction saved by older Fluent. Current
+        // admission pauses unexplained command exits before planning a Writer.
+        let _task_id = complete_failed_tester_no_change_writer(project.path(), &store, &candidate);
+        let item = store.read_work_item("work-1").unwrap();
+
+        let frontier =
+            rejected_final_tester_gate_frontier(project.path(), &item.attempts[0]).unwrap();
+
+        assert!(frontier.iter().any(|entry| {
+            entry
+                .artifact
+                .path
+                .ends_with("/attempt-1-tester/candidate-gate.json")
+        }));
+        assert!(
+            frontier
+                .iter()
+                .any(|entry| entry.artifact.path.ends_with("/tester-results.json"))
+        );
+    }
+
+    #[test]
+    fn baseline_covered_recheck_reopens_stale_round_cap() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, candidate) = final_tester_evidence_fixture(project.path());
+        add_failed_final_tester_command(project.path(), &store);
+        let tester = store.read_work_item("work-1").unwrap().attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Tester)
+            .unwrap()
+            .clone();
+        let source = project
+            .path()
+            .join(&tester.artifact_area.as_ref().unwrap().path)
+            .join("tester-results.json");
+        let mut source_results: serde_json::Value =
+            serde_json::from_slice(&fs::read(&source).unwrap()).unwrap();
+        source_results["tests"] = serde_json::json!([
+            {
+                "id": "baseline_test",
+                "test_harness": "xcodebuild",
+                "status": "fail",
+                "duration_ms": 1,
+                "failure_excerpt": "known baseline failure"
+            },
+            {
+                "id": "transient_test",
+                "test_harness": "xcodebuild",
+                "status": "fail",
+                "duration_ms": 1,
+                "failure_excerpt": "transient failure"
+            }
+        ]);
+        source_results["summary"] =
+            serde_json::json!({"total": 2, "pass": 0, "fail": 2, "skipped": 0});
+        fs::write(&source, serde_json::to_vec_pretty(&source_results).unwrap()).unwrap();
+        // Seed the pre-write failure before the Writer materializes its work.
+        let baseline = project.path().join(work_artifact_path(
+            "work-1",
+            "attempt-1",
+            "attempt-1-baseline-tester",
+        ));
+        fs::create_dir_all(&baseline).unwrap();
+        let mut baseline_results = source_results.clone();
+        baseline_results["tests"]
+            .as_array_mut()
+            .unwrap()
+            .truncate(1);
+        baseline_results["summary"] = serde_json::json!({"total":1,"pass":0,"fail":1,"skipped":0});
+        fs::write(
+            baseline.join("tester-results.json"),
+            serde_json::to_vec(&baseline_results).unwrap(),
+        )
+        .unwrap();
+        complete_failed_tester_no_change_writer(project.path(), &store, &candidate);
+
+        let outcome = plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedFailedCommandRecheck { .. }
+        ));
+        let mut item = store.read_work_item("work-1").unwrap();
+        let recheck = item.attempts[0]
+            .tasks
+            .iter_mut()
+            .find(|task| task.is_failed_command_recheck())
+            .unwrap();
+        crate::work_model::set_task_terminal(recheck, TaskStatus::Complete);
+        write_recheck_result(project.path(), recheck, &candidate, 65);
+        let recheck_path = project
+            .path()
+            .join(&recheck.artifact_area.as_ref().unwrap().path)
+            .join("tester-results.json");
+        let mut recheck_results: serde_json::Value =
+            serde_json::from_slice(&fs::read(&recheck_path).unwrap()).unwrap();
+        recheck_results["tests"] = serde_json::json!([{
+            "id": "baseline_test",
+            "test_harness": "xcodebuild",
+            "status": "fail",
+            "duration_ms": 1,
+            "failure_excerpt": "known baseline failure"
+        }]);
+        recheck_results["summary"] =
+            serde_json::json!({"total": 1, "pass": 0, "fail": 1, "skipped": 0});
+        fs::write(
+            &recheck_path,
+            serde_json::to_vec_pretty(&recheck_results).unwrap(),
+        )
+        .unwrap();
+        item.attempts[0].status = AttemptStatus::NeedsUser;
+        item.attempts[0].pause_kind = Some(PauseKind::RoundCap);
+        item.attempts[0].review_state = Some(AttemptReviewState::Failed);
+        store.write_work_item(&item).unwrap();
+
+        assert!(
+            reopen_baseline_covered_round_cap_attempt(
+                project.path(),
+                &store,
+                "work-1",
+                "attempt-1",
+            )
+            .unwrap()
+        );
+        let reopened = store.read_work_item("work-1").unwrap();
+        assert_eq!(reopened.attempts[0].status, AttemptStatus::Planned);
+        assert_eq!(reopened.attempts[0].pause_kind, None);
+        let outcome =
+            plan_after_completed_writer(project.path(), &store, reopened, "attempt-1").unwrap();
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedReviews { .. }
+        ));
+    }
+
+    #[test]
+    fn external_recheck_evidence_advances_round_cap_to_candidate() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, candidate) = final_tester_evidence_fixture(project.path());
+        let tester = store.read_work_item("work-1").unwrap().attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Tester)
+            .unwrap()
+            .clone();
+        let tester_results = project
+            .path()
+            .join(&tester.artifact_area.as_ref().unwrap().path)
+            .join("tester-results.json");
+        let mut results: serde_json::Value =
+            serde_json::from_slice(&fs::read(&tester_results).unwrap()).unwrap();
+        results["tests"][0]["id"] = serde_json::json!("required_behavior");
+        fs::write(
+            &tester_results,
+            serde_json::to_vec_pretty(&results).unwrap(),
+        )
+        .unwrap();
+        add_failed_final_tester_command(project.path(), &store);
+        let mut source_with_command_record: serde_json::Value =
+            serde_json::from_slice(&fs::read(&tester_results).unwrap()).unwrap();
+        source_with_command_record["tests"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "id": "command-0:xcodebuild test",
+                "test_harness": "xcodebuild",
+                "status": "fail",
+                "duration_ms": 10,
+                "failure_excerpt": "command failed"
+            }));
+        source_with_command_record["summary"] =
+            serde_json::json!({"total": 2, "pass": 1, "fail": 1, "skipped": 0});
+        fs::write(
+            &tester_results,
+            serde_json::to_vec_pretty(&source_with_command_record).unwrap(),
+        )
+        .unwrap();
+        complete_failed_tester_no_change_writer(project.path(), &store, &candidate);
+        store
+            .mutate_work_item("work-1", |item| {
+                item.attempts[0]
+                    .round_cap_extensions
+                    .push(crate::work_model::RoundCapExtension {
+                        id: "round-cap-1-2".to_string(),
+                        old_cap: 1,
+                        new_cap: 2,
+                        additional_write_rounds: 1,
+                        evidence_write_rounds: 0,
+                        authorized_base_cap: None,
+                        pre_extension_write_rounds: None,
+                        candidate_commit: candidate.clone(),
+                        failed_reviews: Vec::new(),
+                        human_resolution: String::new(),
+                        human_resolution_digest: String::new(),
+                        approved_at: "2026-08-21T00:00:00Z".to_string(),
+                    });
+                Ok(())
+            })
+            .unwrap();
+        let outcome = plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+        let WorkAttemptRunOutcome::PlannedFailedCommandRecheck { task_id } = outcome else {
+            panic!("no-change correction must plan the failed-command recheck")
+        };
+        store
+            .mutate_work_item("work-1", |item| {
+                let recheck = item.attempts[0]
+                    .tasks
+                    .iter_mut()
+                    .find(|task| task.id == task_id)
+                    .unwrap();
+                crate::work_model::set_task_terminal(recheck, TaskStatus::Complete);
+                Ok(())
+            })
+            .unwrap();
+        let recheck = store.read_work_item("work-1").unwrap().attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.id == task_id)
+            .unwrap()
+            .clone();
+        write_recheck_result(project.path(), &recheck, &candidate, 65);
+
+        let outcome = plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+        let WorkAttemptRunOutcome::NeedsUser { handoff_path } = outcome else {
+            panic!("exhausted unexplained recheck must request external evidence")
+        };
+        let handoff = fs::read_to_string(project.path().join(&handoff_path)).unwrap();
+        assert!(handoff.contains("--recheck-artifact"));
+        assert!(!handoff.contains("attempt extend"));
+        let paused = store.read_work_item("work-1").unwrap();
+        let status_action = crate::work_status::attempt_recovery_next_action(
+            Some(&paused.attempts[0]),
+            Some(project.path()),
+        )
+        .unwrap();
+        assert!(status_action.contains("--recheck-artifact"));
+        assert!(handoff.contains(&status_action));
+
+        store
+            .mutate_work_item("work-1", |item| {
+                let attempt = &mut item.attempts[0];
+                let final_writer_index = attempt.latest_materialized_write_index().unwrap();
+                let final_writer = attempt.tasks[final_writer_index].clone();
+                let mut failed_tester = attempt
+                    .tasks
+                    .iter()
+                    .find(|task| task.kind == TaskKind::Tester)
+                    .unwrap()
+                    .clone();
+                failed_tester.id = "attempt-1-tester-harness-history".to_string();
+                failed_tester.status = TaskStatus::Failed;
+                failed_tester.output = None;
+                failed_tester.artifact_area = Some(crate::work_model::TaskArtifactArea {
+                    path: work_artifact_path(
+                        "work-1",
+                        "attempt-1",
+                        "attempt-1-tester-harness-history",
+                    ),
+                });
+
+                let mut repair = final_writer.clone();
+                repair.id = "attempt-1-write-repair-history".to_string();
+                repair.role = crate::work_model::TESTER_HARNESS_REPAIR_ROLE.to_string();
+                repair.output.as_mut().unwrap().no_change = None;
+                repair.created_at = Some("2026-08-21T00:00:00Z".to_string());
+                repair.completed_at = Some("2026-08-21T00:02:00Z".to_string());
+                repair.artifact_area = Some(crate::work_model::TaskArtifactArea {
+                    path: work_artifact_path(
+                        "work-1",
+                        "attempt-1",
+                        "attempt-1-write-repair-history",
+                    ),
+                });
+                let repair_output = repair.output.clone().unwrap();
+                repair.review_context = Some(crate::work_model::ReviewContext {
+                    candidate_workspace_id: repair_output.workspace_id.clone(),
+                    candidate_workspace_path: repair_output.workspace_path.clone(),
+                    source_branch: repair_output.source_branch.clone(),
+                    candidate_commit: repair_output.commit.clone(),
+                    base_commit: repair_output.base_commit.clone(),
+                });
+                repair.workspace_access.writes = vec![crate::work_model::WorkspaceRef {
+                    id: repair_output.workspace_id.clone(),
+                    path: repair_output.workspace_path.clone(),
+                }];
+                repair.depends_on = None;
+                repair.input_artifacts = vec![
+                    ArtifactRef {
+                        producer_id: "tester-harness-repair-authority".to_string(),
+                        path: work_artifact_path(
+                            "work-1",
+                            "attempt-1",
+                            "tester-harness-repairs/attempt-1-write-repair-history/repair.json",
+                        ),
+                    },
+                    ArtifactRef {
+                        producer_id: failed_tester.id.clone(),
+                        path: format!(
+                            "{}/tester-results.json",
+                            failed_tester.artifact_area.as_ref().unwrap().path
+                        ),
+                    },
+                ];
+
+                let mut superseded_writer = final_writer;
+                superseded_writer.id = "attempt-1-write-superseded-history".to_string();
+                superseded_writer.status = TaskStatus::Failed;
+                superseded_writer.output = None;
+                superseded_writer.created_at = Some("2026-08-21T00:01:00Z".to_string());
+                superseded_writer.completed_at = Some("2026-08-21T00:03:00Z".to_string());
+                superseded_writer.artifact_area = Some(crate::work_model::TaskArtifactArea {
+                    path: work_artifact_path(
+                        "work-1",
+                        "attempt-1",
+                        "attempt-1-write-superseded-history",
+                    ),
+                });
+                superseded_writer.input_artifacts.clear();
+
+                attempt.tasks.splice(
+                    final_writer_index..final_writer_index,
+                    [failed_tester, repair.clone(), superseded_writer],
+                );
+                attempt.artifacts.push(ArtifactRef {
+                    producer_id: "tester-harness-recovery".to_string(),
+                    path: format!(
+                        ".fluent/work/artifacts/work-1/attempt-1/tester-harness-repairs/{}/superseded-followups.json",
+                        repair.id
+                    ),
+                });
+                assert!(!attempt.has_round_cap_task_blocker());
+                Ok(())
+            })
+            .unwrap();
+
+        let manifest = format!(
+            "{}/failed-command-recheck.json",
+            recheck.artifact_area.as_ref().unwrap().path
+        );
+        let evidence_path = project.path().join("external-evidence.json");
+        fs::write(
+            &evidence_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "producer": "remote Linux host",
+                "check": "xcodebuild test",
+                "working_directory": ".",
+                "result": "pass",
+                "run_at": "2026-08-21T12:00:00Z",
+                "output": "passed on the required host runtime"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let source_bytes = fs::read(&tester_results).unwrap();
+        let mut source_with_extra_failure: serde_json::Value =
+            serde_json::from_slice(&source_bytes).unwrap();
+        source_with_extra_failure["tests"][0]["status"] = serde_json::json!("fail");
+        source_with_extra_failure["summary"]["pass"] = serde_json::json!(0);
+        source_with_extra_failure["summary"]["fail"] = serde_json::json!(1);
+        fs::write(
+            &tester_results,
+            serde_json::to_vec_pretty(&source_with_extra_failure).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            crate::host_evidence::pending_failed_recheck_evidence_recovery_action(
+                project.path(),
+                &store.read_work_item("work-1").unwrap().attempts[0],
+            )
+            .is_none(),
+            "a broader Tester failure must not advertise command-only evidence recovery"
+        );
+        assert!(
+            crate::host_evidence::attach(
+                project.path(),
+                &store,
+                "work-1",
+                "attempt-1",
+                &candidate,
+                &evidence_path,
+                &[],
+                Some(&manifest),
+            )
+            .is_err(),
+            "command evidence must not supersede a structured Tester failure"
+        );
+        fs::write(&tester_results, source_bytes).unwrap();
+        assert!(
+            crate::host_evidence::attach(
+                project.path(),
+                &store,
+                "work-1",
+                "attempt-1",
+                "stale-candidate",
+                &evidence_path,
+                &[],
+                Some(&manifest),
+            )
+            .is_err(),
+            "candidate-mismatched evidence must be rejected"
+        );
+        assert!(
+            crate::host_evidence::attach(
+                project.path(),
+                &store,
+                "work-1",
+                "attempt-1",
+                &candidate,
+                &evidence_path,
+                &[],
+                Some(".fluent/work/artifacts/work-1/attempt-1/unrelated.json"),
+            )
+            .is_err(),
+            "an unrelated recheck artifact must be rejected"
+        );
+        let recovery = crate::host_evidence::attach(
+            project.path(),
+            &store,
+            "work-1",
+            "attempt-1",
+            &candidate,
+            &evidence_path,
+            &[],
+            Some(&manifest),
+        )
+        .unwrap();
+        let review_task_id = store.read_work_item("work-1").unwrap().attempts[0]
+            .evidence_recoveries
+            .iter()
+            .find(|entry| entry.id == recovery.id)
+            .unwrap()
+            .targets[0]
+            .review_task_id
+            .clone()
+            .unwrap();
+        store
+            .mutate_work_item("work-1", |item| {
+                let review = item.attempts[0]
+                    .tasks
+                    .iter_mut()
+                    .find(|task| task.id == review_task_id)
+                    .unwrap();
+                crate::work_model::set_task_terminal(review, TaskStatus::Complete);
+                Ok(())
+            })
+            .unwrap();
+        let review = store.read_work_item("work-1").unwrap().attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.id == review_task_id)
+            .unwrap()
+            .clone();
+        let review_dir = project
+            .path()
+            .join(&review.artifact_area.as_ref().unwrap().path);
+        fs::create_dir_all(&review_dir).unwrap();
+        fs::write(review_dir.join("review.md"), "Verdict: pass\n").unwrap();
+        store
+            .mutate_work_item("work-1", |item| {
+                let attempt = &mut item.attempts[0];
+                attempt.status = AttemptStatus::NeedsUser;
+                attempt.pause_kind = Some(PauseKind::RoundCap);
+                attempt.review_state = Some(AttemptReviewState::Failed);
+                Ok(())
+            })
+            .unwrap();
+        let stale = store.read_work_item("work-1").unwrap();
+        assert!(completed_recheck_evidence_review_round_cap_is_eligible(
+            project.path(),
+            &stale.attempts[0]
+        ));
+        assert!(
+            reopen_completed_recheck_evidence_review_round_cap_attempt(
+                project.path(),
+                &store,
+                "work-1",
+                "attempt-1",
+            )
+            .unwrap()
+        );
+        let mut stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(stored.attempts[0].status, AttemptStatus::Reviewing);
+        assert_eq!(stored.attempts[0].pause_kind, None);
+        assert_eq!(
+            stored.attempts[0]
+                .evidence_recoveries
+                .iter()
+                .find(|entry| entry.id == recovery.id)
+                .unwrap()
+                .state,
+            EvidenceRecoveryState::Reviewing,
+            "ordinary Review interpretation still owns receipt settlement"
+        );
+        stored.attempts[0]
+            .evidence_recoveries
+            .iter_mut()
+            .find(|entry| entry.id == recovery.id)
+            .unwrap()
+            .state = EvidenceRecoveryState::Complete;
+        let shared = crate::verification_assessment::assess_current_verification(
+            project.path(),
+            &stored.attempts[0],
+        )
+        .unwrap();
+        assert!(
+            shared.commands.iter().any(|row| row.satisfied
+                && row.owner == crate::work_model::CompletionResponsibility::Host),
+            "the shared view must credit the accepted recheck occurrence"
+        );
+        assert!(
+            shared.candidate_defects().is_empty(),
+            "accepted command proof must also cover its synthetic command failure"
+        );
+        let stored_recovery = stored.attempts[0]
+            .evidence_recoveries
+            .iter()
+            .find(|entry| entry.id == recovery.id)
+            .unwrap();
+        let snapshot_path = project
+            .path()
+            .join(&stored_recovery.attachment.snapshot_path);
+        let snapshot_bytes = fs::read(&snapshot_path).unwrap();
+        fs::write(&snapshot_path, b"altered evidence\n").unwrap();
+        assert!(
+            crate::host_evidence::completed_recheck_evidence_source(
+                project.path(),
+                &stored.attempts[0],
+            )
+            .is_none(),
+            "altered evidence bytes must not supersede the recheck"
+        );
+        fs::write(&snapshot_path, &snapshot_bytes).unwrap();
+        let binding_path = project
+            .path()
+            .join(&stored_recovery.targets[0].prior_review_artifact);
+        let binding_bytes = fs::read(&binding_path).unwrap();
+        fs::write(&binding_path, b"altered binding\n").unwrap();
+        assert!(
+            crate::host_evidence::completed_recheck_evidence_source(
+                project.path(),
+                &stored.attempts[0],
+            )
+            .is_none(),
+            "altered binding bytes must not supersede the recheck"
+        );
+        fs::write(&binding_path, &binding_bytes).unwrap();
+        let stderr_path = project
+            .path()
+            .join(&recheck.artifact_area.as_ref().unwrap().path)
+            .join("commands/0-stderr.log");
+        let stderr_bytes = fs::read(&stderr_path).unwrap();
+        fs::write(&stderr_path, b"altered recheck log\n").unwrap();
+        assert!(
+            crate::host_evidence::completed_recheck_evidence_source(
+                project.path(),
+                &stored.attempts[0],
+            )
+            .is_none(),
+            "altered recheck bytes must not be covered by prior evidence"
+        );
+        fs::write(&stderr_path, &stderr_bytes).unwrap();
+        assert!(
+            crate::host_evidence::completed_recheck_evidence_source(
+                project.path(),
+                &stored.attempts[0],
+            )
+            .is_some(),
+            "restored exact bytes must recover the accepted evidence frontier"
+        );
+        let mut later_tests_evidence = stored_recovery.clone();
+        later_tests_evidence.id = "host-evidence-later-candidate-gate".to_string();
+        later_tests_evidence.targets[0].prior_review_artifact =
+            ".fluent/work/artifacts/work-1/attempt-1/host-evidence/later-candidate-gate.json"
+                .to_string();
+        fs::create_dir_all(
+            project
+                .path()
+                .join(".fluent/work/artifacts/work-1/attempt-1/host-evidence"),
+        )
+        .unwrap();
+        fs::write(
+            project
+                .path()
+                .join(&later_tests_evidence.targets[0].prior_review_artifact),
+            b"{}\n",
+        )
+        .unwrap();
+        stored.attempts[0]
+            .evidence_recoveries
+            .push(later_tests_evidence);
+        assert!(
+            crate::host_evidence::completed_recheck_evidence_source(
+                project.path(),
+                &stored.attempts[0],
+            )
+            .is_some(),
+            "later completed Tests evidence for another frontier must not hide accepted recheck evidence"
+        );
+        let tester_count = store.read_work_item("work-1").unwrap().attempts[0]
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Tester)
+            .count();
+
+        let outcome = interpret_reviews(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::MergeCandidateReady { .. }
+        ));
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Tester)
+                .count(),
+            tester_count,
+            "accepted external evidence must not rerun the incompatible command"
+        );
+    }
+
+    #[test]
+    fn reviews_after_passing_recheck_still_plan_full_final_tester() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, candidate) = final_tester_evidence_fixture(project.path());
+        add_failed_final_tester_command(project.path(), &store);
+        complete_failed_tester_no_change_writer(project.path(), &store, &candidate);
+        plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+        let mut item = store.read_work_item("work-1").unwrap();
+        let recheck = item.attempts[0]
+            .tasks
+            .iter_mut()
+            .find(|task| task.is_failed_command_recheck())
+            .unwrap();
+        crate::work_model::set_task_terminal(recheck, TaskStatus::Complete);
+        write_recheck_result(project.path(), recheck, &candidate, 0);
+        store.write_work_item(&item).unwrap();
+        plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+        store
+            .mutate_work_item("work-1", |item| {
+                for review in item.attempts[0].tasks.iter_mut().filter(|task| {
+                    task.kind == TaskKind::Review && task.status == TaskStatus::Planned
+                }) {
+                    crate::work_model::set_task_terminal(review, TaskStatus::Complete);
+                    let directory = project
+                        .path()
+                        .join(&review.artifact_area.as_ref().unwrap().path);
+                    fs::create_dir_all(&directory).unwrap();
+                    fs::write(directory.join("review.md"), "Verdict: pass\n").unwrap();
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        let outcome = interpret_reviews(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+            true,
+            None,
+        )
+        .unwrap();
+
+        let WorkAttemptRunOutcome::PlannedFinalTester { task_id } = outcome else {
+            panic!("passing reviewers must retain the complete final Tester")
+        };
+        let stored = store.read_work_item("work-1").unwrap();
+        let tester = stored.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.id == task_id)
+            .unwrap();
+        assert_eq!(tester.role, "tester");
+        assert!(!tester.is_failed_command_recheck());
+    }
+
+    #[test]
+    fn structured_failure_in_recheck_returns_to_writer() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, candidate) = final_tester_evidence_fixture(project.path());
+        add_failed_final_tester_command(project.path(), &store);
+        complete_failed_tester_no_change_writer(project.path(), &store, &candidate);
+        plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+        let mut item = store.read_work_item("work-1").unwrap();
+        let recheck = item.attempts[0]
+            .tasks
+            .iter_mut()
+            .find(|task| task.is_failed_command_recheck())
+            .unwrap();
+        crate::work_model::set_task_terminal(recheck, TaskStatus::Complete);
+        write_recheck_result(project.path(), recheck, &candidate, 0);
+        let results_path = project
+            .path()
+            .join(&recheck.artifact_area.as_ref().unwrap().path)
+            .join("tester-results.json");
+        let mut results: serde_json::Value =
+            serde_json::from_slice(&fs::read(&results_path).unwrap()).unwrap();
+        results["tests"] = serde_json::json!([{
+            "id": "behavior/required",
+            "test_harness": "xcodebuild",
+            "status": "fail",
+            "duration_ms": 1,
+            "failure_excerpt": "assertion failed"
+        }]);
+        results["summary"] = serde_json::json!({"total": 1, "pass": 0, "fail": 1, "skipped": 0});
+        fs::write(&results_path, serde_json::to_vec_pretty(&results).unwrap()).unwrap();
+        store.write_work_item(&item).unwrap();
+
+        let outcome = plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedWriteRound { .. }
+        ));
+        let stored = store.read_work_item("work-1").unwrap();
+        let writer = stored.attempts[0].tasks.last().unwrap();
+        assert!(
+            writer
+                .input_artifacts
+                .iter()
+                .any(|artifact| artifact.path.ends_with("/commands/0-stderr.log"))
+        );
+    }
+
+    #[test]
+    fn final_tester_correction_rejects_noncanonical_log_path() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, _candidate) = final_tester_evidence_fixture(project.path());
+        add_failed_final_tester_command(project.path(), &store);
+        let item = store.read_work_item("work-1").unwrap();
+        let tester = item.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Tester)
+            .unwrap();
+        let results_path = project
+            .path()
+            .join(&tester.artifact_area.as_ref().unwrap().path)
+            .join("tester-results.json");
+        let mut results: serde_json::Value =
+            serde_json::from_slice(&fs::read(&results_path).unwrap()).unwrap();
+        results["commands"][0]["stdout_log"] = serde_json::json!("../private.log");
+        fs::write(&results_path, serde_json::to_vec_pretty(&results).unwrap()).unwrap();
+
+        let error =
+            failed_tester_command_artifacts(project.path(), &item.attempts[0], &results_path)
+                .expect_err("a Tester result may not choose the Writer sandbox grant");
+        assert!(error.to_string().contains("does not match"));
+        let outcome =
+            interpret_reviews(project.path(), &store, item, "attempt-1", true, None).unwrap();
+        assert!(matches!(outcome, WorkAttemptRunOutcome::NeedsUser { .. }));
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn final_tester_gate_round_cap_frontier_binds_all_correction_bytes() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, _candidate) = final_tester_evidence_fixture(project.path());
+        add_failed_final_tester_command(project.path(), &store);
+        store
+            .mutate_work_item("work-1", |item| {
+                let attempt = &mut item.attempts[0];
+                let template = attempt.tasks[0].clone();
+                let additional_writers = (2..=10).map(|round| {
+                    let mut task = template.clone();
+                    task.id = format!("attempt-1-write-{round}");
+                    if let Some(area) = task.artifact_area.as_mut() {
+                        area.path = work_artifact_path("work-1", "attempt-1", &task.id);
+                    }
+                    task
+                });
+                attempt.tasks.splice(1..1, additional_writers);
+                Ok(())
+            })
+            .unwrap();
+
+        // Retain an already rejected final gate from an older admission path.
+        let mut item = store.read_work_item("work-1").unwrap();
+        let results = latest_tester_results_path(project.path(), &item.attempts[0]).unwrap();
+        assert!(
+            gate_candidate_after_final_tester(project.path(), &mut item, 0, Some(&results))
+                .unwrap()
+                .is_some()
+        );
+        item.attempts[0].status = AttemptStatus::NeedsUser;
+        item.attempts[0].pause_kind = Some(PauseKind::RoundCap);
+        item.attempts[0].review_state = Some(AttemptReviewState::Failed);
+        store.write_work_item(&item).unwrap();
+
+        let stored = store.read_work_item("work-1").unwrap();
+        let frontier = round_cap_failure_frontier(project.path(), &stored.attempts[0])
+            .expect("the rejected final-Tester gate must be a round-cap frontier");
+        assert_eq!(frontier.len(), 4);
+        assert!(
+            frontier[0]
+                .artifact
+                .path
+                .contains("candidate-gates/attempt-1-tester")
+        );
+
+        let stderr_index = frontier
+            .iter()
+            .position(|artifact| artifact.artifact.path.ends_with("/commands/0-stderr.log"))
+            .unwrap();
+        let original_digest = frontier[stderr_index].digest.clone();
+        let candidate_commit = stored.attempts[0]
+            .tasks
+            .iter()
+            .rev()
+            .find_map(|task| task.output.as_ref().map(|output| output.commit.clone()))
+            .unwrap();
+        store
+            .mutate_work_item("work-1", |item| {
+                item.attempts[0]
+                    .round_cap_extensions
+                    .push(RoundCapExtension {
+                        id: "round-cap-10-11".to_string(),
+                        old_cap: 10,
+                        new_cap: 11,
+                        additional_write_rounds: 1,
+                        evidence_write_rounds: 0,
+                        authorized_base_cap: None,
+                        pre_extension_write_rounds: None,
+                        candidate_commit: candidate_commit.clone(),
+                        failed_reviews: frontier.clone(),
+                        human_resolution: String::new(),
+                        human_resolution_digest: String::new(),
+                        approved_at: "2026-08-08T00:00:00Z".to_string(),
+                    });
+                Ok(())
+            })
+            .unwrap();
+        let stderr_path = project.path().join(&frontier[stderr_index].artifact.path);
+        fs::write(&stderr_path, "changed failure\n").unwrap();
+        let changed = round_cap_failure_frontier(project.path(), &stored.attempts[0]).unwrap();
+        assert_ne!(changed[stderr_index].digest, original_digest);
+        let error =
+            reopen_approved_round_cap_attempt(project.path(), &store, "work-1", "attempt-1")
+                .expect_err("changed Tester log bytes must invalidate the approval");
+        assert!(error.to_string().contains("bytes no longer match"));
+        let still_paused = store.read_work_item("work-1").unwrap();
+        assert_eq!(still_paused.attempts[0].status, AttemptStatus::NeedsUser);
+        assert_eq!(
+            still_paused.attempts[0].pause_kind,
+            Some(PauseKind::RoundCap)
+        );
+    }
+
+    #[test]
+    fn structured_final_tester_failure_without_gate_is_an_approvable_round_cap_frontier() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, candidate) = final_tester_evidence_fixture(project.path());
+        add_failed_final_tester_command(project.path(), &store);
+        let item = store.read_work_item("work-1").unwrap();
+        let tester = item.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Tester)
+            .unwrap();
+        let results_path = project
+            .path()
+            .join(&tester.artifact_area.as_ref().unwrap().path)
+            .join("tester-results.json");
+        let mut results: serde_json::Value =
+            serde_json::from_slice(&fs::read(&results_path).unwrap()).unwrap();
+        results["tests"] = serde_json::json!([{
+            "id": "behavior/required",
+            "test_harness": "xcodebuild",
+            "status": "fail",
+            "duration_ms": 1,
+            "failure_excerpt": "assertion failed"
+        }]);
+        results["summary"] = serde_json::json!({"total": 1, "pass": 0, "fail": 1, "skipped": 0});
+        fs::write(&results_path, serde_json::to_vec_pretty(&results).unwrap()).unwrap();
+        store
+            .mutate_work_item("work-1", |item| {
+                let attempt = &mut item.attempts[0];
+                let template = attempt.tasks[0].clone();
+                let additional_writers = (2..=10).map(|round| {
+                    let mut task = template.clone();
+                    task.id = format!("attempt-1-write-{round}");
+                    if let Some(area) = task.artifact_area.as_mut() {
+                        area.path = work_artifact_path("work-1", "attempt-1", &task.id);
+                    }
+                    task
+                });
+                attempt.tasks.splice(1..1, additional_writers);
+                Ok(())
+            })
+            .unwrap();
+
+        let outcome = interpret_reviews(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(outcome, WorkAttemptRunOutcome::NeedsUser { .. }));
+        let gate = project.path().join(format!(
+            "{}/{}/{}",
+            work_artifact_path("work-1", "attempt-1", "candidate-gates"),
+            tester.id,
+            crate::candidate_gate::CANDIDATE_GATE_FILE
+        ));
+        assert!(
+            !gate.exists(),
+            "structured failures skip the final Tester gate"
+        );
+
+        let frontier = round_cap_failure_frontier(
+            project.path(),
+            &store.read_work_item("work-1").unwrap().attempts[0],
+        )
+        .expect("the exact failed Tester bytes must form a frontier");
+        assert_eq!(frontier.len(), 3);
+        assert!(
+            frontier
+                .iter()
+                .any(|artifact| artifact.artifact.path.ends_with("/tester-results.json"))
+        );
+        assert!(frontier.iter().all(|artifact| {
+            !artifact
+                .artifact
+                .path
+                .ends_with(crate::candidate_gate::CANDIDATE_GATE_FILE)
+                && artifact.digest.starts_with("sha256:")
+        }));
+        store
+            .mutate_work_item("work-1", |item| {
+                item.attempts[0]
+                    .round_cap_extensions
+                    .push(RoundCapExtension {
+                        id: "round-cap-10-11".to_string(),
+                        old_cap: 10,
+                        new_cap: 11,
+                        additional_write_rounds: 1,
+                        evidence_write_rounds: 0,
+                        authorized_base_cap: None,
+                        pre_extension_write_rounds: None,
+                        candidate_commit: candidate.clone(),
+                        failed_reviews: frontier,
+                        human_resolution: String::new(),
+                        human_resolution_digest: String::new(),
+                        approved_at: "2026-08-11T00:00:00Z".to_string(),
+                    });
+                Ok(())
+            })
+            .unwrap();
+
+        fs::write(&results_path, b"changed after approval\n").unwrap();
+        let error =
+            reopen_approved_round_cap_attempt(project.path(), &store, "work-1", "attempt-1")
+                .expect_err("changed Tester bytes must invalidate the approval");
+        assert!(error.to_string().contains("cannot be resolved"));
+        let still_paused = store.read_work_item("work-1").unwrap();
+        assert_eq!(still_paused.attempts[0].status, AttemptStatus::NeedsUser);
+        assert_eq!(
+            still_paused.attempts[0].pause_kind,
+            Some(PauseKind::RoundCap)
+        );
+    }
+
+    #[test]
+    fn passing_final_tester_without_gate_is_not_a_round_cap_frontier() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, _candidate) = final_tester_evidence_fixture(project.path());
+
+        let frontier = failed_final_tester_without_gate_frontier(
+            project.path(),
+            &store.read_work_item("work-1").unwrap().attempts[0],
+        )
+        .unwrap();
+
+        assert!(frontier.is_empty());
+    }
+
+    #[test]
+    fn failed_final_tester_without_gate_rejects_candidate_mismatch() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, _candidate) = final_tester_evidence_fixture(project.path());
+        add_failed_final_tester_command(project.path(), &store);
+        let item = store.read_work_item("work-1").unwrap();
+        let tester = item.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Tester)
+            .unwrap();
+        let results_path = project
+            .path()
+            .join(&tester.artifact_area.as_ref().unwrap().path)
+            .join("tester-results.json");
+        let mut results: serde_json::Value =
+            serde_json::from_slice(&fs::read(&results_path).unwrap()).unwrap();
+        results["candidate_commit"] = serde_json::json!("different-candidate");
+        fs::write(&results_path, serde_json::to_vec_pretty(&results).unwrap()).unwrap();
+
+        let error = failed_final_tester_without_gate_frontier(project.path(), &item.attempts[0])
+            .expect_err("a mismatched Tester result must not authorize more Writer rounds");
+
+        assert!(error.to_string().contains("not bound to candidate"));
+    }
+
+    #[test]
+    fn failed_final_tester_without_gate_rejects_missing_exact_log() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, _candidate) = final_tester_evidence_fixture(project.path());
+        add_failed_final_tester_command(project.path(), &store);
+        let item = store.read_work_item("work-1").unwrap();
+        let tester = item.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Tester)
+            .unwrap();
+        let missing = project
+            .path()
+            .join(&tester.artifact_area.as_ref().unwrap().path)
+            .join("commands/0-stderr.log");
+        fs::remove_file(missing).unwrap();
+
+        let error = failed_final_tester_without_gate_frontier(project.path(), &item.attempts[0])
+            .expect_err("a missing exact command log must fail closed");
+
+        assert!(error.to_string().contains("command log is missing"));
+    }
+
+    #[test]
+    fn failed_final_tester_without_gate_rejects_malformed_results() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, _candidate) = final_tester_evidence_fixture(project.path());
+        let item = store.read_work_item("work-1").unwrap();
+        let tester = item.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Tester)
+            .unwrap();
+        let results_path = project
+            .path()
+            .join(&tester.artifact_area.as_ref().unwrap().path)
+            .join("tester-results.json");
+        fs::write(results_path, b"not json\n").unwrap();
+
+        let error = failed_final_tester_without_gate_frontier(project.path(), &item.attempts[0])
+            .expect_err("malformed Tester results must not authorize more Writer rounds");
+
+        assert!(
+            error
+                .to_string()
+                .contains("parse failed final-Tester evidence")
+        );
+    }
+
+    #[test]
+    fn missing_final_tester_results_without_gate_is_not_a_round_cap_frontier() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, _candidate) = final_tester_evidence_fixture(project.path());
+        let item = store.read_work_item("work-1").unwrap();
+        let tester = item.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Tester)
+            .unwrap();
+        let results_path = project
+            .path()
+            .join(&tester.artifact_area.as_ref().unwrap().path)
+            .join("tester-results.json");
+        fs::remove_file(results_path).unwrap();
+
+        let frontier =
+            failed_final_tester_without_gate_frontier(project.path(), &item.attempts[0]).unwrap();
+
+        assert!(frontier.is_empty());
+    }
+
+    #[test]
+    fn failed_tester_before_latest_writer_is_not_a_round_cap_frontier() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, candidate) = final_tester_evidence_fixture(project.path());
+        add_failed_final_tester_command(project.path(), &store);
+        store
+            .mutate_work_item("work-1", |item| {
+                let mut writer = item.attempts[0].tasks[0].clone();
+                writer.id = "attempt-1-write-2".to_string();
+                writer.output.as_mut().unwrap().base_commit = Some(candidate.clone());
+                item.attempts[0].tasks.push(writer);
+                Ok(())
+            })
+            .unwrap();
+
+        let frontier = failed_final_tester_without_gate_frontier(
+            project.path(),
+            &store.read_work_item("work-1").unwrap().attempts[0],
+        )
+        .unwrap();
+
+        assert!(frontier.is_empty());
+    }
+
+    #[test]
+    fn failed_command_recheck_is_not_an_ungated_final_tester_frontier() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, _candidate) = final_tester_evidence_fixture(project.path());
+        store
+            .mutate_work_item("work-1", |item| {
+                let tester = item.attempts[0]
+                    .tasks
+                    .iter()
+                    .find(|task| task.kind == TaskKind::Tester)
+                    .unwrap();
+                let source = ArtifactRef {
+                    producer_id: tester.id.clone(),
+                    path: format!(
+                        "{}/tester-results.json",
+                        tester.artifact_area.as_ref().unwrap().path
+                    ),
+                };
+                let recheck_id = item.add_failed_command_recheck_task("attempt-1", source)?;
+                let recheck = item.attempts[0]
+                    .tasks
+                    .iter_mut()
+                    .find(|task| task.id == recheck_id)
+                    .unwrap();
+                crate::work_model::set_task_terminal(recheck, TaskStatus::Complete);
+                Ok(())
+            })
+            .unwrap();
+
+        let frontier = failed_final_tester_without_gate_frontier(
+            project.path(),
+            &store.read_work_item("work-1").unwrap().attempts[0],
+        )
+        .unwrap();
+
+        assert!(frontier.is_empty());
+    }
+
+    fn legacy_learner_tester_evidence_fixture(
+        project_root: &Path,
+    ) -> (
+        WorkModelStore,
+        tempfile::TempDir,
+        String,
+        crate::queue::DispatchToken,
+    ) {
+        let (store, workspace, candidate) = final_tester_evidence_fixture(project_root);
+        crate::queue::add(project_root, "work-1", None).unwrap();
+        let dispatch = crate::queue::claim(project_root, "work-1", "attempt-1")
+            .unwrap()
+            .unwrap();
+        let dispatch = crate::queue::mark_running(project_root, &dispatch).unwrap();
+        let mut item = store.read_work_item("work-1").unwrap();
+        crate::work_model::set_attempt_terminal(&mut item.attempts[0], AttemptStatus::Complete);
+        item.attempts[0].review_state = Some(AttemptReviewState::Passed);
+        item.attempts[0].learning = Some(AttemptLearning::failed_with_kind(
+            1,
+            "Learner candidate gate rejected the reviewed candidate",
+            LearningFailureKind::Generic,
+        ));
+        item.create_or_get_merge_candidate("attempt-1").unwrap();
+        store.write_work_item(&item).unwrap();
+
+        let tester_results = latest_tester_results_path(project_root, &item.attempts[0]).unwrap();
+        let learner_gate = project_root
+            .join(crate::learner::handoff_dir_rel("work-1", "attempt-1"))
+            .join("runs/run-1")
+            .join(crate::candidate_gate::CANDIDATE_GATE_FILE);
+        let mut evidence = crate::candidate_gate::run_candidate_gate(
+            crate::candidate_gate::CandidateGateRequest {
+                project_root,
+                workspace: workspace.path(),
+                work_item_id: "work-1",
+                attempt_id: "attempt-1",
+                task_id: Some("attempt-1-write-1"),
+                phase: crate::candidate_gate::CandidateGatePhase::Learner,
+                base_commit: &candidate,
+                candidate_commit: &candidate,
+                completion_contract: item.attempts[0].writer_completion_contract.as_ref(),
+                allow_tree_identical_metadata_rewrite: false,
+                metadata_rewrite_authorization: None,
+                tester_results_path: Some(&tester_results),
+                accepted_tester_commands: &[],
+                artifact_path: &learner_gate,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            evidence.disposition,
+            crate::candidate_gate::CandidateGateDisposition::Rejected
+        );
+        // The preserved production failure was written by schema version 2.
+        // Keep this fixture on that exact historical version while new
+        // final-Tester gates use the current version.
+        evidence.schema_version = 2;
+        fs::write(&learner_gate, serde_json::to_vec_pretty(&evidence).unwrap()).unwrap();
+        let runs_dir = learner_gate.parent().unwrap().parent().unwrap();
+        fs::create_dir_all(runs_dir.join("run-2")).unwrap();
+        fs::create_dir_all(runs_dir.join("run-3")).unwrap();
+        (store, workspace, candidate, dispatch)
+    }
+
+    #[test]
+    fn legacy_learner_tester_evidence_failure_pauses_for_diagnosis() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, candidate, _dispatch) =
+            legacy_learner_tester_evidence_fixture(project.path());
+
+        let outcome = recover_legacy_learner_tester_evidence_failure(
+            project.path(),
+            &store,
+            &store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap()
+        .expect("the exact legacy failure must normalize");
+        assert!(
+            matches!(outcome, WorkAttemptRunOutcome::NeedsUser { .. }),
+            "legacy evidence alone must not authorize a Writer"
+        );
+        let recovered = store.read_work_item("work-1").unwrap();
+        assert_eq!(recovered.attempts.len(), 1);
+        assert!(recovered.merge_candidates.is_empty());
+        assert!(
+            recovered.attempts[0]
+                .learning
+                .as_ref()
+                .is_some_and(AttemptLearning::is_failed)
+        );
+        assert_eq!(
+            recovered.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            1
+        );
+        let gate = recovered.attempts[0]
+            .artifacts
+            .iter()
+            .rev()
+            .find(|artifact| artifact.path.ends_with("candidate-gate.json"))
+            .unwrap();
+        let normalized: crate::candidate_gate::CandidateGateEvidence =
+            serde_json::from_slice(&fs::read(project.path().join(&gate.path)).unwrap()).unwrap();
+        assert_eq!(
+            normalized.phase,
+            crate::candidate_gate::CandidateGatePhase::FinalTester
+        );
+        assert_eq!(normalized.candidate_commit, candidate);
+    }
+
+    #[test]
+    fn legacy_evidence_recovery_blocks_false_ready_and_blocked_dispatches() {
+        for terminal in [
+            crate::queue::DispatchStatus::CandidateReady,
+            crate::queue::DispatchStatus::Blocked,
+        ] {
+            let project = tempfile::TempDir::new().unwrap();
+            let (_store, _workspace, _candidate, dispatch) =
+                legacy_learner_tester_evidence_fixture(project.path());
+            crate::queue::reconcile(project.path(), &dispatch, terminal).unwrap();
+
+            let error =
+                crate::queue::resume(project.path(), "work-1", "attempt-1", None).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("no passing Tester result matches"),
+                "{terminal}: {error}"
+            );
+            assert!(
+                crate::queue::claim(project.path(), "work-1", "attempt-1")
+                    .unwrap()
+                    .is_none(),
+                "a terminal dispatch cannot authorize a missing-evidence Writer"
+            );
+        }
+    }
+
+    #[test]
+    fn unrelated_generic_learner_failure_keeps_its_existing_recovery() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, _candidate, _dispatch) =
+            legacy_learner_tester_evidence_fixture(project.path());
+        store
+            .mutate_work_item("work-1", |item| {
+                item.attempts[0].learning = Some(AttemptLearning::failed_with_kind(
+                    1,
+                    "Learner coder failed while writing its draft",
+                    LearningFailureKind::Generic,
+                ));
+                Ok(())
+            })
+            .unwrap();
+        let stored = store.read_work_item("work-1").unwrap();
+
+        assert!(
+            !crate::lifecycle_recovery::is_legacy_learner_tester_evidence_failure(
+                project.path(),
+                &stored,
+                "attempt-1"
+            )
+            .unwrap()
+        );
+        assert!(
+            recover_legacy_learner_tester_evidence_failure(
+                project.path(),
+                &store,
+                &stored,
+                "attempt-1"
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(stored.merge_candidates.len(), 1);
+    }
+
+    #[test]
+    fn legacy_evidence_recovery_rejects_nonempty_unrecorded_run() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, _candidate, _dispatch) =
+            legacy_learner_tester_evidence_fixture(project.path());
+        let run_2 = project
+            .path()
+            .join(crate::learner::handoff_dir_rel("work-1", "attempt-1"))
+            .join("runs/run-2");
+        fs::write(run_2.join("execution.json"), "{}\n").unwrap();
+        let stored = store.read_work_item("work-1").unwrap();
+
+        assert!(
+            !crate::lifecycle_recovery::is_legacy_learner_tester_evidence_failure(
+                project.path(),
+                &stored,
+                "attempt-1"
+            )
+            .unwrap()
+        );
+        assert!(
+            recover_legacy_learner_tester_evidence_failure(
+                project.path(),
+                &store,
+                &stored,
+                "attempt-1"
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(stored.merge_candidates.len(), 1);
+    }
+
+    #[test]
+    fn legacy_evidence_recovery_preserves_a_concurrent_model_change() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, _candidate, _dispatch) =
+            legacy_learner_tester_evidence_fixture(project.path());
+        let stale = store.read_work_item("work-1").unwrap();
+        store
+            .mutate_work_item("work-1", |fresh| {
+                fresh.title = "concurrently updated title".to_string();
+                Ok(())
+            })
+            .unwrap();
+
+        let error = recover_legacy_learner_tester_evidence_failure(
+            project.path(),
+            &store,
+            &stale,
+            "attempt-1",
+        )
+        .expect_err("a stale recovery snapshot must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("changed while legacy lifecycle recovery was being prepared")
+        );
+        let preserved = store.read_work_item("work-1").unwrap();
+        assert_eq!(preserved.title, "concurrently updated title");
+        assert_eq!(preserved.merge_candidates.len(), 1);
+        assert_eq!(
+            preserved.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            1
+        );
+    }
+
+    fn add_evidence_targeted_review(
+        project_root: &Path,
+        store: &WorkModelStore,
+        content: &str,
+    ) -> String {
+        let task_id = "attempt-1-evidence-abc-behaviors";
+        let artifact_path = work_artifact_path("work-1", "attempt-1", task_id);
+        let artifact_dir = project_root.join(&artifact_path);
+        fs::create_dir_all(&artifact_dir).unwrap();
+        fs::write(artifact_dir.join("review.md"), content).unwrap();
+
+        let evidence_path = ".fluent/work/artifacts/work-1/attempt-1/host-evidence/abc.json";
+        let evidence_bytes =
+            br#"{"schema_version":1,"check":"host check","result":"pass","working_directory":"."}"#;
+        fs::create_dir_all(project_root.join(evidence_path).parent().unwrap()).unwrap();
+        fs::write(project_root.join(evidence_path), evidence_bytes).unwrap();
+        let evidence_digest = format!("sha256:{:x}", Sha256::digest(evidence_bytes));
+
+        store
+            .mutate_work_item("work-1", |item| {
+                let attempt = &mut item.attempts[0];
+                let candidate = attempt
+                    .tasks
+                    .iter()
+                    .rev()
+                    .find(|task| {
+                        task.kind == TaskKind::Write && task.status == TaskStatus::Complete
+                    })
+                    .unwrap()
+                    .output
+                    .as_ref()
+                    .unwrap()
+                    .commit
+                    .clone();
+                let prior = attempt
+                    .tasks
+                    .iter()
+                    .find(|task| task.role == "behaviors" && task.kind == TaskKind::Review)
+                    .cloned()
+                    .unwrap();
+                let prior_review_artifact =
+                    format!("{}/review.md", prior.artifact_area.as_ref().unwrap().path);
+                attempt
+                    .evidence_recoveries
+                    .push(crate::work_model::EvidenceRecovery {
+                        carried_finding: None,
+                        required_check: None,
+                        id: "host-evidence-abc".to_string(),
+                        candidate_commit: candidate.clone(),
+                        attachment: crate::work_model::EvidenceAttachment {
+                            snapshot_path:
+                                ".fluent/work/artifacts/work-1/attempt-1/host-evidence/abc.json"
+                                    .to_string(),
+                            digest: evidence_digest.clone(),
+                        },
+                        targets: vec![crate::work_model::EvidenceReviewTarget {
+                            role: "behaviors".to_string(),
+                            prior_review_artifact: prior_review_artifact.clone(),
+                            review_task_id: Some(task_id.to_string()),
+                            review_digest: None,
+                        }],
+                        state: EvidenceRecoveryState::Reviewing,
+                        created_at: "2026-08-03T00:00:00Z".to_string(),
+                        code_change_classification: None,
+                    });
+                let mut targeted = review_task_with_artifact(task_id, "behaviors", &artifact_path);
+                targeted.review_context = prior.review_context.clone();
+                targeted.workspace_access = prior.workspace_access.clone();
+                targeted.evidence_review_context = Some(crate::work_model::EvidenceReviewContext {
+                    recovery_id: "host-evidence-abc".to_string(),
+                    candidate_commit: candidate.clone(),
+                    attachment: crate::work_model::EvidenceAttachment {
+                        snapshot_path:
+                            ".fluent/work/artifacts/work-1/attempt-1/host-evidence/abc.json"
+                                .to_string(),
+                        digest: evidence_digest.clone(),
+                    },
+                    prior_review_artifact,
+                });
+                attempt.tasks.push(targeted);
+                attempt.status = AttemptStatus::Reviewing;
+                attempt.review_state = Some(AttemptReviewState::NotReviewed);
+                Ok(())
+            })
+            .unwrap();
+        task_id.to_string()
+    }
+
+    #[test]
+    fn exact_candidate_review_check_reopens_only_missing_invalidated_roles() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (_, mut item) = make_interpret_reviews_fixture(tmp.path(), "PASS", None);
+        item.attempts[0]
+            .tasks
+            .retain(|task| task.role != "documentation");
+        assert_eq!(
+            stale_review_roles_after_latest_write(tmp.path(), &item.attempts[0]),
+            vec!["documentation"]
+        );
+    }
+
+    #[test]
+    fn exact_candidate_review_check_reopens_a_mismatched_current_role() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (_, mut item) = make_interpret_reviews_fixture(tmp.path(), "PASS", None);
+        item.attempts[0]
+            .tasks
+            .iter_mut()
+            .find(|task| task.role == "documentation")
+            .unwrap()
+            .review_context
+            .as_mut()
+            .unwrap()
+            .candidate_commit = "older-candidate".into();
+        assert_eq!(
+            stale_review_roles_after_latest_write(tmp.path(), &item.attempts[0]),
+            vec!["documentation"]
+        );
+    }
+
+    #[test]
+    fn exact_candidate_review_check_accepts_the_latest_replacement_for_a_role() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (_, mut item) = make_interpret_reviews_fixture(tmp.path(), "PASS", None);
+        let prior = item.attempts[0]
+            .tasks
+            .iter_mut()
+            .find(|task| task.role == "documentation")
+            .unwrap();
+        let mut replacement = prior.clone();
+        replacement.id = "attempt-1-review-2-documentation".into();
+        prior.review_context.as_mut().unwrap().candidate_commit = "older-candidate".into();
+        item.attempts[0].tasks.push(replacement);
+        assert!(stale_review_roles_after_latest_write(tmp.path(), &item.attempts[0]).is_empty());
+    }
+
+    #[test]
+    fn ordinary_review_coverage_rejects_ambiguous_prior_context() {
+        for missing in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (_, mut item) = make_interpret_reviews_fixture(tmp.path(), "PASS", None);
+            let attempt = &mut item.attempts[0];
+            let prior = attempt
+                .tasks
+                .iter_mut()
+                .find(|task| task.role == "documentation")
+                .unwrap();
+            if missing {
+                prior.review_context = None;
+            } else {
+                prior.review_context.as_mut().unwrap().candidate_commit = "older-candidate".into();
+            }
+            let mut writer = attempt
+                .tasks
+                .iter()
+                .find(|task| task.kind == TaskKind::Write)
+                .unwrap()
+                .clone();
+            writer.id = "attempt-1-write-2".into();
+            attempt.tasks.push(writer);
+            assert_eq!(
+                stale_review_roles_after_latest_write(tmp.path(), attempt),
+                review::REVIEWERS
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_review_coverage_reopens_unknown_review_roles() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (_, mut item) = make_interpret_reviews_fixture(tmp.path(), "PASS", None);
+        let mut unknown = item.attempts[0].tasks.last().unwrap().clone();
+        unknown.role = "unknown-role".into();
+        item.attempts[0].tasks.push(unknown);
+        assert_eq!(
+            stale_review_roles_after_latest_write(tmp.path(), &item.attempts[0]),
+            review::REVIEWERS
+        );
+    }
+
+    #[test]
+    fn ordinary_review_coverage_ignores_targeted_passes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (store, _) = make_interpret_reviews_fixture(tmp.path(), "FAIL", None);
+        add_evidence_targeted_review(tmp.path(), &store, "Verdict: pass\n");
+        let item = store.read_work_item("work-1").unwrap();
+        assert!(
+            stale_review_roles_after_latest_write(tmp.path(), &item.attempts[0])
+                .contains(&"behaviors"),
+            "a targeted pass cannot supply ordinary coverage"
+        );
+    }
+
+    #[test]
+    fn evidence_targeted_review_pass_preserves_writer_and_tester() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (store, _) =
+            make_interpret_reviews_fixture(tmp.path(), "FAIL", Some(passing_tester_json()));
+        add_evidence_targeted_review(tmp.path(), &store, "Verdict: pass\n");
+        let before = store.read_work_item("work-1").unwrap();
+        let before_writers = before.attempts[0]
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Write)
+            .count();
+        let before_testers = before.attempts[0]
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Tester)
+            .count();
+
+        let outcome =
+            interpret_reviews(tmp.path(), &store, before, "attempt-1", true, None).unwrap();
+
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedReviews { .. }
+        ));
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            before_writers
+        );
+        assert_eq!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Tester)
+                .count(),
+            before_testers
+        );
+        assert_eq!(
+            stored.attempts[0].evidence_recoveries[0].state,
+            EvidenceRecoveryState::Complete
+        );
+    }
+
+    #[test]
+    fn evidence_needed_review_pauses_without_writer_round() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (store, _) =
+            make_interpret_reviews_fixture(tmp.path(), "FAIL", Some(passing_tester_json()));
+        let review_content = "Verdict: fail\nDisposition: evidence-needed\nExternal-Condition: Restore the host launch network.\nAdditional-Proof: Attach a rerun after restoring it.\n";
+        add_evidence_targeted_review(tmp.path(), &store, review_content);
+        let before = store.read_work_item("work-1").unwrap();
+        let writer_count = before.attempts[0]
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Write)
+            .count();
+
+        let outcome =
+            interpret_reviews(tmp.path(), &store, before, "attempt-1", true, None).unwrap();
+
+        assert!(matches!(outcome, WorkAttemptRunOutcome::NeedsUser { .. }));
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(stored.attempts[0].status, AttemptStatus::NeedsUser);
+        assert_eq!(stored.attempts[0].pause_kind, Some(PauseKind::Uncertain));
+        assert_eq!(
+            stored.attempts[0].evidence_recoveries[0].state,
+            EvidenceRecoveryState::NeedsEvidence
+        );
+        let expected_review_digest =
+            format!("sha256:{:x}", Sha256::digest(review_content.as_bytes()));
+        assert_eq!(
+            stored.attempts[0].evidence_recoveries[0].targets[0]
+                .review_digest
+                .as_deref(),
+            Some(expected_review_digest.as_str())
+        );
+        assert_eq!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            writer_count
+        );
+    }
+
+    #[test]
+    fn unqualified_evidence_needed_review_plans_ordinary_writer() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (store, _) =
+            make_interpret_reviews_fixture(tmp.path(), "FAIL", Some(passing_tester_json()));
+        add_evidence_targeted_review(
+            tmp.path(),
+            &store,
+            "Verdict: fail\nDisposition: evidence-needed\n",
+        );
+        let before = store.read_work_item("work-1").unwrap();
+        let writer_count = before.attempts[0]
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Write)
+            .count();
+
+        let outcome =
+            interpret_reviews(tmp.path(), &store, before, "attempt-1", true, None).unwrap();
+
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedWriteRound { .. }
+        ));
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(stored.attempts[0].status, AttemptStatus::Planned);
+        assert_eq!(
+            stored.attempts[0].evidence_recoveries[0].state,
+            EvidenceRecoveryState::CodeChange
+        );
+        assert_eq!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            writer_count + 1
+        );
+    }
+
+    #[test]
+    fn malformed_single_evidence_needed_review_plans_writer() {
+        for content in [
+            "Verdict: fail\nDisposition: evidence-needed\nExternal-Condition: \nAdditional-Proof: Attach proof.\n",
+            "Verdict: fail\nDisposition: evidence-needed\nExternal-Condition: Repair the host.\nAdditional-Proof: Attach proof.\nAdditional-Proof: Attach more proof.\n",
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (store, _) =
+                make_interpret_reviews_fixture(tmp.path(), "FAIL", Some(passing_tester_json()));
+            add_evidence_targeted_review(tmp.path(), &store, content);
+            let before = store.read_work_item("work-1").unwrap();
+            let writer_count = before.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count();
+
+            let outcome =
+                interpret_reviews(tmp.path(), &store, before, "attempt-1", true, None).unwrap();
+
+            assert!(matches!(
+                outcome,
+                WorkAttemptRunOutcome::PlannedWriteRound { .. }
+            ));
+            let stored = store.read_work_item("work-1").unwrap();
+            assert_eq!(stored.attempts[0].status, AttemptStatus::Planned);
+            assert_eq!(
+                stored.attempts[0].evidence_recoveries[0].state,
+                EvidenceRecoveryState::CodeChange
+            );
+            assert_eq!(
+                stored.attempts[0]
+                    .tasks
+                    .iter()
+                    .filter(|task| task.kind == TaskKind::Write)
+                    .count(),
+                writer_count + 1
+            );
+        }
+    }
+
+    #[test]
+    fn ambiguous_evidence_disposition_pauses_without_writer() {
+        for content in [
+            "Verdict: fail\nDisposition: evidence-needed\nDisposition: code-change\nExternal-Condition: Repair the host.\nAdditional-Proof: Attach proof.\n",
+            "Verdict: fail\nDisposition: unknown\n",
+            "Verdict: fail\n",
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (store, _) =
+                make_interpret_reviews_fixture(tmp.path(), "FAIL", Some(passing_tester_json()));
+            add_evidence_targeted_review(tmp.path(), &store, content);
+            let before = store.read_work_item("work-1").unwrap();
+            let writer_count = before.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count();
+
+            let outcome =
+                interpret_reviews(tmp.path(), &store, before, "attempt-1", true, None).unwrap();
+
+            assert!(matches!(outcome, WorkAttemptRunOutcome::NeedsUser { .. }));
+            let stored = store.read_work_item("work-1").unwrap();
+            assert_eq!(stored.attempts[0].status, AttemptStatus::NeedsUser);
+            assert_eq!(
+                stored.attempts[0]
+                    .tasks
+                    .iter()
+                    .filter(|task| task.kind == TaskKind::Write)
+                    .count(),
+                writer_count
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_tests_review_focused_request_pauses_without_writer_round() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (store, _) =
+            make_interpret_reviews_fixture(tmp.path(), "FAIL", Some(passing_tester_json()));
+        let review_path = tmp.path().join(work_artifact_path(
+            "work-1",
+            "attempt-1",
+            "attempt-1-review-behaviors",
+        ));
+        fs::write(
+            review_path.join("review.md"),
+            "Verdict: fail\nEvidence-Command: cargo test exact_case\nEvidence-Working-Directory: .\n",
+        )
+        .unwrap();
+        store
+            .mutate_work_item("work-1", |item| {
+                item.attempts[0]
+                    .tasks
+                    .iter_mut()
+                    .find(|task| task.role == "tests")
+                    .unwrap()
+                    .role = "behaviors".into();
+                item.attempts[0]
+                    .tasks
+                    .iter_mut()
+                    .find(|task| task.id == "attempt-1-review-behaviors")
+                    .unwrap()
+                    .role = "tests".to_string();
+                Ok(())
+            })
+            .unwrap();
+        let before = store.read_work_item("work-1").unwrap();
+        let writer_count = before.attempts[0]
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Write)
+            .count();
+
+        let outcome =
+            interpret_reviews(tmp.path(), &store, before, "attempt-1", true, None).unwrap();
+
+        let handoff_path = match outcome {
+            WorkAttemptRunOutcome::NeedsUser { handoff_path } => handoff_path,
+            other => panic!("expected focused evidence pause, got {other:?}"),
+        };
+        let handoff = fs::read_to_string(tmp.path().join(handoff_path)).unwrap();
+        assert!(handoff.contains(
+            "fluent attempt evidence run work-1 attempt-1 --review-artifact .fluent/work/artifacts/work-1/attempt-1/attempt-1-review-behaviors/review.md"
+        ));
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(stored.attempts[0].status, AttemptStatus::NeedsUser);
+        assert_eq!(stored.attempts[0].pause_kind, Some(PauseKind::Uncertain));
+        assert_eq!(
+            stored.attempts[0].review_state,
+            Some(AttemptReviewState::Failed)
+        );
+        assert_eq!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            writer_count
+        );
+    }
+
+    fn add_completed_focused_tests_evidence(
+        project_root: &Path,
+        store: &WorkModelStore,
+        command: &str,
+    ) {
+        let saved = store.read_work_item("work-1").unwrap();
+        let prior_id = saved.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Review && task.role == "tests")
+            .unwrap()
+            .id
+            .as_str();
+        let candidate = saved.attempts[0]
+            .tasks
+            .iter()
+            .rev()
+            .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+            .unwrap()
+            .output
+            .as_ref()
+            .unwrap()
+            .commit
+            .clone();
+        let prior_path = format!(
+            "{}/review.md",
+            work_artifact_path("work-1", "attempt-1", prior_id)
+        );
+        fs::write(
+            project_root.join(&prior_path),
+            format!("Verdict: fail\nEvidence-Command: {command}\nEvidence-Working-Directory: .\n"),
+        )
+        .unwrap();
+        let evidence_bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "producer": "compatible host",
+            "check": command,
+            "working_directory": ".",
+            "result": "pass",
+            "run_at": "2026-08-24T01:00:00Z",
+            "output": "passed"
+        }))
+        .unwrap();
+        let digest = format!("sha256:{:x}", Sha256::digest(&evidence_bytes));
+        let snapshot = format!(
+            ".fluent/work/artifacts/work-1/attempt-1/host-evidence/{}.json",
+            &digest[7..]
+        );
+        fs::create_dir_all(project_root.join(&snapshot).parent().unwrap()).unwrap();
+        fs::write(project_root.join(&snapshot), &evidence_bytes).unwrap();
+
+        let targeted_id = "attempt-1-evidence-compatible-tests";
+        let targeted_area = work_artifact_path("work-1", "attempt-1", targeted_id);
+        fs::create_dir_all(project_root.join(&targeted_area)).unwrap();
+        fs::write(
+            project_root.join(&targeted_area).join("review.md"),
+            "Verdict: pass\n",
+        )
+        .unwrap();
+        store
+            .mutate_work_item("work-1", |item| {
+                let attempt = &mut item.attempts[0];
+                let attachment = crate::work_model::EvidenceAttachment {
+                    snapshot_path: snapshot.clone(),
+                    digest: digest.clone(),
+                };
+                let recovery_id = "host-evidence-compatible".to_string();
+                attempt
+                    .evidence_recoveries
+                    .push(crate::work_model::EvidenceRecovery {
+                        carried_finding: None,
+                        required_check: None,
+                        id: recovery_id.clone(),
+                        candidate_commit: candidate.clone(),
+                        attachment: attachment.clone(),
+                        targets: vec![crate::work_model::EvidenceReviewTarget {
+                            role: "tests".to_string(),
+                            prior_review_artifact: prior_path.clone(),
+                            review_task_id: Some(targeted_id.to_string()),
+                            review_digest: None,
+                        }],
+                        state: EvidenceRecoveryState::Complete,
+                        created_at: "2026-08-24T01:00:00Z".to_string(),
+                        code_change_classification: None,
+                    });
+                let mut targeted = review_task_with_artifact(targeted_id, "tests", &targeted_area);
+                let prior = attempt
+                    .tasks
+                    .iter()
+                    .find(|task| task.id == prior_id)
+                    .unwrap();
+                targeted.review_context = prior.review_context.clone();
+                targeted.workspace_access = prior.workspace_access.clone();
+                targeted.evidence_review_context = Some(crate::work_model::EvidenceReviewContext {
+                    recovery_id,
+                    candidate_commit: candidate.clone(),
+                    attachment,
+                    prior_review_artifact: prior_path,
+                });
+                attempt.tasks.push(targeted);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn accepted_pre_tester_host_evidence_supersedes_same_final_tester_command() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let command = "xcodebuild test";
+        let (store, _workspace, candidate) = final_tester_evidence_fixture(tmp.path());
+        add_failed_final_tester_command(tmp.path(), &store);
+        let path = crate::verification_assessment::assess_canonical_checks(
+            tmp.path(),
+            &store.read_work_item("work-1").unwrap().attempts[0],
+        )
+        .unwrap()
+        .results_path;
+        let mut results: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        results["tests"][0]["id"] = serde_json::json!("required_behavior");
+        fs::write(&path, serde_json::to_vec(&results).unwrap()).unwrap();
+        assert_eq!(results["candidate_commit"], candidate);
+        add_completed_focused_tests_evidence(tmp.path(), &store, command);
+        store
+            .mutate_work_item("work-1", |item| {
+                let attempt = &mut item.attempts[0];
+                attempt.status = AttemptStatus::NeedsUser;
+                attempt.pause_kind = Some(PauseKind::RoundCap);
+                attempt.review_state = Some(AttemptReviewState::Failed);
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(
+            reopen_review_evidence_covered_round_cap_attempt(
+                tmp.path(),
+                &store,
+                "work-1",
+                "attempt-1",
+            )
+            .unwrap(),
+            "the public resume path must reopen the stale round-cap pause"
+        );
+        let reopened = store.read_work_item("work-1").unwrap();
+        let writer_count = reopened.attempts[0]
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Write)
+            .count();
+        let outcome =
+            interpret_reviews(tmp.path(), &store, reopened, "attempt-1", false, None).unwrap();
+
+        assert!(
+            matches!(
+                outcome,
+                WorkAttemptRunOutcome::PlannedReviews { .. }
+                    | WorkAttemptRunOutcome::MergeCandidateReady { .. }
+            ),
+            "{outcome:?}"
+        );
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            writer_count,
+            "accepted exact evidence must not schedule a redundant Writer"
+        );
+        assert!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .all(|task| !task.is_failed_command_recheck())
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "test-support")]
+    fn baseline_attribution_agrees_across_current_consumers() {
+        use std::os::unix::fs::PermissionsExt;
+        for case in [
+            "pass",
+            "review",
+            "missing",
+            "failed-reference",
+            "command-reference",
+            "introduced",
+            "no-baseline",
+        ] {
+            let root = tempfile::TempDir::new().unwrap();
+            let (store, workspace, _) = final_tester_evidence_fixture(root.path());
+            let command = "sh tests/suite.sh";
+            fs::write(
+                workspace.path().join(".fluent/tester.yaml"),
+                format!("commands:\n  - command: {command}\n    test_harness: shell-harness\n"),
+            )
+            .unwrap();
+            fs::write(workspace.path().join("tests/behavior.rs"),
+                "#[test]\nfn required_behavior() {}\n#[test]\nfn preexisting_failure() {}\n#[test]\nfn missing_behavior() {}\n").unwrap();
+            fs::write(
+                workspace.path().join("tests/suite.sh"),
+                r#"#!/bin/sh
+if test 1 = 2; then result=pass; else result=fail; fi
+printf '{"id":"preexisting_failure","test_harness":"shell-harness","status":"%s"}\n' "$result"
+printf '%s\n' '{"id":"required_behavior","test_harness":"shell-harness","status":"pass"}'
+if test -f tests/introduced; then
+    printf '%s\n' '{"id":"introduced_failure","test_harness":"shell-harness","status":"fail"}'
+fi
+exit 1
+"#,
+            )
+            .unwrap();
+            let extractor = workspace.path().join(".fluent/extract-tester-results");
+            fs::write(&extractor, r#"#!/usr/bin/env python3
+import json, pathlib, sys
+print(json.dumps([json.loads(line) for line in (pathlib.Path(sys.argv[1])/'commands/0-stdout.log').read_text().splitlines()]))
+"#).unwrap();
+            fs::set_permissions(&extractor, fs::Permissions::from_mode(0o755)).unwrap();
+            crate::git::run(
+                workspace.path(),
+                &["add", ".fluent", "tests"],
+                "stage suite fixture",
+            )
+            .unwrap();
+            crate::git::run(
+                workspace.path(),
+                &["commit", "-qm", "Declare suite checks"],
+                "commit suite fixture",
+            )
+            .unwrap();
+            let mut candidate =
+                crate::git::run_stdout(workspace.path(), &["rev-parse", "HEAD"], "read candidate")
+                    .unwrap();
+            let mut item = store.read_work_item("work-1").unwrap();
+            for task in &mut item.attempts[0].tasks {
+                if let Some(output) = &mut task.output {
+                    output.commit = candidate.clone();
+                }
+                if let Some(context) = &mut task.review_context {
+                    context.candidate_commit = candidate.clone();
+                }
+            }
+            let reference = match case {
+                "missing" => "tests/behavior.rs::missing_behavior".to_string(),
+                "failed-reference" => "tests/behavior.rs::preexisting_failure".to_string(),
+                "command-reference" => {
+                    serde_json::json!({"kind":"command","command":command}).to_string()
+                }
+                _ => "tests/behavior.rs::required_behavior".to_string(),
+            };
+            item.attempts[0]
+                .writer_completion_contract
+                .as_mut()
+                .unwrap()
+                .requirements[0]
+                .verification_refs = vec![reference];
+            let tester = item.attempts[0]
+                .tasks
+                .iter()
+                .find(|task| task.kind == TaskKind::Tester)
+                .unwrap();
+            let area = root
+                .path()
+                .join(&tester.artifact_area.as_ref().unwrap().path);
+            let results_ref = format!(
+                "{}/tester-results.json",
+                tester.artifact_area.as_ref().unwrap().path
+            );
+            let baseline_ref = format!(
+                "{}/tester-results.json",
+                work_artifact_path("work-1", "attempt-1", "attempt-1-baseline-tester")
+            );
+            let baseline_area = root
+                .path()
+                .join(&baseline_ref)
+                .parent()
+                .unwrap()
+                .to_path_buf();
+            let resolver = crate::content::ContentResolver::new(Some(workspace.path()));
+            if case != "no-baseline" {
+                fs::create_dir_all(&baseline_area).unwrap();
+                crate::tester::run(workspace.path(), &baseline_area, true, &resolver).unwrap();
+            }
+            if case == "introduced" {
+                fs::write(workspace.path().join("tests/introduced"), "new failure\n").unwrap();
+                crate::git::run(
+                    workspace.path(),
+                    &["add", "tests/introduced"],
+                    "stage introduced failure",
+                )
+                .unwrap();
+                crate::git::run(
+                    workspace.path(),
+                    &["commit", "-qm", "Introduce a failure"],
+                    "commit introduced failure",
+                )
+                .unwrap();
+                candidate = crate::git::run_stdout(
+                    workspace.path(),
+                    &["rev-parse", "HEAD"],
+                    "read changed candidate",
+                )
+                .unwrap();
+                for task in &mut item.attempts[0].tasks {
+                    if let Some(output) = &mut task.output {
+                        output.commit = candidate.clone();
+                    }
+                    if let Some(context) = &mut task.review_context {
+                        context.candidate_commit = candidate.clone();
+                    }
+                }
+            }
+            crate::tester::run(workspace.path(), &area, true, &resolver).unwrap();
+            crate::tester::bind_candidate_commit(&area, &candidate).unwrap();
+            let current_bytes = fs::read(area.join("tester-results.json")).unwrap();
+            let baseline_bytes = fs::read(root.path().join(&baseline_ref)).ok();
+            assert!(area.join("canonical-run.json").is_file());
+            let mut inputs = vec![ArtifactRef {
+                producer_id: "tester".into(),
+                path: results_ref.clone(),
+            }];
+            if case == "review" {
+                let review = item.attempts[0]
+                    .tasks
+                    .iter()
+                    .find(|task| task.kind == TaskKind::Review)
+                    .unwrap();
+                let path = format!("{}/review.md", review.artifact_area.as_ref().unwrap().path);
+                fs::write(
+                    root.path().join(&path),
+                    "Verdict: fail\n\n- [ ] Repair the unrelated source check\n",
+                )
+                .unwrap();
+                inputs.push(ArtifactRef {
+                    producer_id: review.id.clone(),
+                    path,
+                });
+            }
+            item.attempts[0].tasks[0].input_artifacts = inputs;
+            store.write_work_item(&item).unwrap();
+            let view = crate::verification_assessment::assess_current_verification(
+                root.path(),
+                &item.attempts[0],
+            )
+            .unwrap();
+            let introduced = matches!(case, "introduced" | "no-baseline");
+            assert_eq!(
+                view.candidate_defects().len(),
+                usize::from(introduced),
+                "{case}: baseline failures are historical"
+            );
+            let reference_passes = matches!(case, "pass" | "review" | "introduced" | "no-baseline");
+            assert_eq!(view.references[0].satisfied, reference_passes, "{case}");
+            if !introduced {
+                assert!(
+                    view.commands[0].satisfied,
+                    "{case}: baseline explains the suite exit"
+                );
+                assert!(
+                    view.commands[0]
+                        .bindings
+                        .iter()
+                        .any(|binding| binding.path == baseline_ref)
+                );
+            }
+            let status = crate::work_status::summarize_work_item(&item, Some(root.path()));
+            assert_eq!(status.verification.as_ref(), Some(&view), "{case}");
+            let (findings, context) = crate::work_task_executor::verification_views_for_test(
+                root.path(),
+                &item.attempts[0],
+                workspace.path(),
+            );
+            assert_eq!(
+                findings.len(),
+                usize::from(case == "review" || introduced),
+                "{case}: {findings:?}"
+            );
+            if case == "introduced" {
+                assert!(findings[0].requirement.contains("introduced_failure"));
+            }
+            assert_eq!(
+                context["current-findings"].as_array().unwrap().len(),
+                findings.len()
+            );
+            if case == "review" {
+                assert!(findings[0].requirement.contains("unrelated source check"));
+            }
+            let admission = crate::recovery_contracts::validate_verification_writer_start(
+                root.path(),
+                &item.attempts[0],
+                &item.attempts[0].tasks[0],
+            );
+            assert_eq!(admission.is_ok(), case == "review" || introduced, "{case}");
+            let gate = crate::candidate_gate::run_candidate_gate(
+                crate::candidate_gate::CandidateGateRequest {
+                    project_root: root.path(),
+                    workspace: workspace.path(),
+                    work_item_id: "work-1",
+                    attempt_id: "attempt-1",
+                    task_id: None,
+                    phase: crate::candidate_gate::CandidateGatePhase::FinalTester,
+                    base_commit: &candidate,
+                    candidate_commit: &candidate,
+                    completion_contract: item.attempts[0].writer_completion_contract.as_ref(),
+                    allow_tree_identical_metadata_rewrite: false,
+                    metadata_rewrite_authorization: None,
+                    tester_results_path: Some(&area.join("tester-results.json")),
+                    accepted_tester_commands: &[],
+                    artifact_path: &root.path().join("baseline-gate.json"),
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                gate.checks
+                    .iter()
+                    .find(|check| check.name == "tester-reference-evidence")
+                    .unwrap()
+                    .status
+                    == crate::candidate_gate::CandidateCheckStatus::Passed,
+                reference_passes,
+                "{case}"
+            );
+            let outcome =
+                interpret_reviews(root.path(), &store, item, "attempt-1", true, None).unwrap();
+            match case {
+                "pass" => assert!(
+                    matches!(outcome, WorkAttemptRunOutcome::MergeCandidateReady { .. }),
+                    "{outcome:?}"
+                ),
+                "review" | "introduced" | "no-baseline" => assert!(
+                    matches!(outcome, WorkAttemptRunOutcome::PlannedWriteRound { .. }),
+                    "{outcome:?}"
+                ),
+                _ => assert!(
+                    matches!(outcome, WorkAttemptRunOutcome::NeedsUser { .. }),
+                    "{outcome:?}"
+                ),
+            }
+            assert_eq!(
+                fs::read(area.join("tester-results.json")).unwrap(),
+                current_bytes
+            );
+            assert_eq!(
+                fs::read(root.path().join(&baseline_ref)).ok(),
+                baseline_bytes
+            );
+        }
+    }
+
+    #[test]
+    fn inconsistent_summary_blocks_gate_status_and_attempt() {
+        use std::os::unix::fs::PermissionsExt;
+        for (failing_native, with_contract) in [(false, true), (true, true), (false, false)] {
+            let root = tempfile::TempDir::new().unwrap();
+            let (store, workspace, _) = final_tester_evidence_fixture(root.path());
+            fs::write(
+                workspace.path().join(".fluent/tester.yaml"),
+                "commands:\n  - command: true\n    test_harness: shell-harness\n",
+            )
+            .unwrap();
+            let extractor = workspace.path().join(".fluent/extract-tester-results");
+            fs::write(&extractor, "#!/bin/sh\nprintf '%s\\n' '[{\"id\":\"required_behavior\",\"test_harness\":\"cargo-nextest\",\"status\":\"pass\"}]'\n").unwrap();
+            fs::set_permissions(&extractor, fs::Permissions::from_mode(0o755)).unwrap();
+            crate::git::run(
+                workspace.path(),
+                &["add", ".fluent"],
+                "stage passing canonical fixture",
+            )
+            .unwrap();
+            crate::git::run(
+                workspace.path(),
+                &["commit", "-qm", "Declare passing verification"],
+                "commit passing canonical fixture",
+            )
+            .unwrap();
+            let candidate =
+                crate::git::run_stdout(workspace.path(), &["rev-parse", "HEAD"], "read candidate")
+                    .unwrap();
+            store
+                .mutate_work_item("work-1", |item| {
+                    for task in &mut item.attempts[0].tasks {
+                        if let Some(output) = &mut task.output {
+                            output.commit = candidate.clone();
+                        }
+                        if let Some(context) = &mut task.review_context {
+                            context.candidate_commit = candidate.clone();
+                        }
+                    }
+                    if !with_contract {
+                        item.attempts[0].writer_completion_contract = None;
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            let item = store.read_work_item("work-1").unwrap();
+            let tester = item.attempts[0]
+                .tasks
+                .iter()
+                .find(|task| task.kind == TaskKind::Tester)
+                .unwrap();
+            let area = root
+                .path()
+                .join(&tester.artifact_area.as_ref().unwrap().path);
+            crate::tester::run(
+                workspace.path(),
+                &area,
+                true,
+                &crate::content::ContentResolver::new(Some(workspace.path())),
+            )
+            .unwrap();
+            crate::tester::bind_candidate_commit(&area, &candidate).unwrap();
+            assert!(area.join("canonical-run.json").is_file());
+            let path = area.join("tester-results.json");
+            let mut results: crate::tester::TesterResults =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(results.commands[0].exit_code, 0);
+            results.summary.total = 2;
+            results.summary.pass = 2;
+            if failing_native {
+                results.tests[0].status = "fail".into();
+                results.summary.pass = 0;
+                results.summary.fail = 1;
+            }
+            fs::write(&path, serde_json::to_vec(&results).unwrap()).unwrap();
+            let view = crate::verification_assessment::assess_current_verification(
+                root.path(),
+                &item.attempts[0],
+            )
+            .unwrap();
+            assert!(view.commands.iter().any(|row| row.cause
+                == Some(
+                    crate::verification_assessment::VerificationCause::UninterpretableEvidence
+                )));
+            let gate = crate::candidate_gate::run_candidate_gate(
+                crate::candidate_gate::CandidateGateRequest {
+                    project_root: root.path(),
+                    workspace: workspace.path(),
+                    work_item_id: "work-1",
+                    attempt_id: "attempt-1",
+                    task_id: None,
+                    phase: crate::candidate_gate::CandidateGatePhase::FinalTester,
+                    base_commit: &candidate,
+                    candidate_commit: &candidate,
+                    completion_contract: item.attempts[0].writer_completion_contract.as_ref(),
+                    allow_tree_identical_metadata_rewrite: false,
+                    metadata_rewrite_authorization: None,
+                    tester_results_path: Some(&path),
+                    accepted_tester_commands: &[],
+                    artifact_path: &root.path().join("current-gate.json"),
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                gate.checks
+                    .iter()
+                    .find(|check| check.name == "tester-reference-evidence")
+                    .unwrap()
+                    .status,
+                crate::candidate_gate::CandidateCheckStatus::Error
+            );
+            let status = crate::work_status::summarize_work_item(&item, Some(root.path()));
+            assert!(
+                status
+                    .recovery_blocker
+                    .as_ref()
+                    .is_some_and(|reason| reason.contains("summary"))
+            );
+            let writers = item.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count();
+            let outcome =
+                interpret_reviews(root.path(), &store, item, "attempt-1", true, None).unwrap();
+            assert!(
+                matches!(outcome, WorkAttemptRunOutcome::NeedsUser { .. }),
+                "{outcome:?}"
+            );
+            let current = store.read_work_item("work-1").unwrap();
+            assert!(current.merge_candidates.is_empty());
+            assert_eq!(
+                current.attempts[0].pause_kind,
+                Some(PauseKind::HostEvidence)
+            );
+            assert_eq!(
+                current.attempts[0]
+                    .tasks
+                    .iter()
+                    .filter(|task| task.kind == TaskKind::Write)
+                    .count(),
+                writers
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_command_references_use_canonical_applicability() {
+        use std::os::unix::fs::PermissionsExt;
+        for case in [
+            "duplicate",
+            "comparison",
+            "applicability",
+            "matching",
+            "outside",
+        ] {
+            let root = tempfile::TempDir::new().unwrap();
+            let (store, workspace, _) = final_tester_evidence_fixture(root.path());
+            let command = "python3 tests/check.py";
+            fs::write(
+                workspace.path().join("tests/check.py"),
+                "raise SystemExit(1)\n",
+            )
+            .unwrap();
+            let applicability = if case == "applicability" {
+                serde_json::json!({"environment":{"os":std::env::consts::OS}})
+            } else {
+                serde_json::json!({})
+            };
+            let mut definitions = vec![
+                serde_json::json!({"command":if case == "outside" { "true" } else { command },"test_harness":"shell-harness","applicability":applicability}),
+            ];
+            if case == "duplicate" {
+                definitions.push(definitions[0].clone());
+            }
+            fs::write(
+                workspace.path().join(".fluent/tester.yaml"),
+                serde_json::to_vec(&serde_json::json!({"commands":definitions})).unwrap(),
+            )
+            .unwrap();
+            let extractor = workspace.path().join(".fluent/extract-tester-results");
+            fs::set_permissions(&extractor, fs::Permissions::from_mode(0o755)).unwrap();
+            crate::git::run(
+                workspace.path(),
+                &["add", "tests/check.py", ".fluent"],
+                "stage legacy command fixture",
+            )
+            .unwrap();
+            crate::git::run(
+                workspace.path(),
+                &["commit", "-qm", "Declare Python commands"],
+                "commit legacy command fixture",
+            )
+            .unwrap();
+            let candidate =
+                crate::git::run_stdout(workspace.path(), &["rev-parse", "HEAD"], "read candidate")
+                    .unwrap();
+            store
+                .mutate_work_item("work-1", |item| {
+                    for task in &mut item.attempts[0].tasks {
+                        if let Some(output) = &mut task.output {
+                            output.commit = candidate.clone();
+                        }
+                        if let Some(context) = &mut task.review_context {
+                            context.candidate_commit = candidate.clone();
+                        }
+                    }
+                    item.attempts[0].writer_completion_contract =
+                        crate::work_model::WriterCompletionContract::from_planning_context(
+                            &crate::work_model::PlanningContext {
+                                behaviors: Some(format!(
+                                    "### B1\n\nTHE SYSTEM SHALL verify the Python script.\nTest: {command}\n"
+                                )),
+                                ..Default::default()
+                            },
+                        );
+                    Ok(())
+                })
+                .unwrap();
+            let item = store.read_work_item("work-1").unwrap();
+            let tester = item.attempts[0]
+                .tasks
+                .iter()
+                .find(|task| task.kind == TaskKind::Tester)
+                .unwrap();
+            let area = root
+                .path()
+                .join(&tester.artifact_area.as_ref().unwrap().path);
+            crate::tester::run(
+                workspace.path(),
+                &area,
+                true,
+                &crate::content::ContentResolver::new(Some(workspace.path())),
+            )
+            .unwrap();
+            crate::tester::bind_candidate_commit(&area, &candidate).unwrap();
+            add_completed_focused_tests_evidence(root.path(), &store, command);
+            if case == "comparison" {
+                store
+                    .mutate_work_item("work-1", |item| {
+                        let review = item.attempts[0]
+                            .tasks
+                            .iter_mut()
+                            .find(|task| {
+                                task.kind == TaskKind::Review
+                                    && task.role == "tests"
+                                    && task.evidence_review_context.is_none()
+                            })
+                            .unwrap();
+                        review.review_context.as_mut().unwrap().base_commit =
+                            Some("different-comparison".into());
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            let item = store.read_work_item("work-1").unwrap();
+            let view = crate::verification_assessment::assess_current_verification(
+                root.path(),
+                &item.attempts[0],
+            )
+            .unwrap();
+            let expected = matches!(case, "matching" | "outside");
+            assert_eq!(view.commands[0].satisfied, expected, "{case}");
+            assert_eq!(
+                view.references[0].satisfied, expected,
+                "{case}: canonical and legacy references must agree"
+            );
+            let status = crate::work_status::summarize_work_item(&item, Some(root.path()));
+            assert_eq!(status.verification.as_ref().unwrap(), &view);
+            let results = area.join("tester-results.json");
+            let gate = crate::candidate_gate::run_candidate_gate(
+                crate::candidate_gate::CandidateGateRequest {
+                    project_root: root.path(),
+                    workspace: workspace.path(),
+                    work_item_id: "work-1",
+                    attempt_id: "attempt-1",
+                    task_id: None,
+                    phase: crate::candidate_gate::CandidateGatePhase::FinalTester,
+                    base_commit: &candidate,
+                    candidate_commit: &candidate,
+                    completion_contract: item.attempts[0].writer_completion_contract.as_ref(),
+                    allow_tree_identical_metadata_rewrite: false,
+                    metadata_rewrite_authorization: None,
+                    tester_results_path: Some(&results),
+                    accepted_tester_commands: &[],
+                    artifact_path: &root.path().join("current-gate.json"),
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                gate.checks
+                    .iter()
+                    .find(|check| check.name == "tester-reference-evidence")
+                    .unwrap()
+                    .status
+                    == crate::candidate_gate::CandidateCheckStatus::Passed,
+                expected,
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn focused_proof_cannot_cover_duplicate_command_occurrences() {
+        let root = tempfile::TempDir::new().unwrap();
+        let (store, workspace, _) = final_tester_evidence_fixture(root.path());
+        let config = "commands:\n  - command: xcodebuild test\n    test_harness: xcodebuild\n  - command: xcodebuild test\n    test_harness: xcodebuild\n";
+        fs::write(workspace.path().join(".fluent/tester.yaml"), config).unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["add", ".fluent/tester.yaml"],
+            "stage duplicate occurrence",
+        )
+        .unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["commit", "-qm", "Add repeated command"],
+            "commit duplicate occurrence",
+        )
+        .unwrap();
+        let candidate =
+            crate::git::run_stdout(workspace.path(), &["rev-parse", "HEAD"], "read candidate")
+                .unwrap();
+        store
+            .mutate_work_item("work-1", |item| {
+                for task in &mut item.attempts[0].tasks {
+                    if let Some(output) = &mut task.output {
+                        output.commit = candidate.clone();
+                    }
+                    if let Some(context) = &mut task.review_context {
+                        context.candidate_commit = candidate.clone();
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+        add_failed_final_tester_command(root.path(), &store);
+        let saved = store.read_work_item("work-1").unwrap();
+        let tester = saved.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Tester)
+            .unwrap();
+        let area = root
+            .path()
+            .join(&tester.artifact_area.as_ref().unwrap().path);
+        let path = area.join("tester-results.json");
+        let mut results: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        results["candidate_commit"] = serde_json::json!(candidate);
+        let mut second = results["commands"][0].clone();
+        second["exit_code"] = serde_json::json!(0);
+        for stream in ["stdout", "stderr"] {
+            let log = format!("commands/1-{stream}.log");
+            fs::write(area.join(&log), "").unwrap();
+            second[format!("{stream}_log")] = serde_json::json!(log);
+        }
+        results["commands"].as_array_mut().unwrap().push(second);
+        fs::write(&path, serde_json::to_vec(&results).unwrap()).unwrap();
+        add_completed_focused_tests_evidence(root.path(), &store, "xcodebuild test");
+        let item = store.read_work_item("work-1").unwrap();
+        let view = crate::verification_assessment::assess_current_verification(
+            root.path(),
+            &item.attempts[0],
+        )
+        .unwrap();
+        assert!(!view.commands[0].satisfied);
+        assert!(view.commands[1].satisfied);
+        assert!(
+            !crate::host_evidence::completed_review_evidence_covers_tester_failure(
+                root.path(),
+                &item.attempts[0],
+                &path,
+                None
+            )
+        );
+    }
+
+    #[test]
+    fn pre_tester_host_evidence_does_not_cover_a_different_final_tester_command() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let actual = "./tests/container-smoke.sh";
+        let mut results: serde_json::Value = serde_json::from_str(
+            &tester_json_with_failed_command(&[&format!("command-0:{actual}")], actual, 1),
+        )
+        .unwrap();
+        results["candidate_commit"] = serde_json::json!("abc123");
+        let tester_json = serde_json::to_string(&results).unwrap();
+        let (store, _) = make_interpret_reviews_fixture(tmp.path(), "PASS", Some(&tester_json));
+        add_completed_focused_tests_evidence(tmp.path(), &store, "./tests/other-smoke.sh");
+        let tester_commands = tmp.path().join(work_artifact_path(
+            "work-1",
+            "attempt-1",
+            "attempt-1-tester/commands",
+        ));
+        fs::create_dir_all(&tester_commands).unwrap();
+        fs::write(tester_commands.join("0-stdout.log"), "").unwrap();
+        fs::write(tester_commands.join("0-stderr.log"), "unavailable host\n").unwrap();
+
+        let item = store.read_work_item("work-1").unwrap();
+        let outcome = interpret_reviews(tmp.path(), &store, item, "attempt-1", true, None).unwrap();
+        let WorkAttemptRunOutcome::PlannedReviews { task_ids } = outcome else {
+            panic!("targeted evidence must precede fresh ordinary Tests coverage: {outcome:?}");
+        };
+        store
+            .mutate_work_item("work-1", |item| {
+                for task in item.attempts[0]
+                    .tasks
+                    .iter_mut()
+                    .filter(|task| task_ids.contains(&task.id))
+                {
+                    assert_eq!(task.role, "tests");
+                    assert!(task.evidence_review_context.is_none());
+                    task.status = TaskStatus::Complete;
+                    let area = tmp.path().join(&task.artifact_area.as_ref().unwrap().path);
+                    fs::create_dir_all(&area).unwrap();
+                    fs::write(area.join("review.md"), "Verdict: pass\n").unwrap();
+                }
+                Ok(())
+            })
+            .unwrap();
+        let item = store.read_work_item("work-1").unwrap();
+        let view = crate::verification_assessment::assess_current_verification(
+            tmp.path(),
+            &item.attempts[0],
+        )
+        .unwrap();
+        assert!(
+            !view.commands[0].satisfied,
+            "unrelated host proof cannot cover the canonical command"
+        );
+        let outcome = interpret_reviews(tmp.path(), &store, item, "attempt-1", true, None).unwrap();
+        assert!(
+            matches!(outcome, WorkAttemptRunOutcome::PlannedWriteRound { .. }),
+            "{outcome:?}"
+        );
+        let stored = store.read_work_item("work-1").unwrap();
+        assert!(stored.merge_candidates.is_empty());
+    }
+
+    #[test]
+    fn code_change_evidence_review_plans_ordinary_writer() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (store, _) =
+            make_interpret_reviews_fixture(tmp.path(), "FAIL", Some(passing_tester_json()));
+        let targeted_id = add_evidence_targeted_review(
+            tmp.path(),
+            &store,
+            "Verdict: fail\nDisposition: code-change\n",
+        );
+        let before = store.read_work_item("work-1").unwrap();
+
+        let outcome =
+            interpret_reviews(tmp.path(), &store, before, "attempt-1", true, None).unwrap();
+
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedWriteRound { .. }
+        ));
+        let stored = store.read_work_item("work-1").unwrap();
+        let writer = stored.attempts[0].tasks.last().unwrap();
+        assert_eq!(writer.kind, TaskKind::Write);
+        assert_eq!(writer.status, TaskStatus::Planned);
+        assert_eq!(writer.input_artifacts.len(), 1);
+        assert_eq!(writer.input_artifacts[0].producer_id, targeted_id);
+        assert_eq!(
+            stored.attempts[0].evidence_recoveries[0].state,
+            EvidenceRecoveryState::CodeChange
+        );
     }
 
     fn passing_tester_json() -> &'static str {
@@ -5441,6 +19314,24 @@ mod tests {
         )
     }
 
+    fn tester_json_with_failed_command(fail_ids: &[&str], command: &str, exit_code: i32) -> String {
+        let mut results: serde_json::Value =
+            serde_json::from_str(&tester_json_with_ids(fail_ids, &[])).unwrap();
+        results["commands"] = serde_json::json!([{
+            "command": command,
+            "test_harness": "cargo-nextest",
+            "exit_code": exit_code,
+            "duration_ms": 10,
+            "stdout_log": "commands/0-stdout.log",
+            "stderr_log": "commands/0-stderr.log",
+            "process_settlement": {
+                "settlement_directory": "commands/settlement/0",
+                "leaks": []
+            }
+        }]);
+        serde_json::to_string(&results).unwrap()
+    }
+
     #[test]
     fn failing_ids_extracts_fail_test_ids() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -5481,6 +19372,43 @@ mod tests {
     }
 
     #[test]
+    fn baseline_explains_matching_failed_tester_command() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let current = tmp.path().join("current.json");
+        let baseline = tmp.path().join("baseline.json");
+        let results = tester_json_with_failed_command(&["test_a"], "cargo nextest run", 100);
+        fs::write(&current, &results).unwrap();
+        fs::write(&baseline, &results).unwrap();
+
+        assert_eq!(
+            unexplained_failed_tester_commands(&current, Some(&baseline)),
+            0
+        );
+    }
+
+    #[test]
+    fn changed_failed_tester_command_is_not_explained_by_baseline() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let current = tmp.path().join("current.json");
+        let baseline = tmp.path().join("baseline.json");
+        fs::write(
+            &current,
+            tester_json_with_failed_command(&["test_a"], "cargo nextest run --all", 100),
+        )
+        .unwrap();
+        fs::write(
+            &baseline,
+            tester_json_with_failed_command(&["test_a"], "cargo nextest run", 100),
+        )
+        .unwrap();
+
+        assert_eq!(
+            unexplained_failed_tester_commands(&current, Some(&baseline)),
+            1
+        );
+    }
+
+    #[test]
     fn preexisting_failures_pass_gate_with_baseline() {
         let tmp = tempfile::TempDir::new().unwrap();
         let baseline_json = tester_json_with_ids(&["test_b"], &["test_a"]);
@@ -5496,6 +19424,21 @@ mod tests {
         assert!(
             matches!(outcome, WorkAttemptRunOutcome::MergeCandidateReady { .. }),
             "pre-existing failure should pass gate when baseline matches; got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn preexisting_failed_command_passes_gate_with_matching_baseline() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let results = tester_json_with_failed_command(&["test_b"], "cargo nextest run", 100);
+        let (store, _) =
+            make_fixture_with_baseline(tmp.path(), "PASS", Some(&results), Some(&results));
+        let item = store.read_work_item("work-1").unwrap();
+        let outcome = interpret_reviews(tmp.path(), &store, item, "attempt-1", true, None).unwrap();
+
+        assert!(
+            matches!(outcome, WorkAttemptRunOutcome::MergeCandidateReady { .. }),
+            "a baseline-explained command exit should pass the gate; got {outcome:?}"
         );
     }
 
@@ -5532,7 +19475,7 @@ mod tests {
     }
 
     #[test]
-    fn passing_or_missing_tester_does_not_block() {
+    fn passing_tester_advances_but_missing_final_results_fail_closed() {
         let tmp_pass = tempfile::TempDir::new().unwrap();
         let (store_pass, _) =
             make_interpret_reviews_fixture(tmp_pass.path(), "PASS", Some(passing_tester_json()));
@@ -5567,11 +19510,134 @@ mod tests {
         )
         .unwrap();
         assert!(
-            matches!(
-                outcome_missing,
-                WorkAttemptRunOutcome::MergeCandidateReady { .. }
-            ),
-            "missing tester results should allow merge candidate; got {outcome_missing:?}"
+            matches!(outcome_missing, WorkAttemptRunOutcome::NeedsUser { .. }),
+            "missing final Tester results must pause for diagnosis; got {outcome_missing:?}"
+        );
+        let handoff = fs::read_to_string(tmp_missing.path().join(work_artifact_path(
+            "work-1",
+            "attempt-1",
+            "required-check-needs-user.md",
+        )))
+        .unwrap();
+        let candidate = store_missing.read_work_item("work-1").unwrap().attempts[0].tasks[0]
+            .output
+            .as_ref()
+            .unwrap()
+            .commit
+            .clone();
+        for expected in [
+            candidate.as_str(),
+            "attempt-1-tester",
+            "tester-results.json",
+            "cannot read",
+        ] {
+            assert!(handoff.contains(expected), "{expected}: {handoff}");
+        }
+    }
+
+    #[test]
+    fn unreadable_final_tester_results_fail_closed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (store, _) = make_interpret_reviews_fixture(tmp.path(), "PASS", Some("not valid JSON"));
+        let item = store.read_work_item("work-1").unwrap();
+
+        let outcome = interpret_reviews(tmp.path(), &store, item, "attempt-1", true, None).unwrap();
+
+        assert!(
+            matches!(outcome, WorkAttemptRunOutcome::NeedsUser { .. }),
+            "unreadable final Tester evidence must pause for diagnosis; got {outcome:?}"
+        );
+        let handoff = fs::read_to_string(tmp.path().join(work_artifact_path(
+            "work-1",
+            "attempt-1",
+            "required-check-needs-user.md",
+        )))
+        .unwrap();
+        let candidate = store.read_work_item("work-1").unwrap().attempts[0].tasks[0]
+            .output
+            .as_ref()
+            .unwrap()
+            .commit
+            .clone();
+        for expected in [
+            candidate.as_str(),
+            "attempt-1-tester",
+            "tester-results.json",
+            "cannot parse",
+            "line 1 column",
+        ] {
+            assert!(handoff.contains(expected), "{expected}: {handoff}");
+        }
+    }
+
+    #[test]
+    fn host_inventory_failure_does_not_schedule_a_writer() {
+        let root = tempfile::TempDir::new().unwrap();
+        let mut source: serde_json::Value = serde_json::from_str(errored_tester_json()).unwrap();
+        source["error"] = serde_json::json!({"kind":"process_settlement_infrastructure", "message":"cannot inventory processes", "details":"process collector unavailable"});
+        source["commands"] = serde_json::json!([{"command":"host inventory", "test_harness":"shell-harness", "exit_code":0,"duration_ms":1,"stdout_log":"commands/0-stdout.log","stderr_log":"commands/0-stderr.log"}]);
+        let (store, _) =
+            make_interpret_reviews_fixture(root.path(), "PASS", Some(&source.to_string()));
+        let item = store.read_work_item("work-1").unwrap();
+        let writers = item.attempts[0]
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Write)
+            .count();
+        let outcome =
+            interpret_reviews(root.path(), &store, item, "attempt-1", true, None).unwrap();
+        assert!(matches!(outcome, WorkAttemptRunOutcome::NeedsUser { .. }));
+        assert_eq!(
+            store.read_work_item("work-1").unwrap().attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            writers
+        );
+        let handoff = fs::read_to_string(root.path().join(work_artifact_path(
+            "work-1",
+            "attempt-1",
+            "required-check-needs-user.md",
+        )))
+        .unwrap();
+        let candidate = store.read_work_item("work-1").unwrap().attempts[0].tasks[0]
+            .output
+            .as_ref()
+            .unwrap()
+            .commit
+            .clone();
+        for expected in [
+            candidate.as_str(),
+            "attempt-1-tester",
+            "tester-results.json",
+            "process_settlement_infrastructure",
+            "cannot inventory processes",
+            "process collector unavailable",
+            "commands/0-stdout.log",
+            "commands/0-stderr.log",
+        ] {
+            assert!(handoff.contains(expected), "{expected}: {handoff}");
+        }
+        let (bound_root, bound) = crate::recovery_contracts::verification_tests::fixture(false);
+        let path = crate::verification_assessment::assess_canonical_checks(
+            bound_root.path(),
+            &bound.attempts[0],
+        )
+        .unwrap()
+        .results_path;
+        let mut result: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        result["error"] = serde_json::json!({"kind":"process_settlement_infrastructure","message":"cannot inventory host processes","details":"host process inventory failed"});
+        fs::write(path, serde_json::to_vec(&result).unwrap()).unwrap();
+        assert!(
+            crate::verification_assessment::assess_current_verification(
+                bound_root.path(),
+                &bound.attempts[0]
+            )
+            .unwrap()
+            .candidate_defects()
+            .is_empty()
         );
     }
 
@@ -5687,6 +19753,16 @@ mod tests {
         fs::create_dir_all(&workspace).unwrap();
         init_learner_repo(&workspace);
         fs::write(workspace.join("src.rs"), "fn main() {}").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::create_dir_all(workspace.join(".fluent")).unwrap();
+        fs::write(
+            workspace.join(".fluent/tester.yaml"),
+            "commands:\n  - command: true\n    test_harness: shell-harness\n",
+        )
+        .unwrap();
+        let extractor = workspace.join(".fluent/extract-tester-results");
+        fs::write(&extractor, "#!/bin/sh\necho '[]'\n").unwrap();
+        fs::set_permissions(&extractor, fs::Permissions::from_mode(0o755)).unwrap();
         git::run(&workspace, &["add", "."], "add").unwrap();
         git::run(&workspace, &["commit", "-m", "initial"], "commit").unwrap();
         let base = git::run_stdout(&workspace, &["rev-parse", "HEAD"], "base").unwrap();
@@ -5705,6 +19781,8 @@ mod tests {
             source_branch: "main".to_string(),
             base_commit: None,
             commit: base.clone(),
+            no_change: None,
+            learner_canonicalization: None,
         };
 
         let attempt = &mut item.attempts[0];
@@ -5720,6 +19798,21 @@ mod tests {
         let review1_dir = project_root.join(&review1_path);
         fs::create_dir_all(&review1_dir).unwrap();
         fs::write(review1_dir.join("review.md"), "Verdict: pass\n").unwrap();
+
+        for role in review::REVIEWERS
+            .iter()
+            .copied()
+            .filter(|role| *role != "tests")
+        {
+            let id = format!("attempt-1-review-1-{role}");
+            let path = work_artifact_path("work-1", "attempt-1", &id);
+            let dir = project_root.join(&path);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("review.md"), "Verdict: pass\n").unwrap();
+            attempt
+                .tasks
+                .push(review_task_with_artifact(&id, role, &path));
+        }
 
         if rounds >= 2 {
             attempt.tasks.push(Task {
@@ -5741,11 +19834,38 @@ mod tests {
             fs::write(review2_dir.join("review.md"), "Verdict: pass\n").unwrap();
         }
 
+        let tester_id = if rounds >= 2 {
+            "attempt-1-tester-2"
+        } else {
+            "attempt-1-tester"
+        };
+        let tester_path = work_artifact_path("work-1", "attempt-1", tester_id);
+        attempt.tasks.push(tester_task(tester_id, &tester_path));
+        let tester_dir = project_root.join(&tester_path);
+        fs::create_dir_all(&tester_dir).unwrap();
+        crate::tester::run(
+            &workspace,
+            &tester_dir,
+            true,
+            &crate::content::ContentResolver::new(Some(&workspace)),
+        )
+        .unwrap();
+        crate::tester::bind_candidate_commit(&tester_dir, &base).unwrap();
+
         // The reviewed change lives at `base`, so every Tester and reviewer context
         // names it. The pre-land no-expertise pointer-identity gate reads these
         // contexts, so they must reflect the real reviewed Writer SHA rather than a
         // placeholder.
         for task in &mut item.attempts[0].tasks {
+            if task.kind == TaskKind::Tester && task.review_context.is_none() {
+                task.review_context = Some(crate::work_model::ReviewContext {
+                    candidate_workspace_id: "candidate".to_string(),
+                    candidate_workspace_path: "../work-1-candidate".to_string(),
+                    source_branch: "main".to_string(),
+                    candidate_commit: base.clone(),
+                    base_commit: None,
+                });
+            }
             if let Some(context) = task.review_context.as_mut() {
                 context.candidate_commit = base.clone();
             }
@@ -5753,6 +19873,37 @@ mod tests {
 
         store.create_work_item(&item).unwrap();
         (store, project_root, workspace, base)
+    }
+
+    fn mark_latest_writer_as_verified_no_change(store: &WorkModelStore, commit: &str) {
+        store
+            .mutate_work_item("work-1", |item| {
+                let task = item.attempts[0]
+                    .tasks
+                    .iter_mut()
+                    .rev()
+                    .find(|task| {
+                        task.kind == TaskKind::Write && task.status == TaskStatus::Complete
+                    })
+                    .expect("completed Writer");
+                let artifact_path = work_artifact_path("work-1", "attempt-1", &task.id);
+                task.artifact_area = Some(TaskArtifactArea {
+                    path: artifact_path.clone(),
+                });
+                let output = task.output.as_mut().expect("Writer output");
+                output.base_commit = Some(commit.to_string());
+                output.no_change = Some(crate::work_model::NoChangeOutput {
+                    schema_version: 1,
+                    declaration_path: format!("{artifact_path}/no-change.json"),
+                    reason: "The candidate already satisfies the correction".to_string(),
+                    verification: vec![crate::work_model::NoChangeVerification {
+                        command: "cargo test focused".to_string(),
+                        result: crate::work_model::NoChangeVerificationResult::Pass,
+                    }],
+                });
+                Ok(())
+            })
+            .unwrap();
     }
 
     /// A Learner coder stub that writes an untrusted draft into the handoff
@@ -5772,6 +19923,104 @@ mod tests {
     }
 
     #[test]
+    fn evidence_targeted_reviews_advance_unchanged_candidate_to_learning() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (store, project_root, _workspace, candidate) =
+            make_learner_passing_fixture(tmp.path(), 1);
+
+        let evidence_path = ".fluent/work/artifacts/work-1/attempt-1/host-evidence/abc.json";
+        let evidence_bytes =
+            br#"{"schema_version":1,"check":"host check","result":"pass","working_directory":"."}"#;
+        fs::create_dir_all(project_root.join(evidence_path).parent().unwrap()).unwrap();
+        fs::write(project_root.join(evidence_path), evidence_bytes).unwrap();
+        let evidence_digest = format!("sha256:{:x}", Sha256::digest(evidence_bytes));
+
+        let targeted_id = "attempt-1-evidence-abc-tests";
+        let targeted_path = work_artifact_path("work-1", "attempt-1", targeted_id);
+        fs::create_dir_all(project_root.join(&targeted_path)).unwrap();
+        fs::write(
+            project_root.join(&targeted_path).join("review.md"),
+            "Verdict: pass\n",
+        )
+        .unwrap();
+        store
+            .mutate_work_item("work-1", |item| {
+                let attempt = &mut item.attempts[0];
+                let prior = attempt
+                    .tasks
+                    .iter()
+                    .find(|task| task.kind == TaskKind::Review && task.role == "tests")
+                    .cloned()
+                    .unwrap();
+                let prior_review_artifact =
+                    format!("{}/review.md", prior.artifact_area.as_ref().unwrap().path);
+                let attachment = crate::work_model::EvidenceAttachment {
+                    snapshot_path: ".fluent/work/artifacts/work-1/attempt-1/host-evidence/abc.json"
+                        .to_string(),
+                    digest: evidence_digest.clone(),
+                };
+                attempt
+                    .evidence_recoveries
+                    .push(crate::work_model::EvidenceRecovery {
+                        carried_finding: None,
+                        required_check: None,
+                        id: "host-evidence-abc".to_string(),
+                        candidate_commit: candidate.clone(),
+                        attachment: attachment.clone(),
+                        targets: vec![crate::work_model::EvidenceReviewTarget {
+                            role: "tests".to_string(),
+                            prior_review_artifact: prior_review_artifact.clone(),
+                            review_task_id: Some(targeted_id.to_string()),
+                            review_digest: None,
+                        }],
+                        state: EvidenceRecoveryState::Reviewing,
+                        created_at: "2026-08-03T00:00:00Z".to_string(),
+                        code_change_classification: None,
+                    });
+                let mut targeted = review_task_with_artifact(targeted_id, "tests", &targeted_path);
+                targeted.review_context.as_mut().unwrap().candidate_commit = candidate.clone();
+                targeted.evidence_review_context = Some(crate::work_model::EvidenceReviewContext {
+                    recovery_id: "host-evidence-abc".to_string(),
+                    candidate_commit: candidate.clone(),
+                    attachment,
+                    prior_review_artifact,
+                });
+                attempt.tasks.push(targeted);
+                attempt.status = AttemptStatus::Reviewing;
+                attempt.review_state = Some(AttemptReviewState::NotReviewed);
+                Ok(())
+            })
+            .unwrap();
+
+        let run_coder = draft_only_coder(r#"{"learning_summary":"learned","follow_ups":[]}"#);
+        let outcome = interpret_reviews(
+            &project_root,
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+            true,
+            Some(LearnerConfig {
+                run_coder: &run_coder,
+                codex_worker: None,
+                no_sandbox: false,
+            }),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::MergeCandidateReady { .. }
+        ));
+        let stored = store.read_work_item("work-1").unwrap();
+        assert!(stored.attempts[0].learning.as_ref().unwrap().is_succeeded());
+        assert_eq!(
+            stored.attempts[0].evidence_recoveries[0].state,
+            EvidenceRecoveryState::Complete
+        );
+        assert_eq!(stored.merge_candidates[0].candidate_commit, candidate);
+    }
+
+    #[test]
     fn learner_runs_after_first_pass_without_findings() {
         let tmp = tempfile::TempDir::new().unwrap();
         let (store, project_root, _workspace, _base) = make_learner_passing_fixture(tmp.path(), 1);
@@ -5787,13 +20036,20 @@ mod tests {
             Some(LearnerConfig {
                 run_coder: &run_coder,
                 codex_worker: None,
+                no_sandbox: false,
             }),
         )
         .unwrap();
 
         assert!(
             matches!(outcome, WorkAttemptRunOutcome::MergeCandidateReady { .. }),
-            "first-pass reviews passed — candidate ready; got {outcome:?}"
+            "first-pass reviews passed — candidate ready; got {outcome:?}; gate: {}",
+            fs::read_to_string(project_root.join(work_artifact_path(
+                "work-1",
+                "attempt-1",
+                "learner/runs/run-1/candidate-gate.json",
+            )))
+            .unwrap_or_default()
         );
         let stored = store.read_work_item("work-1").unwrap();
         let learning = stored.attempts[0]
@@ -5801,6 +20057,11 @@ mod tests {
             .as_ref()
             .expect("learner ran on first pass");
         assert!(learning.is_succeeded());
+        let ready_at = stored.merge_candidates[0]
+            .ready_at
+            .as_ref()
+            .expect("successful Learning stamps candidate readiness");
+        assert_eq!(stored.attempts[0].completed_at.as_ref(), Some(ready_at));
         let handoff_ref = learning.handoff.as_ref().expect("handoff persisted");
         let handoff = crate::learner::load_verified_handoff(&project_root, handoff_ref).unwrap();
         assert_eq!(handoff.source_work_item_id, "work-1");
@@ -5837,6 +20098,7 @@ mod tests {
             Some(LearnerConfig {
                 run_coder: &failing_coder,
                 codex_worker: None,
+                no_sandbox: false,
             }),
         )
         .unwrap();
@@ -5847,6 +20109,15 @@ mod tests {
                 ..
             }
         ));
+        let failed = store.read_work_item("work-1").unwrap();
+        assert!(
+            failed.attempts[0].completed_at.is_none(),
+            "failed Learning must not end end-to-end Attempt timing"
+        );
+        assert!(
+            failed.merge_candidates[0].ready_at.is_none(),
+            "failed Learning must not stamp candidate readiness"
+        );
 
         let resumed = store.read_work_item("work-1").unwrap();
         let task_count = resumed.attempts[0].tasks.len();
@@ -5874,6 +20145,8 @@ mod tests {
             resolver: &resolver,
             extra_args: &[],
             no_sandbox: true,
+            tester_no_sandbox: false,
+            resume_cancellation_requested_at: None,
             coder_mapping_inputs: None,
             learner_run_coder: Some(&run_coder),
         })
@@ -5908,6 +20181,11 @@ mod tests {
                 .as_ref()
                 .is_some_and(AttemptLearning::is_succeeded)
         );
+        let ready_at = resumed.merge_candidates[0]
+            .ready_at
+            .as_ref()
+            .expect("Learner retry stamps candidate readiness");
+        assert_eq!(resumed.attempts[0].completed_at.as_ref(), Some(ready_at));
     }
 
     #[test]
@@ -5965,6 +20243,7 @@ mod tests {
             Some(LearnerConfig {
                 run_coder: &run_coder,
                 codex_worker: None,
+                no_sandbox: false,
             }),
         )
         .unwrap();
@@ -6027,6 +20306,7 @@ mod tests {
                             message: None,
                         },
                     ),
+                    provider_liveness: None,
                 }],
             },
         };
@@ -6066,6 +20346,7 @@ mod tests {
             Some(LearnerConfig {
                 run_coder: &run_coder,
                 codex_worker: None,
+                no_sandbox: false,
             }),
         )
         .unwrap();
@@ -6121,6 +20402,7 @@ mod tests {
             Some(LearnerConfig {
                 run_coder: &run_coder,
                 codex_worker: None,
+                no_sandbox: false,
             }),
         )
         .unwrap();
@@ -6178,6 +20460,7 @@ mod tests {
             Some(LearnerConfig {
                 run_coder: &run_coder,
                 codex_worker: None,
+                no_sandbox: false,
             }),
         );
         assert!(
@@ -6205,8 +20488,40 @@ mod tests {
         // exposed handoff with no learning state.
         use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
         let tmp = tempfile::TempDir::new().unwrap();
-        let (store, project_root, _workspace, _base) = make_learner_passing_fixture(tmp.path(), 1);
+        let (store, project_root, _workspace, verified_commit) =
+            make_learner_passing_fixture(tmp.path(), 1);
+        mark_latest_writer_as_verified_no_change(&store, &verified_commit);
+        store
+            .mutate_work_item("work-1", |item| {
+                item.attempts[0].review_state = Some(AttemptReviewState::Passed);
+                crate::work_model::set_attempt_terminal(
+                    &mut item.attempts[0],
+                    AttemptStatus::Complete,
+                );
+                item.create_or_get_merge_candidate("attempt-1")?;
+                item.attempts[0].learning = Some(AttemptLearning::in_progress(1));
+                Ok(())
+            })
+            .unwrap();
         let mut item = store.read_work_item("work-1").unwrap();
+        // Mirror the production boundary: `try_learn` canonicalizes only the
+        // in-memory aggregate returned from the accepted Learner run. The durable
+        // reservation remains non-divergent/InProgress until `finalize_learning`
+        // atomically persists the pointers with HandoffPending.
+        let canonical_commit = "canonical-expertise-commit".to_string();
+        let output = item.attempts[0]
+            .tasks
+            .iter_mut()
+            .rev()
+            .find(|task| task.kind == TaskKind::Write)
+            .and_then(|task| task.output.as_mut())
+            .unwrap();
+        output.commit = canonical_commit.clone();
+        output.learner_canonicalization = Some(LearnerCommitCanonicalization {
+            from_commit: verified_commit.clone(),
+            to_commit: canonical_commit.clone(),
+        });
+        item.merge_candidates[0].candidate_commit = canonical_commit;
 
         let handoff = crate::follow_up::LearnerHandoffV1::new(
             "work-1",
@@ -6227,6 +20542,7 @@ mod tests {
             let probe = WorkModelStore::new(&probe_root)
                 .read_work_item("work-1")
                 .unwrap();
+            probe.validate().unwrap();
             let learning = probe.attempts[0]
                 .learning
                 .as_ref()
@@ -6268,6 +20584,24 @@ mod tests {
             .as_ref()
             .expect("Succeeded carries its handoff reference");
         assert_eq!(handoff_ref.path, "handoff.json");
+        let output = stored.attempts[0]
+            .tasks
+            .iter()
+            .rev()
+            .find(|task| task.kind == TaskKind::Write)
+            .and_then(|task| task.output.as_ref())
+            .unwrap();
+        assert_eq!(
+            output.base_commit.as_deref(),
+            Some(verified_commit.as_str())
+        );
+        assert_eq!(
+            output
+                .learner_canonicalization
+                .as_ref()
+                .map(|transition| transition.to_commit.as_str()),
+            Some("canonical-expertise-commit")
+        );
     }
 
     #[test]
@@ -6330,6 +20664,7 @@ mod tests {
                         &LearnerConfig {
                             run_coder: &run_coder,
                             codex_worker: None,
+                            no_sandbox: false,
                         },
                     )
                     .unwrap();
@@ -6375,6 +20710,7 @@ mod tests {
                 &LearnerConfig {
                     run_coder: &run_coder,
                     codex_worker: None,
+                    no_sandbox: false,
                 },
             )
             .unwrap();
@@ -6425,6 +20761,7 @@ mod tests {
             Some(LearnerConfig {
                 run_coder: &run_coder,
                 codex_worker: None,
+                no_sandbox: false,
             }),
         )
         .unwrap();
@@ -6468,9 +20805,9 @@ mod tests {
         // Required-progress production B1: creating a planned Attempt from a Plan with
         // required rows stamps its immutable manifest, and the host materializes
         // exactly one stable current-required-progress entry per required row into the
-        // authoritative section BEFORE the first Writer launches. Materialization is
-        // idempotent (crash-retry safe), never rewrites a Writer's checkmarks, and the
-        // manifest survives persistence unchanged.
+        // host-owned section BEFORE the first Writer launches. Materialization is
+        // idempotent (crash-retry safe), leaves an existing projection untouched, and
+        // the manifest survives persistence unchanged.
         let tmp = tempfile::TempDir::new().unwrap();
         let project_root = tmp.path();
         let store = WorkModelStore::new(project_root);
@@ -6529,8 +20866,8 @@ mod tests {
             "non-required rows are excluded from the required-progress section"
         );
 
-        // Crash-retry / follow-up Writer: a checked entry with evidence survives a
-        // second materialization untouched, so the checklist is never overwritten.
+        // Crash-retry: existing content survives pre-Writer materialization. The
+        // completed-Writer gate, not this setup step, later projects matrix evidence.
         let checked = "## Required completion\n\n\
              - [x] step-1 — First requirement; Evidence: src/x.rs\n\
              - [ ] step-2 — Second requirement\n";
@@ -6615,6 +20952,5173 @@ mod tests {
     }
 
     #[test]
+    fn unchecked_required_progress_plans_writer_before_tester_or_review() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let mut item = WorkItem::planned("work-1", "Finish required work");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let writer = &mut item.attempts[0].tasks[0];
+        writer.status = TaskStatus::Complete;
+        writer.output = Some(TaskOutput {
+            workspace_id: "candidate".to_string(),
+            workspace_path: ".fluent/work/workspaces/work-1/attempt-1/candidate".to_string(),
+            source_branch: "work/attempt-1".to_string(),
+            base_commit: None,
+            commit: "abc123".to_string(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        item.attempts[0].progress_contract = Some(crate::work_model::ProgressContract {
+            version: crate::work_model::PROGRESS_CONTRACT_VERSION,
+            required: vec![crate::work_model::RequiredProgressEntry {
+                id: "step-1".to_string(),
+                requirement: "Do the thing".to_string(),
+            }],
+        });
+        store.create_work_item(&item).unwrap();
+        let progress_path = tmp
+            .path()
+            .join(".fluent/work/progress/work-1/attempt-1/progress.md");
+        fs::create_dir_all(progress_path.parent().unwrap()).unwrap();
+        fs::write(
+            progress_path,
+            "## Required completion\n\n- [ ] step-1 — Do the thing\n",
+        )
+        .unwrap();
+
+        let mut item = store.read_work_item("work-1").unwrap();
+        let outcome =
+            gate_writer_completion_before_reviews(tmp.path(), &store, &mut item, "attempt-1")
+                .unwrap()
+                .expect("unchecked progress must be handled before review planning");
+
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedWriteRound { .. }
+        ));
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            2
+        );
+        assert!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .all(|task| !is_review_phase_task(task))
+        );
+        assert_eq!(
+            stored.attempts[0].writer_runs[0].outcome,
+            WriterOutcome::Continue
+        );
+    }
+
+    #[test]
+    fn writer_completion_excludes_host_and_later_stage_work() {
+        let context = crate::work_model::PlanningContext {
+            behaviors: Some("## Fix\n### B1\nWHEN invoked, THE SYSTEM SHALL work.\nTest: src/lib.rs (fix)\n".into()),
+            plan: Some("| # | State reached | Behaviors | Verification | Responsibility | Req? |\n| 1 | Fix source | Fix:B1 | `cargo test fix` | writer | Yes |\n| 2 | Check host | | `bash tests/host.sh` | host | Yes |\n| 3 | Review | | All reviews | review | Yes |\n| 4 | Test | | Canonical suite | tester | Yes |\n| 5 | Learn | | Successful Learner | learner | Yes |\n".into()),
+            ..Default::default()
+        };
+        let contract =
+            crate::work_model::WriterCompletionContract::from_planning_context(&context).unwrap();
+        let findings = vec![crate::work_model::WriterCompletionFinding {
+            id: "finding:tests:fix".into(),
+            role: "tests".into(),
+            source: "review.md".into(),
+            requirement: "Fix the regression".into(),
+        }];
+        let mut matrix = crate::work_model::WriterCompletionMatrix::skeleton(
+            &contract, "writer", &findings, None,
+        )
+        .unwrap();
+        for row in &mut matrix.rows {
+            if row.id.starts_with("behavior:")
+                || row.id == "plan:step-1"
+                || row.id.starts_with("finding:")
+            {
+                row.state = crate::work_model::WriterCompletionState::Complete;
+                row.implementation_evidence = vec!["src/lib.rs: fix".into()];
+                row.verification = vec![crate::work_model::WriterVerificationClaim {
+                    command: "cargo test fix".into(),
+                    result: crate::work_model::WriterVerificationResult::Pass,
+                }];
+                if row.id.starts_with("finding:") {
+                    row.applicable_constraints = vec!["behavior:fix:b1".into()];
+                }
+            }
+        }
+        let status = matrix
+            .status_against(&contract, "writer", &findings)
+            .unwrap();
+        assert!(status.is_complete(), "{status:?}");
+        assert_eq!(status.required, 3);
+        matrix.rows.last_mut().unwrap().state = crate::work_model::WriterCompletionState::Pending;
+        matrix
+            .rows
+            .last_mut()
+            .unwrap()
+            .implementation_evidence
+            .clear();
+        matrix.rows.last_mut().unwrap().verification.clear();
+        matrix
+            .rows
+            .last_mut()
+            .unwrap()
+            .applicable_constraints
+            .clear();
+        assert!(
+            !matrix
+                .status_against(&contract, "writer", &findings)
+                .unwrap()
+                .is_complete()
+        );
+    }
+
+    #[test]
+    fn pending_host_action_pauses_before_another_writer() {
+        for after_review in [false, true] {
+            let project = tempfile::TempDir::new().unwrap();
+            let workspace = tempfile::TempDir::new().unwrap();
+            init_learner_repo(workspace.path());
+            fs::write(workspace.path().join("source.rs"), "fixed\n").unwrap();
+            git::run(workspace.path(), &["add", "."], "stage").unwrap();
+            git::run(workspace.path(), &["commit", "-m", "Fix source"], "commit").unwrap();
+            let candidate =
+                git::run_stdout(workspace.path(), &["rev-parse", "HEAD"], "candidate").unwrap();
+            let mut item = WorkItem::planned("ownership", "Assign work");
+            item.planning_context = Some(crate::work_model::PlanningContext {
+                plan: Some("| # | State reached | Behaviors | Verification | Responsibility | Req? |\n| 1 | Fix source | | `cargo test fix` | writer | Yes |\n| 2 | Check host | | `bash tests/host.sh` | host | Yes |\n| 3 | Review | | Applicable reviews | review | Yes |\n".into()),
+                ..Default::default()
+            });
+            item.add_initial_attempt("attempt-1").unwrap();
+            let path = crate::work_task_executor::materialize_writer_completion_before_writer(
+                project.path(),
+                &item,
+                "attempt-1",
+                "attempt-1-write-1",
+            )
+            .unwrap()
+            .unwrap();
+            let mut matrix: crate::work_model::WriterCompletionMatrix =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            matrix.rows[0].state = crate::work_model::WriterCompletionState::Complete;
+            matrix.rows[0].implementation_evidence = vec!["source.rs".into()];
+            matrix.rows[0].verification = vec![crate::work_model::WriterVerificationClaim {
+                command: "cargo test fix".into(),
+                result: crate::work_model::WriterVerificationResult::Pass,
+            }];
+            fs::write(&path, serde_json::to_vec_pretty(&matrix).unwrap()).unwrap();
+            let writer = &mut item.attempts[0].tasks[0];
+            writer.status = TaskStatus::Complete;
+            writer.output = Some(TaskOutput {
+                workspace_id: "candidate".into(),
+                workspace_path: workspace.path().display().to_string(),
+                source_branch: "main".into(),
+                base_commit: None,
+                commit: candidate.clone(),
+                no_change: None,
+                learner_canonicalization: None,
+            });
+            if after_review {
+                item.add_next_review_tasks("attempt-1", &["tests"]).unwrap();
+                let review = item.attempts[0].tasks.last_mut().unwrap();
+                review.status = TaskStatus::Complete;
+                item.attempts[0].review_state = Some(AttemptReviewState::Failed);
+            }
+            let store = WorkModelStore::new(project.path());
+            store.create_work_item(&item).unwrap();
+            let before_tasks = item.attempts[0].tasks.clone();
+            let outcome = gate_writer_completion_before_reviews(
+                project.path(),
+                &store,
+                &mut item,
+                "attempt-1",
+            )
+            .unwrap();
+            let Some(WorkAttemptRunOutcome::NeedsUser { handoff_path }) = outcome else {
+                panic!("expected host pause: {outcome:?}")
+            };
+            let handoff = fs::read_to_string(project.path().join(handoff_path)).unwrap();
+            for value in [&candidate, "plan:step-2", "bash tests/host.sh", "evidence"] {
+                assert!(handoff.contains(value), "missing {value}: {handoff}");
+            }
+            assert!(
+                handoff.contains("Evidence working_directory: ."),
+                "{handoff}"
+            );
+            assert!(handoff.contains("candidate checkout root"), "{handoff}");
+            let stored = store.read_work_item("ownership").unwrap();
+            assert_eq!(stored.attempts[0].tasks, before_tasks);
+            assert_eq!(stored.attempts[0].status, AttemptStatus::NeedsUser);
+        }
+    }
+
+    #[test]
+    fn stagnant_post_review_continuations_pause() {
+        for scenario in [
+            "stagnant",
+            "new-finding",
+            "progress",
+            "no-output",
+            "regressed",
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let store = make_completed_writer_matrix_fixture(tmp.path(), false);
+            let mut item = store.read_work_item("matrix-work").unwrap();
+            let review_path = ".fluent/work/artifacts/matrix-work/attempt-1/review-tests/review.md";
+            fs::create_dir_all(tmp.path().join(review_path).parent().unwrap()).unwrap();
+            fs::write(
+                tmp.path().join(review_path),
+                "Verdict: fail\n- [ ] Keep the pending correction (blocking)\n",
+            )
+            .unwrap();
+            let review = ArtifactRef {
+                producer_id: "review-tests".into(),
+                path: review_path.into(),
+            };
+            // Each corrective Writer receives a stable finding and a new commit.
+            for round in 0..3 {
+                item.add_next_write_round("attempt-1", vec![review.clone()])
+                    .unwrap();
+                let task_id = item.attempts[0].tasks.last().unwrap().id.clone();
+                if round == 2 && scenario == "new-finding" {
+                    // A new review artifact keeps earlier finding history intact.
+                    let path =
+                        ".fluent/work/artifacts/matrix-work/attempt-1/new-review-tests/review.md";
+                    fs::create_dir_all(tmp.path().join(path).parent().unwrap()).unwrap();
+                    fs::write(
+                        tmp.path().join(path),
+                        "Verdict: fail\n- [ ] A genuinely new correction (blocking)\n",
+                    )
+                    .unwrap();
+                    item.attempts[0].tasks.last_mut().unwrap().input_artifacts =
+                        vec![ArtifactRef {
+                            producer_id: "review-tests".into(),
+                            path: path.into(),
+                        }];
+                }
+                let path = crate::work_task_executor::materialize_writer_completion_before_writer(
+                    tmp.path(),
+                    &item,
+                    "attempt-1",
+                    &task_id,
+                )
+                .unwrap()
+                .unwrap();
+                let mut matrix: crate::work_model::WriterCompletionMatrix =
+                    serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                if (scenario == "progress" && round == 2) || (scenario == "regressed" && round < 2)
+                {
+                    matrix.rows[0].state = crate::work_model::WriterCompletionState::Complete;
+                    matrix.rows[0].implementation_evidence = vec!["src/dashboard.rs".into()];
+                    matrix.rows[0].verification =
+                        vec![crate::work_model::WriterVerificationClaim {
+                            command: "cargo test preserves_selection".into(),
+                            result: crate::work_model::WriterVerificationResult::Pass,
+                        }];
+                } else if scenario == "regressed" {
+                    matrix.rows[0].state = crate::work_model::WriterCompletionState::Pending;
+                    matrix.rows[0].implementation_evidence.clear();
+                    matrix.rows[0].verification.clear();
+                }
+                if scenario == "new-finding" && round < 2 {
+                    let finding = matrix.rows.last_mut().unwrap();
+                    finding.state = crate::work_model::WriterCompletionState::Complete;
+                    finding.implementation_evidence = vec!["src/dashboard.rs".into()];
+                    finding.verification = vec![crate::work_model::WriterVerificationClaim {
+                        command: "cargo test preserves_selection".into(),
+                        result: crate::work_model::WriterVerificationResult::Pass,
+                    }];
+                    finding.applicable_constraints = vec!["behavior:dashboard:b1".into()];
+                }
+                fs::write(&path, serde_json::to_vec_pretty(&matrix).unwrap()).unwrap();
+                let workspace = tmp.path().join("candidate");
+                let base =
+                    git::run_stdout(&workspace, &["rev-parse", "HEAD"], "read prior candidate")
+                        .unwrap();
+                if !(round == 2 && scenario == "no-output") {
+                    fs::write(workspace.join("correction.txt"), format!("round {round}\n"))
+                        .unwrap();
+                    git::run(&workspace, &["add", "correction.txt"], "stage correction").unwrap();
+                    git::run(
+                        &workspace,
+                        &["commit", "-qm", "Record correction"],
+                        "commit correction",
+                    )
+                    .unwrap();
+                }
+                let candidate =
+                    git::run_stdout(&workspace, &["rev-parse", "HEAD"], "read candidate").unwrap();
+                let task = item.attempts[0].tasks.last_mut().unwrap();
+                task.status = TaskStatus::Complete;
+                task.output = Some(TaskOutput {
+                    workspace_id: "candidate".into(),
+                    workspace_path: "candidate".into(),
+                    source_branch: "main".into(),
+                    base_commit: Some(base),
+                    commit: candidate,
+                    no_change: None,
+                    learner_canonicalization: None,
+                });
+                if round < 2 {
+                    record_writer_run(
+                        tmp.path(),
+                        &mut item,
+                        0,
+                        WriterOutcome::Continue,
+                        0,
+                        usize::from(matches!(scenario, "regressed" | "new-finding")),
+                    );
+                }
+            }
+            store.write_work_item(&item).unwrap();
+            let prior_tasks = item.attempts[0].tasks.len();
+            let outcome =
+                gate_writer_completion_before_reviews(tmp.path(), &store, &mut item, "attempt-1")
+                    .unwrap()
+                    .unwrap();
+            if matches!(scenario, "stagnant" | "no-output" | "regressed") {
+                let WorkAttemptRunOutcome::NeedsUser { handoff_path } = outcome else {
+                    panic!("{scenario}: {outcome:?}");
+                };
+                let handoff = fs::read_to_string(tmp.path().join(handoff_path)).unwrap();
+                if scenario == "stagnant" {
+                    assert!(
+                        handoff.contains("two") && handoff.contains("no completion progress"),
+                        "{handoff}"
+                    );
+                }
+                assert_eq!(
+                    store.read_work_item("matrix-work").unwrap().attempts[0]
+                        .tasks
+                        .len(),
+                    prior_tasks
+                );
+            } else {
+                assert!(
+                    matches!(outcome, WorkAttemptRunOutcome::PlannedWriteRound { .. }),
+                    "{scenario}: {outcome:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn second_stagnant_pre_review_continuation_pauses() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let mut item = WorkItem::planned("work-1", "Finish required work");
+        item.add_initial_attempt("attempt-1").unwrap();
+        item.attempts[0].progress_contract = Some(crate::work_model::ProgressContract {
+            version: crate::work_model::PROGRESS_CONTRACT_VERSION,
+            required: vec![crate::work_model::RequiredProgressEntry {
+                id: "step-1".to_string(),
+                requirement: "Do the thing".to_string(),
+            }],
+        });
+        for round in 0..3 {
+            if round > 0 {
+                item.add_next_write_round(
+                    "attempt-1",
+                    vec![required_progress_artifact(&item.attempts[0])],
+                )
+                .unwrap();
+            }
+            let task_id = {
+                let task = item.attempts[0]
+                    .tasks
+                    .iter_mut()
+                    .rev()
+                    .find(|task| task.kind == TaskKind::Write)
+                    .unwrap();
+                task.status = TaskStatus::Complete;
+                task.output = Some(TaskOutput {
+                    workspace_id: "candidate".to_string(),
+                    workspace_path: "candidate".to_string(),
+                    source_branch: "work/attempt-1".to_string(),
+                    base_commit: None,
+                    commit: format!("commit-{}", round + 1),
+                    no_change: None,
+                    learner_canonicalization: None,
+                });
+                task.id.clone()
+            };
+            if round < 2 {
+                item.attempts[0].writer_runs.push(WriterRun {
+                    task_id,
+                    outcome: WriterOutcome::Continue,
+                    kind: if round == 0 {
+                        crate::work_model::WriterRunKind::Initial
+                    } else {
+                        crate::work_model::WriterRunKind::PreReviewContinuation
+                    },
+                    provider: "codex".to_string(),
+                    session_id: Some("writer-thread-1".to_string()),
+                    continuation: round,
+                    checked_required: 0,
+                    completed_matrix: 0,
+                    candidate_commit: format!("commit-{}", round + 1),
+                });
+            }
+        }
+        store.create_work_item(&item).unwrap();
+        let progress = tmp
+            .path()
+            .join(".fluent/work/progress/work-1/attempt-1/progress.md");
+        fs::create_dir_all(progress.parent().unwrap()).unwrap();
+        fs::write(
+            progress,
+            "## Required completion\n\n- [ ] step-1 — Do the thing\n",
+        )
+        .unwrap();
+
+        let mut item = store.read_work_item("work-1").unwrap();
+        let outcome =
+            gate_writer_completion_before_reviews(tmp.path(), &store, &mut item, "attempt-1")
+                .unwrap()
+                .expect("an incomplete no-change Writer pauses");
+
+        assert!(matches!(outcome, WorkAttemptRunOutcome::NeedsUser { .. }));
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(stored.attempts[0].status, AttemptStatus::NeedsUser);
+        assert_eq!(
+            stored.attempts[0].writer_runs.last().unwrap().outcome,
+            WriterOutcome::Blocked
+        );
+        assert!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .all(|task| !is_review_phase_task(task))
+        );
+    }
+
+    #[test]
+    fn incomplete_no_change_writer_pauses_instead_of_continuing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = make_completed_writer_gate_fixture(
+            tmp.path(),
+            Some("## Required completion\n\n- [ ] step-1 — Do the thing\n"),
+            true,
+        );
+        store
+            .mutate_work_item("work-1", |item| {
+                let output = item.attempts[0].tasks[0].output.as_mut().unwrap();
+                output.base_commit = Some(output.commit.clone());
+                Ok(())
+            })
+            .unwrap();
+
+        let mut item = store.read_work_item("work-1").unwrap();
+        let outcome =
+            gate_writer_completion_before_reviews(tmp.path(), &store, &mut item, "attempt-1")
+                .unwrap()
+                .expect("an incomplete no-change Writer pauses");
+
+        assert!(matches!(outcome, WorkAttemptRunOutcome::NeedsUser { .. }));
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            stored.attempts[0].writer_runs[0].outcome,
+            WriterOutcome::Blocked
+        );
+        assert_eq!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            1
+        );
+        assert_eq!(
+            stored.attempts[0].tasks[0].output.as_ref().unwrap().commit,
+            "abc123"
+        );
+    }
+
+    #[test]
+    fn regressed_required_progress_pauses_before_review() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let mut item = WorkItem::planned("work-1", "Keep progress monotonic");
+        item.add_initial_attempt("attempt-1").unwrap();
+        item.attempts[0].progress_contract = Some(crate::work_model::ProgressContract {
+            version: crate::work_model::PROGRESS_CONTRACT_VERSION,
+            required: vec![
+                crate::work_model::RequiredProgressEntry {
+                    id: "step-1".to_string(),
+                    requirement: "First".to_string(),
+                },
+                crate::work_model::RequiredProgressEntry {
+                    id: "step-2".to_string(),
+                    requirement: "Second".to_string(),
+                },
+            ],
+        });
+        let first_task_id = {
+            let first = &mut item.attempts[0].tasks[0];
+            first.status = TaskStatus::Complete;
+            first.output = Some(TaskOutput {
+                workspace_id: "candidate".to_string(),
+                workspace_path: "candidate".to_string(),
+                source_branch: "work/attempt-1".to_string(),
+                base_commit: None,
+                commit: "commit-1".to_string(),
+                no_change: None,
+                learner_canonicalization: None,
+            });
+            first.id.clone()
+        };
+        item.attempts[0].writer_runs.push(WriterRun {
+            task_id: first_task_id,
+            outcome: WriterOutcome::Continue,
+            kind: WriterRunKind::Initial,
+            provider: "codex".to_string(),
+            session_id: Some("thread-1".to_string()),
+            continuation: 0,
+            checked_required: 1,
+            completed_matrix: 0,
+            candidate_commit: "commit-1".to_string(),
+        });
+        let artifact = required_progress_artifact(&item.attempts[0]);
+        item.add_next_write_round("attempt-1", vec![artifact])
+            .unwrap();
+        let current = item.attempts[0].tasks.last_mut().unwrap();
+        current.status = TaskStatus::Complete;
+        current.output = Some(TaskOutput {
+            workspace_id: "candidate".to_string(),
+            workspace_path: "candidate".to_string(),
+            source_branch: "work/attempt-1".to_string(),
+            base_commit: None,
+            commit: "commit-2".to_string(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        store.create_work_item(&item).unwrap();
+        let progress = tmp
+            .path()
+            .join(".fluent/work/progress/work-1/attempt-1/progress.md");
+        fs::create_dir_all(progress.parent().unwrap()).unwrap();
+        fs::write(
+            progress,
+            "## Required completion\n\n- [ ] step-1 — First\n- [ ] step-2 — Second\n",
+        )
+        .unwrap();
+
+        let outcome = plan_after_completed_writer(
+            tmp.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, WorkAttemptRunOutcome::NeedsUser { .. }));
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            stored.attempts[0].writer_runs.last().unwrap().outcome,
+            WriterOutcome::Blocked
+        );
+        assert_eq!(
+            stored.attempts[0]
+                .writer_runs
+                .last()
+                .unwrap()
+                .candidate_commit,
+            "commit-2"
+        );
+        assert!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .all(|task| !is_review_phase_task(task))
+        );
+    }
+
+    fn make_completed_writer_gate_fixture(
+        project_root: &Path,
+        progress: Option<&str>,
+        marked: bool,
+    ) -> WorkModelStore {
+        let store = WorkModelStore::new(project_root);
+        let mut item = WorkItem::planned("work-1", "Finish required work");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let writer = &mut item.attempts[0].tasks[0];
+        writer.status = TaskStatus::Complete;
+        writer.output = Some(TaskOutput {
+            workspace_id: "candidate".to_string(),
+            workspace_path: ".fluent/work/workspaces/work-1/attempt-1/candidate".to_string(),
+            source_branch: "work/attempt-1".to_string(),
+            base_commit: None,
+            commit: "abc123".to_string(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        if marked {
+            item.attempts[0].progress_contract = Some(crate::work_model::ProgressContract {
+                version: crate::work_model::PROGRESS_CONTRACT_VERSION,
+                required: vec![crate::work_model::RequiredProgressEntry {
+                    id: "step-1".to_string(),
+                    requirement: "Do the thing".to_string(),
+                }],
+            });
+        }
+        store.create_work_item(&item).unwrap();
+        if let Some(progress) = progress {
+            let path = project_root.join(".fluent/work/progress/work-1/attempt-1/progress.md");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, progress).unwrap();
+        }
+        store
+    }
+
+    #[test]
+    fn checked_required_progress_plans_review_round_without_tester() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = make_completed_writer_gate_fixture(
+            tmp.path(),
+            Some("## Required completion\n\n- [x] step-1 — Do the thing; Evidence: src/x.rs\n"),
+            true,
+        );
+        let transcript = tmp
+            .path()
+            .join(".fluent/work/artifacts/work-1/attempt-1/attempt-1-write-1/transcript.jsonl");
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::write(
+            transcript,
+            "{\"type\":\"thread.started\",\"thread_id\":\"writer-session-1\"}\n",
+        )
+        .unwrap();
+
+        let outcome = plan_after_completed_writer(
+            tmp.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedReviews { .. }
+        ));
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Tester)
+                .count(),
+            0
+        );
+        assert_eq!(stored.attempts[0].writer_runs.len(), 1);
+        assert_eq!(
+            stored.attempts[0].writer_runs[0].outcome,
+            WriterOutcome::Complete
+        );
+        assert_eq!(
+            stored.attempts[0].writer_runs[0].session_id.as_deref(),
+            Some("writer-session-1")
+        );
+        assert_eq!(stored.attempts[0].writer_runs[0].continuation, 0);
+        assert_eq!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Review)
+                .count(),
+            review::REVIEWERS.len()
+        );
+        assert_eq!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            1
+        );
+    }
+
+    fn make_completed_writer_matrix_fixture(project_root: &Path, complete: bool) -> WorkModelStore {
+        let workspace = project_root.join("candidate");
+        fs::create_dir_all(workspace.join("tests")).unwrap();
+        init_learner_repo(&workspace);
+        fs::write(
+            workspace.join("tests/dashboard.rs"),
+            "#[test]\nfn preserves_selection() {}\n",
+        )
+        .unwrap();
+        git::run(
+            &workspace,
+            &["add", "tests/dashboard.rs"],
+            "stage behavior source",
+        )
+        .unwrap();
+        git::run(
+            &workspace,
+            &["commit", "-qm", "Add behavior source"],
+            "commit behavior source",
+        )
+        .unwrap();
+        let candidate =
+            git::run_stdout(&workspace, &["rev-parse", "HEAD"], "read candidate").unwrap();
+        let store = WorkModelStore::new(project_root);
+        let mut item = WorkItem::planned("matrix-work", "Complete the approved behaviors");
+        item.planning_context = Some(crate::work_model::PlanningContext {
+            behaviors: Some(
+                "# Behaviors (diff)\n\n\
+                 ## Dashboard\n\n\
+                 ### B1\n\n\
+                 WHEN refreshed, THE SYSTEM SHALL preserve selection.\n\
+                 Test: tests/dashboard.rs (preserves_selection)\n"
+                    .to_string(),
+            ),
+            ..Default::default()
+        });
+        item.add_initial_attempt("attempt-1").unwrap();
+        crate::work_task_executor::materialize_writer_completion_before_writer(
+            project_root,
+            &item,
+            "attempt-1",
+            "attempt-1-write-1",
+        )
+        .unwrap();
+        let matrix_path = project_root.join(
+            ".fluent/work/artifacts/matrix-work/attempt-1/attempt-1-write-1/writer-completion.json",
+        );
+        let mut matrix: crate::work_model::WriterCompletionMatrix =
+            serde_json::from_str(&fs::read_to_string(&matrix_path).unwrap()).unwrap();
+        if complete {
+            matrix.rows[0].state = crate::work_model::WriterCompletionState::Complete;
+            matrix.rows[0].implementation_evidence = vec!["src/dashboard.rs".to_string()];
+            matrix.rows[0].verification = vec![crate::work_model::WriterVerificationClaim {
+                command: "cargo test preserves_selection".to_string(),
+                result: crate::work_model::WriterVerificationResult::Pass,
+            }];
+            fs::write(&matrix_path, serde_json::to_vec_pretty(&matrix).unwrap()).unwrap();
+        }
+        let writer = &mut item.attempts[0].tasks[0];
+        writer.status = TaskStatus::Complete;
+        writer.output = Some(TaskOutput {
+            workspace_id: "candidate".to_string(),
+            workspace_path: "candidate".to_string(),
+            source_branch: "work/attempt-1".to_string(),
+            base_commit: None,
+            commit: candidate,
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        store.create_work_item(&item).unwrap();
+        store
+    }
+
+    fn make_completed_writer_progress_matrix_fixture(project_root: &Path) -> WorkModelStore {
+        let store = WorkModelStore::new(project_root);
+        let mut item = WorkItem::planned("matrix-progress-work", "Project required progress");
+        item.planning_context = Some(crate::work_model::PlanningContext {
+            plan: Some(
+                "| # | State reached | Behaviors | Verification | Req? |\n\
+                 |---|---------------|-----------|--------------|------|\n\
+                 | 1 | Preserve the approved punctuation. | B1 | cargo test projection | Yes |\n"
+                    .to_string(),
+            ),
+            ..Default::default()
+        });
+        item.add_initial_attempt("attempt-1").unwrap();
+        crate::work_task_executor::materialize_required_progress_before_writer(
+            project_root,
+            &item,
+            "attempt-1",
+        )
+        .unwrap();
+        crate::work_task_executor::materialize_writer_completion_before_writer(
+            project_root,
+            &item,
+            "attempt-1",
+            "attempt-1-write-1",
+        )
+        .unwrap();
+        let matrix_path = project_root.join(
+            ".fluent/work/artifacts/matrix-progress-work/attempt-1/attempt-1-write-1/writer-completion.json",
+        );
+        let mut matrix: crate::work_model::WriterCompletionMatrix =
+            serde_json::from_str(&fs::read_to_string(&matrix_path).unwrap()).unwrap();
+        for row in &mut matrix.rows {
+            row.state = crate::work_model::WriterCompletionState::Complete;
+            row.implementation_evidence = vec!["src/work_model.rs".to_string()];
+            row.verification = vec![crate::work_model::WriterVerificationClaim {
+                command: "cargo test projection".to_string(),
+                result: crate::work_model::WriterVerificationResult::Pass,
+            }];
+        }
+        fs::write(&matrix_path, serde_json::to_vec_pretty(&matrix).unwrap()).unwrap();
+
+        let progress_path =
+            project_root.join(".fluent/work/progress/matrix-progress-work/attempt-1/progress.md");
+        fs::write(
+            &progress_path,
+            "## Required completion\n\n\
+             - [x] step-1 — Preserve the approved punctuation; Evidence: Writer text\n\
+               - commit abc123\n\n\
+             ## Review follow-ups\n\n\
+             - [ ] Preserve this separate finding\n",
+        )
+        .unwrap();
+
+        let writer = &mut item.attempts[0].tasks[0];
+        writer.status = TaskStatus::Complete;
+        writer.output = Some(TaskOutput {
+            workspace_id: "candidate".to_string(),
+            workspace_path: "candidate".to_string(),
+            source_branch: "work/attempt-1".to_string(),
+            base_commit: None,
+            commit: "abc123".to_string(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        store.create_work_item(&item).unwrap();
+        store
+    }
+
+    #[test]
+    fn incomplete_writer_completion_matrix_returns_to_writer_before_review() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = make_completed_writer_matrix_fixture(tmp.path(), false);
+
+        let outcome = plan_after_completed_writer(
+            tmp.path(),
+            &store,
+            store.read_work_item("matrix-work").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedWriteRound { .. }
+        ));
+        let stored = store.read_work_item("matrix-work").unwrap();
+        assert_eq!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            2
+        );
+        assert!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .all(|task| !is_review_phase_task(task))
+        );
+        assert_eq!(stored.attempts[0].writer_runs[0].completed_matrix, 0);
+    }
+
+    #[test]
+    fn complete_writer_completion_matrix_reaches_review_and_is_attached() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = make_completed_writer_matrix_fixture(tmp.path(), true);
+
+        let outcome = plan_after_completed_writer(
+            tmp.path(),
+            &store,
+            store.read_work_item("matrix-work").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedReviews { .. }
+        ));
+        let stored = store.read_work_item("matrix-work").unwrap();
+        assert_eq!(stored.attempts[0].writer_runs[0].completed_matrix, 1);
+        for review in stored.attempts[0]
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Review)
+        {
+            assert!(
+                review
+                    .input_artifacts
+                    .iter()
+                    .any(|artifact| artifact.path.ends_with("/writer-completion.json"))
+            );
+        }
+    }
+
+    #[test]
+    fn recoverable_writer_completion_claims_are_repaired_before_review() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = make_completed_writer_matrix_fixture(tmp.path(), true);
+        let source_path = tmp.path().join(
+            ".fluent/work/artifacts/matrix-work/attempt-1/attempt-1-write-1/writer-completion.json",
+        );
+        let mut matrix: crate::work_model::WriterCompletionMatrix =
+            serde_json::from_str(&fs::read_to_string(&source_path).unwrap()).unwrap();
+        matrix.rows[0].applicable_constraints = vec![
+            "behavior:dashboard:b1".to_string(),
+            "plan:step-1".to_string(),
+        ];
+        fs::write(&source_path, serde_json::to_vec_pretty(&matrix).unwrap()).unwrap();
+
+        let outcome = plan_after_completed_writer(
+            tmp.path(),
+            &store,
+            store.read_work_item("matrix-work").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedReviews { .. }
+        ));
+        let original: crate::work_model::WriterCompletionMatrix =
+            serde_json::from_str(&fs::read_to_string(&source_path).unwrap()).unwrap();
+        assert!(!original.rows[0].applicable_constraints.is_empty());
+        let stored = store.read_work_item("matrix-work").unwrap();
+        let repair_evidence = stored.attempts[0]
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.path.ends_with("/repair.json"))
+            .expect("repair evidence is attached to the Attempt");
+        let evidence: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(tmp.path().join(&repair_evidence.path)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(evidence["schema-version"], 1);
+        assert_eq!(
+            evidence["repairs"][0]["kind"],
+            "cleared-non-finding-constraints"
+        );
+        assert_eq!(
+            evidence["source-sha256"],
+            format!("{:x}", Sha256::digest(fs::read(&source_path).unwrap()))
+        );
+        let repaired_path = tmp
+            .path()
+            .join(evidence["repaired-artifact"].as_str().unwrap());
+        assert_eq!(
+            evidence["repaired-sha256"],
+            format!("{:x}", Sha256::digest(fs::read(repaired_path).unwrap()))
+        );
+        for review in stored.attempts[0]
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Review)
+        {
+            let repaired = review
+                .input_artifacts
+                .iter()
+                .find(|artifact| artifact.path.contains("writer-completion-repairs"))
+                .expect("review receives the repaired completion matrix");
+            let matrix: crate::work_model::WriterCompletionMatrix =
+                serde_json::from_str(&fs::read_to_string(tmp.path().join(&repaired.path)).unwrap())
+                    .unwrap();
+            assert!(matrix.rows[0].applicable_constraints.is_empty());
+        }
+    }
+
+    #[test]
+    fn repaired_incomplete_claims_return_a_no_change_writer_to_writer() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = make_completed_writer_matrix_fixture(tmp.path(), true);
+        let source_path = tmp.path().join(
+            ".fluent/work/artifacts/matrix-work/attempt-1/attempt-1-write-1/writer-completion.json",
+        );
+        let mut matrix: crate::work_model::WriterCompletionMatrix =
+            serde_json::from_str(&fs::read_to_string(&source_path).unwrap()).unwrap();
+        matrix.rows[0].state = crate::work_model::WriterCompletionState::Pending;
+        fs::write(&source_path, serde_json::to_vec_pretty(&matrix).unwrap()).unwrap();
+        store
+            .mutate_work_item("matrix-work", |item| {
+                let output = item.attempts[0].tasks[0].output.as_mut().unwrap();
+                output.base_commit = Some(output.commit.clone());
+                Ok(())
+            })
+            .unwrap();
+
+        let mut item = store.read_work_item("matrix-work").unwrap();
+        let outcome =
+            gate_writer_completion_before_reviews(tmp.path(), &store, &mut item, "attempt-1")
+                .unwrap()
+                .expect("incomplete repaired claims plan another Writer");
+
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedWriteRound { .. }
+        ));
+        let stored = store.read_work_item("matrix-work").unwrap();
+        assert_eq!(stored.attempts[0].status, AttemptStatus::Planned);
+        assert_eq!(
+            stored.attempts[0].writer_runs[0].outcome,
+            WriterOutcome::Continue
+        );
+        assert_eq!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn complete_matrix_repairs_writer_progress_before_review() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = make_completed_writer_progress_matrix_fixture(tmp.path());
+
+        let outcome = plan_after_completed_writer(
+            tmp.path(),
+            &store,
+            store.read_work_item("matrix-progress-work").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedReviews { .. }
+        ));
+        let progress = fs::read_to_string(
+            tmp.path()
+                .join(".fluent/work/progress/matrix-progress-work/attempt-1/progress.md"),
+        )
+        .unwrap();
+        assert!(progress.contains(
+            "- [x] step-1 — Preserve the approved punctuation.; Evidence: \
+             .fluent/work/artifacts/matrix-progress-work/attempt-1/attempt-1-write-1/writer-completion.json#plan:step-1"
+        ));
+        assert!(progress.contains("## Review follow-ups\n\n- [ ] Preserve this separate finding"));
+        assert!(!progress.contains("Writer text"));
+        assert!(!progress.contains("commit abc123"));
+        let stored = store.read_work_item("matrix-progress-work").unwrap();
+        assert_eq!(stored.attempts[0].writer_runs[0].checked_required, 1);
+        assert_eq!(stored.attempts[0].writer_runs[0].completed_matrix, 1);
+    }
+
+    #[test]
+    fn incomplete_matrix_drives_continuation_without_trusting_writer_progress() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = make_completed_writer_progress_matrix_fixture(tmp.path());
+        let matrix_path = tmp.path().join(
+            ".fluent/work/artifacts/matrix-progress-work/attempt-1/attempt-1-write-1/writer-completion.json",
+        );
+        let mut matrix: crate::work_model::WriterCompletionMatrix =
+            serde_json::from_str(&fs::read_to_string(&matrix_path).unwrap()).unwrap();
+        matrix.rows[0].state = crate::work_model::WriterCompletionState::Pending;
+        matrix.rows[0].implementation_evidence.clear();
+        matrix.rows[0].verification.clear();
+        fs::write(&matrix_path, serde_json::to_vec_pretty(&matrix).unwrap()).unwrap();
+
+        let outcome = plan_after_completed_writer(
+            tmp.path(),
+            &store,
+            store.read_work_item("matrix-progress-work").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedWriteRound { .. }
+        ));
+        let stored = store.read_work_item("matrix-progress-work").unwrap();
+        assert_eq!(stored.attempts[0].writer_runs[0].checked_required, 0);
+        assert_eq!(stored.attempts[0].writer_runs[0].completed_matrix, 0);
+        assert_eq!(
+            stored.attempts[0].writer_runs[0].outcome,
+            WriterOutcome::Continue
+        );
+    }
+
+    #[test]
+    fn pending_new_findings_do_not_regress_completed_plan_progress() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = make_completed_writer_progress_matrix_fixture(tmp.path());
+        let review_path = ".fluent/work/artifacts/matrix-progress-work/attempt-1/attempt-1-review-2-tests/review.md";
+        fs::create_dir_all(tmp.path().join(review_path).parent().unwrap()).unwrap();
+        fs::write(
+            tmp.path().join(review_path),
+            "Verdict: fail\n\n- [ ] Exercise the new failure path directly (blocking)\n",
+        )
+        .unwrap();
+
+        store
+            .mutate_work_item("matrix-progress-work", |item| {
+                let first_task_id = item.attempts[0].tasks[0].id.clone();
+                item.attempts[0].writer_runs.push(WriterRun {
+                    task_id: first_task_id,
+                    outcome: WriterOutcome::Complete,
+                    kind: WriterRunKind::Initial,
+                    provider: "codex".to_string(),
+                    session_id: Some("thread-1".to_string()),
+                    continuation: 0,
+                    checked_required: 1,
+                    completed_matrix: 1,
+                    candidate_commit: "abc123".to_string(),
+                });
+                item.add_next_write_round(
+                    "attempt-1",
+                    vec![ArtifactRef {
+                        producer_id: "attempt-1-review-2-tests".to_string(),
+                        path: review_path.to_string(),
+                    }],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let item = store.read_work_item("matrix-progress-work").unwrap();
+        let second_task_id = item.attempts[0].tasks.last().unwrap().id.clone();
+        crate::work_task_executor::materialize_writer_completion_before_writer(
+            tmp.path(),
+            &item,
+            "attempt-1",
+            &second_task_id,
+        )
+        .unwrap();
+        store
+            .mutate_work_item("matrix-progress-work", |item| {
+                let writer = item.attempts[0].tasks.last_mut().unwrap();
+                writer.status = TaskStatus::Complete;
+                writer.output = Some(TaskOutput {
+                    workspace_id: "candidate".to_string(),
+                    workspace_path: "candidate".to_string(),
+                    source_branch: "work/attempt-1".to_string(),
+                    base_commit: Some("abc123".to_string()),
+                    commit: "def456".to_string(),
+                    no_change: None,
+                    learner_canonicalization: None,
+                });
+                Ok(())
+            })
+            .unwrap();
+
+        let mut item = store.read_work_item("matrix-progress-work").unwrap();
+        let outcome =
+            gate_writer_completion_before_reviews(tmp.path(), &store, &mut item, "attempt-1")
+                .unwrap()
+                .expect("the pending finding must return to the Writer");
+
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedWriteRound { .. }
+        ));
+        let stored = store.read_work_item("matrix-progress-work").unwrap();
+        let latest_run = stored.attempts[0].writer_runs.last().unwrap();
+        assert_eq!(latest_run.outcome, WriterOutcome::Continue);
+        assert_eq!(latest_run.kind, WriterRunKind::Corrective);
+        assert_eq!(latest_run.checked_required, 1);
+        assert_eq!(latest_run.completed_matrix, 1);
+        assert_eq!(stored.attempts[0].status, AttemptStatus::Planned);
+    }
+
+    #[test]
+    fn matrix_progress_contract_disagreement_pauses_before_review() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = make_completed_writer_progress_matrix_fixture(tmp.path());
+        store
+            .mutate_work_item("matrix-progress-work", |item| {
+                item.attempts[0]
+                    .progress_contract
+                    .as_mut()
+                    .unwrap()
+                    .required[0]
+                    .requirement = "A contradictory persisted requirement.".to_string();
+                Ok(())
+            })
+            .unwrap();
+
+        let outcome = plan_after_completed_writer(
+            tmp.path(),
+            &store,
+            store.read_work_item("matrix-progress-work").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+
+        let WorkAttemptRunOutcome::NeedsUser { handoff_path } = outcome else {
+            panic!("contract disagreement must pause before review")
+        };
+        let stored = store.read_work_item("matrix-progress-work").unwrap();
+        assert_eq!(stored.attempts[0].status, AttemptStatus::NeedsUser);
+        assert!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .all(|task| !is_review_phase_task(task))
+        );
+        let handoff = fs::read_to_string(tmp.path().join(handoff_path)).unwrap();
+        assert!(handoff.contains("disagrees"));
+    }
+
+    #[test]
+    fn scalar_writer_completion_evidence_recovers_before_review() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = make_completed_writer_matrix_fixture(tmp.path(), true);
+        let path = tmp.path().join(
+            ".fluent/work/artifacts/matrix-work/attempt-1/attempt-1-write-1/writer-completion.json",
+        );
+        let mut value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        value["rows"][0]["implementation-evidence"] =
+            serde_json::Value::String("src/dashboard.rs".to_string());
+        fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+        let outcome = plan_after_completed_writer(
+            tmp.path(),
+            &store,
+            store.read_work_item("matrix-work").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedReviews { .. }
+        ));
+        assert_eq!(
+            store.read_work_item("matrix-work").unwrap().attempts[0].status,
+            AttemptStatus::Reviewing
+        );
+    }
+
+    #[test]
+    fn explanatory_pass_result_is_normalized_before_review() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = make_completed_writer_matrix_fixture(tmp.path(), true);
+        let path = tmp.path().join(
+            ".fluent/work/artifacts/matrix-work/attempt-1/attempt-1-write-1/writer-completion.json",
+        );
+        let mut value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        value["rows"][0]["verification"][0]["result"] =
+            serde_json::Value::String("pass: 2,824 nextest tests; 2 skipped".to_string());
+        let original = serde_json::to_vec_pretty(&value).unwrap();
+        fs::write(&path, &original).unwrap();
+
+        let outcome = plan_after_completed_writer(
+            tmp.path(),
+            &store,
+            store.read_work_item("matrix-work").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedReviews { .. }
+        ));
+        let stored = store.read_work_item("matrix-work").unwrap();
+        assert_eq!(stored.attempts[0].status, AttemptStatus::Reviewing);
+        let evidence_ref = stored.attempts[0]
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.path.ends_with("/format-repair.json"))
+            .expect("format repair evidence is attached");
+        let evidence: serde_json::Value =
+            serde_json::from_slice(&fs::read(tmp.path().join(&evidence_ref.path)).unwrap())
+                .unwrap();
+        assert_eq!(evidence["kind"], "writer-completion-format-normalization");
+        assert_eq!(
+            evidence["source-sha256"],
+            format!("{:x}", Sha256::digest(&original))
+        );
+        assert_eq!(
+            evidence["normalizations"][0]["original-result"],
+            "pass: 2,824 nextest tests; 2 skipped"
+        );
+        let repaired_ref = stored.attempts[0]
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.path.ends_with("/format/writer-completion.json"))
+            .expect("format-repaired matrix is attached");
+        let repaired: crate::work_model::WriterCompletionMatrix =
+            serde_json::from_slice(&fs::read(tmp.path().join(&repaired_ref.path)).unwrap())
+                .unwrap();
+        assert_eq!(
+            repaired.rows[0].verification[0].result,
+            crate::work_model::WriterVerificationResult::Pass
+        );
+        for review in stored.attempts[0]
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Review)
+        {
+            assert!(
+                review
+                    .input_artifacts
+                    .iter()
+                    .any(|artifact| { artifact.path.ends_with("/format/writer-completion.json") })
+            );
+        }
+    }
+
+    #[test]
+    fn completed_state_is_normalized_and_audited_before_review() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = make_completed_writer_matrix_fixture(tmp.path(), true);
+        let path = tmp.path().join(
+            ".fluent/work/artifacts/matrix-work/attempt-1/attempt-1-write-1/writer-completion.json",
+        );
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        value["rows"][0]["state"] = serde_json::json!("completed");
+        let original = serde_json::to_vec_pretty(&value).unwrap();
+        fs::write(&path, &original).unwrap();
+
+        let outcome = plan_after_completed_writer(
+            tmp.path(),
+            &store,
+            store.read_work_item("matrix-work").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedReviews { .. }
+        ));
+        let stored = store.read_work_item("matrix-work").unwrap();
+        let evidence_ref = stored.attempts[0]
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.path.ends_with("/format-repair.json"))
+            .unwrap();
+        let evidence: serde_json::Value =
+            serde_json::from_slice(&fs::read(tmp.path().join(&evidence_ref.path)).unwrap())
+                .unwrap();
+        assert_eq!(
+            evidence["source-sha256"],
+            format!("{:x}", Sha256::digest(&original))
+        );
+        assert_eq!(evidence["normalizations"][0]["field"], "state");
+        assert_eq!(
+            evidence["normalizations"][0]["original-result"],
+            "completed"
+        );
+        assert_eq!(
+            evidence["normalizations"][0]["normalized-result"],
+            "complete"
+        );
+        let repaired_ref = stored.attempts[0]
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.path.ends_with("/format/writer-completion.json"))
+            .unwrap();
+        let repaired: crate::work_model::WriterCompletionMatrix =
+            serde_json::from_slice(&fs::read(tmp.path().join(&repaired_ref.path)).unwrap())
+                .unwrap();
+        assert_eq!(
+            repaired.rows[0].state,
+            crate::work_model::WriterCompletionState::Complete
+        );
+        assert_eq!(fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn parenthetical_pass_result_is_normalized_before_review() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = make_completed_writer_matrix_fixture(tmp.path(), true);
+        let path = tmp.path().join(
+            ".fluent/work/artifacts/matrix-work/attempt-1/attempt-1-write-1/writer-completion.json",
+        );
+        let mut value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        value["rows"][0]["verification"][0]["result"] =
+            serde_json::Value::String("pass (clean)".to_string());
+        let original = serde_json::to_vec_pretty(&value).unwrap();
+        fs::write(&path, &original).unwrap();
+
+        let outcome = plan_after_completed_writer(
+            tmp.path(),
+            &store,
+            store.read_work_item("matrix-work").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedReviews { .. }
+        ));
+        let stored = store.read_work_item("matrix-work").unwrap();
+        assert_eq!(stored.attempts[0].status, AttemptStatus::Reviewing);
+        let evidence_ref = stored.attempts[0]
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.path.ends_with("/format-repair.json"))
+            .expect("format repair evidence is attached");
+        let evidence: serde_json::Value =
+            serde_json::from_slice(&fs::read(tmp.path().join(&evidence_ref.path)).unwrap())
+                .unwrap();
+        assert_eq!(
+            evidence["normalizations"][0]["original-result"],
+            "pass (clean)"
+        );
+        let repaired_ref = stored.attempts[0]
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.path.ends_with("/format/writer-completion.json"))
+            .expect("format-repaired matrix is attached");
+        let repaired: crate::work_model::WriterCompletionMatrix =
+            serde_json::from_slice(&fs::read(tmp.path().join(&repaired_ref.path)).unwrap())
+                .unwrap();
+        assert_eq!(
+            repaired.rows[0].verification[0].result,
+            crate::work_model::WriterVerificationResult::Pass
+        );
+    }
+
+    #[test]
+    fn string_verification_claim_is_normalized_before_review() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = make_completed_writer_matrix_fixture(tmp.path(), true);
+        let path = tmp.path().join(
+            ".fluent/work/artifacts/matrix-work/attempt-1/attempt-1-write-1/writer-completion.json",
+        );
+        let mut value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        value["rows"][0]["verification"][0] =
+            serde_json::Value::String("cargo test matrix passed".to_string());
+        let original = serde_json::to_vec_pretty(&value).unwrap();
+        fs::write(&path, &original).unwrap();
+
+        let outcome = plan_after_completed_writer(
+            tmp.path(),
+            &store,
+            store.read_work_item("matrix-work").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedReviews { .. }
+        ));
+        let stored = store.read_work_item("matrix-work").unwrap();
+        assert_eq!(stored.attempts[0].status, AttemptStatus::Reviewing);
+        let repaired_ref = stored.attempts[0]
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.path.ends_with("/format/writer-completion.json"))
+            .expect("format-repaired matrix is attached");
+        let repaired: crate::work_model::WriterCompletionMatrix =
+            serde_json::from_slice(&fs::read(tmp.path().join(&repaired_ref.path)).unwrap())
+                .unwrap();
+        assert_eq!(
+            repaired.rows[0].verification[0].command,
+            "cargo test matrix"
+        );
+        assert_eq!(
+            repaired.rows[0].verification[0].result,
+            crate::work_model::WriterVerificationResult::Pass
+        );
+        let evidence_ref = stored.attempts[0]
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.path.ends_with("/format-repair.json"))
+            .expect("format repair evidence is attached");
+        let evidence: serde_json::Value =
+            serde_json::from_slice(&fs::read(tmp.path().join(&evidence_ref.path)).unwrap())
+                .unwrap();
+        assert_eq!(
+            evidence["normalizations"][0]["original-result"],
+            "cargo test matrix passed"
+        );
+    }
+
+    fn make_candidate_gate_fixture(
+        project_root: &Path,
+        candidate_source: &str,
+        hook: Option<&str>,
+    ) -> (WorkModelStore, tempfile::TempDir) {
+        let parent = project_root.parent().unwrap();
+        let workspace = tempfile::Builder::new()
+            .prefix("work-candidate-gate-")
+            .tempdir_in(parent)
+            .unwrap();
+        crate::git::run(workspace.path(), &["init", "-q"], "initialize candidate").unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["config", "user.name", "Test Author"],
+            "configure author",
+        )
+        .unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["config", "user.email", "test@example.com"],
+            "configure email",
+        )
+        .unwrap();
+        fs::write(workspace.path().join("README.md"), "base\n").unwrap();
+        crate::git::run(workspace.path(), &["add", "README.md"], "stage base").unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["commit", "-q", "-m", "Create base"],
+            "commit base",
+        )
+        .unwrap();
+        let base =
+            crate::git::run_stdout(workspace.path(), &["rev-parse", "HEAD"], "read base").unwrap();
+        fs::create_dir_all(workspace.path().join("src")).unwrap();
+        fs::write(workspace.path().join("src/lib.rs"), candidate_source).unwrap();
+        crate::git::run(workspace.path(), &["add", "src/lib.rs"], "stage candidate").unwrap();
+        crate::git::run(
+            workspace.path(),
+            &[
+                "commit",
+                "-q",
+                "-m",
+                "Add candidate\n\n- Describe the candidate",
+            ],
+            "commit candidate",
+        )
+        .unwrap();
+        let candidate =
+            crate::git::run_stdout(workspace.path(), &["rev-parse", "HEAD"], "read candidate")
+                .unwrap();
+        if let Some(hook) = hook {
+            use std::os::unix::fs::PermissionsExt;
+            let hook_dir = project_root.join(".fluent/hooks");
+            fs::create_dir_all(&hook_dir).unwrap();
+            let path = hook_dir.join("check-pre-merge");
+            fs::write(&path, hook).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let store = WorkModelStore::new(project_root);
+        let mut item = WorkItem::planned("work-1", "Gate the candidate");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let relative_workspace = format!(
+            "../{}",
+            workspace.path().file_name().unwrap().to_string_lossy()
+        );
+        let writer = &mut item.attempts[0].tasks[0];
+        writer.status = TaskStatus::Complete;
+        writer.output = Some(TaskOutput {
+            workspace_id: "candidate".to_string(),
+            workspace_path: relative_workspace,
+            source_branch: "work/attempt-1".to_string(),
+            base_commit: Some(base),
+            commit: candidate,
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        store.create_work_item(&item).unwrap();
+        (store, workspace)
+    }
+
+    fn attach_gate_named_work_item_input(project_root: &Path, item: &mut WorkItem) -> ArtifactRef {
+        let snapshot_path = work_artifact_path("work-1", "inputs", "0000-candidate-gate.json");
+        let snapshot = project_root.join(&snapshot_path);
+        fs::create_dir_all(snapshot.parent().unwrap()).unwrap();
+        let checks = [
+            ("candidate-identity", CandidateCheckStatus::Passed),
+            ("whitespace", CandidateCheckStatus::Failed),
+            ("commit-metadata", CandidateCheckStatus::Passed),
+            ("behavior-references", CandidateCheckStatus::Skipped),
+            ("tester-reference-evidence", CandidateCheckStatus::Skipped),
+            ("project-check", CandidateCheckStatus::Passed),
+        ]
+        .into_iter()
+        .map(|(name, status)| CandidateCheckEvidence {
+            name: name.to_string(),
+            status,
+            diagnostics: Vec::new(),
+            log_path: None,
+        })
+        .collect();
+        let bytes = serde_json::to_vec_pretty(&CandidateGateEvidence {
+            schema_version: crate::candidate_gate::CANDIDATE_GATE_SCHEMA_VERSION,
+            phase: CandidateGatePhase::Writer,
+            disposition: CandidateGateDisposition::Rejected,
+            base_commit: "preserved-base".to_string(),
+            candidate_commit: "preserved-candidate".to_string(),
+            tester_results_path: None,
+            metadata_rewrite: None,
+            checks,
+        })
+        .unwrap();
+        fs::write(&snapshot, &bytes).unwrap();
+        item.input_artifacts
+            .push(crate::work_model::WorkItemInputArtifact {
+                source_path: "approved/candidate-gate.json".to_string(),
+                snapshot_path: snapshot_path.clone(),
+                digest: format!("sha256:{:x}", Sha256::digest(&bytes)),
+            });
+        let artifact = ArtifactRef {
+            producer_id: "work-item".to_string(),
+            path: snapshot_path,
+        };
+        item.attempts[0].tasks[0]
+            .input_artifacts
+            .push(artifact.clone());
+        artifact
+    }
+
+    #[test]
+    fn work_item_gate_named_input_is_not_prior_writer_gate() {
+        let project = tempfile::tempdir().unwrap();
+        let (store, _workspace) =
+            make_candidate_gate_fixture(project.path(), "pub fn value() {}\n", None);
+        let mut item = store.read_work_item("work-1").unwrap();
+        attach_gate_named_work_item_input(project.path(), &mut item);
+
+        let outcome =
+            gate_candidate_after_writer(project.path(), &store, &mut item, "attempt-1", 0, None)
+                .unwrap();
+
+        assert!(outcome.is_none());
+        let gate_path = project.path().join(
+            ".fluent/work/artifacts/work-1/attempt-1/candidate-gates/attempt-1-write-1/candidate-gate.json",
+        );
+        let gate: CandidateGateEvidence =
+            serde_json::from_slice(&fs::read(gate_path).unwrap()).unwrap();
+        assert_eq!(gate.disposition, CandidateGateDisposition::Passed);
+        assert_eq!(
+            gate.base_commit,
+            item.attempts[0].tasks[0]
+                .output
+                .as_ref()
+                .unwrap()
+                .base_commit
+                .as_deref()
+                .unwrap()
+        );
+    }
+
+    fn rejected_gate_matrix_fixture(
+        project_root: &Path,
+        malformed: bool,
+    ) -> (WorkModelStore, tempfile::TempDir) {
+        let (store, workspace) =
+            make_candidate_gate_fixture(project_root, "pub fn value() {}\n", None);
+        let mut item = store.read_work_item("work-1").unwrap();
+        let context = crate::work_model::PlanningContext {
+            behaviors: Some("### B1\nWHEN called, THE SYSTEM SHALL work.\nTest: tests/missing.rs (missing_case)\n".into()),
+            ..Default::default()
+        };
+        item.planning_context = Some(context.clone());
+        item.attempts[0].writer_completion_contract =
+            crate::work_model::WriterCompletionContract::from_planning_context(&context);
+        crate::work_task_executor::materialize_writer_completion_before_writer(
+            project_root,
+            &item,
+            "attempt-1",
+            "attempt-1-write-1",
+        )
+        .unwrap();
+        let matrix = project_root.join(
+            ".fluent/work/artifacts/work-1/attempt-1/attempt-1-write-1/writer-completion.json",
+        );
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&matrix).unwrap()).unwrap();
+        value["rows"][0]["state"] = "complete".into();
+        value["rows"][0]["implementation-evidence"] = serde_json::json!(["src/lib.rs: candidate"]);
+        value["rows"][0]["verification"] = if malformed {
+            serde_json::json!(["cargo test missing_case: 8/8 pass including regression"])
+        } else {
+            serde_json::json!([{"command":"cargo test missing_case","result":"pass"}])
+        };
+        fs::write(matrix, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        store.write_work_item(&item).unwrap();
+        (store, workspace)
+    }
+
+    #[test]
+    fn malformed_prior_matrix_after_candidate_gate_pauses_before_correction() {
+        let project = tempfile::tempdir().unwrap();
+        let (store, _workspace) = rejected_gate_matrix_fixture(project.path(), true);
+        let outcome = plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+        let WorkAttemptRunOutcome::NeedsUser { handoff_path } = outcome else {
+            panic!("malformed prior matrix must pause: {outcome:?}");
+        };
+        let attempt = &store.read_work_item("work-1").unwrap().attempts[0];
+        assert_eq!(attempt.pause_kind, Some(PauseKind::WriterCompletion));
+        assert_eq!(attempt.tasks.len(), 1);
+        let handoff = fs::read_to_string(project.path().join(handoff_path)).unwrap();
+        assert!(handoff.contains("writer-completion.json"));
+        assert!(handoff.contains("Writer completion matrix is malformed"));
+        assert!(handoff.contains("invalid type: string"), "{handoff}");
+        assert!(
+            handoff.contains("structured verification entry"),
+            "{handoff}"
+        );
+        assert!(
+            handoff.contains("preserve the host-generated row identities and requirements"),
+            "{handoff}"
+        );
+        assert!(
+            handoff.contains("fluent queue resume work-1 --attempt attempt-1"),
+            "{handoff}"
+        );
+    }
+
+    #[test]
+    fn malformed_prior_matrix_pause_preserves_candidate_and_gate() {
+        let project = tempfile::tempdir().unwrap();
+        let (store, workspace) = rejected_gate_matrix_fixture(project.path(), true);
+        let mut item = store.read_work_item("work-1").unwrap();
+        let original = item.attempts[0].tasks[0]
+            .output
+            .as_ref()
+            .unwrap()
+            .commit
+            .clone();
+        let output = item.attempts[0].tasks[0].output.as_ref().unwrap();
+        let base = output.base_commit.as_deref().unwrap().to_string();
+        let assessment_path = project.path().join("private/candidate-gate.json");
+        let evidence = crate::candidate_gate::assess_candidate_gate_with_prior_and_role(
+            crate::candidate_gate::CandidateGateRequest {
+                project_root: project.path(),
+                workspace: workspace.path(),
+                work_item_id: "work-1",
+                attempt_id: "attempt-1",
+                task_id: Some("attempt-1-write-1"),
+                phase: CandidateGatePhase::Writer,
+                base_commit: &base,
+                candidate_commit: &original,
+                completion_contract: item.attempts[0].writer_completion_contract.as_ref(),
+                allow_tree_identical_metadata_rewrite: false,
+                metadata_rewrite_authorization: None,
+                tester_results_path: None,
+                accepted_tester_commands: &[],
+                artifact_path: &assessment_path,
+            },
+            None,
+            Some("writer"),
+        )
+        .unwrap();
+        let assessed = WriterGateAssessment {
+            evidence,
+            requested_base_commit: base,
+            logs: Vec::new(),
+        };
+        assert!(
+            assessed
+                .evidence
+                .checks
+                .iter()
+                .all(|check| check.log_path.is_none())
+        );
+        let expected_gate_bytes = serde_json::to_vec_pretty(&assessed.evidence).unwrap();
+        let _ = gate_candidate_after_writer(
+            project.path(),
+            &store,
+            &mut item,
+            "attempt-1",
+            0,
+            Some(&assessed),
+        )
+        .unwrap();
+        let attempt = &store.read_work_item("work-1").unwrap().attempts[0];
+        assert_eq!(attempt.tasks[0].output.as_ref().unwrap().commit, original);
+        let gate = attempt
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.path.ends_with("candidate-gate.json"))
+            .unwrap();
+        let bytes = fs::read(project.path().join(&gate.path)).unwrap();
+        assert_eq!(bytes, expected_gate_bytes);
+        let evidence: CandidateGateEvidence = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(evidence.candidate_commit, original);
+        assert_eq!(evidence.disposition, CandidateGateDisposition::Rejected);
+        assert_eq!(
+            evidence
+                .checks
+                .iter()
+                .find(|check| check.name == "behavior-references")
+                .unwrap()
+                .status,
+            CandidateCheckStatus::Failed
+        );
+    }
+
+    #[test]
+    fn repaired_prior_matrix_resumes_candidate_gate_correction_once() {
+        let project = tempfile::tempdir().unwrap();
+        let (store, _workspace) = rejected_gate_matrix_fixture(project.path(), true);
+        let _ = plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+        let paused = store.read_work_item("work-1").unwrap();
+        let attempt = &paused.attempts[0];
+        let candidate = attempt.tasks[0].output.as_ref().unwrap().commit.clone();
+        let gate = attempt
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.path.ends_with("candidate-gate.json"))
+            .unwrap()
+            .clone();
+        let gate_bytes = fs::read(project.path().join(&gate.path)).unwrap();
+        let resolver = ContentResolver::new(None);
+        let resume = || {
+            run_attempt(WorkAttemptRunConfig {
+                project_root: project.path(),
+                store: &store,
+                work_item_id: "work-1",
+                attempt_id: "attempt-1",
+                resolver: &resolver,
+                extra_args: &[],
+                no_sandbox: true,
+                tester_no_sandbox: false,
+                resume_cancellation_requested_at: None,
+                coder_mapping_inputs: None,
+                learner_run_coder: None,
+            })
+        };
+        let before_repair = resume().expect_err("malformed matrix must block operator resume");
+        assert!(before_repair.to_string().contains("remains malformed"));
+        let still_paused = store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            still_paused.attempts[0].pause_kind,
+            Some(PauseKind::WriterCompletion)
+        );
+        assert_eq!(still_paused.attempts[0].tasks, paused.attempts[0].tasks);
+        assert_eq!(
+            still_paused.attempts[0].artifacts,
+            paused.attempts[0].artifacts
+        );
+        assert_eq!(
+            fs::read(project.path().join(&gate.path)).unwrap(),
+            gate_bytes
+        );
+        let matrix = project.path().join(
+            ".fluent/work/artifacts/work-1/attempt-1/attempt-1-write-1/writer-completion.json",
+        );
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&matrix).unwrap()).unwrap();
+        value["rows"][0]["verification"] =
+            serde_json::json!([{"command":"cargo test missing_case","result":"pass"}]);
+        fs::write(&matrix, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        let launched = resume().expect_err("the fixture has no source Git repository");
+        assert!(launched.to_string().contains("git"), "{launched:#}");
+        let current = store.read_work_item("work-1").unwrap();
+        let attempt = &current.attempts[0];
+        assert_eq!(attempt.tasks.len(), 2);
+        assert_eq!(attempt.tasks[0].output.as_ref().unwrap().commit, candidate);
+        assert!(attempt.tasks[1].input_artifacts.contains(&gate));
+        assert_eq!(
+            fs::read(project.path().join(&gate.path)).unwrap(),
+            gate_bytes
+        );
+        let _ = resume().expect_err("repeat resume must reach the same planned Writer");
+        assert_eq!(
+            store.read_work_item("work-1").unwrap().attempts[0]
+                .tasks
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn valid_prior_matrix_preserves_candidate_gate_correction() {
+        let project = tempfile::tempdir().unwrap();
+        let (store, _workspace) = rejected_gate_matrix_fixture(project.path(), false);
+        let outcome = plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedWriteRound { .. }
+        ));
+        let current = store.read_work_item("work-1").unwrap();
+        let attempt = &current.attempts[0];
+        assert_eq!(attempt.tasks.len(), 2);
+        let gate = attempt
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.path.ends_with("candidate-gate.json"))
+            .unwrap();
+        assert!(attempt.tasks[1].input_artifacts.contains(gate));
+    }
+
+    #[test]
+    fn repairable_prior_matrix_is_persisted_before_gate_correction() {
+        let project = tempfile::tempdir().unwrap();
+        let (store, _workspace) = rejected_gate_matrix_fixture(project.path(), false);
+        let source = project.path().join(
+            ".fluent/work/artifacts/work-1/attempt-1/attempt-1-write-1/writer-completion.json",
+        );
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&source).unwrap()).unwrap();
+        value["rows"][0]["verification"][0]["result"] = "pass: focused run".into();
+        fs::write(&source, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        let outcome = plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedWriteRound { .. }
+        ));
+        let item = store.read_work_item("work-1").unwrap();
+        let attempt = &item.attempts[0];
+        let repair = attempt
+            .artifacts
+            .iter()
+            .find(|artifact| {
+                artifact.producer_id == "writer-completion-repair"
+                    && artifact.path.ends_with("/format/writer-completion.json")
+            })
+            .expect("accepted normalization must be authoritative before correction");
+        let repaired: crate::work_model::WriterCompletionMatrix =
+            serde_json::from_slice(&fs::read(project.path().join(&repair.path)).unwrap()).unwrap();
+        assert_eq!(
+            repaired.rows[0].verification[0].result,
+            crate::work_model::WriterVerificationResult::Pass
+        );
+        crate::work_task_executor::materialize_writer_completion_before_writer(
+            project.path(),
+            &item,
+            "attempt-1",
+            &attempt.tasks[1].id,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn final_writer_gate_publishes_assessed_result_without_rerunning_hook() {
+        let project = tempfile::tempdir().unwrap();
+        let marker = project.path().join("hook-ran");
+        let hook = format!(
+            "#!/bin/sh\nif [ -e '{}' ]; then exit 1; fi\nprintf x > '{}'\n",
+            marker.display(),
+            marker.display()
+        );
+        let (store, workspace) =
+            make_candidate_gate_fixture(project.path(), "pub fn value() {}\n", Some(&hook));
+        let mut item = store.read_work_item("work-1").unwrap();
+        let output = item.attempts[0].tasks[0].output.as_ref().unwrap();
+        let assessment_path = project.path().join("private/candidate-gate.json");
+        let evidence = crate::candidate_gate::assess_candidate_gate_with_prior_and_role(
+            crate::candidate_gate::CandidateGateRequest {
+                project_root: project.path(),
+                workspace: workspace.path(),
+                work_item_id: "work-1",
+                attempt_id: "attempt-1",
+                task_id: Some("attempt-1-write-1"),
+                phase: CandidateGatePhase::Writer,
+                base_commit: output.base_commit.as_deref().unwrap(),
+                candidate_commit: &output.commit,
+                completion_contract: None,
+                allow_tree_identical_metadata_rewrite: false,
+                metadata_rewrite_authorization: None,
+                tester_results_path: None,
+                accepted_tester_commands: &[],
+                artifact_path: &assessment_path,
+            },
+            None,
+            Some("writer"),
+        )
+        .unwrap();
+        assert_eq!(evidence.disposition, CandidateGateDisposition::Passed);
+        assert_eq!(fs::read(&marker).unwrap(), b"x");
+        let assessed = WriterGateAssessment {
+            requested_base_commit: output.base_commit.as_deref().unwrap().to_string(),
+            logs: evidence
+                .checks
+                .iter()
+                .enumerate()
+                .filter_map(|(index, check)| {
+                    check
+                        .log_path
+                        .as_ref()
+                        .map(|path| (index, fs::read(project.path().join(path)).unwrap()))
+                })
+                .collect(),
+            evidence,
+        };
+        let outcome = gate_candidate_after_writer(
+            project.path(),
+            &store,
+            &mut item,
+            "attempt-1",
+            0,
+            Some(&assessed),
+        )
+        .unwrap();
+        assert!(outcome.is_none());
+        assert_eq!(
+            fs::read(&marker).unwrap(),
+            b"x",
+            "publication reran the hook"
+        );
+        let gate_path = project.path().join(
+            ".fluent/work/artifacts/work-1/attempt-1/candidate-gates/attempt-1-write-1/candidate-gate.json",
+        );
+        let gate: CandidateGateEvidence =
+            serde_json::from_slice(&fs::read(gate_path).unwrap()).unwrap();
+        assert_eq!(gate.disposition, assessed.evidence.disposition);
+        assert_eq!(
+            gate.checks
+                .iter()
+                .map(|check| &check.status)
+                .collect::<Vec<_>>(),
+            assessed
+                .evidence
+                .checks
+                .iter()
+                .map(|check| &check.status)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn prior_writer_gate_selection_rejects_unsafe_ownership() {
+        let project = tempfile::tempdir().unwrap();
+        let (store, _workspace) =
+            make_candidate_gate_fixture(project.path(), "pub fn value() {}\n", None);
+        let mut item = store.read_work_item("work-1").unwrap();
+        let first_gate = ArtifactRef {
+            producer_id: "attempt-1-write-1".to_string(),
+            path: work_artifact_path(
+                "work-1",
+                "attempt-1",
+                "candidate-gates/attempt-1-write-1/candidate-gate.json",
+            ),
+        };
+        item.add_next_write_round("attempt-1", vec![first_gate.clone()])
+            .unwrap();
+        assert_eq!(
+            select_prior_writer_candidate_gate(&item, 0, 1).unwrap(),
+            Some(&first_gate)
+        );
+
+        let mut wrong_producer = item.clone();
+        wrong_producer.attempts[0].tasks[0].kind = TaskKind::Review;
+        assert!(select_prior_writer_candidate_gate(&wrong_producer, 0, 1).is_err());
+
+        let invalid = [
+            ArtifactRef {
+                producer_id: "work-item".to_string(),
+                path: first_gate.path.clone(),
+            },
+            ArtifactRef {
+                producer_id: "attempt-1-review-tests".to_string(),
+                path: first_gate.path.clone(),
+            },
+            ArtifactRef {
+                producer_id: first_gate.producer_id.clone(),
+                path: work_artifact_path(
+                    "other-work",
+                    "attempt-1",
+                    "candidate-gates/attempt-1-write-1/candidate-gate.json",
+                ),
+            },
+            ArtifactRef {
+                producer_id: first_gate.producer_id.clone(),
+                path: work_artifact_path(
+                    "work-1",
+                    "other-attempt",
+                    "candidate-gates/attempt-1-write-1/candidate-gate.json",
+                ),
+            },
+            ArtifactRef {
+                producer_id: first_gate.producer_id.clone(),
+                path: work_artifact_path(
+                    "work-1",
+                    "attempt-1",
+                    "candidate-gates/attempt-1-write-1/./candidate-gate.json",
+                ),
+            },
+            ArtifactRef {
+                producer_id: "attempt-1-write-missing".to_string(),
+                path: work_artifact_path(
+                    "work-1",
+                    "attempt-1",
+                    "candidate-gates/attempt-1-write-missing/candidate-gate.json",
+                ),
+            },
+        ];
+        for artifact in invalid {
+            let mut invalid_item = item.clone();
+            invalid_item.attempts[0].tasks[1].input_artifacts = vec![artifact];
+            assert!(select_prior_writer_candidate_gate(&invalid_item, 0, 1).is_err());
+        }
+
+        let mut ambiguous = item;
+        let repeated_output = ambiguous.attempts[0].tasks[0].output.clone().unwrap();
+        let second = &mut ambiguous.attempts[0].tasks[1];
+        second.output = Some(repeated_output);
+        crate::work_model::set_task_terminal(second, TaskStatus::Complete);
+        let second_gate = ArtifactRef {
+            producer_id: "attempt-1-write-2".to_string(),
+            path: work_artifact_path(
+                "work-1",
+                "attempt-1",
+                "candidate-gates/attempt-1-write-2/candidate-gate.json",
+            ),
+        };
+        ambiguous
+            .add_next_write_round("attempt-1", vec![first_gate, second_gate])
+            .unwrap();
+        assert!(select_prior_writer_candidate_gate(&ambiguous, 0, 2).is_err());
+    }
+
+    struct RetiredCommitStyleFixture {
+        _root: tempfile::TempDir,
+        project_root: PathBuf,
+        workspace: PathBuf,
+        store: WorkModelStore,
+        gate_path: PathBuf,
+        log_path: PathBuf,
+        candidate: String,
+        candidate_tree: String,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct RetiredCommitStyleBoundarySnapshot {
+        work_item: serde_json::Value,
+        candidate_head: String,
+        candidate_tree: String,
+        candidate_status: String,
+        gate: Option<Vec<u8>>,
+        hook_log: Vec<u8>,
+    }
+
+    fn retired_commit_style_boundary_snapshot(
+        fixture: &RetiredCommitStyleFixture,
+    ) -> RetiredCommitStyleBoundarySnapshot {
+        RetiredCommitStyleBoundarySnapshot {
+            work_item: serde_json::to_value(fixture.store.read_work_item("work-1").unwrap())
+                .unwrap(),
+            candidate_head: crate::git::run_stdout(
+                &fixture.workspace,
+                &["rev-parse", "HEAD"],
+                "snapshot retired-style candidate HEAD",
+            )
+            .unwrap(),
+            candidate_tree: crate::git::run_stdout(
+                &fixture.workspace,
+                &["rev-parse", "HEAD^{tree}"],
+                "snapshot retired-style candidate tree",
+            )
+            .unwrap(),
+            candidate_status: crate::git::run_stdout(
+                &fixture.workspace,
+                &["status", "--porcelain", "--untracked-files=all"],
+                "snapshot retired-style candidate status",
+            )
+            .unwrap(),
+            gate: fs::read(&fixture.gate_path).ok(),
+            hook_log: fs::read(&fixture.log_path).unwrap(),
+        }
+    }
+
+    fn assert_retired_commit_style_boundary_unchanged(
+        fixture: &RetiredCommitStyleFixture,
+        before: RetiredCommitStyleBoundarySnapshot,
+    ) {
+        assert_eq!(retired_commit_style_boundary_snapshot(fixture), before);
+    }
+
+    fn assert_legacy_gate_index_recovery_rejected(
+        fixture: &RetiredCommitStyleFixture,
+        expected_error: Option<&str>,
+    ) {
+        let before = retired_commit_style_boundary_snapshot(fixture);
+        let result = recover_retired_commit_style_pause(
+            &fixture.project_root,
+            &fixture.store,
+            "work-1",
+            "attempt-1",
+        );
+        if let Some(expected_error) = expected_error {
+            assert!(
+                result.unwrap_err().to_string().contains(expected_error),
+                "legacy rejection must report {expected_error:?}"
+            );
+        } else {
+            assert!(!result.unwrap(), "legacy recovery must not match");
+        }
+        assert_retired_commit_style_boundary_unchanged(fixture, before);
+    }
+
+    fn make_retired_commit_style_pause_fixture(long_body_line: bool) -> RetiredCommitStyleFixture {
+        make_retired_commit_style_pause_fixture_with_options(long_body_line, false, false)
+    }
+
+    fn make_retired_commit_style_pause_fixture_with_input(
+        long_body_line: bool,
+        preserved_input: bool,
+    ) -> RetiredCommitStyleFixture {
+        make_retired_commit_style_pause_fixture_with_options(long_body_line, preserved_input, false)
+    }
+
+    fn make_legacy_omitted_gate_index_fixture() -> RetiredCommitStyleFixture {
+        let fixture = make_retired_commit_style_pause_fixture(true);
+        fixture
+            .store
+            .mutate_work_item("work-1", |item| {
+                item.attempts[0]
+                    .artifacts
+                    .retain(|artifact| !artifact.path.ends_with("/candidate-gate.json"));
+                Ok(())
+            })
+            .unwrap();
+        fixture
+    }
+
+    fn make_retired_commit_style_pause_fixture_with_options(
+        long_body_line: bool,
+        preserved_input: bool,
+        prior_prohibited_trailer: bool,
+    ) -> RetiredCommitStyleFixture {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::TempDir::new().unwrap();
+        let project_root = root.path().join("project");
+        let workspace = root.path().join("work-candidate");
+        fs::create_dir_all(project_root.join("scripts")).unwrap();
+        fs::create_dir_all(project_root.join(".fluent/hooks")).unwrap();
+        crate::git::run(
+            &project_root,
+            &["init", "-q", "-b", "main"],
+            "initialize retired-style project",
+        )
+        .unwrap();
+        crate::git::run(
+            &project_root,
+            &["config", "user.name", "Test Author"],
+            "configure retired-style author",
+        )
+        .unwrap();
+        crate::git::run(
+            &project_root,
+            &["config", "user.email", "test@example.com"],
+            "configure retired-style email",
+        )
+        .unwrap();
+        fs::write(project_root.join("README.md"), "base\n").unwrap();
+        fs::write(
+            project_root.join("scripts/check-commit-message-policy.sh"),
+            "#!/bin/sh\ncandidate=$(git rev-parse HEAD)\nif [ \"${FLUENT_BASE_COMMIT:-}\" = \"$candidate\" ]; then\n  exit 0\nfi\nprintf 'commit %s has no body separated from its subject by a blank line\\n' \"$candidate\" >&2\nexit 1\n",
+        )
+        .unwrap();
+        let hook = project_root.join(".fluent/hooks/check-pre-merge");
+        fs::write(&hook, "#!/bin/sh\nscripts/check-commit-message-policy.sh\n").unwrap();
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::git::run(
+            &project_root,
+            &["add", "README.md", "scripts", ".fluent/hooks"],
+            "stage retired-style policy",
+        )
+        .unwrap();
+        crate::git::run(
+            &project_root,
+            &[
+                "commit",
+                "-q",
+                "-m",
+                "Enforce presentation style",
+                "-m",
+                "- Model the policy that produced the stored rejection",
+            ],
+            "commit legacy retired-style policy",
+        )
+        .unwrap();
+        let base = crate::git::run_stdout(
+            &project_root,
+            &["rev-parse", "HEAD"],
+            "read retired-style base",
+        )
+        .unwrap();
+        crate::git::run(
+            &project_root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "work/attempt-1",
+                workspace.to_str().unwrap(),
+                "HEAD",
+            ],
+            "create retired-style candidate worktree",
+        )
+        .unwrap();
+        fs::create_dir_all(workspace.join("src")).unwrap();
+        if prior_prohibited_trailer {
+            fs::write(
+                workspace.join("src/attributed.rs"),
+                "pub fn attributed() {}\n",
+            )
+            .unwrap();
+            crate::git::run(
+                &workspace,
+                &["add", "src/attributed.rs"],
+                "stage attributed retired-style precursor",
+            )
+            .unwrap();
+            crate::git::run(
+                &workspace,
+                &[
+                    "commit",
+                    "-q",
+                    "-m",
+                    "Add attributed precursor",
+                    "-m",
+                    "- Prepare the candidate history",
+                    "-m",
+                    "Co-Authored-By: Bot <bot@example.com>",
+                ],
+                "commit attributed retired-style precursor",
+            )
+            .unwrap();
+        }
+        fs::write(workspace.join("src/lib.rs"), "pub fn value() {}\n").unwrap();
+        crate::git::run(
+            &workspace,
+            &["add", "src/lib.rs"],
+            "stage retired-style candidate",
+        )
+        .unwrap();
+        if long_body_line {
+            let body = "x".repeat(73);
+            crate::git::run(
+                &workspace,
+                &["commit", "-q", "-m", "Add candidate", "-m", &body],
+                "commit long-line retired-style candidate",
+            )
+            .unwrap();
+        } else {
+            assert!(!prior_prohibited_trailer);
+            crate::git::run(
+                &workspace,
+                &["commit", "-q", "-m", "Add candidate"],
+                "commit bodyless retired-style candidate",
+            )
+            .unwrap();
+        }
+        let candidate = crate::git::run_stdout(
+            &workspace,
+            &["rev-parse", "HEAD"],
+            "read retired-style candidate",
+        )
+        .unwrap();
+        let candidate_tree = crate::git::run_stdout(
+            &workspace,
+            &["rev-parse", "HEAD^{tree}"],
+            "read retired-style candidate tree",
+        )
+        .unwrap();
+
+        fs::write(
+            project_root.join("scripts/check-commit-message-policy.sh"),
+            "#!/bin/sh\n# fluent-policy: commit-message-presentation-advisory-v1\nexit 0\n",
+        )
+        .unwrap();
+        crate::git::run(
+            &project_root,
+            &["add", "scripts/check-commit-message-policy.sh"],
+            "stage advisory retired-style policy",
+        )
+        .unwrap();
+        crate::git::run(
+            &project_root,
+            &[
+                "commit",
+                "-q",
+                "-m",
+                "Make presentation advisory",
+                "-m",
+                "- Retire presentation-only failures",
+            ],
+            "commit advisory retired-style policy",
+        )
+        .unwrap();
+
+        let gate_artifact = ArtifactRef {
+            producer_id: "attempt-1-write-1".to_string(),
+            path: work_artifact_path(
+                "work-1",
+                "attempt-1",
+                "candidate-gates/attempt-1-write-1/candidate-gate.json",
+            ),
+        };
+        let gate_path = project_root.join(&gate_artifact.path);
+        let log_path = gate_path
+            .parent()
+            .unwrap()
+            .join("hooks/check-pre-merge.log");
+        fs::create_dir_all(log_path.parent().unwrap()).unwrap();
+        let finding = if long_body_line {
+            format!("commit {candidate} body line 3 exceeds 72 characters\n")
+        } else {
+            format!("commit {candidate} has no body separated from its subject by a blank line\n")
+        };
+        fs::write(&log_path, finding).unwrap();
+        let log_relative = log_path
+            .strip_prefix(&project_root)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let checks = [
+            ("candidate-identity", CandidateCheckStatus::Passed),
+            ("whitespace", CandidateCheckStatus::Passed),
+            ("commit-metadata", CandidateCheckStatus::Passed),
+            ("behavior-references", CandidateCheckStatus::Skipped),
+            ("tester-reference-evidence", CandidateCheckStatus::Skipped),
+            ("project-check", CandidateCheckStatus::Failed),
+        ]
+        .into_iter()
+        .map(|(name, status)| CandidateCheckEvidence {
+            name: name.to_string(),
+            status,
+            diagnostics: (name == "project-check")
+                .then(|| vec!["check-pre-merge exited 1".to_string()])
+                .unwrap_or_default(),
+            log_path: (name == "project-check").then(|| log_relative.clone()),
+        })
+        .collect();
+        fs::write(
+            &gate_path,
+            serde_json::to_vec_pretty(&CandidateGateEvidence {
+                schema_version: crate::candidate_gate::CANDIDATE_GATE_SCHEMA_VERSION,
+                phase: CandidateGatePhase::Writer,
+                disposition: CandidateGateDisposition::Rejected,
+                base_commit: base.clone(),
+                candidate_commit: candidate.clone(),
+                tester_results_path: None,
+                metadata_rewrite: None,
+                checks,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let store = WorkModelStore::new(&project_root);
+        let approved_input = b"approved recovery context\n";
+        let input_artifacts = if preserved_input {
+            let snapshot_path = work_artifact_path("work-1", "inputs", "0000-context.md");
+            let snapshot = project_root.join(&snapshot_path);
+            fs::create_dir_all(snapshot.parent().unwrap()).unwrap();
+            fs::write(&snapshot, approved_input).unwrap();
+            vec![crate::work_model::WorkItemInputArtifact {
+                source_path: "approved/context.md".to_string(),
+                snapshot_path,
+                digest: format!("sha256:{:x}", Sha256::digest(approved_input)),
+            }]
+        } else {
+            Vec::new()
+        };
+        let mut item = WorkItem {
+            input_artifacts,
+            ..WorkItem::planned("work-1", "Recover retired commit style")
+        };
+        item.add_initial_attempt("attempt-1").unwrap();
+        let writer = &mut item.attempts[0].tasks[0];
+        crate::work_model::set_task_terminal(writer, TaskStatus::Complete);
+        writer.output = Some(TaskOutput {
+            workspace_id: "candidate".to_string(),
+            workspace_path: "../work-candidate".to_string(),
+            source_branch: "work/attempt-1".to_string(),
+            base_commit: Some(base),
+            commit: candidate.clone(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        item.attempts[0].artifacts.push(gate_artifact.clone());
+        let correction = item
+            .add_next_write_round("attempt-1", vec![gate_artifact])
+            .unwrap();
+        let attempt = &mut item.attempts[0];
+        let correction = attempt
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == correction)
+            .unwrap();
+        crate::work_model::set_task_terminal(correction, TaskStatus::NeedsUser);
+        attempt.status = AttemptStatus::NeedsUser;
+        attempt.pause_kind = Some(PauseKind::WriterCompletion);
+        store.create_work_item(&item).unwrap();
+
+        RetiredCommitStyleFixture {
+            _root: root,
+            project_root,
+            workspace,
+            store,
+            gate_path,
+            log_path,
+            candidate,
+            candidate_tree,
+        }
+    }
+
+    #[test]
+    fn retired_commit_style_pause_reuses_preceding_candidate() {
+        for long_body_line in [false, true] {
+            let fixture = make_retired_commit_style_pause_fixture(long_body_line);
+            let gate_before = fs::read(&fixture.gate_path).unwrap();
+            let log_before = fs::read(&fixture.log_path).unwrap();
+
+            assert!(
+                recover_retired_commit_style_pause(
+                    &fixture.project_root,
+                    &fixture.store,
+                    "work-1",
+                    "attempt-1",
+                )
+                .unwrap()
+            );
+
+            let recovered = fixture.store.read_work_item("work-1").unwrap();
+            let attempt = &recovered.attempts[0];
+            assert_eq!(attempt.tasks.len(), 2);
+            assert_eq!(attempt.tasks[0].status, TaskStatus::Complete);
+            assert_eq!(
+                attempt.tasks[0].output.as_ref().unwrap().commit,
+                fixture.candidate
+            );
+            assert_eq!(attempt.tasks[1].status, TaskStatus::Superseded);
+            assert!(attempt.tasks[1].output.is_none());
+            assert_eq!(attempt.status, AttemptStatus::Planned);
+            assert_eq!(attempt.pause_kind, None);
+            assert_eq!(fs::read(&fixture.gate_path).unwrap(), gate_before);
+            assert_eq!(fs::read(&fixture.log_path).unwrap(), log_before);
+            assert_eq!(
+                crate::git::run_stdout(
+                    &fixture.workspace,
+                    &["rev-parse", "HEAD^{tree}"],
+                    "verify recovered candidate tree",
+                )
+                .unwrap(),
+                fixture.candidate_tree
+            );
+            let receipt = attempt
+                .artifacts
+                .iter()
+                .find(|artifact| artifact.path.ends_with("/reclassification.json"))
+                .expect("policy reclassification is recorded")
+                .clone();
+            let parsed: serde_json::Value = serde_json::from_slice(
+                &fs::read(fixture.project_root.join(&receipt.path)).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(parsed["candidate-commit"], fixture.candidate);
+            assert_eq!(parsed["candidate-tree"], fixture.candidate_tree);
+
+            let outcome = plan_after_completed_writer(
+                &fixture.project_root,
+                &fixture.store,
+                recovered,
+                "attempt-1",
+            )
+            .unwrap();
+            assert!(matches!(
+                outcome,
+                WorkAttemptRunOutcome::PlannedReviews { .. }
+            ));
+            let reviewed = fixture.store.read_work_item("work-1").unwrap();
+            assert_eq!(
+                reviewed.attempts[0]
+                    .tasks
+                    .iter()
+                    .filter(|task| task.kind == TaskKind::Write)
+                    .count(),
+                2
+            );
+            for reviewer in reviewed.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Review)
+            {
+                assert_eq!(
+                    reviewer.review_context.as_ref().unwrap().candidate_commit,
+                    fixture.candidate
+                );
+                assert!(reviewer.input_artifacts.contains(&receipt));
+            }
+            assert_eq!(fs::read(&fixture.gate_path).unwrap(), gate_before);
+            assert_eq!(fs::read(&fixture.log_path).unwrap(), log_before);
+        }
+    }
+
+    #[test]
+    fn retired_commit_style_recovers_legacy_omitted_gate_index() {
+        let fixture = make_legacy_omitted_gate_index_fixture();
+        let gate_before = fs::read(&fixture.gate_path).unwrap();
+        let log_before = fs::read(&fixture.log_path).unwrap();
+        let omitted = fixture.store.read_work_item("work-1").unwrap();
+        assert!(
+            omitted.attempts[0]
+                .artifacts
+                .iter()
+                .all(|artifact| !artifact.path.ends_with("/candidate-gate.json"))
+        );
+
+        assert!(
+            recover_retired_commit_style_pause(
+                &fixture.project_root,
+                &fixture.store,
+                "work-1",
+                "attempt-1",
+            )
+            .unwrap()
+        );
+
+        let recovered = fixture.store.read_work_item("work-1").unwrap();
+        let attempt = &recovered.attempts[0];
+        let gate = attempt.tasks[1].input_artifacts[0].clone();
+        assert_eq!(attempt.tasks[1].status, TaskStatus::Superseded);
+        assert_eq!(
+            attempt
+                .artifacts
+                .iter()
+                .filter(|artifact| **artifact == gate)
+                .count(),
+            1,
+            "recovery must normalize the omitted aggregate gate reference"
+        );
+        assert_eq!(
+            attempt
+                .artifacts
+                .iter()
+                .filter(|artifact| artifact.path.ends_with("/reclassification.json"))
+                .count(),
+            1
+        );
+        assert_eq!(fs::read(&fixture.gate_path).unwrap(), gate_before);
+        assert_eq!(fs::read(&fixture.log_path).unwrap(), log_before);
+
+        let outcome = plan_after_completed_writer(
+            &fixture.project_root,
+            &fixture.store,
+            recovered,
+            "attempt-1",
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedReviews { .. }
+        ));
+        let reviewed = fixture.store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            reviewed.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            2,
+            "legacy recovery must not plan another Writer"
+        );
+    }
+
+    #[test]
+    fn retired_commit_style_pause_preserves_work_item_inputs() {
+        let fixture = make_retired_commit_style_pause_fixture_with_input(false, true);
+        let before = fixture.store.read_work_item("work-1").unwrap();
+        let preserved = ArtifactRef {
+            producer_id: "work-item".to_string(),
+            path: before.input_artifacts[0].snapshot_path.clone(),
+        };
+        let gate = before.attempts[0]
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.path.ends_with("/candidate-gate.json"))
+            .unwrap()
+            .clone();
+        assert_eq!(
+            before.attempts[0].tasks[1].input_artifacts,
+            vec![preserved.clone(), gate]
+        );
+
+        assert!(
+            recover_retired_commit_style_pause(
+                &fixture.project_root,
+                &fixture.store,
+                "work-1",
+                "attempt-1",
+            )
+            .unwrap()
+        );
+        let recovered = fixture.store.read_work_item("work-1").unwrap();
+        assert!(matches!(
+            plan_after_completed_writer(
+                &fixture.project_root,
+                &fixture.store,
+                recovered,
+                "attempt-1",
+            )
+            .unwrap(),
+            WorkAttemptRunOutcome::PlannedReviews { .. }
+        ));
+        let reviewed = fixture.store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            reviewed.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            2
+        );
+        assert!(
+            reviewed.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Review)
+                .all(|task| task.input_artifacts.contains(&preserved))
+        );
+    }
+
+    #[test]
+    fn retired_commit_style_recovery_rejects_unsafe_frontiers() {
+        let unlogged_provenance =
+            make_retired_commit_style_pause_fixture_with_options(true, false, true);
+        let item = unlogged_provenance.store.read_work_item("work-1").unwrap();
+        let source = item.attempts[0].tasks[0].output.as_ref().unwrap();
+        let base = source.base_commit.as_ref().unwrap();
+        let commits = crate::git::run_stdout(
+            &unlogged_provenance.workspace,
+            &[
+                "rev-list",
+                "--reverse",
+                &format!("{base}..{}", unlogged_provenance.candidate),
+            ],
+            "inspect unlogged provenance fixture history",
+        )
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        assert_eq!(commits.len(), 2);
+        let prior_message = crate::git::run_stdout(
+            &unlogged_provenance.workspace,
+            &["show", "-s", "--format=%B", &commits[0]],
+            "inspect earlier unlogged attribution",
+        )
+        .unwrap();
+        assert!(prior_message.contains("Co-Authored-By: Bot <bot@example.com>"));
+        assert_eq!(commits[1], unlogged_provenance.candidate);
+        let tip_message = crate::git::run_stdout(
+            &unlogged_provenance.workspace,
+            &["show", "-s", "--format=%B", &commits[1]],
+            "inspect presentation-only tip",
+        )
+        .unwrap();
+        assert!(!tip_message.contains("Co-Authored-By:"));
+        assert!(tip_message.lines().any(|line| line.chars().count() > 72));
+        let before = retired_commit_style_boundary_snapshot(&unlogged_provenance);
+        assert!(
+            recover_retired_commit_style_pause(
+                &unlogged_provenance.project_root,
+                &unlogged_provenance.store,
+                "work-1",
+                "attempt-1",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("prohibited Co-Authored-By trailer")
+        );
+        assert_retired_commit_style_boundary_unchanged(&unlogged_provenance, before);
+
+        let mixed = make_retired_commit_style_pause_fixture(false);
+        fs::write(
+            &mixed.log_path,
+            format!(
+                "commit {} has no body separated from its subject by a blank line\ncommit {} contains a prohibited Co-Authored-By trailer\n",
+                mixed.candidate, mixed.candidate
+            ),
+        )
+        .unwrap();
+        let before = retired_commit_style_boundary_snapshot(&mixed);
+        assert!(
+            recover_retired_commit_style_pause(
+                &mixed.project_root,
+                &mixed.store,
+                "work-1",
+                "attempt-1",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("unknown retired commit-style hook diagnostic")
+        );
+        assert_retired_commit_style_boundary_unchanged(&mixed, before);
+
+        let dirty = make_retired_commit_style_pause_fixture(false);
+        fs::write(dirty.workspace.join("untracked.txt"), "dirty\n").unwrap();
+        let before = retired_commit_style_boundary_snapshot(&dirty);
+        assert!(
+            recover_retired_commit_style_pause(
+                &dirty.project_root,
+                &dirty.store,
+                "work-1",
+                "attempt-1",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("not clean and unchanged")
+        );
+        assert_retired_commit_style_boundary_unchanged(&dirty, before);
+
+        let live = make_retired_commit_style_pause_fixture(false);
+        let _lease = crate::lease::acquire(&crate::lease::task_lock_path(
+            &live.project_root,
+            "work-1",
+            "attempt-1-write-2",
+        ))
+        .unwrap();
+        let before = retired_commit_style_boundary_snapshot(&live);
+        assert!(
+            recover_retired_commit_style_pause(
+                &live.project_root,
+                &live.store,
+                "work-1",
+                "attempt-1",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("live execution")
+        );
+        assert_retired_commit_style_boundary_unchanged(&live, before);
+
+        let output = make_retired_commit_style_pause_fixture(false);
+        let mut item = output.store.read_work_item("work-1").unwrap();
+        crate::work_model::set_task_terminal(&mut item.attempts[0].tasks[1], TaskStatus::Complete);
+        item.attempts[0].tasks[1].output = item.attempts[0].tasks[0].output.clone();
+        output.store.write_work_item(&item).unwrap();
+        let before = retired_commit_style_boundary_snapshot(&output);
+        assert!(
+            recover_retired_commit_style_pause(
+                &output.project_root,
+                &output.store,
+                "work-1",
+                "attempt-1",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("produced output")
+        );
+        assert_retired_commit_style_boundary_unchanged(&output, before);
+
+        let drifted = make_retired_commit_style_pause_fixture(false);
+        fs::write(drifted.workspace.join("later.txt"), "later\n").unwrap();
+        crate::git::run(
+            &drifted.workspace,
+            &["add", "later.txt"],
+            "stage drifted candidate",
+        )
+        .unwrap();
+        crate::git::run(
+            &drifted.workspace,
+            &[
+                "commit",
+                "-q",
+                "-m",
+                "Add later change",
+                "-m",
+                "- Explain drift",
+            ],
+            "commit drifted candidate",
+        )
+        .unwrap();
+        let before = retired_commit_style_boundary_snapshot(&drifted);
+        assert!(
+            recover_retired_commit_style_pause(
+                &drifted.project_root,
+                &drifted.store,
+                "work-1",
+                "attempt-1",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("not clean and unchanged")
+        );
+        assert_retired_commit_style_boundary_unchanged(&drifted, before);
+
+        let unbound = make_retired_commit_style_pause_fixture(false);
+        unbound
+            .store
+            .mutate_work_item("work-1", |item| {
+                item.attempts[0].tasks[1].input_artifacts[0].producer_id =
+                    "attempt-1-write-other".to_string();
+                Ok(())
+            })
+            .unwrap();
+        let before = retired_commit_style_boundary_snapshot(&unbound);
+        assert!(
+            recover_retired_commit_style_pause(
+                &unbound.project_root,
+                &unbound.store,
+                "work-1",
+                "attempt-1",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("not bound to the source Writer")
+        );
+        assert_retired_commit_style_boundary_unchanged(&unbound, before);
+
+        let extra_input = make_retired_commit_style_pause_fixture(false);
+        extra_input
+            .store
+            .mutate_work_item("work-1", |item| {
+                item.attempts[0].tasks[1].input_artifacts.push(ArtifactRef {
+                    producer_id: "attempt-1-review-tests".to_string(),
+                    path: work_artifact_path(
+                        "work-1",
+                        "attempt-1",
+                        "attempt-1-review-tests/review.md",
+                    ),
+                });
+                Ok(())
+            })
+            .unwrap();
+        let before = retired_commit_style_boundary_snapshot(&extra_input);
+        assert!(
+            recover_retired_commit_style_pause(
+                &extra_input.project_root,
+                &extra_input.store,
+                "work-1",
+                "attempt-1",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("inputs do not match")
+        );
+        assert_retired_commit_style_boundary_unchanged(&extra_input, before);
+
+        let missing_input = make_retired_commit_style_pause_fixture(false);
+        missing_input
+            .store
+            .mutate_work_item("work-1", |item| {
+                item.input_artifacts
+                    .push(crate::work_model::WorkItemInputArtifact {
+                        source_path: "approved/evidence.json".to_string(),
+                        snapshot_path: work_artifact_path("work-1", "inputs", "0000-evidence.json"),
+                        digest: "sha256:approved".to_string(),
+                    });
+                Ok(())
+            })
+            .unwrap();
+        let before = retired_commit_style_boundary_snapshot(&missing_input);
+        assert!(
+            recover_retired_commit_style_pause(
+                &missing_input.project_root,
+                &missing_input.store,
+                "work-1",
+                "attempt-1",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("inputs do not match")
+        );
+        assert_retired_commit_style_boundary_unchanged(&missing_input, before);
+
+        let changed_hook = make_retired_commit_style_pause_fixture(false);
+        fs::write(
+            changed_hook
+                .project_root
+                .join(".fluent/hooks/check-pre-merge"),
+            "#!/bin/sh\nexit 1\n",
+        )
+        .unwrap();
+        crate::git::run(
+            &changed_hook.project_root,
+            &["add", ".fluent/hooks/check-pre-merge"],
+            "stage changed retired-style hook",
+        )
+        .unwrap();
+        crate::git::run(
+            &changed_hook.project_root,
+            &[
+                "commit",
+                "-q",
+                "-m",
+                "Change candidate hook",
+                "-m",
+                "- Stop invoking the advisory policy",
+            ],
+            "commit changed retired-style hook",
+        )
+        .unwrap();
+        let before = retired_commit_style_boundary_snapshot(&changed_hook);
+        assert!(
+            recover_retired_commit_style_pause(
+                &changed_hook.project_root,
+                &changed_hook.store,
+                "work-1",
+                "attempt-1",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("does not invoke Factory's commit-message policy")
+        );
+        assert_retired_commit_style_boundary_unchanged(&changed_hook, before);
+
+        let changed_policy = make_retired_commit_style_pause_fixture(false);
+        fs::write(
+            changed_policy
+                .project_root
+                .join("scripts/check-commit-message-policy.sh"),
+            "#!/bin/sh\nexit 0\n",
+        )
+        .unwrap();
+        crate::git::run(
+            &changed_policy.project_root,
+            &["add", "scripts/check-commit-message-policy.sh"],
+            "stage changed retired-style policy",
+        )
+        .unwrap();
+        crate::git::run(
+            &changed_policy.project_root,
+            &[
+                "commit",
+                "-q",
+                "-m",
+                "Change commit policy",
+                "-m",
+                "- Remove the advisory policy marker",
+            ],
+            "commit changed retired-style policy",
+        )
+        .unwrap();
+        let before = retired_commit_style_boundary_snapshot(&changed_policy);
+        assert!(
+            recover_retired_commit_style_pause(
+                &changed_policy.project_root,
+                &changed_policy.store,
+                "work-1",
+                "attempt-1",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("has not retired presentation findings")
+        );
+        assert_retired_commit_style_boundary_unchanged(&changed_policy, before);
+
+        let changed_gate = make_retired_commit_style_pause_fixture(false);
+        recover_retired_commit_style_pause(
+            &changed_gate.project_root,
+            &changed_gate.store,
+            "work-1",
+            "attempt-1",
+        )
+        .unwrap();
+        let mut changed_gate_bytes = fs::read(&changed_gate.gate_path).unwrap();
+        changed_gate_bytes.push(b'\n');
+        fs::write(&changed_gate.gate_path, &changed_gate_bytes).unwrap();
+        let before = retired_commit_style_boundary_snapshot(&changed_gate);
+        let error = plan_after_completed_writer(
+            &changed_gate.project_root,
+            &changed_gate.store,
+            changed_gate.store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("no longer matches"));
+        assert_retired_commit_style_boundary_unchanged(&changed_gate, before);
+    }
+
+    #[test]
+    fn retired_commit_style_legacy_index_recovery_rejects_unsafe_frontiers() {
+        let missing = make_legacy_omitted_gate_index_fixture();
+        missing
+            .store
+            .mutate_work_item("work-1", |item| {
+                item.attempts[0].tasks[1].input_artifacts.clear();
+                Ok(())
+            })
+            .unwrap();
+        assert_legacy_gate_index_recovery_rejected(
+            &missing,
+            Some("does not name a candidate gate"),
+        );
+
+        let missing_evidence = make_legacy_omitted_gate_index_fixture();
+        missing_evidence
+            .store
+            .mutate_work_item("work-1", |item| {
+                item.attempts[0].tasks[1].input_artifacts.clear();
+                Ok(())
+            })
+            .unwrap();
+        fs::remove_file(&missing_evidence.gate_path).unwrap();
+        assert_legacy_gate_index_recovery_rejected(
+            &missing_evidence,
+            Some("does not name a candidate gate"),
+        );
+
+        let duplicated = make_legacy_omitted_gate_index_fixture();
+        duplicated
+            .store
+            .mutate_work_item("work-1", |item| {
+                let gate = item.attempts[0].tasks[1].input_artifacts[0].clone();
+                item.attempts[0].tasks[1].input_artifacts.push(gate);
+                Ok(())
+            })
+            .unwrap();
+        assert_legacy_gate_index_recovery_rejected(&duplicated, Some("multiple candidate gates"));
+
+        let noncanonical = make_legacy_omitted_gate_index_fixture();
+        noncanonical
+            .store
+            .mutate_work_item("work-1", |item| {
+                let gate = &mut item.attempts[0].tasks[1].input_artifacts[0];
+                gate.path = gate
+                    .path
+                    .replace("/candidate-gate.json", "/nested/../candidate-gate.json");
+                Ok(())
+            })
+            .unwrap();
+        assert_legacy_gate_index_recovery_rejected(&noncanonical, Some("not bound"));
+
+        let reassigned = make_legacy_omitted_gate_index_fixture();
+        reassigned
+            .store
+            .mutate_work_item("work-1", |item| {
+                item.attempts[0].tasks[1].input_artifacts[0].producer_id =
+                    "attempt-1-write-other".to_string();
+                Ok(())
+            })
+            .unwrap();
+        assert_legacy_gate_index_recovery_rejected(&reassigned, Some("not bound"));
+
+        let ambiguous_index = make_legacy_omitted_gate_index_fixture();
+        ambiguous_index
+            .store
+            .mutate_work_item("work-1", |item| {
+                let mut gate = item.attempts[0].tasks[1].input_artifacts[0].clone();
+                gate.producer_id = "attempt-1-write-other".to_string();
+                item.attempts[0].artifacts.push(gate);
+                Ok(())
+            })
+            .unwrap();
+        assert_legacy_gate_index_recovery_rejected(&ambiguous_index, Some("index is ambiguous"));
+
+        let mismatched_source_index = make_legacy_omitted_gate_index_fixture();
+        mismatched_source_index
+            .store
+            .mutate_work_item("work-1", |item| {
+                let mut gate = item.attempts[0].tasks[1].input_artifacts[0].clone();
+                gate.path = gate.path.replace(
+                    "/attempt-1-write-1/candidate-gate.json",
+                    "/attempt-1-write-other/candidate-gate.json",
+                );
+                item.attempts[0].artifacts.push(gate);
+                Ok(())
+            })
+            .unwrap();
+        assert_legacy_gate_index_recovery_rejected(
+            &mismatched_source_index,
+            Some("index is ambiguous"),
+        );
+
+        let noncanonical_source_index = make_legacy_omitted_gate_index_fixture();
+        noncanonical_source_index
+            .store
+            .mutate_work_item("work-1", |item| {
+                let mut gate = item.attempts[0].tasks[1].input_artifacts[0].clone();
+                gate.path = gate
+                    .path
+                    .replace("/candidate-gate.json", "/nested/../candidate-gate.json");
+                item.attempts[0].artifacts.push(gate);
+                Ok(())
+            })
+            .unwrap();
+        assert_legacy_gate_index_recovery_rejected(
+            &noncanonical_source_index,
+            Some("index is ambiguous"),
+        );
+
+        let extra = make_legacy_omitted_gate_index_fixture();
+        extra
+            .store
+            .mutate_work_item("work-1", |item| {
+                item.attempts[0].tasks[1].input_artifacts.push(ArtifactRef {
+                    producer_id: "attempt-1-review-tests".to_string(),
+                    path: work_artifact_path(
+                        "work-1",
+                        "attempt-1",
+                        "attempt-1-review-tests/review.md",
+                    ),
+                });
+                Ok(())
+            })
+            .unwrap();
+        assert_legacy_gate_index_recovery_rejected(&extra, Some("inputs do not match"));
+
+        let mixed = make_legacy_omitted_gate_index_fixture();
+        fs::write(
+            &mixed.log_path,
+            format!(
+                "commit {} body line 3 exceeds 72 characters\ncommit {} contains a prohibited Co-Authored-By trailer\n",
+                mixed.candidate, mixed.candidate
+            ),
+        )
+        .unwrap();
+        assert_legacy_gate_index_recovery_rejected(
+            &mixed,
+            Some("unknown retired commit-style hook diagnostic"),
+        );
+
+        let changed_gate = make_legacy_omitted_gate_index_fixture();
+        let mut gate: crate::candidate_gate::CandidateGateEvidence =
+            serde_json::from_slice(&fs::read(&changed_gate.gate_path).unwrap()).unwrap();
+        gate.candidate_commit = "changed-candidate".to_string();
+        fs::write(
+            &changed_gate.gate_path,
+            serde_json::to_vec_pretty(&gate).unwrap(),
+        )
+        .unwrap();
+        assert_legacy_gate_index_recovery_rejected(&changed_gate, Some("names candidate"));
+
+        let changed_hook = make_legacy_omitted_gate_index_fixture();
+        fs::write(
+            &changed_hook.log_path,
+            format!(
+                "commit {} contains a prohibited Co-Authored-By trailer\n",
+                changed_hook.candidate
+            ),
+        )
+        .unwrap();
+        assert_legacy_gate_index_recovery_rejected(
+            &changed_hook,
+            Some("unknown retired commit-style hook diagnostic"),
+        );
+
+        let dirty = make_legacy_omitted_gate_index_fixture();
+        fs::write(dirty.workspace.join("untracked.txt"), "dirty\n").unwrap();
+        assert_legacy_gate_index_recovery_rejected(&dirty, Some("not clean and unchanged"));
+
+        let drifted = make_legacy_omitted_gate_index_fixture();
+        fs::write(drifted.workspace.join("later.txt"), "later\n").unwrap();
+        crate::git::run(
+            &drifted.workspace,
+            &["add", "later.txt"],
+            "stage legacy candidate drift",
+        )
+        .unwrap();
+        crate::git::run(
+            &drifted.workspace,
+            &[
+                "commit",
+                "-q",
+                "-m",
+                "Add later change",
+                "-m",
+                "- Move the candidate beyond the stored gate",
+            ],
+            "commit legacy candidate drift",
+        )
+        .unwrap();
+        assert_legacy_gate_index_recovery_rejected(&drifted, Some("not clean and unchanged"));
+
+        let live = make_legacy_omitted_gate_index_fixture();
+        let _lease = crate::lease::acquire(&crate::lease::task_lock_path(
+            &live.project_root,
+            "work-1",
+            "attempt-1-write-2",
+        ))
+        .unwrap();
+        assert_legacy_gate_index_recovery_rejected(&live, Some("live execution"));
+
+        let output = make_legacy_omitted_gate_index_fixture();
+        output
+            .store
+            .mutate_work_item("work-1", |item| {
+                crate::work_model::set_task_terminal(
+                    &mut item.attempts[0].tasks[1],
+                    TaskStatus::Complete,
+                );
+                item.attempts[0].tasks[1].output = item.attempts[0].tasks[0].output.clone();
+                Ok(())
+            })
+            .unwrap();
+        assert_legacy_gate_index_recovery_rejected(&output, Some("produced output"));
+    }
+
+    #[test]
+    fn retired_commit_style_admission_survives_unrelated_policy_advance() {
+        let fixture = make_retired_commit_style_pause_fixture(false);
+        let gate_before = fs::read(&fixture.gate_path).unwrap();
+        let log_before = fs::read(&fixture.log_path).unwrap();
+        recover_retired_commit_style_pause(
+            &fixture.project_root,
+            &fixture.store,
+            "work-1",
+            "attempt-1",
+        )
+        .unwrap();
+        let recovered = fixture.store.read_work_item("work-1").unwrap();
+        let receipt = recovered.attempts[0]
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.path.ends_with("/reclassification.json"))
+            .expect("policy reclassification is recorded")
+            .clone();
+        let receipt_before = fs::read(fixture.project_root.join(&receipt.path)).unwrap();
+
+        fs::write(
+            fixture.project_root.join("CHANGELOG.md"),
+            "Unrelated project update\n",
+        )
+        .unwrap();
+        crate::git::run(
+            &fixture.project_root,
+            &["add", "CHANGELOG.md"],
+            "stage unrelated policy advance",
+        )
+        .unwrap();
+        crate::git::run(
+            &fixture.project_root,
+            &[
+                "commit",
+                "-q",
+                "-m",
+                "Update project notes",
+                "-m",
+                "- Leave the advisory commit policy unchanged",
+            ],
+            "commit unrelated policy advance",
+        )
+        .unwrap();
+
+        let outcome = plan_after_completed_writer(
+            &fixture.project_root,
+            &fixture.store,
+            recovered,
+            "attempt-1",
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedReviews { .. }
+        ));
+        let reviewed = fixture.store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            reviewed.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Review)
+                .count(),
+            crate::review::REVIEWERS.len()
+        );
+        assert_eq!(
+            fs::read(fixture.project_root.join(&receipt.path)).unwrap(),
+            receipt_before
+        );
+        assert_eq!(fs::read(&fixture.gate_path).unwrap(), gate_before);
+        assert_eq!(fs::read(&fixture.log_path).unwrap(), log_before);
+        assert_eq!(
+            crate::git::run_stdout(
+                &fixture.workspace,
+                &["rev-parse", "HEAD"],
+                "verify candidate after unrelated policy advance",
+            )
+            .unwrap(),
+            fixture.candidate
+        );
+        assert_eq!(
+            crate::git::run_stdout(
+                &fixture.workspace,
+                &["rev-parse", "HEAD^{tree}"],
+                "verify candidate tree after unrelated policy advance",
+            )
+            .unwrap(),
+            fixture.candidate_tree
+        );
+    }
+
+    #[test]
+    fn retired_commit_style_recovery_reuses_matching_unbound_receipt() {
+        let fixture = make_retired_commit_style_pause_fixture(false);
+        let item = fixture.store.read_work_item("work-1").unwrap();
+        let recovery = crate::lifecycle_recovery::inspect_retired_commit_style_recovery(
+            &fixture.project_root,
+            &item,
+            "attempt-1",
+        )
+        .unwrap()
+        .unwrap();
+        let artifact = crate::lifecycle_recovery::retired_commit_style_reclassification_artifact(
+            "work-1",
+            "attempt-1",
+            &recovery.source_writer_task_id,
+        );
+        let receipt = crate::lifecycle_recovery::RetiredCommitStyleReclassification::from_recovery(
+            &item,
+            "attempt-1",
+            &recovery,
+        );
+        let receipt_bytes = serde_json::to_vec_pretty(&receipt).unwrap();
+        let path = fixture.project_root.join(&artifact.path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, &receipt_bytes).unwrap();
+
+        fs::write(
+            fixture.project_root.join("CHANGELOG.md"),
+            "Unrelated project update\n",
+        )
+        .unwrap();
+        crate::git::run(
+            &fixture.project_root,
+            &["add", "CHANGELOG.md"],
+            "stage unrelated unbound-receipt advance",
+        )
+        .unwrap();
+        crate::git::run(
+            &fixture.project_root,
+            &[
+                "commit",
+                "-q",
+                "-m",
+                "Update project notes",
+                "-m",
+                "- Leave the advisory commit policy unchanged",
+            ],
+            "commit unrelated unbound-receipt advance",
+        )
+        .unwrap();
+
+        assert!(
+            recover_retired_commit_style_pause(
+                &fixture.project_root,
+                &fixture.store,
+                "work-1",
+                "attempt-1",
+            )
+            .unwrap()
+        );
+        assert_eq!(fs::read(path).unwrap(), receipt_bytes);
+        let stored = fixture.store.read_work_item("work-1").unwrap();
+        assert_eq!(stored.attempts[0].tasks[1].status, TaskStatus::Superseded);
+        assert_eq!(
+            stored.attempts[0]
+                .artifacts
+                .iter()
+                .filter(|candidate| **candidate == artifact)
+                .count(),
+            1
+        );
+    }
+
+    fn make_uncertain_review_pause_fixture(
+        project_root: &Path,
+    ) -> (WorkModelStore, tempfile::TempDir) {
+        let (store, workspace) =
+            make_candidate_gate_fixture(project_root, "pub fn value() {}\n", None);
+        store
+            .mutate_work_item("work-1", |item| {
+                let output = item.attempts[0].tasks[0].output.clone().unwrap();
+                for role in crate::review::REVIEWERS {
+                    let id = format!("attempt-1-review-{role}");
+                    let artifact_path = work_artifact_path("work-1", "attempt-1", &id);
+                    let mut task = review_task_with_artifact(&id, role, &artifact_path);
+                    task.workspace_access.reads[0].path = output.workspace_path.clone();
+                    let context = task.review_context.as_mut().unwrap();
+                    context.candidate_workspace_path = output.workspace_path.clone();
+                    context.candidate_commit = output.commit.clone();
+                    context.source_branch = output.source_branch.clone();
+                    item.attempts[0].tasks.push(task);
+                }
+                item.attempts[0].review_state = Some(AttemptReviewState::Uncertain);
+                crate::work_model::suspend_attempt(&mut item.attempts[0], PauseKind::Uncertain);
+                Ok(())
+            })
+            .unwrap();
+        let item = store.read_work_item("work-1").unwrap();
+        for task in item.attempts[0]
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Review)
+        {
+            let directory = project_root.join(&task.artifact_area.as_ref().unwrap().path);
+            fs::create_dir_all(&directory).unwrap();
+            let verdict = if task.role == "skills" {
+                "UNCERTAIN"
+            } else {
+                "PASS"
+            };
+            fs::write(directory.join("review.md"), format!("Verdict: {verdict}\n")).unwrap();
+        }
+        (store, workspace)
+    }
+
+    #[test]
+    fn approach_revision_corrective_writer_schedules_targeted_reviews() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace) =
+            make_candidate_gate_fixture(project.path(), "pub fn value() {}\n", None);
+        store
+            .mutate_work_item("work-1", |item| {
+                let output = item.attempts[0].tasks[0].output.clone().unwrap();
+                item.add_review_tasks("attempt-1", &["architecture", "documentation"])?;
+                let attempt = &mut item.attempts[0];
+                for task in attempt
+                    .tasks
+                    .iter_mut()
+                    .filter(|task| task.kind == TaskKind::Review)
+                {
+                    crate::work_model::set_task_terminal(task, TaskStatus::Complete);
+                }
+                let review_inputs = attempt.tasks[1..]
+                    .iter()
+                    .map(|task| ArtifactRef {
+                        producer_id: task.id.clone(),
+                        path: format!("{}/review.md", task.artifact_area.as_ref().unwrap().path),
+                    })
+                    .collect::<Vec<_>>();
+                let mut failed_launch = attempt.tasks[1].clone();
+                failed_launch.id = "attempt-1-review-2-architecture".to_string();
+                crate::work_model::set_task_terminal(&mut failed_launch, TaskStatus::Failed);
+                attempt.tasks.push(failed_launch.clone());
+                attempt.approach_revision_superseded_tasks.push(
+                    crate::work_model::ApproachRevisionSupersession {
+                        failed_task_id: failed_launch.id.clone(),
+                        audit_artifact: ArtifactRef {
+                            producer_id: "planning-approach-recovery".to_string(),
+                            path: ".fluent/work/artifacts/work-1/attempt-1/audit.json".to_string(),
+                        },
+                        source_review_task_id: "attempt-1-review-architecture".to_string(),
+                        candidate_commit: output.commit.clone(),
+                        corrective_writer_task_id: "pending".to_string(),
+                    },
+                );
+                let corrective_id = item.add_next_write_round("attempt-1", review_inputs)?;
+                let corrective = item.attempts[0]
+                    .tasks
+                    .iter_mut()
+                    .find(|task| task.id == corrective_id)
+                    .unwrap();
+                crate::work_model::set_task_terminal(corrective, TaskStatus::Complete);
+                corrective.output = Some(output);
+                let audit = ArtifactRef {
+                    producer_id: "planning-approach-recovery".to_string(),
+                    path: ".fluent/work/artifacts/work-1/attempt-1/audit.json".to_string(),
+                };
+                item.attempts[0].artifacts.push(audit.clone());
+                item.attempts[0].approach_revision_superseded_tasks[0].corrective_writer_task_id =
+                    corrective_id;
+                item.attempts[0].status = AttemptStatus::Planned;
+                Ok(())
+            })
+            .unwrap();
+
+        let outcome = plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+        let WorkAttemptRunOutcome::PlannedReviews { task_ids } = outcome else {
+            panic!("a completed corrective Writer must schedule targeted reviews");
+        };
+        let attempt = &store.read_work_item("work-1").unwrap().attempts[0];
+        let mut roles = task_ids
+            .iter()
+            .map(|id| {
+                attempt
+                    .tasks
+                    .iter()
+                    .find(|task| &task.id == id)
+                    .unwrap()
+                    .role
+                    .as_str()
+            })
+            .collect::<Vec<_>>();
+        roles.sort_unstable();
+        assert_eq!(
+            roles,
+            vec![
+                "architecture",
+                "behaviors",
+                "documentation",
+                "skills",
+                "tests"
+            ]
+        );
+    }
+
+    #[test]
+    fn uncertain_review_resume_reopens_only_uncertain_roles() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace) = make_uncertain_review_pause_fixture(project.path());
+
+        let task_ids =
+            reopen_uncertain_review_attempt(project.path(), &store, "work-1", "attempt-1").unwrap();
+
+        assert_eq!(task_ids, vec!["attempt-1-review-2-skills"]);
+        let stored = store.read_work_item("work-1").unwrap();
+        let attempt = &stored.attempts[0];
+        assert_eq!(attempt.status, AttemptStatus::Reviewing);
+        assert_eq!(attempt.review_state, Some(AttemptReviewState::NotReviewed));
+        assert_eq!(attempt.pause_kind, None);
+        assert_eq!(attempt.completed_at, None);
+        assert!(
+            attempt
+                .tasks
+                .iter()
+                .filter(|task| {
+                    task.kind == TaskKind::Review
+                        && task.role != "skills"
+                        && task.status == TaskStatus::Complete
+                })
+                .count()
+                == crate::review::REVIEWERS.len() - 1
+        );
+        let retry = attempt.tasks.last().unwrap();
+        assert_eq!(retry.role, "skills");
+        assert_eq!(retry.status, TaskStatus::Planned);
+    }
+
+    #[test]
+    fn retried_uncertain_role_combines_with_preserved_passes() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace) = make_uncertain_review_pause_fixture(project.path());
+        let task_id =
+            reopen_uncertain_review_attempt(project.path(), &store, "work-1", "attempt-1")
+                .unwrap()
+                .pop()
+                .unwrap();
+        store
+            .mutate_work_item("work-1", |item| {
+                let task = item.attempts[0]
+                    .tasks
+                    .iter_mut()
+                    .find(|task| task.id == task_id)
+                    .unwrap();
+                crate::work_model::set_task_terminal(task, TaskStatus::Complete);
+                Ok(())
+            })
+            .unwrap();
+        let stored = store.read_work_item("work-1").unwrap();
+        let retry = stored.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.id == task_id)
+            .unwrap();
+        let directory = project
+            .path()
+            .join(&retry.artifact_area.as_ref().unwrap().path);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("review.md"), "Verdict: PASS\n").unwrap();
+
+        let outcome = interpret_reviews(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+            true,
+            None,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedFinalTester { .. }
+        ));
+    }
+
+    #[test]
+    fn uncertain_review_resume_rejects_missing_evidence_without_mutation() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace) = make_uncertain_review_pause_fixture(project.path());
+        let before = serde_json::to_value(store.read_work_item("work-1").unwrap()).unwrap();
+        let stored = store.read_work_item("work-1").unwrap();
+        let skills = stored.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.role == "skills")
+            .unwrap();
+        fs::remove_file(
+            project
+                .path()
+                .join(&skills.artifact_area.as_ref().unwrap().path)
+                .join("review.md"),
+        )
+        .unwrap();
+
+        let error = reopen_uncertain_review_attempt(project.path(), &store, "work-1", "attempt-1")
+            .unwrap_err();
+        assert!(error.to_string().contains("read review evidence"));
+        let after = serde_json::to_value(store.read_work_item("work-1").unwrap()).unwrap();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn uncertain_review_resume_rejects_dirty_candidate_without_mutation() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, workspace) = make_uncertain_review_pause_fixture(project.path());
+        let before = serde_json::to_value(store.read_work_item("work-1").unwrap()).unwrap();
+        fs::write(workspace.path().join("untracked.txt"), "dirty\n").unwrap();
+
+        let error = reopen_uncertain_review_attempt(project.path(), &store, "work-1", "attempt-1")
+            .unwrap_err();
+        assert!(error.to_string().contains("workspace is dirty"));
+        let after = serde_json::to_value(store.read_work_item("work-1").unwrap()).unwrap();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn uncertain_review_resume_rejects_moved_candidate_without_mutation() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, workspace) = make_uncertain_review_pause_fixture(project.path());
+        let before = serde_json::to_value(store.read_work_item("work-1").unwrap()).unwrap();
+        fs::write(
+            workspace.path().join("src/lib.rs"),
+            "pub fn value() { 1 }\n",
+        )
+        .unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["add", "src/lib.rs"],
+            "stage moved candidate",
+        )
+        .unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["commit", "-q", "-m", "Move candidate"],
+            "commit moved candidate",
+        )
+        .unwrap();
+
+        let error = reopen_uncertain_review_attempt(project.path(), &store, "work-1", "attempt-1")
+            .unwrap_err();
+        assert!(error.to_string().contains("HEAD no longer matches"));
+        let after = serde_json::to_value(store.read_work_item("work-1").unwrap()).unwrap();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn uncertain_review_resume_rejects_stale_review_context_without_mutation() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace) = make_uncertain_review_pause_fixture(project.path());
+        store
+            .mutate_work_item("work-1", |item| {
+                item.attempts[0]
+                    .tasks
+                    .iter_mut()
+                    .find(|task| task.role == "skills")
+                    .unwrap()
+                    .review_context
+                    .as_mut()
+                    .unwrap()
+                    .candidate_commit = "stale-review-commit".to_string();
+                Ok(())
+            })
+            .unwrap();
+        let before = serde_json::to_value(store.read_work_item("work-1").unwrap()).unwrap();
+
+        let error = reopen_uncertain_review_attempt(project.path(), &store, "work-1", "attempt-1")
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not match the current candidate")
+        );
+        let after = serde_json::to_value(store.read_work_item("work-1").unwrap()).unwrap();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn uncertain_review_resume_rejects_a_latest_failed_verdict_without_mutation() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace) = make_uncertain_review_pause_fixture(project.path());
+        let stored = store.read_work_item("work-1").unwrap();
+        let tests = stored.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.role == "tests")
+            .unwrap();
+        let path = project
+            .path()
+            .join(&tests.artifact_area.as_ref().unwrap().path)
+            .join("review.md");
+        fs::write(path, "Verdict: FAIL\n").unwrap();
+        let before = serde_json::to_value(store.read_work_item("work-1").unwrap()).unwrap();
+
+        let error = reopen_uncertain_review_attempt(project.path(), &store, "work-1", "attempt-1")
+            .unwrap_err();
+        assert!(error.to_string().contains("now reports fail"));
+        let after = serde_json::to_value(store.read_work_item("work-1").unwrap()).unwrap();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn deterministic_candidate_failure_returns_to_writer_before_review() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace) =
+            make_candidate_gate_fixture(project.path(), "pub fn value() {    \n}\n", None);
+
+        let outcome = plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedWriteRound { .. }
+        ));
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            2
+        );
+        assert!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .all(|task| task.kind != TaskKind::Review && task.kind != TaskKind::Tester)
+        );
+        let gate = &stored.attempts[0].tasks.last().unwrap().input_artifacts[0];
+        assert!(gate.path.ends_with("/candidate-gate.json"));
+        let evidence: crate::candidate_gate::CandidateGateEvidence =
+            serde_json::from_slice(&fs::read(project.path().join(&gate.path)).unwrap()).unwrap();
+        assert_eq!(
+            evidence.disposition,
+            crate::candidate_gate::CandidateGateDisposition::Rejected
+        );
+    }
+
+    #[test]
+    fn first_rejected_candidate_gate_is_indexed_before_correction() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace) =
+            make_candidate_gate_fixture(project.path(), "pub fn value() {    \n}\n", None);
+
+        let outcome = plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedWriteRound { .. }
+        ));
+        let stored = store.read_work_item("work-1").unwrap();
+        let attempt = &stored.attempts[0];
+        let correction = attempt.tasks.last().unwrap();
+        let gate = correction
+            .input_artifacts
+            .iter()
+            .find(|artifact| artifact.path.ends_with("/candidate-gate.json"))
+            .expect("the correction must name its rejected source gate");
+        assert_eq!(
+            attempt
+                .artifacts
+                .iter()
+                .filter(|artifact| *artifact == gate)
+                .count(),
+            1,
+            "the Attempt must index the exact correction input once"
+        );
+    }
+
+    #[test]
+    fn metadata_recovery_rejects_descendant_product_change_after_writer() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, workspace) =
+            make_candidate_gate_fixture(project.path(), "pub fn value() {}\n", None);
+        let source_output = store.read_work_item("work-1").unwrap().attempts[0].tasks[0]
+            .output
+            .clone()
+            .unwrap();
+        let source_candidate = source_output.commit.clone();
+        let protected_base = source_output.base_commit.clone().unwrap();
+        let gate = work_artifact_path(
+            "work-1",
+            "attempt-1",
+            "candidate-gates/attempt-1-write-1/candidate-gate.json",
+        );
+        let gate_path = project.path().join(&gate);
+        fs::create_dir_all(gate_path.parent().unwrap()).unwrap();
+        let checks = [
+            ("candidate-identity", CandidateCheckStatus::Passed),
+            ("whitespace", CandidateCheckStatus::Passed),
+            ("commit-metadata", CandidateCheckStatus::Failed),
+            ("behavior-references", CandidateCheckStatus::Skipped),
+            ("tester-reference-evidence", CandidateCheckStatus::Skipped),
+            ("project-check", CandidateCheckStatus::Skipped),
+        ]
+        .into_iter()
+        .map(|(name, status)| CandidateCheckEvidence {
+            name: name.to_string(),
+            status,
+            diagnostics: if name == "commit-metadata" {
+                vec!["commit message is missing a body".to_string()]
+            } else {
+                Vec::new()
+            },
+            log_path: None,
+        })
+        .collect();
+        fs::write(
+            &gate_path,
+            serde_json::to_vec_pretty(&CandidateGateEvidence {
+                schema_version: crate::candidate_gate::CANDIDATE_GATE_SCHEMA_VERSION,
+                phase: CandidateGatePhase::Writer,
+                disposition: CandidateGateDisposition::Rejected,
+                base_commit: protected_base,
+                candidate_commit: source_candidate.clone(),
+                tester_results_path: None,
+                metadata_rewrite: None,
+                checks,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let source_gate = ArtifactRef {
+            producer_id: "attempt-1-write-1".to_string(),
+            path: gate,
+        };
+        store
+            .mutate_work_item("work-1", |item| {
+                let attempt = &mut item.attempts[0];
+                attempt.status = AttemptStatus::NeedsUser;
+                attempt.pause_kind = Some(PauseKind::CandidateGate);
+                attempt.review_state = Some(AttemptReviewState::NotReviewed);
+                attempt.artifacts.push(source_gate.clone());
+                Ok(())
+            })
+            .unwrap();
+
+        let recovery = crate::candidate_metadata_recovery::repair(
+            project.path(),
+            &store,
+            "work-1",
+            "attempt-1",
+            "Rewrite only malformed commit messages after the protected base.",
+        )
+        .unwrap();
+        assert!(!recovery.already_authorized);
+
+        fs::write(
+            workspace.path().join("src/product.rs"),
+            "pub fn product_change() {}\n",
+        )
+        .unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["add", "src/product.rs"],
+            "stage descendant product change",
+        )
+        .unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["commit", "-q", "-m", "Extend product"],
+            "commit descendant product change",
+        )
+        .unwrap();
+        let descendant = crate::git::run_stdout(
+            workspace.path(),
+            &["rev-parse", "HEAD"],
+            "read descendant product change",
+        )
+        .unwrap();
+
+        store
+            .mutate_work_item("work-1", |item| {
+                let task = item.attempts[0]
+                    .tasks
+                    .iter_mut()
+                    .find(|task| task.id == recovery.task_id)
+                    .unwrap();
+                crate::work_model::set_task_terminal(task, TaskStatus::Complete);
+                task.output = Some(TaskOutput {
+                    base_commit: Some(source_candidate.clone()),
+                    commit: descendant.clone(),
+                    ..source_output.clone()
+                });
+                Ok(())
+            })
+            .unwrap();
+
+        let outcome = plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, WorkAttemptRunOutcome::NeedsUser { .. }));
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(stored.attempts[0].status, AttemptStatus::NeedsUser);
+        assert_eq!(
+            stored.attempts[0].pause_kind,
+            Some(PauseKind::CandidateGate)
+        );
+        assert!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .all(|task| task.kind != TaskKind::Review && task.kind != TaskKind::Tester)
+        );
+        let gate_ref = stored.attempts[0]
+            .artifacts
+            .iter()
+            .find(|artifact| {
+                artifact.producer_id == recovery.task_id
+                    && artifact.path.ends_with("/candidate-gate.json")
+            })
+            .unwrap();
+        let evidence: CandidateGateEvidence =
+            serde_json::from_slice(&fs::read(project.path().join(&gate_ref.path)).unwrap())
+                .unwrap();
+        assert_eq!(evidence.disposition, CandidateGateDisposition::Blocked);
+        let identity = evidence
+            .checks
+            .iter()
+            .find(|check| check.name == "candidate-identity")
+            .unwrap();
+        assert_eq!(identity.status, CandidateCheckStatus::Error);
+        assert!(
+            identity
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("rewritten candidate tree"))
+        );
+    }
+
+    #[test]
+    fn missing_commit_body_reaches_review_without_a_project_policy_hook() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, workspace) =
+            make_candidate_gate_fixture(project.path(), "pub fn value() {}\n", None);
+        crate::git::run(
+            workspace.path(),
+            &["commit", "--amend", "-q", "-m", "Add candidate"],
+            "remove candidate body",
+        )
+        .unwrap();
+        let candidate = crate::git::run_stdout(
+            workspace.path(),
+            &["rev-parse", "HEAD"],
+            "read bodyless candidate",
+        )
+        .unwrap();
+        store
+            .mutate_work_item("work-1", |item| {
+                item.attempts[0].tasks[0].output.as_mut().unwrap().commit = candidate;
+                Ok(())
+            })
+            .unwrap();
+
+        let outcome = plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedReviews { .. }
+        ));
+        let stored = store.read_work_item("work-1").unwrap();
+        assert!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .any(|task| task.kind == TaskKind::Review)
+        );
+        let gate = stored.attempts[0]
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.path.ends_with("/candidate-gate.json"))
+            .unwrap();
+        let evidence: crate::candidate_gate::CandidateGateEvidence =
+            serde_json::from_slice(&fs::read(project.path().join(&gate.path)).unwrap()).unwrap();
+        assert_eq!(
+            evidence.disposition,
+            crate::candidate_gate::CandidateGateDisposition::Passed
+        );
+        assert_eq!(
+            evidence
+                .checks
+                .iter()
+                .find(|check| check.name == "commit-metadata")
+                .unwrap()
+                .status,
+            crate::candidate_gate::CandidateCheckStatus::Passed
+        );
+    }
+
+    fn pause_after_second_candidate_rejection(
+        project_root: &Path,
+        store: &WorkModelStore,
+        workspace: &Path,
+    ) -> WorkAttemptRunOutcome {
+        let first = plan_after_completed_writer(
+            project_root,
+            store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+        assert!(matches!(
+            first,
+            WorkAttemptRunOutcome::PlannedWriteRound { .. }
+        ));
+
+        fs::write(workspace.join("src/second.rs"), "pub fn second() {}\n").unwrap();
+        crate::git::run(workspace, &["add", "src/second.rs"], "stage correction").unwrap();
+        crate::git::run(
+            workspace,
+            &["commit", "-q", "-m", "Extend candidate"],
+            "commit correction",
+        )
+        .unwrap();
+        let candidate =
+            crate::git::run_stdout(workspace, &["rev-parse", "HEAD"], "read correction").unwrap();
+        let mut item = store.read_work_item("work-1").unwrap();
+        let prior = item.attempts[0].tasks[0].output.clone().unwrap();
+        let correction = item.attempts[0].tasks.last_mut().unwrap();
+        correction.status = TaskStatus::Complete;
+        correction.output = Some(TaskOutput {
+            base_commit: Some(prior.commit.clone()),
+            commit: candidate,
+            ..prior
+        });
+        store.write_work_item(&item).unwrap();
+
+        plan_after_completed_writer(
+            project_root,
+            store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn repeated_candidate_rejection_pauses_for_explicit_bounded_resume() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, workspace) =
+            make_candidate_gate_fixture(project.path(), "pub fn value() {    \n}\n", None);
+
+        let outcome =
+            pause_after_second_candidate_rejection(project.path(), &store, workspace.path());
+        let WorkAttemptRunOutcome::NeedsUser { handoff_path } = outcome else {
+            panic!("the second rejection must pause")
+        };
+        let paused = store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            paused.attempts[0].pause_kind,
+            Some(PauseKind::CandidateGate)
+        );
+        assert_eq!(
+            paused.attempts[0].review_state,
+            Some(AttemptReviewState::NotReviewed)
+        );
+        assert!(
+            paused.attempts[0]
+                .tasks
+                .iter()
+                .all(|task| !is_review_phase_task(task))
+        );
+        let handoff = fs::read_to_string(project.path().join(handoff_path)).unwrap();
+        assert!(handoff.contains("fluent queue resume work-1 --attempt attempt-1"));
+        assert!(handoff.contains("fluent attempt run work-1 attempt-1"));
+
+        let resumed =
+            reopen_candidate_gate_attempt(project.path(), &store, "work-1", "attempt-1").unwrap();
+        assert_eq!(
+            resumed,
+            CandidateGateResume::PlannedWriter {
+                task_id: "attempt-1-write-3".to_string()
+            }
+        );
+        let reopened = store.read_work_item("work-1").unwrap();
+        assert_eq!(reopened.attempts[0].status, AttemptStatus::Planned);
+        assert!(reopened.attempts[0].pause_kind.is_none());
+        let writer = reopened.attempts[0].tasks.last().unwrap();
+        assert_eq!(writer.id, "attempt-1-write-3");
+        assert_eq!(writer.status, TaskStatus::Planned);
+        assert_eq!(writer.workspace_access.writes.len(), 1);
+        assert!(
+            writer
+                .input_artifacts
+                .iter()
+                .any(|artifact| artifact.path.ends_with("/candidate-gate.json"))
+        );
+    }
+
+    #[test]
+    fn legacy_uncertain_candidate_gate_pause_normalizes_on_resume() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, workspace) =
+            make_candidate_gate_fixture(project.path(), "pub fn value() {    \n}\n", None);
+        pause_after_second_candidate_rejection(project.path(), &store, workspace.path());
+        store
+            .mutate_work_item("work-1", |item| {
+                item.attempts[0].pause_kind = Some(PauseKind::Uncertain);
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(matches!(
+            reopen_candidate_gate_attempt(project.path(), &store, "work-1", "attempt-1").unwrap(),
+            CandidateGateResume::PlannedWriter { .. }
+        ));
+        let resumed = store.read_work_item("work-1").unwrap();
+        assert_eq!(resumed.attempts[0].tasks.len(), 3);
+        assert!(resumed.attempts[0].pause_kind.is_none());
+    }
+
+    #[test]
+    fn failed_candidate_gate_correction_retries_the_same_writer_task() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, workspace) =
+            make_candidate_gate_fixture(project.path(), "pub fn value() {    \n}\n", None);
+        pause_after_second_candidate_rejection(project.path(), &store, workspace.path());
+        reopen_candidate_gate_attempt(project.path(), &store, "work-1", "attempt-1").unwrap();
+        store
+            .mutate_work_item("work-1", |item| {
+                let attempt = &mut item.attempts[0];
+                attempt.status = AttemptStatus::Failed;
+                attempt.pause_kind = None;
+                attempt.review_state = Some(AttemptReviewState::Failed);
+                attempt.completed_at = Some("2026-08-08T00:00:00Z".to_string());
+                let task = attempt.tasks.last_mut().unwrap();
+                task.status = TaskStatus::Failed;
+                task.started_at = Some("2026-08-08T00:00:00Z".to_string());
+                task.completed_at = Some("2026-08-08T00:01:00Z".to_string());
+                Ok(())
+            })
+            .unwrap();
+
+        let failed = store.read_work_item("work-1").unwrap();
+        assert!(matches!(
+            reject_terminal_attempt(&failed.attempts[0]).unwrap(),
+            TerminalCheck::Reopen
+        ));
+
+        assert_eq!(
+            reopen_candidate_gate_attempt(project.path(), &store, "work-1", "attempt-1").unwrap(),
+            CandidateGateResume::PlannedWriter {
+                task_id: "attempt-1-write-3".to_string()
+            }
+        );
+        let resumed = store.read_work_item("work-1").unwrap();
+        assert_eq!(resumed.attempts[0].tasks.len(), 3);
+        assert_eq!(resumed.attempts[0].status, AttemptStatus::Planned);
+        let task = resumed.attempts[0].tasks.last().unwrap();
+        assert_eq!(task.id, "attempt-1-write-3");
+        assert_eq!(task.status, TaskStatus::Planned);
+        assert!(task.started_at.is_none());
+        assert!(task.completed_at.is_none());
+    }
+
+    #[test]
+    fn another_rejected_recovery_pauses_again_without_looping() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, workspace) =
+            make_candidate_gate_fixture(project.path(), "pub fn value() {    \n}\n", None);
+        pause_after_second_candidate_rejection(project.path(), &store, workspace.path());
+        reopen_candidate_gate_attempt(project.path(), &store, "work-1", "attempt-1").unwrap();
+
+        fs::write(workspace.path().join("src/third.rs"), "pub fn third() {}\n").unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["add", "src/third.rs"],
+            "stage resumed correction",
+        )
+        .unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["commit", "-q", "-m", "Extend candidate again"],
+            "commit resumed correction",
+        )
+        .unwrap();
+        let candidate = crate::git::run_stdout(
+            workspace.path(),
+            &["rev-parse", "HEAD"],
+            "read resumed correction",
+        )
+        .unwrap();
+        let mut item = store.read_work_item("work-1").unwrap();
+        let prior = item.attempts[0].tasks[1].output.clone().unwrap();
+        let correction = item.attempts[0].tasks.last_mut().unwrap();
+        correction.status = TaskStatus::Complete;
+        correction.output = Some(TaskOutput {
+            base_commit: Some(prior.commit.clone()),
+            commit: candidate,
+            ..prior
+        });
+        store.write_work_item(&item).unwrap();
+
+        let outcome = plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+        assert!(matches!(outcome, WorkAttemptRunOutcome::NeedsUser { .. }));
+        let paused = store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            paused.attempts[0].pause_kind,
+            Some(PauseKind::CandidateGate)
+        );
+        assert_eq!(
+            paused.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            3,
+            "another Writer needs a new explicit resume"
+        );
+    }
+
+    #[test]
+    fn blocked_candidate_gate_rechecks_without_planning_writer() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace) = make_candidate_gate_fixture(
+            project.path(),
+            "pub fn value() {}\n",
+            Some("#!/bin/sh\nprintf dirty > hook-output.txt\n"),
+        );
+        let outcome = plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+        assert!(matches!(outcome, WorkAttemptRunOutcome::NeedsUser { .. }));
+
+        assert_eq!(
+            reopen_candidate_gate_attempt(project.path(), &store, "work-1", "attempt-1").unwrap(),
+            CandidateGateResume::Recheck
+        );
+        let reopened = store.read_work_item("work-1").unwrap();
+        assert_eq!(reopened.attempts[0].status, AttemptStatus::Planned);
+        assert_eq!(
+            reopened.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn explicit_final_tester_gate_resume_restores_matching_legacy_tracked_mutation() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, workspace) =
+            make_candidate_gate_fixture(project.path(), "pub fn value() {}\n", None);
+        let mut item = store.read_work_item("work-1").unwrap();
+        let writer = item.attempts[0].tasks[0].clone();
+        let output = writer.output.as_ref().unwrap().clone();
+        let tester_id = item.add_final_tester_task("attempt-1").unwrap();
+        let tester = item.attempts[0]
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == tester_id)
+            .unwrap();
+        crate::work_model::set_task_terminal(tester, TaskStatus::Complete);
+        let tester_artifact = tester.artifact_area.as_ref().unwrap().path.clone();
+        fs::create_dir_all(project.path().join(&tester_artifact)).unwrap();
+
+        fs::write(workspace.path().join("src/lib.rs"), "tester mutation\n").unwrap();
+        let tracked_status = crate::git::run_stdout(
+            workspace.path(),
+            &["status", "--porcelain", "--untracked-files=no"],
+            "read Tester mutation status",
+        )
+        .unwrap();
+        let gate_path = format!(
+            "{}/{}/{}",
+            work_artifact_path("work-1", "attempt-1", "candidate-gates"),
+            tester_id,
+            crate::candidate_gate::CANDIDATE_GATE_FILE
+        );
+        let gate = ArtifactRef {
+            producer_id: writer.id,
+            path: gate_path.clone(),
+        };
+        let evidence = crate::candidate_gate::CandidateGateEvidence {
+            schema_version: crate::candidate_gate::CANDIDATE_GATE_SCHEMA_VERSION,
+            phase: crate::candidate_gate::CandidateGatePhase::FinalTester,
+            disposition: crate::candidate_gate::CandidateGateDisposition::Blocked,
+            base_commit: output.commit.clone(),
+            candidate_commit: output.commit.clone(),
+            tester_results_path: Some(format!("{tester_artifact}/tester-results.json")),
+            metadata_rewrite: None,
+            checks: vec![crate::candidate_gate::CandidateCheckEvidence {
+                name: "candidate-identity".to_string(),
+                status: crate::candidate_gate::CandidateCheckStatus::Error,
+                diagnostics: vec![format!(
+                    "candidate workspace is dirty before admission:\n{tracked_status}"
+                )],
+                log_path: None,
+            }],
+        };
+        let absolute_gate = project.path().join(&gate_path);
+        fs::create_dir_all(absolute_gate.parent().unwrap()).unwrap();
+        fs::write(
+            &absolute_gate,
+            serde_json::to_vec_pretty(&evidence).unwrap(),
+        )
+        .unwrap();
+        item.attempts[0].artifacts.push(gate);
+        item.attempts[0].status = AttemptStatus::NeedsUser;
+        item.attempts[0].pause_kind = Some(PauseKind::CandidateGate);
+        item.attempts[0].completed_at = Some("2026-08-10T00:00:00Z".to_string());
+        store.write_work_item(&item).unwrap();
+
+        assert_eq!(
+            reopen_candidate_gate_attempt(project.path(), &store, "work-1", "attempt-1").unwrap(),
+            CandidateGateResume::Recheck
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("src/lib.rs")).unwrap(),
+            "pub fn value() {}\n"
+        );
+        assert!(
+            crate::git::run_stdout(
+                workspace.path(),
+                &["status", "--porcelain", "--untracked-files=no"],
+                "verify restored Tester mutation",
+            )
+            .unwrap()
+            .is_empty()
+        );
+        let mutation: serde_json::Value = serde_json::from_slice(
+            &fs::read(
+                project
+                    .path()
+                    .join(tester_artifact)
+                    .join("candidate-mutation.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(mutation["candidate_commit"], output.commit);
+        assert_eq!(mutation["restored"], true);
+    }
+
+    #[test]
+    fn literal_backslash_n_candidate_advances_without_corrective_writer() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, workspace) = make_candidate_gate_fixture(
+            project.path(),
+            "pub fn value() {}\n",
+            Some(include_str!("../scripts/check-commit-message-policy.sh")),
+        );
+        crate::git::run(
+            workspace.path(),
+            &[
+                "commit",
+                "--amend",
+                "-q",
+                "-m",
+                "Add candidate\\n\\nExplain candidate",
+            ],
+            "create literal newline candidate",
+        )
+        .unwrap();
+        let candidate =
+            crate::git::run_stdout(workspace.path(), &["rev-parse", "HEAD"], "read candidate")
+                .unwrap();
+        let mut item = store.read_work_item("work-1").unwrap();
+        item.attempts[0].tasks[0].output.as_mut().unwrap().commit = candidate.clone();
+        let writer = item.attempts[0].tasks[0].clone();
+        store.write_work_item(&item).unwrap();
+
+        let outcome =
+            plan_after_completed_writer(project.path(), &store, item, "attempt-1").unwrap();
+
+        let WorkAttemptRunOutcome::PlannedReviews { task_ids } = outcome else {
+            panic!("literal newline advice must advance directly to review: {outcome:?}");
+        };
+        let stored = store.read_work_item("work-1").unwrap();
+        let attempt = &stored.attempts[0];
+        assert_eq!(attempt.status, AttemptStatus::Reviewing);
+        assert_eq!(attempt.pause_kind, None);
+        assert_eq!(attempt.tasks[0], writer);
+        assert_eq!(
+            attempt
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            1
+        );
+        assert_eq!(attempt.tasks.len(), 1 + task_ids.len());
+        assert_eq!(task_ids.len(), crate::review::REVIEWERS.len());
+        let gate = attempt
+            .artifacts
+            .iter()
+            .find(|artifact| {
+                artifact.producer_id == writer.id && artifact.path.ends_with("/candidate-gate.json")
+            })
+            .unwrap();
+        let evidence: CandidateGateEvidence =
+            serde_json::from_slice(&fs::read(project.path().join(&gate.path)).unwrap()).unwrap();
+        assert_eq!(evidence.candidate_commit, candidate);
+        assert_eq!(evidence.disposition, CandidateGateDisposition::Passed);
+        assert!(evidence.metadata_rewrite.is_none());
+        let hook = evidence
+            .checks
+            .iter()
+            .find(|check| check.name == "project-check")
+            .unwrap();
+        assert_eq!(hook.status, CandidateCheckStatus::Passed);
+        assert!(
+            fs::read_to_string(project.path().join(hook.log_path.as_ref().unwrap()))
+                .unwrap()
+                .contains("advice: commit-message contains literal \\n text")
+        );
+        for reviewer in &attempt.tasks[1..] {
+            assert_eq!(reviewer.kind, TaskKind::Review);
+            assert!(task_ids.contains(&reviewer.id));
+            assert!(reviewer.input_artifacts.contains(gate));
+            assert_eq!(
+                reviewer.review_context.as_ref().unwrap().candidate_commit,
+                candidate
+            );
+        }
+        assert_eq!(
+            crate::git::run_stdout(
+                workspace.path(),
+                &["rev-parse", "HEAD"],
+                "verify unchanged candidate"
+            )
+            .unwrap(),
+            candidate
+        );
+        assert!(
+            crate::candidate_metadata_recovery::candidate_gate_authorization_context(
+                project.path(),
+                attempt,
+                &writer
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn metadata_only_history_repair_reaches_review() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, workspace) =
+            make_candidate_gate_fixture(project.path(), "pub fn value() {}\n", None);
+        crate::git::run(
+            workspace.path(),
+            &[
+                "commit",
+                "--amend",
+                "-q",
+                "-m",
+                "Add candidate\\n\\nExplain candidate",
+            ],
+            "create historical literal newline candidate",
+        )
+        .unwrap();
+        let rejected = crate::git::run_stdout(
+            workspace.path(),
+            &["rev-parse", "HEAD"],
+            "read rejected candidate",
+        )
+        .unwrap();
+        let mut item = store.read_work_item("work-1").unwrap();
+        item.attempts[0].tasks[0].output.as_mut().unwrap().commit = rejected.clone();
+        let preserved_input = attach_gate_named_work_item_input(project.path(), &mut item);
+        store.write_work_item(&item).unwrap();
+
+        // Reconstruct a persisted failure and corrective Task from an older Fluent.
+        // Current admission accepts this message and cannot create this history.
+        assert!(
+            gate_candidate_after_writer(project.path(), &store, &mut item, "attempt-1", 0, None)
+                .unwrap()
+                .is_none()
+        );
+        let prior_gate = item.attempts[0].artifacts.last().unwrap().clone();
+        let prior_path = project.path().join(&prior_gate.path);
+        let mut evidence: CandidateGateEvidence =
+            serde_json::from_slice(&fs::read(&prior_path).unwrap()).unwrap();
+        let metadata = evidence
+            .checks
+            .iter_mut()
+            .find(|check| check.name == "commit-metadata")
+            .unwrap();
+        metadata.status = CandidateCheckStatus::Failed;
+        metadata.diagnostics = vec![format!(
+            "commit {rejected} contains literal \\n text instead of line breaks"
+        )];
+        evidence.disposition = CandidateGateDisposition::Rejected;
+        fs::write(&prior_path, serde_json::to_vec_pretty(&evidence).unwrap()).unwrap();
+        item.add_next_write_round("attempt-1", vec![prior_gate])
+            .unwrap();
+        store.write_work_item(&item).unwrap();
+
+        crate::git::run(
+            workspace.path(),
+            &[
+                "commit",
+                "--amend",
+                "-q",
+                "-m",
+                "Add candidate\n\n- Explain the candidate",
+            ],
+            "repair candidate metadata",
+        )
+        .unwrap();
+        let replacement = crate::git::run_stdout(
+            workspace.path(),
+            &["rev-parse", "HEAD"],
+            "read replacement candidate",
+        )
+        .unwrap();
+        let mut item = store.read_work_item("work-1").unwrap();
+        {
+            let attempt = &item.attempts[0];
+            let correction_index = attempt.tasks.len() - 1;
+            let correction = &attempt.tasks[correction_index];
+            assert_eq!(correction.kind, TaskKind::Write);
+            assert!(correction.input_artifacts.contains(&preserved_input));
+            let prior_writer_gate = correction
+                .input_artifacts
+                .iter()
+                .find(|artifact| {
+                    artifact.producer_id == "attempt-1-write-1"
+                        && artifact
+                            .path
+                            .ends_with(crate::candidate_gate::CANDIDATE_GATE_FILE)
+                })
+                .unwrap();
+            assert_eq!(
+                select_prior_writer_candidate_gate(&item, 0, correction_index).unwrap(),
+                Some(prior_writer_gate)
+            );
+        }
+        let original_output = item.attempts[0].tasks[0].output.clone().unwrap();
+        let correction = item.attempts[0].tasks.last_mut().unwrap();
+        correction.status = TaskStatus::Complete;
+        correction.output = Some(TaskOutput {
+            base_commit: Some(rejected.clone()),
+            commit: replacement.clone(),
+            ..original_output
+        });
+        store.write_work_item(&item).unwrap();
+
+        let outcome = plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedReviews { .. }
+        ));
+        let stored = store.read_work_item("work-1").unwrap();
+        let final_gate = stored.attempts[0]
+            .artifacts
+            .iter()
+            .find(|artifact| {
+                artifact.producer_id == "attempt-1-write-2"
+                    && artifact.path.ends_with("/candidate-gate.json")
+            })
+            .unwrap();
+        let evidence: crate::candidate_gate::CandidateGateEvidence =
+            serde_json::from_slice(&fs::read(project.path().join(&final_gate.path)).unwrap())
+                .unwrap();
+        let rewrite = evidence.metadata_rewrite.as_ref().unwrap();
+        assert_eq!(rewrite.rejected_candidate_commit, rejected);
+        assert_eq!(rewrite.replacement_candidate_commit, replacement);
+        for reviewer in stored.attempts[0]
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Review)
+        {
+            assert!(reviewer.input_artifacts.contains(final_gate));
+            assert_eq!(
+                reviewer.review_context.as_ref().unwrap().candidate_commit,
+                replacement
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_project_check_pauses_without_reviewer_or_tester() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace) = make_candidate_gate_fixture(
+            project.path(),
+            "pub fn value() {}\n",
+            Some("#!/bin/sh\nprintf dirty > hook-output.txt\n"),
+        );
+
+        let outcome = plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, WorkAttemptRunOutcome::NeedsUser { .. }));
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(stored.attempts[0].status, AttemptStatus::NeedsUser);
+        assert!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .all(|task| task.kind != TaskKind::Review && task.kind != TaskKind::Tester)
+        );
+    }
+
+    #[test]
+    fn passing_candidate_gate_is_attached_to_every_reviewer() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace) =
+            make_candidate_gate_fixture(project.path(), "pub fn value() {}\n", None);
+
+        let outcome = plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedReviews { .. }
+        ));
+        let stored = store.read_work_item("work-1").unwrap();
+        for reviewer in stored.attempts[0]
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Review)
+        {
+            assert!(
+                reviewer
+                    .input_artifacts
+                    .iter()
+                    .any(|artifact| artifact.path.ends_with("/candidate-gate.json"))
+            );
+        }
+    }
+
+    #[test]
+    fn rewritten_writer_completion_fields_are_restored_before_review() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = make_completed_writer_matrix_fixture(tmp.path(), true);
+        let path = tmp.path().join(
+            ".fluent/work/artifacts/matrix-work/attempt-1/attempt-1-write-1/writer-completion.json",
+        );
+        let mut matrix: crate::work_model::WriterCompletionMatrix =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        matrix.rows[0].requirement = "A rewritten requirement".to_string();
+        fs::write(&path, serde_json::to_vec_pretty(&matrix).unwrap()).unwrap();
+
+        let outcome = plan_after_completed_writer(
+            tmp.path(),
+            &store,
+            store.read_work_item("matrix-work").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedReviews { .. }
+        ));
+        let stored = store.read_work_item("matrix-work").unwrap();
+        let repair_evidence = stored.attempts[0]
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.path.ends_with("/repair.json"))
+            .expect("host-owned field repair is recorded");
+        let evidence: serde_json::Value =
+            serde_json::from_slice(&fs::read(tmp.path().join(&repair_evidence.path)).unwrap())
+                .unwrap();
+        assert_eq!(evidence["repairs"][0]["kind"], "restored-host-owned-fields");
+        let repaired: crate::work_model::WriterCompletionMatrix = serde_json::from_slice(
+            &fs::read(
+                tmp.path()
+                    .join(evidence["repaired-artifact"].as_str().unwrap()),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_ne!(repaired.rows[0].requirement, "A rewritten requirement");
+    }
+
+    #[test]
+    fn missing_writer_completion_matrix_pauses_before_review() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = make_completed_writer_matrix_fixture(tmp.path(), true);
+        fs::remove_file(tmp.path().join(
+            ".fluent/work/artifacts/matrix-work/attempt-1/attempt-1-write-1/writer-completion.json",
+        ))
+        .unwrap();
+
+        let outcome = plan_after_completed_writer(
+            tmp.path(),
+            &store,
+            store.read_work_item("matrix-work").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+
+        let WorkAttemptRunOutcome::NeedsUser { handoff_path } = outcome else {
+            panic!("a deleted host-owned matrix must pause")
+        };
+        let handoff = fs::read_to_string(tmp.path().join(handoff_path)).unwrap();
+        assert!(handoff.contains("completion matrix is missing"));
+    }
+
+    #[test]
+    fn oversized_writer_completion_matrix_pauses_without_reading_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = make_completed_writer_matrix_fixture(tmp.path(), true);
+        let path = tmp.path().join(
+            ".fluent/work/artifacts/matrix-work/attempt-1/attempt-1-write-1/writer-completion.json",
+        );
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len((crate::work_model::WRITER_COMPLETION_MATRIX_MAX_BYTES + 1) as u64)
+            .unwrap();
+
+        let outcome = plan_after_completed_writer(
+            tmp.path(),
+            &store,
+            store.read_work_item("matrix-work").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+
+        let WorkAttemptRunOutcome::NeedsUser { handoff_path } = outcome else {
+            panic!("an oversized matrix must pause before it is read")
+        };
+        let handoff = fs::read_to_string(tmp.path().join(handoff_path)).unwrap();
+        assert!(handoff.contains("maximum"));
+    }
+
+    #[test]
+    fn incomplete_writer_completion_retry_does_not_duplicate_continuation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = make_completed_writer_matrix_fixture(tmp.path(), false);
+
+        let first = plan_after_completed_writer(
+            tmp.path(),
+            &store,
+            store.read_work_item("matrix-work").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+        let second = plan_after_completed_writer(
+            tmp.path(),
+            &store,
+            store.read_work_item("matrix-work").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+
+        assert_eq!(first, second);
+        let stored = store.read_work_item("matrix-work").unwrap();
+        assert_eq!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn writer_session_identity_accepts_claude_and_codex_transcripts() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let claude = tmp.path().join("claude.jsonl");
+        fs::write(
+            &claude,
+            "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"claude-session-1\",\"model\":\"claude\"}\n",
+        )
+        .unwrap();
+        let codex = tmp.path().join("codex.jsonl");
+        fs::write(
+            &codex,
+            "{\"type\":\"thread.started\",\"thread_id\":\"codex-thread-1\"}\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            writer_session_id(&claude).as_deref(),
+            Some("claude-session-1")
+        );
+        assert_eq!(writer_session_id(&codex).as_deref(), Some("codex-thread-1"));
+    }
+
+    #[test]
+    fn legacy_completed_writer_plans_reviews_without_progress_contract() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = make_completed_writer_gate_fixture(tmp.path(), None, false);
+
+        let outcome = plan_after_completed_writer(
+            tmp.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedReviews { .. }
+        ));
+    }
+
+    #[test]
+    fn malformed_required_progress_pauses_before_tester_or_review() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = make_completed_writer_gate_fixture(
+            tmp.path(),
+            Some("## Required completion\n\n- step-1 — Do the thing\n"),
+            true,
+        );
+
+        let outcome = plan_after_completed_writer(
+            tmp.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+
+        let WorkAttemptRunOutcome::NeedsUser { handoff_path } = outcome else {
+            panic!("malformed progress must pause before reviews")
+        };
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(stored.attempts[0].status, AttemptStatus::NeedsUser);
+        assert_eq!(
+            stored.attempts[0].pause_kind,
+            Some(PauseKind::WriterCompletion)
+        );
+        assert_eq!(
+            stored.attempts[0].writer_runs[0].outcome,
+            WriterOutcome::Blocked
+        );
+        assert!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .all(|task| !is_review_phase_task(task))
+        );
+        let handoff = fs::read_to_string(tmp.path().join(handoff_path)).unwrap();
+        assert!(handoff.contains("malformed required-progress line"));
+        assert!(handoff.contains("before Tester and review planning"));
+    }
+
+    #[test]
+    fn writer_completion_resume_plans_a_follow_up_writer() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = make_completed_writer_progress_matrix_fixture(tmp.path());
+        let handoff = ArtifactRef {
+            producer_id: "required-progress".to_string(),
+            path: ".fluent/work/artifacts/matrix-progress-work/attempt-1/required-progress-needs-user.md"
+                .to_string(),
+        };
+        store
+            .mutate_work_item("matrix-progress-work", |item| {
+                let attempt = &mut item.attempts[0];
+                attempt.status = AttemptStatus::NeedsUser;
+                attempt.pause_kind = Some(PauseKind::WriterCompletion);
+                attempt.review_state = Some(AttemptReviewState::NotReviewed);
+                attempt.completed_at = Some("2026-08-19T00:00:00Z".to_string());
+                attempt.artifacts.push(handoff.clone());
+                Ok(())
+            })
+            .unwrap();
+
+        reopen_resumable_attempt(tmp.path(), &store, "matrix-progress-work", "attempt-1").unwrap();
+
+        let stored = store.read_work_item("matrix-progress-work").unwrap();
+        let attempt = &stored.attempts[0];
+        assert_eq!(attempt.status, AttemptStatus::Planned);
+        assert!(attempt.pause_kind.is_none());
+        assert!(attempt.completed_at.is_none());
+        assert_eq!(
+            attempt
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            2
+        );
+        let follow_up = attempt.tasks.last().unwrap();
+        assert_eq!(follow_up.id, "attempt-1-write-2");
+        assert_eq!(follow_up.status, TaskStatus::Planned);
+        assert!(
+            follow_up
+                .input_artifacts
+                .contains(&required_progress_artifact(attempt))
+        );
+        assert!(follow_up.input_artifacts.contains(&handoff));
+        assert!(follow_up.input_artifacts.iter().any(|artifact| {
+            artifact
+                .path
+                .ends_with("attempt-1-write-1/writer-completion.json")
+        }));
+    }
+
+    #[test]
+    fn rewritten_required_progress_pauses_before_tester_or_review() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = make_completed_writer_gate_fixture(
+            tmp.path(),
+            Some("## Required completion\n\n- [x] step-1 — Different work; Evidence: src/x.rs\n"),
+            true,
+        );
+
+        let outcome = plan_after_completed_writer(
+            tmp.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+
+        let WorkAttemptRunOutcome::NeedsUser { handoff_path } = outcome else {
+            panic!("rewritten progress must pause before reviews")
+        };
+        let stored = store.read_work_item("work-1").unwrap();
+        assert!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .all(|task| !is_review_phase_task(task))
+        );
+        let handoff = fs::read_to_string(tmp.path().join(handoff_path)).unwrap();
+        assert!(handoff.contains("requirement was rewritten"));
+    }
+
+    #[test]
+    fn post_write_gate_retry_does_not_duplicate_continuation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = make_completed_writer_gate_fixture(
+            tmp.path(),
+            Some("## Required completion\n\n- [ ] step-1 — Do the thing\n"),
+            true,
+        );
+
+        let first = plan_after_completed_writer(
+            tmp.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+        let second = plan_after_completed_writer(
+            tmp.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+
+        assert_eq!(first, second);
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            2
+        );
+        assert!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .all(|task| !is_review_phase_task(task))
+        );
+    }
+
+    #[test]
+    fn post_write_gate_retry_does_not_duplicate_review_tasks() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = make_completed_writer_gate_fixture(
+            tmp.path(),
+            Some("## Required completion\n\n- [x] step-1 — Do the thing; Evidence: src/x.rs\n"),
+            true,
+        );
+
+        let first = plan_after_completed_writer(
+            tmp.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+        let second = plan_after_completed_writer(
+            tmp.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+
+        assert_eq!(first, second);
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Tester)
+                .count(),
+            0
+        );
+        assert_eq!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Review)
+                .count(),
+            review::REVIEWERS.len()
+        );
+    }
+
+    #[test]
     fn unchecked_required_progress_blocks_review_pass() {
         // Advancement gates B2: reviews pass, but the marked Attempt's required entry
         // is unchecked. The pass transition is rejected — no Merge Candidate, no
@@ -6641,6 +26145,7 @@ mod tests {
             Some(LearnerConfig {
                 run_coder: &run_coder,
                 codex_worker: None,
+                no_sandbox: false,
             }),
         )
         .unwrap();
@@ -6689,6 +26194,7 @@ mod tests {
             Some(LearnerConfig {
                 run_coder: &run_coder,
                 codex_worker: None,
+                no_sandbox: false,
             }),
         )
         .unwrap();
@@ -6735,6 +26241,7 @@ mod tests {
             Some(LearnerConfig {
                 run_coder: &run_coder,
                 codex_worker: None,
+                no_sandbox: false,
             }),
         )
         .unwrap();
@@ -7045,6 +26552,7 @@ mod tests {
             Some(LearnerConfig {
                 run_coder: &run_coder,
                 codex_worker: None,
+                no_sandbox: false,
             }),
         )
         .unwrap();
@@ -7079,6 +26587,7 @@ mod tests {
             Some(LearnerConfig {
                 run_coder: &run_coder,
                 codex_worker: None,
+                no_sandbox: false,
             }),
         )
         .unwrap();
@@ -7116,6 +26625,7 @@ mod tests {
             Some(LearnerConfig {
                 run_coder: &run_coder,
                 codex_worker: None,
+                no_sandbox: false,
             }),
         )
         .unwrap();
@@ -7155,6 +26665,7 @@ mod tests {
             Some(LearnerConfig {
                 run_coder: &run_coder,
                 codex_worker: None,
+                no_sandbox: false,
             }),
         )
         .unwrap();
@@ -7187,6 +26698,7 @@ mod tests {
             Some(LearnerConfig {
                 run_coder: &run_coder,
                 codex_worker: None,
+                no_sandbox: false,
             }),
         )
         .unwrap();
@@ -7272,6 +26784,7 @@ mod tests {
             Some(LearnerConfig {
                 run_coder: &run_coder,
                 codex_worker: None,
+                no_sandbox: false,
             }),
         )
         .unwrap();
@@ -7380,9 +26893,8 @@ mod tests {
 
     #[test]
     fn pre_land_no_expertise_rejects_mismatched_final_review_context() {
-        // B4: if any final-round Tester or built-in reviewer context names a SHA
-        // other than the reviewed Writer SHA, the preflight fails closed before the
-        // coder launches.
+        // B4: if a final-round reviewer context names a SHA other than the reviewed
+        // Writer SHA, exact-candidate validation reopens that role before the Learner.
         let tmp = tempfile::TempDir::new().unwrap();
         let (store, project_root, _workspace, base) = make_learner_passing_fixture(tmp.path(), 1);
         mark_no_expertise(&store);
@@ -7402,7 +26914,7 @@ mod tests {
         };
         let outcome = run_pre_land_learner_outcome(&project_root, &store, &run_coder);
         assert!(
-            matches!(outcome, WorkAttemptRunOutcome::LearnerNotReady { .. }),
+            matches!(outcome, WorkAttemptRunOutcome::PlannedReviews { .. }),
             "a mismatched final review context blocks readiness; got {outcome:?}"
         );
         assert!(
@@ -7410,8 +26922,16 @@ mod tests {
             "no coder launches when a final review context disagrees"
         );
         let stored = store.read_work_item("work-1").unwrap();
-        assert_eq!(stored.merge_candidates[0].candidate_commit, base);
-        assert!(stored.attempts[0].learning.as_ref().unwrap().is_failed());
+        assert!(stored.merge_candidates.is_empty());
+        assert!(stored.attempts[0].learning.is_none());
+        assert!(stored.attempts[0].tasks.iter().any(|task| {
+            task.kind == TaskKind::Review
+                && task.role == "tests"
+                && task
+                    .review_context
+                    .as_ref()
+                    .is_some_and(|context| context.candidate_commit == base)
+        }));
     }
 
     #[test]
@@ -7539,6 +27059,22 @@ mod tests {
                 task.review_context.as_mut().unwrap().candidate_commit = "stale123".to_string();
             }
         }
+        // The ambiguous prior round invalidates all carry-forward. Model a
+        // complete final round before testing the Learner's identity check.
+        for role in review::REVIEWERS
+            .iter()
+            .copied()
+            .filter(|role| *role != "tests")
+        {
+            let id = format!("attempt-1-review-2-{role}");
+            let path = work_artifact_path("work-1", "attempt-1", &id);
+            let dir = project_root.join(&path);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("review.md"), "Verdict: pass\n").unwrap();
+            let mut task = review_task_with_artifact(&id, role, &path);
+            task.review_context.as_mut().unwrap().candidate_commit = base.clone();
+            item.attempts[0].tasks.push(task);
+        }
         store.write_work_item(&item).unwrap();
 
         let run_coder = draft_only_coder(r#"{"learning_summary":"noted","follow_ups":[]}"#);
@@ -7568,7 +27104,20 @@ mod tests {
                 // an invalid draft to force a schema repair.
                 fs::write(ws.join("scratch.md"), "note").unwrap();
                 git::run(ws, &["add", "-A"], "add").unwrap();
-                git::run(ws, &["commit", "-m", "scratch"], "commit").unwrap();
+                git::run(
+                    ws,
+                    &[
+                        "-c",
+                        "user.name=Test Author",
+                        "-c",
+                        "user.email=test@example.com",
+                        "commit",
+                        "-m",
+                        "scratch",
+                    ],
+                    "commit",
+                )
+                .unwrap();
                 fs::create_dir_all(request.handoff_dir).unwrap();
                 fs::write(
                     request.handoff_dir.join(crate::learner::DRAFT_FILE_NAME),
@@ -7618,14 +27167,40 @@ mod tests {
             ("source commit", |ws| {
                 fs::write(ws.join("src.rs"), "fn changed() {}").unwrap();
                 git::run(ws, &["add", "-A"], "add").unwrap();
-                git::run(ws, &["commit", "-m", "change"], "commit").unwrap();
+                git::run(
+                    ws,
+                    &[
+                        "-c",
+                        "user.name=Test Author",
+                        "-c",
+                        "user.email=test@example.com",
+                        "commit",
+                        "-m",
+                        "change",
+                    ],
+                    "commit",
+                )
+                .unwrap();
             }),
             ("expertise-only commit", |ws| {
                 let dir = ws.join(".fluent/expertise");
                 fs::create_dir_all(&dir).unwrap();
                 fs::write(dir.join("note.md"), "note").unwrap();
                 git::run(ws, &["add", "-A"], "add").unwrap();
-                git::run(ws, &["commit", "-m", "Update expertise"], "commit").unwrap();
+                git::run(
+                    ws,
+                    &[
+                        "-c",
+                        "user.name=Test Author",
+                        "-c",
+                        "user.email=test@example.com",
+                        "commit",
+                        "-m",
+                        "Update expertise",
+                    ],
+                    "commit",
+                )
+                .unwrap();
             }),
             ("staged change", |ws| {
                 fs::write(ws.join("src.rs"), "fn staged() {}").unwrap();
@@ -7757,6 +27332,7 @@ mod tests {
             Some(LearnerConfig {
                 run_coder: &run_coder,
                 codex_worker: None,
+                no_sandbox: false,
             }),
         )
         .unwrap();
@@ -7766,6 +27342,10 @@ mod tests {
         assert!(
             stored.attempts[0].learning.is_none(),
             "review-only Attempt records no learning"
+        );
+        assert!(
+            stored.attempts[0].completed_at.is_some(),
+            "review-only Attempt completion ends its timing"
         );
     }
 
@@ -7792,6 +27372,9 @@ mod tests {
                     },
                     artifact_area: None,
                     review_context: None,
+                    writer_correction_assignment: None,
+                    verification_context: None,
+                    evidence_review_context: None,
                     input_artifacts: Vec::new(),
                     depends_on: None,
                     output: None,
@@ -7813,6 +27396,9 @@ mod tests {
                     },
                     artifact_area: None,
                     review_context: None,
+                    writer_correction_assignment: None,
+                    verification_context: None,
+                    evidence_review_context: None,
                     input_artifacts: Vec::new(),
                     depends_on: None,
                     output: None,
@@ -7918,6 +27504,9 @@ mod tests {
                     },
                     artifact_area: None,
                     review_context: None,
+                    writer_correction_assignment: None,
+                    verification_context: None,
+                    evidence_review_context: None,
                     input_artifacts: Vec::new(),
                     depends_on: None,
                     output: Some(TaskOutput {
@@ -7926,6 +27515,8 @@ mod tests {
                         source_branch: "main".to_string(),
                         base_commit: None,
                         commit: "abc123".to_string(),
+                        no_change: None,
+                        learner_canonicalization: None,
                     }),
                     created_at: None,
                     started_at: None,
@@ -7945,6 +27536,9 @@ mod tests {
                     },
                     artifact_area: None,
                     review_context: None,
+                    writer_correction_assignment: None,
+                    verification_context: None,
+                    evidence_review_context: None,
                     input_artifacts: Vec::new(),
                     depends_on: None,
                     output: None,
@@ -7984,6 +27578,853 @@ mod tests {
     }
 
     #[test]
+    fn direct_run_names_the_scheduler_command_required_by_tester_recovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let mut item = WorkItem::planned("work-1", "Resume Tester with explicit approval");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let attempt = &mut item.attempts[0];
+        attempt.status = AttemptStatus::NeedsUser;
+        attempt.pause_kind = Some(PauseKind::TesterHarness);
+        attempt.pause_recovery = Some(PauseRecovery::TesterNoSandbox);
+        attempt.tasks[0].kind = TaskKind::Tester;
+        attempt.tasks[0].status = TaskStatus::NeedsUser;
+        store.create_work_item(&item).unwrap();
+        let resolver = ContentResolver::new(Some(tmp.path()));
+
+        let error = run_attempt(WorkAttemptRunConfig {
+            project_root: tmp.path(),
+            store: &store,
+            work_item_id: "work-1",
+            attempt_id: "attempt-1",
+            resolver: &resolver,
+            extra_args: &[],
+            no_sandbox: true,
+            tester_no_sandbox: false,
+            resume_cancellation_requested_at: None,
+            coder_mapping_inputs: None,
+            learner_run_coder: None,
+        })
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("fluent queue resume work-1 --attempt attempt-1 --no-sandbox")
+        );
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(stored.attempts[0].status, AttemptStatus::NeedsUser);
+        assert_eq!(stored.attempts[0].tasks[0].status, TaskStatus::NeedsUser);
+    }
+
+    #[test]
+    fn provider_pause_resumes_exact_unfinished_tasks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let mut item = WorkItem {
+            id: "resume-provider-pause".to_string(),
+            title: "Resume provider pause".to_string(),
+            ..Default::default()
+        };
+        item.add_initial_attempt("resume-attempt").unwrap();
+        let attempt = &mut item.attempts[0];
+        let writer = &mut attempt.tasks[0];
+        writer.status = TaskStatus::Complete;
+        writer.output = Some(TaskOutput {
+            workspace_id: "candidate".to_string(),
+            workspace_path: "candidate".to_string(),
+            source_branch: "work/resume-attempt".to_string(),
+            base_commit: None,
+            commit: "abc123".to_string(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        let mut blocker = review_task_with_artifact(
+            "resume-attempt-blocker",
+            "blocker",
+            ".fluent/work/artifacts/resume-provider-pause/resume-attempt/blocker",
+        );
+        blocker.status = TaskStatus::Planned;
+        blocker.depends_on = Some("missing-predecessor".to_string());
+        blocker.work_item_id = item.id.clone();
+        blocker.attempt_id = Some(attempt.id.clone());
+        let mut paused = review_task_with_artifact(
+            "resume-attempt-review",
+            "reviewer",
+            ".fluent/work/artifacts/resume-provider-pause/resume-attempt/review",
+        );
+        paused.status = TaskStatus::NeedsUser;
+        paused.depends_on = Some(blocker.id.clone());
+        paused.work_item_id = item.id.clone();
+        paused.attempt_id = Some(attempt.id.clone());
+        attempt.tasks.extend([blocker, paused]);
+        attempt.status = AttemptStatus::NeedsUser;
+        attempt.pause_kind = Some(PauseKind::ProviderUnavailable);
+        store.create_work_item(&item).unwrap();
+        let transcript = tmp.path().join(
+            ".fluent/work/artifacts/resume-provider-pause/resume-attempt/review/transcript.jsonl",
+        );
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::write(&transcript, "durable provider evidence\n").unwrap();
+        let resolver = ContentResolver::new(Some(tmp.path()));
+
+        let error = run_attempt(WorkAttemptRunConfig {
+            project_root: tmp.path(),
+            store: &store,
+            work_item_id: "resume-provider-pause",
+            attempt_id: "resume-attempt",
+            resolver: &resolver,
+            extra_args: &[],
+            no_sandbox: true,
+            tester_no_sandbox: false,
+            resume_cancellation_requested_at: None,
+            coder_mapping_inputs: None,
+            learner_run_coder: None,
+        })
+        .expect_err("blocked follow-up work stops after the public route reopens the pause");
+        assert!(error.to_string().contains("no planned transition"));
+
+        let attempt = &store
+            .read_work_item("resume-provider-pause")
+            .unwrap()
+            .attempts[0];
+        assert_eq!(attempt.status, AttemptStatus::Planned);
+        assert_eq!(attempt.tasks[0].status, TaskStatus::Complete);
+        assert_eq!(attempt.tasks[2].status, TaskStatus::Planned);
+        assert_eq!(
+            fs::read_to_string(transcript).unwrap(),
+            "durable provider evidence\n"
+        );
+    }
+
+    #[test]
+    fn provider_pause_reopen_preserves_concurrent_peer_completion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let mut item = WorkItem {
+            id: "provider-pause-peer".to_string(),
+            title: "Resume provider pause without losing a peer".to_string(),
+            ..Default::default()
+        };
+        item.add_initial_attempt("provider-pause-attempt").unwrap();
+        let attempt = &mut item.attempts[0];
+        attempt.tasks[0].status = TaskStatus::Complete;
+        attempt.tasks[0].output = Some(TaskOutput {
+            workspace_id: "candidate".to_string(),
+            workspace_path: "candidate".to_string(),
+            source_branch: "work/provider-pause-attempt".to_string(),
+            base_commit: None,
+            commit: "abc123".to_string(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        let mut paused = review_task_with_artifact(
+            "provider-pause-review",
+            "architecture",
+            ".fluent/work/artifacts/provider-pause-peer/provider-pause-attempt/review",
+        );
+        paused.status = TaskStatus::NeedsUser;
+        paused.work_item_id = item.id.clone();
+        paused.attempt_id = Some(attempt.id.clone());
+        let mut peer = review_task_with_artifact(
+            "provider-pause-peer-review",
+            "tests",
+            ".fluent/work/artifacts/provider-pause-peer/provider-pause-attempt/peer",
+        );
+        peer.work_item_id = item.id.clone();
+        peer.attempt_id = Some(attempt.id.clone());
+        attempt.tasks.extend([paused, peer]);
+        attempt.status = AttemptStatus::NeedsUser;
+        attempt.pause_kind = Some(PauseKind::ProviderUnavailable);
+        store.create_work_item(&item).unwrap();
+
+        // This mutation stands in for a peer that completes after the outer loop
+        // observed the pause but before the reopen transaction acquires its lock.
+        store
+            .mutate_work_item("provider-pause-peer", |fresh| {
+                crate::work_model::set_task_terminal(
+                    &mut fresh.attempts[0].tasks[2],
+                    TaskStatus::Complete,
+                );
+                Ok(())
+            })
+            .unwrap();
+
+        reopen_resumable_attempt(
+            tmp.path(),
+            &store,
+            "provider-pause-peer",
+            "provider-pause-attempt",
+        )
+        .unwrap();
+
+        let attempt = &store
+            .read_work_item("provider-pause-peer")
+            .unwrap()
+            .attempts[0];
+        assert_eq!(attempt.status, AttemptStatus::Planned);
+        assert_eq!(attempt.tasks[0].status, TaskStatus::Complete);
+        assert_eq!(attempt.tasks[1].status, TaskStatus::Planned);
+        assert_eq!(
+            attempt.tasks[2].status,
+            TaskStatus::Complete,
+            "the fresh lock-held reopen must retain a peer completion"
+        );
+    }
+
+    #[test]
+    fn generic_reopen_never_bypasses_round_cap_frontier_validation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let mut item = WorkItem::planned("round-cap-race", "Round cap race");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let attempt = &mut item.attempts[0];
+        attempt.status = AttemptStatus::NeedsUser;
+        attempt.pause_kind = Some(PauseKind::RoundCap);
+        attempt.review_state = Some(AttemptReviewState::Failed);
+        attempt.tasks[0].status = TaskStatus::NeedsUser;
+        attempt.round_cap_extensions.push(RoundCapExtension {
+            id: "round-cap-1-2".to_string(),
+            old_cap: 1,
+            new_cap: 2,
+            additional_write_rounds: 1,
+            evidence_write_rounds: 0,
+            authorized_base_cap: None,
+            pre_extension_write_rounds: None,
+            candidate_commit: "abc123".to_string(),
+            failed_reviews: Vec::new(),
+            human_resolution: String::new(),
+            human_resolution_digest: String::new(),
+            approved_at: "2026-08-07T00:00:00Z".to_string(),
+        });
+        store.create_work_item(&item).unwrap();
+
+        let error = reopen_resumable_attempt(tmp.path(), &store, "round-cap-race", "attempt-1")
+            .expect_err("generic recovery must not reopen a round-cap pause");
+
+        assert!(error.to_string().contains("changed to round-cap"));
+        let stored = store.read_work_item("round-cap-race").unwrap();
+        assert_eq!(stored.attempts[0].status, AttemptStatus::NeedsUser);
+        assert_eq!(stored.attempts[0].pause_kind, Some(PauseKind::RoundCap));
+    }
+
+    #[test]
+    fn preserved_scheduler_attempt_transcripts_resume_through_public_route() {
+        for (work_item_id, fixture_name) in [
+            (
+                "20260730-175933-persistent-scheduler-service-attempt-submit-attach",
+                "claude-scheduler-outage-a.jsonl",
+            ),
+            (
+                "20260730-175933-persistent-scheduler-service-multi-project-dispatch",
+                "claude-scheduler-outage-b.jsonl",
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let attempt_id = "attempt-1";
+            let store = legacy_provider_pause_fixture_with_ids(
+                tmp.path(),
+                crate::coder::CoderKind::Claude,
+                work_item_id,
+                attempt_id,
+            );
+            replace_provider_evidence_with_legacy_scheduler_fixture(
+                tmp.path(),
+                work_item_id,
+                attempt_id,
+                "review-provider",
+                fixture_name,
+            );
+            store
+                .mutate_work_item(work_item_id, |item| {
+                    let attempt = &mut item.attempts[0];
+                    let mut blocker = attempt.tasks[1].clone();
+                    blocker.id = "attempt-1-review-blocker".to_string();
+                    blocker.status = TaskStatus::Planned;
+                    blocker.depends_on = Some("missing-predecessor".to_string());
+                    blocker.artifact_area = Some(TaskArtifactArea {
+                        path: work_artifact_path(work_item_id, attempt_id, "review-blocker"),
+                    });
+                    attempt.tasks[1].depends_on = Some(blocker.id.clone());
+                    attempt.tasks.push(blocker);
+                    let mut tester = tester_task(
+                        "attempt-1-tester",
+                        &work_artifact_path(work_item_id, attempt_id, "tester"),
+                    );
+                    tester.work_item_id = item.id.clone();
+                    tester.status = TaskStatus::Complete;
+                    attempt.tasks.push(tester);
+                    for role in ["behaviors", "documentation", "skills", "tests"] {
+                        let artifact_name = format!("review-{role}");
+                        let mut review = review_task_with_artifact(
+                            &format!("attempt-1-review-{role}"),
+                            role,
+                            &work_artifact_path(work_item_id, attempt_id, &artifact_name),
+                        );
+                        review.work_item_id = item.id.clone();
+                        review.attempt_id = Some(attempt_id.to_string());
+                        review.status = TaskStatus::Failed;
+                        review.depends_on = Some("attempt-1-review-blocker".to_string());
+                        attempt.tasks.push(review);
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            for role in ["behaviors", "documentation", "skills", "tests"] {
+                let artifact_name = format!("review-{role}");
+                let artifact_dir =
+                    tmp.path()
+                        .join(work_artifact_path(work_item_id, attempt_id, &artifact_name));
+                fs::create_dir_all(&artifact_dir).unwrap();
+                fs::copy(
+                    Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("tests/fixtures/provider-transcripts")
+                        .join(fixture_name),
+                    artifact_dir.join("transcript.jsonl"),
+                )
+                .unwrap();
+            }
+            let candidate_marker = tmp.path().join(format!(
+                ".fluent/work/workspaces/{work_item_id}/{attempt_id}/candidate/preserved.txt"
+            ));
+            fs::create_dir_all(candidate_marker.parent().unwrap()).unwrap();
+            fs::write(&candidate_marker, "candidate state").unwrap();
+            let before = store.read_work_item(work_item_id).unwrap();
+            let transcript = tmp.path().join(work_artifact_path(
+                work_item_id,
+                attempt_id,
+                "review-provider/transcript.jsonl",
+            ));
+            let evidence = fs::read(&transcript).unwrap();
+            let resolver = ContentResolver::new(Some(tmp.path()));
+
+            let error = run_attempt(WorkAttemptRunConfig {
+                project_root: tmp.path(),
+                store: &store,
+                work_item_id,
+                attempt_id,
+                resolver: &resolver,
+                extra_args: &[],
+                no_sandbox: true,
+                tester_no_sandbox: false,
+                resume_cancellation_requested_at: None,
+                coder_mapping_inputs: None,
+                learner_run_coder: None,
+            })
+            .expect_err("the public route reopens the preserved reviews before blocked work stops");
+            assert!(error.to_string().contains("no planned transition"));
+
+            let after = store.read_work_item(work_item_id).unwrap();
+            let before_attempt = &before.attempts[0];
+            let after_attempt = &after.attempts[0];
+            assert_eq!(after_attempt.status, AttemptStatus::Planned);
+            assert!(after_attempt.pause_kind.is_none());
+            assert_eq!(after_attempt.tasks[0], before_attempt.tasks[0]);
+            assert_eq!(after_attempt.tasks[3], before_attempt.tasks[3]);
+            assert_eq!(
+                after_attempt
+                    .tasks
+                    .iter()
+                    .map(|task| task.id.as_str())
+                    .collect::<Vec<_>>(),
+                before_attempt
+                    .tasks
+                    .iter()
+                    .map(|task| task.id.as_str())
+                    .collect::<Vec<_>>()
+            );
+            assert!(
+                after_attempt
+                    .tasks
+                    .iter()
+                    .filter(|task| task.kind == TaskKind::Review
+                        && task.id != "attempt-1-review-blocker")
+                    .all(|task| task.status == TaskStatus::Planned)
+            );
+            assert_eq!(fs::read(transcript).unwrap(), evidence);
+            assert_eq!(
+                fs::read_to_string(candidate_marker).unwrap(),
+                "candidate state"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_scheduler_transcript_deviations_remain_round_cap() {
+        let cases = [
+            ("missing-event", "lacks conclusive"),
+            ("extra-event", "lacks conclusive"),
+            ("malformed-event", "lacks conclusive"),
+            ("reordered-events", "lacks conclusive"),
+            ("retry-sequence", "lacks conclusive"),
+            ("retry-count", "lacks conclusive"),
+            ("session-identity", "lacks conclusive"),
+            ("terminal-semantics", "lacks conclusive"),
+            ("model-tokens", "lacks conclusive"),
+            ("thinking", "lacks conclusive"),
+            ("tool-use", "lacks conclusive"),
+            ("nonzero-cost", "lacks conclusive"),
+            ("nonzero-usage", "lacks conclusive"),
+            ("model-usage", "lacks conclusive"),
+            ("permission-use", "lacks conclusive"),
+            ("unknown-field", "lacks conclusive"),
+            ("reviewer-verdict", "reviewer verdict"),
+            ("mixed-non-review", "not a review Task"),
+        ];
+
+        for (case, expected_error) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            let store = legacy_provider_pause_fixture(tmp.path(), crate::coder::CoderKind::Claude);
+            replace_provider_evidence_with_legacy_scheduler_fixture(
+                tmp.path(),
+                "work-1",
+                "attempt-1",
+                "review-provider",
+                "claude-scheduler-outage-a.jsonl",
+            );
+            let transcript = tmp.path().join(work_artifact_path(
+                "work-1",
+                "attempt-1",
+                "review-provider/transcript.jsonl",
+            ));
+            let mut events: Vec<serde_json::Value> = fs::read_to_string(&transcript)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            match case {
+                "missing-event" => {
+                    events.remove(5);
+                }
+                "extra-event" => events.push(events[0].clone()),
+                "malformed-event" => fs::write(&transcript, "not json\n").unwrap(),
+                "reordered-events" => events.swap(2, 3),
+                "retry-sequence" => events[5]["attempt"] = serde_json::json!(99),
+                "retry-count" => events[5]["max_retries"] = serde_json::json!(9),
+                "session-identity" => events[5]["session_id"] = serde_json::json!("other-session"),
+                "terminal-semantics" => events[12]["terminal_reason"] = serde_json::json!("error"),
+                "model-tokens" => {
+                    events[11]["message"]["usage"]["output_tokens"] = serde_json::json!(1)
+                }
+                "thinking" => events[11]["message"]["content"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(serde_json::json!({"type": "thinking", "thinking": "work"})),
+                "tool-use" => events[11]["message"]["content"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(serde_json::json!({"type": "tool_use", "name": "Read"})),
+                "nonzero-cost" => events[12]["total_cost_usd"] = serde_json::json!(0.01),
+                "nonzero-usage" => events[12]["usage"]["input_tokens"] = serde_json::json!(1),
+                "model-usage" => {
+                    events[12]["modelUsage"] = serde_json::json!({"claude-sonnet-4-6": {}})
+                }
+                "permission-use" => events[12]["permission_denials"] = serde_json::json!(["Read"]),
+                "unknown-field" => events[12]["new_activity"] = serde_json::json!(true),
+                "reviewer-verdict" => {
+                    fs::write(transcript.with_file_name("review.md"), "Verdict: FAIL\n").unwrap()
+                }
+                "mixed-non-review" => store
+                    .mutate_work_item("work-1", |item| {
+                        item.attempts[0].tasks[1].kind = TaskKind::Tester;
+                        Ok(())
+                    })
+                    .unwrap(),
+                _ => unreachable!(),
+            }
+            if !matches!(
+                case,
+                "malformed-event" | "reviewer-verdict" | "mixed-non-review"
+            ) {
+                let content = events
+                    .iter()
+                    .map(serde_json::to_string)
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap()
+                    .join("\n");
+                fs::write(&transcript, format!("{content}\n")).unwrap();
+            }
+            let before = store.read_work_item("work-1").unwrap();
+            let resolver = ContentResolver::new(Some(tmp.path()));
+
+            let error = run_attempt(WorkAttemptRunConfig {
+                project_root: tmp.path(),
+                store: &store,
+                work_item_id: "work-1",
+                attempt_id: "attempt-1",
+                resolver: &resolver,
+                extra_args: &[],
+                no_sandbox: true,
+                tester_no_sandbox: false,
+                resume_cancellation_requested_at: None,
+                coder_mapping_inputs: None,
+                learner_run_coder: None,
+            })
+            .expect_err("deviated legacy evidence must remain blocked");
+
+            assert!(
+                error.to_string().contains(expected_error),
+                "{case} should explain its inconclusive evidence: {error:#}"
+            );
+            assert_eq!(
+                store.read_work_item("work-1").unwrap(),
+                before,
+                "{case} must not mutate the persisted round-cap Attempt"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_provider_recovery_preserves_completed_attempt_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = legacy_provider_pause_fixture(tmp.path(), crate::coder::CoderKind::Claude);
+        let before = store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            reclassify_legacy_provider_pause(&store, tmp.path(), "work-1", "attempt-1").unwrap(),
+            LegacyProviderPauseRecovery::Reclassified
+        );
+        let after = store.read_work_item("work-1").unwrap();
+        assert_eq!(after.attempts[0].tasks[0], before.attempts[0].tasks[0]);
+        assert!(
+            tmp.path()
+                .join(".fluent/work/artifacts/work-1/attempt-1/review-provider/transcript.jsonl")
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn reclassifies_failed_codex_transport_task_for_same_task_resume() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let mut item = WorkItem::planned("work-1", "Recover Codex transport outage");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let attempt = &mut item.attempts[0];
+        attempt.coder_mapping.write.coder = crate::coder::CoderKind::Codex;
+        attempt.status = AttemptStatus::NeedsUser;
+        attempt.pause_kind = Some(PauseKind::RoundCap);
+        attempt.review_state = Some(AttemptReviewState::Failed);
+        let task = &mut attempt.tasks[0];
+        task.status = TaskStatus::Failed;
+        task.artifact_area = Some(TaskArtifactArea {
+            path: work_artifact_path("work-1", "attempt-1", "attempt-1-write-1"),
+        });
+        store.create_work_item(&item).unwrap();
+
+        let transcript = tmp.path().join(work_artifact_path(
+            "work-1",
+            "attempt-1",
+            "attempt-1-write-1/transcript.jsonl",
+        ));
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::write(
+            &transcript,
+            concat!(
+                "{\"type\":\"thread.started\"}\n",
+                "{\"type\":\"turn.started\"}\n",
+                "{\"type\":\"error\",\"message\":\"Reconnecting... stream disconnected before completion: Connection refused (os error 61)\"}\n",
+                "{\"type\":\"turn.failed\",\"error\":{\"message\":\"stream disconnected before completion: error sending request for url (https://example.invalid)\"}}\n",
+            ),
+        )
+        .unwrap();
+
+        assert!(
+            reclassify_codex_transport_pause(&store, tmp.path(), "work-1", "attempt-1").unwrap()
+        );
+        let item = store.read_work_item("work-1").unwrap();
+        let attempt = &item.attempts[0];
+        assert_eq!(attempt.status, AttemptStatus::NeedsUser);
+        assert_eq!(attempt.pause_kind, Some(PauseKind::ProviderUnavailable));
+        assert_eq!(attempt.tasks[0].status, TaskStatus::NeedsUser);
+        assert!(attempt.tasks[0].output.is_none());
+    }
+
+    #[test]
+    fn reclassifies_failed_codex_auth_task_for_same_task_resume_idempotently() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let mut item = WorkItem::planned("work-1", "Recover Codex authentication outage");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let attempt = &mut item.attempts[0];
+        attempt.coder_mapping.write.coder = crate::coder::CoderKind::Codex;
+        attempt.status = AttemptStatus::NeedsUser;
+        attempt.pause_kind = Some(PauseKind::RoundCap);
+        attempt.review_state = Some(AttemptReviewState::Failed);
+        let task = &mut attempt.tasks[0];
+        task.status = TaskStatus::Failed;
+        task.artifact_area = Some(TaskArtifactArea {
+            path: work_artifact_path("work-1", "attempt-1", "attempt-1-write-1"),
+        });
+        store.create_work_item(&item).unwrap();
+
+        let transcript = tmp.path().join(work_artifact_path(
+            "work-1",
+            "attempt-1",
+            "attempt-1-write-1/transcript.jsonl",
+        ));
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::write(
+            &transcript,
+            concat!(
+                "{\"type\":\"thread.started\"}\n",
+                "{\"type\":\"turn.started\"}\n",
+                "{\"type\":\"error\",\"message\":\"Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again.\"}\n",
+                "{\"type\":\"turn.failed\",\"error\":{\"message\":\"Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again.\"}}\n",
+            ),
+        )
+        .unwrap();
+
+        assert!(reclassify_codex_auth_pause(&store, tmp.path(), "work-1", "attempt-1").unwrap());
+        let migrated = store.read_work_item("work-1").unwrap();
+        let attempt = &migrated.attempts[0];
+        assert_eq!(attempt.pause_kind, Some(PauseKind::Auth));
+        assert_eq!(attempt.tasks[0].status, TaskStatus::NeedsUser);
+        assert!(attempt.tasks[0].output.is_none());
+
+        assert!(!reclassify_codex_auth_pause(&store, tmp.path(), "work-1", "attempt-1").unwrap());
+        assert_eq!(store.read_work_item("work-1").unwrap(), migrated);
+    }
+
+    #[test]
+    fn codex_transport_recovery_rejects_progressed_task() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let mut item = WorkItem::planned("work-1", "Keep progressed failure hard");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let attempt = &mut item.attempts[0];
+        attempt.coder_mapping.write.coder = crate::coder::CoderKind::Codex;
+        attempt.status = AttemptStatus::NeedsUser;
+        attempt.pause_kind = Some(PauseKind::RoundCap);
+        attempt.tasks[0].status = TaskStatus::Failed;
+        attempt.tasks[0].artifact_area = Some(TaskArtifactArea {
+            path: work_artifact_path("work-1", "attempt-1", "attempt-1-write-1"),
+        });
+        store.create_work_item(&item).unwrap();
+
+        let transcript = tmp.path().join(work_artifact_path(
+            "work-1",
+            "attempt-1",
+            "attempt-1-write-1/transcript.jsonl",
+        ));
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::write(
+            &transcript,
+            concat!(
+                "{\"type\":\"thread.started\"}\n",
+                "{\"type\":\"turn.started\"}\n",
+                "{\"type\":\"item.completed\",\"item\":{\"type\":\"command_execution\",\"status\":\"completed\"}}\n",
+                "{\"type\":\"turn.failed\",\"error\":{\"message\":\"stream disconnected before completion: Connection refused (os error 61)\"}}\n",
+            ),
+        )
+        .unwrap();
+
+        assert!(
+            !reclassify_codex_transport_pause(&store, tmp.path(), "work-1", "attempt-1").unwrap()
+        );
+        let item = store.read_work_item("work-1").unwrap();
+        assert_eq!(item.attempts[0].pause_kind, Some(PauseKind::RoundCap));
+        assert_eq!(item.attempts[0].tasks[0].status, TaskStatus::Failed);
+    }
+
+    #[test]
+    fn legacy_round_cap_without_complete_provider_proof_remains_blocked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = legacy_provider_pause_fixture(tmp.path(), crate::coder::CoderKind::Claude);
+        fs::remove_file(
+            tmp.path()
+                .join(".fluent/work/artifacts/work-1/attempt-1/review-provider/transcript.jsonl"),
+        )
+        .unwrap();
+        assert!(matches!(
+            reclassify_legacy_provider_pause(&store, tmp.path(), "work-1", "attempt-1").unwrap(),
+            LegacyProviderPauseRecovery::Ineligible(reason)
+                if reason.contains("lacks conclusive provider-unavailable transcript evidence")
+        ));
+        let item = store.read_work_item("work-1").unwrap();
+        assert_eq!(item.attempts[0].pause_kind, Some(PauseKind::RoundCap));
+    }
+
+    #[test]
+    fn legacy_ineligible_round_cap_explains_provider_evidence_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = legacy_provider_pause_fixture(tmp.path(), crate::coder::CoderKind::Claude);
+        fs::remove_file(
+            tmp.path()
+                .join(".fluent/work/artifacts/work-1/attempt-1/review-provider/transcript.jsonl"),
+        )
+        .unwrap();
+        let resolver = ContentResolver::new(Some(tmp.path()));
+
+        let error = run_attempt(WorkAttemptRunConfig {
+            project_root: tmp.path(),
+            store: &store,
+            work_item_id: "work-1",
+            attempt_id: "attempt-1",
+            resolver: &resolver,
+            extra_args: &[],
+            no_sandbox: true,
+            tester_no_sandbox: false,
+            resume_cancellation_requested_at: None,
+            coder_mapping_inputs: None,
+            learner_run_coder: None,
+        })
+        .expect_err("incomplete provider evidence leaves the legacy round cap blocked");
+
+        assert!(
+            error
+                .to_string()
+                .contains("lacks conclusive provider-unavailable transcript evidence"),
+            "the public attempt route must identify the compatibility eligibility failure: {error:#}"
+        );
+        assert_eq!(
+            store.read_work_item("work-1").unwrap().attempts[0].pause_kind,
+            Some(PauseKind::RoundCap),
+            "a failed compatibility check must not mutate legacy state"
+        );
+    }
+
+    #[test]
+    fn legacy_round_cap_at_real_write_limit_remains_blocked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = legacy_provider_pause_fixture(tmp.path(), crate::coder::CoderKind::Claude);
+        store
+            .mutate_work_item("work-1", |item| {
+                let attempt = &mut item.attempts[0];
+                let writer = attempt.tasks[0].clone();
+                for round in 2..=max_total_write_rounds() {
+                    let mut task = writer.clone();
+                    task.id = format!("attempt-1-write-{round}");
+                    attempt.tasks.push(task);
+                }
+                Ok(())
+            })
+            .unwrap();
+        let resolver = ContentResolver::new(Some(tmp.path()));
+
+        let error = run_attempt(WorkAttemptRunConfig {
+            project_root: tmp.path(),
+            store: &store,
+            work_item_id: "work-1",
+            attempt_id: "attempt-1",
+            resolver: &resolver,
+            extra_args: &[],
+            no_sandbox: true,
+            tester_no_sandbox: false,
+            resume_cancellation_requested_at: None,
+            coder_mapping_inputs: None,
+            learner_run_coder: None,
+        })
+        .expect_err("a real write-round limit must remain blocked");
+
+        assert!(
+            error.to_string().contains("real write-round limit"),
+            "the public attempt route must explain why migration is ineligible: {error:#}"
+        );
+        let attempt = &store.read_work_item("work-1").unwrap().attempts[0];
+        assert_eq!(attempt.pause_kind, Some(PauseKind::RoundCap));
+        assert_eq!(attempt.tasks[1].status, TaskStatus::Failed);
+    }
+
+    #[test]
+    fn legacy_round_cap_with_failed_non_review_task_remains_blocked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = legacy_provider_pause_fixture(tmp.path(), crate::coder::CoderKind::Claude);
+        store
+            .mutate_work_item("work-1", |item| {
+                item.attempts[0].tasks[1].kind = TaskKind::Tester;
+                Ok(())
+            })
+            .unwrap();
+        let resolver = ContentResolver::new(Some(tmp.path()));
+
+        let error = run_attempt(WorkAttemptRunConfig {
+            project_root: tmp.path(),
+            store: &store,
+            work_item_id: "work-1",
+            attempt_id: "attempt-1",
+            resolver: &resolver,
+            extra_args: &[],
+            no_sandbox: true,
+            tester_no_sandbox: false,
+            resume_cancellation_requested_at: None,
+            coder_mapping_inputs: None,
+            learner_run_coder: None,
+        })
+        .expect_err("a non-review failure must remain a legacy round-cap pause");
+
+        assert!(error.to_string().contains("not a review Task"));
+        let attempt = &store.read_work_item("work-1").unwrap().attempts[0];
+        assert_eq!(attempt.pause_kind, Some(PauseKind::RoundCap));
+        assert_eq!(attempt.tasks[1].status, TaskStatus::Failed);
+    }
+
+    #[test]
+    fn legacy_round_cap_with_reviewer_verdict_remains_blocked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = legacy_provider_pause_fixture(tmp.path(), crate::coder::CoderKind::Claude);
+        let review = tmp
+            .path()
+            .join(".fluent/work/artifacts/work-1/attempt-1/review-provider/review.md");
+        fs::write(&review, "Verdict: FAIL\n").unwrap();
+        let resolver = ContentResolver::new(Some(tmp.path()));
+
+        let error = run_attempt(WorkAttemptRunConfig {
+            project_root: tmp.path(),
+            store: &store,
+            work_item_id: "work-1",
+            attempt_id: "attempt-1",
+            resolver: &resolver,
+            extra_args: &[],
+            no_sandbox: true,
+            tester_no_sandbox: false,
+            resume_cancellation_requested_at: None,
+            coder_mapping_inputs: None,
+            learner_run_coder: None,
+        })
+        .expect_err("a reviewer verdict must remain a legacy round-cap pause");
+
+        assert!(error.to_string().contains("has a reviewer verdict"));
+        let attempt = &store.read_work_item("work-1").unwrap().attempts[0];
+        assert_eq!(attempt.pause_kind, Some(PauseKind::RoundCap));
+        assert_eq!(attempt.tasks[1].status, TaskStatus::Failed);
+    }
+
+    #[test]
+    fn legacy_provider_recovery_rejects_non_claude_evidence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_item_id = "other-legacy-work";
+        let attempt_id = "nonstandard-resume-id";
+        let store = legacy_provider_pause_fixture_with_ids(
+            tmp.path(),
+            crate::coder::CoderKind::Codex,
+            work_item_id,
+            attempt_id,
+        );
+        let resolver = ContentResolver::new(Some(tmp.path()));
+
+        let error = run_attempt(WorkAttemptRunConfig {
+            project_root: tmp.path(),
+            store: &store,
+            work_item_id,
+            attempt_id,
+            resolver: &resolver,
+            extra_args: &[],
+            no_sandbox: true,
+            tester_no_sandbox: false,
+            resume_cancellation_requested_at: None,
+            coder_mapping_inputs: None,
+            learner_run_coder: None,
+        })
+        .expect_err("the Claude-only compatibility route rejects Codex evidence");
+
+        assert!(error.to_string().contains("lacks conclusive"));
+        let attempt = &store.read_work_item(work_item_id).unwrap().attempts[0];
+        assert_eq!(attempt.status, AttemptStatus::NeedsUser);
+        assert_eq!(attempt.pause_kind, Some(PauseKind::RoundCap));
+        assert_eq!(attempt.tasks[0].status, TaskStatus::Complete);
+        assert_eq!(attempt.tasks[1].status, TaskStatus::Failed);
+    }
+
+    #[test]
     fn transcript_pump_pause_is_resumable() {
         // A transcript-pump pause is a supported resume, like an auth pause: the
         // Attempt reopens and the pump-failed coder task resets to Planned so it
@@ -7991,6 +28432,7 @@ mod tests {
         // as a terminal write-round cap.
         let mut attempt = Attempt {
             id: "attempt-1".to_string(),
+            work_item_id: "work-1".to_string(),
             status: AttemptStatus::NeedsUser,
             pause_kind: Some(PauseKind::TranscriptPump),
             tasks: vec![Task {
@@ -8007,6 +28449,9 @@ mod tests {
                 },
                 artifact_area: None,
                 review_context: None,
+                writer_correction_assignment: None,
+                verification_context: None,
+                evidence_review_context: None,
                 input_artifacts: Vec::new(),
                 depends_on: None,
                 output: None,
@@ -8037,6 +28482,326 @@ mod tests {
     }
 
     #[test]
+    fn host_sandbox_pause_is_resumable() {
+        let mut attempt = Attempt {
+            id: "attempt-1".to_string(),
+            status: AttemptStatus::NeedsUser,
+            pause_kind: Some(PauseKind::HostSandbox),
+            tasks: vec![Task {
+                id: "attempt-1-write-1".to_string(),
+                kind: TaskKind::Write,
+                status: TaskStatus::NeedsUser,
+                role: "author".to_string(),
+                instructions: None,
+                work_item_id: "work-1".to_string(),
+                attempt_id: Some("attempt-1".to_string()),
+                workspace_access: WorkspaceAccess {
+                    reads: Vec::new(),
+                    writes: Vec::new(),
+                },
+                artifact_area: None,
+                review_context: None,
+                writer_correction_assignment: None,
+                verification_context: None,
+                evidence_review_context: None,
+                input_artifacts: Vec::new(),
+                depends_on: None,
+                output: None,
+                created_at: None,
+                started_at: None,
+                completed_at: None,
+            }],
+            completed_at: Some("2026-07-28T12:00:00Z".to_string()),
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            reject_terminal_attempt(&attempt).unwrap(),
+            TerminalCheck::Reopen
+        ));
+        crate::work_model::reopen_attempt(&mut attempt);
+        assert_eq!(attempt.status, AttemptStatus::Planned);
+        assert_eq!(attempt.tasks[0].status, TaskStatus::Planned);
+    }
+
+    #[test]
+    fn tester_harness_pause_replans_only_tester() {
+        let mut attempt = Attempt {
+            id: "attempt-1".to_string(),
+            status: AttemptStatus::NeedsUser,
+            pause_kind: Some(PauseKind::TesterHarness),
+            tasks: vec![
+                Task {
+                    id: "attempt-1-write-1".to_string(),
+                    kind: TaskKind::Write,
+                    status: TaskStatus::Complete,
+                    role: "author".to_string(),
+                    instructions: None,
+                    work_item_id: "work-1".to_string(),
+                    attempt_id: Some("attempt-1".to_string()),
+                    workspace_access: WorkspaceAccess {
+                        reads: Vec::new(),
+                        writes: Vec::new(),
+                    },
+                    artifact_area: None,
+                    review_context: None,
+                    writer_correction_assignment: None,
+                    verification_context: None,
+                    evidence_review_context: None,
+                    input_artifacts: Vec::new(),
+                    depends_on: None,
+                    output: None,
+                    created_at: None,
+                    started_at: None,
+                    completed_at: None,
+                },
+                Task {
+                    id: "attempt-1-tester".to_string(),
+                    kind: TaskKind::Tester,
+                    status: TaskStatus::NeedsUser,
+                    role: "tester".to_string(),
+                    instructions: None,
+                    work_item_id: "work-1".to_string(),
+                    attempt_id: Some("attempt-1".to_string()),
+                    workspace_access: WorkspaceAccess {
+                        reads: Vec::new(),
+                        writes: Vec::new(),
+                    },
+                    artifact_area: None,
+                    review_context: None,
+                    writer_correction_assignment: None,
+                    verification_context: None,
+                    evidence_review_context: None,
+                    input_artifacts: Vec::new(),
+                    depends_on: None,
+                    output: None,
+                    created_at: None,
+                    started_at: None,
+                    completed_at: None,
+                },
+            ],
+            completed_at: Some("2026-07-30T12:00:00Z".to_string()),
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            reject_terminal_attempt(&attempt).unwrap(),
+            TerminalCheck::Reopen
+        ));
+
+        crate::work_model::reopen_attempt(&mut attempt);
+
+        assert_eq!(attempt.status, AttemptStatus::Planned);
+        assert!(attempt.pause_kind.is_none());
+        assert_eq!(
+            attempt.tasks[0].status,
+            TaskStatus::Complete,
+            "recovery must retain the completed Writer task"
+        );
+        assert_eq!(
+            attempt.tasks[1].status,
+            TaskStatus::Planned,
+            "recovery must replan the paused Tester task"
+        );
+    }
+
+    #[test]
+    fn tester_harness_repair_resume_preserves_failed_tester_and_plans_writer() {
+        let failed_tester_id = "attempt-1-tester";
+        let mut attempt = Attempt {
+            id: "attempt-1".to_string(),
+            work_item_id: "work-1".to_string(),
+            status: AttemptStatus::NeedsUser,
+            pause_kind: Some(PauseKind::TesterHarness),
+            tasks: vec![
+                Task {
+                    id: failed_tester_id.to_string(),
+                    kind: TaskKind::Tester,
+                    status: TaskStatus::Failed,
+                    role: "tester".to_string(),
+                    instructions: None,
+                    work_item_id: "work-1".to_string(),
+                    attempt_id: Some("attempt-1".to_string()),
+                    workspace_access: WorkspaceAccess {
+                        reads: Vec::new(),
+                        writes: Vec::new(),
+                    },
+                    artifact_area: Some(TaskArtifactArea {
+                        path: ".fluent/work/artifacts/work-1/attempt-1/attempt-1-tester"
+                            .to_string(),
+                    }),
+                    review_context: Some(crate::work_model::ReviewContext {
+                        candidate_workspace_id: "candidate".to_string(),
+                        candidate_workspace_path: "../work-4-work-1-attempt-1".to_string(),
+                        source_branch: "main".to_string(),
+                        candidate_commit: "abc123".to_string(),
+                        base_commit: None,
+                    }),
+                    writer_correction_assignment: None,
+                    verification_context: None,
+                    evidence_review_context: None,
+                    input_artifacts: Vec::new(),
+                    depends_on: None,
+                    output: None,
+                    created_at: None,
+                    started_at: None,
+                    completed_at: Some("2026-08-22T11:50:00Z".to_string()),
+                },
+                Task {
+                    id: "attempt-1-write-2".to_string(),
+                    kind: TaskKind::Write,
+                    status: TaskStatus::Planned,
+                    role: crate::work_model::TESTER_HARNESS_REPAIR_ROLE.to_string(),
+                    instructions: Some("Repair the project Tester harness.".to_string()),
+                    work_item_id: "work-1".to_string(),
+                    attempt_id: Some("attempt-1".to_string()),
+                    workspace_access: WorkspaceAccess {
+                        reads: Vec::new(),
+                        writes: vec![crate::work_model::WorkspaceRef {
+                            id: "candidate".to_string(),
+                            path: "../work-4-work-1-attempt-1".to_string(),
+                        }],
+                    },
+                    artifact_area: Some(TaskArtifactArea {
+                        path: ".fluent/work/artifacts/work-1/attempt-1/attempt-1-write-2"
+                            .to_string(),
+                    }),
+                    review_context: Some(crate::work_model::ReviewContext {
+                        candidate_workspace_id: "candidate".to_string(),
+                        candidate_workspace_path: "../work-4-work-1-attempt-1".to_string(),
+                        source_branch: "main".to_string(),
+                        candidate_commit: "abc123".to_string(),
+                        base_commit: None,
+                    }),
+                    writer_correction_assignment: None,
+                    verification_context: None,
+                    evidence_review_context: None,
+                    input_artifacts: vec![
+                        ArtifactRef {
+                            producer_id: "tester-harness-repair-authority".to_string(),
+                            path: ".fluent/work/artifacts/work-1/attempt-1/tester-harness-repairs/attempt-1-write-2/repair.json".to_string(),
+                        },
+                        ArtifactRef {
+                            producer_id: failed_tester_id.to_string(),
+                            path: ".fluent/work/artifacts/work-1/attempt-1/attempt-1-tester/tester-results.json".to_string(),
+                        },
+                    ],
+                    depends_on: None,
+                    output: None,
+                    created_at: Some("2026-08-22T12:00:00Z".to_string()),
+                    started_at: None,
+                    completed_at: None,
+                },
+            ],
+            completed_at: Some("2026-08-22T12:00:00Z".to_string()),
+            ..Default::default()
+        };
+
+        attempt.validate("work-1").unwrap();
+        assert!(matches!(
+            reject_terminal_attempt(&attempt).unwrap(),
+            TerminalCheck::Reopen
+        ));
+
+        crate::work_model::reopen_attempt(&mut attempt);
+
+        assert_eq!(attempt.status, AttemptStatus::Planned);
+        assert_eq!(attempt.tasks[0].status, TaskStatus::Failed);
+        assert_eq!(attempt.tasks[1].status, TaskStatus::Planned);
+    }
+
+    #[test]
+    fn writer_completion_retry_replans_repair_without_appending_author_writer() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let failed_tester_id = "attempt-1-tester";
+        let mut item = WorkItem::planned("work-1", "Retry Tester repair");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let attempt = &mut item.attempts[0];
+        attempt.tasks[0].status = TaskStatus::Failed;
+        attempt.tasks[0].kind = TaskKind::Tester;
+        attempt.tasks[0].role = "tester".to_string();
+        attempt.tasks[0].id = failed_tester_id.to_string();
+        attempt.tasks[0].artifact_area = Some(TaskArtifactArea {
+            path: work_artifact_path("work-1", "attempt-1", failed_tester_id),
+        });
+        attempt.tasks[0].review_context = Some(crate::work_model::ReviewContext {
+            candidate_workspace_id: "candidate".to_string(),
+            candidate_workspace_path: "../work-4-work-1-attempt-1".to_string(),
+            source_branch: "main".to_string(),
+            candidate_commit: "abc123".to_string(),
+            base_commit: None,
+        });
+        attempt.tasks.push(Task {
+            id: "attempt-1-write-2".to_string(),
+            kind: TaskKind::Write,
+            status: TaskStatus::NeedsUser,
+            role: crate::work_model::TESTER_HARNESS_REPAIR_ROLE.to_string(),
+            instructions: Some("Repair the project Tester harness.".to_string()),
+            work_item_id: "work-1".to_string(),
+            attempt_id: Some("attempt-1".to_string()),
+            workspace_access: WorkspaceAccess {
+                reads: Vec::new(),
+                writes: vec![crate::work_model::WorkspaceRef {
+                    id: "candidate".to_string(),
+                    path: "../work-4-work-1-attempt-1".to_string(),
+                }],
+            },
+            artifact_area: Some(TaskArtifactArea {
+                path: work_artifact_path("work-1", "attempt-1", "attempt-1-write-2"),
+            }),
+            review_context: Some(crate::work_model::ReviewContext {
+                candidate_workspace_id: "candidate".to_string(),
+                candidate_workspace_path: "../work-4-work-1-attempt-1".to_string(),
+                source_branch: "main".to_string(),
+                candidate_commit: "abc123".to_string(),
+                base_commit: None,
+            }),
+            writer_correction_assignment: None,
+            verification_context: None,
+            evidence_review_context: None,
+            input_artifacts: vec![
+                ArtifactRef {
+                    producer_id: "tester-harness-repair-authority".to_string(),
+                    path: work_artifact_path(
+                        "work-1",
+                        "attempt-1",
+                        "tester-harness-repairs/attempt-1-write-2/repair.json",
+                    ),
+                },
+                ArtifactRef {
+                    producer_id: failed_tester_id.to_string(),
+                    path: format!(
+                        "{}/tester-results.json",
+                        work_artifact_path("work-1", "attempt-1", failed_tester_id)
+                    ),
+                },
+            ],
+            depends_on: None,
+            output: None,
+            created_at: Some("2026-08-22T12:00:00Z".to_string()),
+            started_at: Some("2026-08-22T12:01:00Z".to_string()),
+            completed_at: Some("2026-08-22T12:02:00Z".to_string()),
+        });
+        attempt.status = AttemptStatus::NeedsUser;
+        attempt.pause_kind = Some(PauseKind::WriterCompletion);
+        attempt.review_state = Some(AttemptReviewState::NotReviewed);
+        attempt.completed_at = Some("2026-08-22T12:02:00Z".to_string());
+        store.create_work_item(&item).unwrap();
+
+        reopen_resumable_attempt(tmp.path(), &store, "work-1", "attempt-1").unwrap();
+
+        let stored = store.read_work_item("work-1").unwrap();
+        let attempt = &stored.attempts[0];
+        assert_eq!(attempt.tasks.len(), 2);
+        assert_eq!(attempt.tasks[1].status, TaskStatus::Planned);
+        assert_eq!(
+            attempt.tasks[1].role,
+            crate::work_model::TESTER_HARNESS_REPAIR_ROLE
+        );
+    }
+
+    #[test]
     fn transcript_pump_pause_with_mixed_state_is_not_auto_resumed() {
         // A resumable pause that also carries a hard-Failed or still-live peer
         // Task is a mixed state: resuming could discard a hard failure or race a
@@ -8056,6 +28821,9 @@ mod tests {
             },
             artifact_area: None,
             review_context: None,
+            writer_correction_assignment: None,
+            verification_context: None,
+            evidence_review_context: None,
             input_artifacts: Vec::new(),
             depends_on: None,
             output: None,
@@ -8134,6 +28902,8 @@ mod tests {
             resolver: &resolver,
             extra_args: &[],
             no_sandbox: true,
+            tester_no_sandbox: false,
+            resume_cancellation_requested_at: None,
             coder_mapping_inputs: None,
             learner_run_coder: None,
         })
@@ -8155,6 +28925,34 @@ mod tests {
             Some(PauseKind::Uncertain),
             "pause kind should be preserved"
         );
+    }
+
+    #[test]
+    fn legacy_writer_completion_pause_reopens_without_admitting_review_uncertainty() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let mut item = WorkItem::planned("work-1", "Recover completion evidence");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let attempt = &mut item.attempts[0];
+        attempt.status = AttemptStatus::NeedsUser;
+        attempt.pause_kind = Some(PauseKind::Uncertain);
+        attempt.review_state = Some(AttemptReviewState::NotReviewed);
+        attempt.artifacts.push(ArtifactRef {
+            producer_id: "required-progress".to_string(),
+            path: ".fluent/work/artifacts/work-1/attempt-1/writer-completion-needs-user.md"
+                .to_string(),
+        });
+        store.create_work_item(&item).unwrap();
+
+        assert!(matches!(
+            reject_terminal_attempt(&item.attempts[0]).unwrap(),
+            TerminalCheck::Reopen
+        ));
+        reopen_resumable_attempt(tmp.path(), &store, "work-1", "attempt-1").unwrap();
+
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(stored.attempts[0].status, AttemptStatus::Planned);
+        assert_eq!(stored.attempts[0].pause_kind, None);
     }
 
     #[test]
@@ -8233,6 +29031,7 @@ mod tests {
             Some(LearnerConfig {
                 run_coder: &run_coder,
                 codex_worker: None,
+                no_sandbox: false,
             }),
         )
         .unwrap();
@@ -8243,6 +29042,194 @@ mod tests {
         assert_eq!(
             stored.merge_candidates[0].candidate_commit, expertise_head,
             "a confined expertise commit becomes the candidate commit"
+        );
+    }
+
+    #[test]
+    fn learner_candidate_gate_rejects_and_rolls_back_bad_expertise_commit() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (store, project_root, workspace, reviewed) =
+            make_learner_passing_fixture(tmp.path(), 1);
+        let run_coder = |request: &LearnerCoderRequest<'_>| -> Result<()> {
+            let expertise = request.workspace_path.join(".fluent/expertise");
+            fs::create_dir_all(&expertise).unwrap();
+            fs::write(expertise.join("learning.md"), "# Learning    \n").unwrap();
+            git::run(
+                request.workspace_path,
+                &["add", ".fluent/expertise/learning.md"],
+                "add invalid expertise",
+            )
+            .unwrap();
+            git::run(
+                request.workspace_path,
+                &["commit", "-m", "Update expertise"],
+                "commit invalid expertise",
+            )
+            .unwrap();
+            fs::create_dir_all(request.handoff_dir).unwrap();
+            fs::write(
+                request.handoff_dir.join(crate::learner::DRAFT_FILE_NAME),
+                r#"{"learning_summary":"x","follow_ups":[]}"#,
+            )
+            .unwrap();
+            Ok(())
+        };
+
+        let outcome = interpret_reviews(
+            &project_root,
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+            true,
+            Some(LearnerConfig {
+                run_coder: &run_coder,
+                codex_worker: None,
+                no_sandbox: false,
+            }),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::LearnerNotReady { .. }
+        ));
+        assert_eq!(
+            git::run_stdout(&workspace, &["rev-parse", "HEAD"], "read restored HEAD").unwrap(),
+            reviewed
+        );
+        let stored = store.read_work_item("work-1").unwrap();
+        let learning = stored.attempts[0].learning.as_ref().unwrap();
+        assert!(learning.is_failed());
+        assert!(
+            learning
+                .last_failure
+                .as_deref()
+                .unwrap_or_default()
+                .contains("candidate gate rejected")
+        );
+        let gates = project_root.join(".fluent/work/artifacts/work-1/attempt-1/learner/runs");
+        assert!(fs::read_dir(gates).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .path()
+                .join(crate::candidate_gate::CANDIDATE_GATE_FILE)
+                .is_file()
+        }));
+    }
+
+    #[test]
+    fn learner_expertise_commit_preserves_no_change_writer_identity() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (store, project_root, workspace, verified_commit) =
+            make_learner_passing_fixture(tmp.path(), 2);
+        mark_latest_writer_as_verified_no_change(&store, &verified_commit);
+
+        let run_coder = |request: &LearnerCoderRequest<'_>| -> Result<()> {
+            let expertise = request.workspace_path.join(".fluent/expertise");
+            fs::create_dir_all(&expertise).unwrap();
+            fs::write(expertise.join("no-change-identity.md"), "learned").unwrap();
+            write_valid_learner_draft(request);
+            Ok(())
+        };
+
+        let outcome = run_pre_land_learner_outcome(&project_root, &store, &run_coder);
+        assert!(
+            matches!(outcome, WorkAttemptRunOutcome::MergeCandidateReady { .. }),
+            "canonicalized no-change output remains ready; got {outcome:?}"
+        );
+
+        let canonical_commit =
+            git::run_stdout(&workspace, &["rev-parse", "HEAD"], "canonical HEAD").unwrap();
+        assert_ne!(canonical_commit, verified_commit);
+        let stored = store.read_work_item("work-1").unwrap();
+        stored.validate().unwrap();
+        let output = stored.attempts[0]
+            .tasks
+            .iter()
+            .rev()
+            .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+            .and_then(|task| task.output.as_ref())
+            .expect("latest Writer output");
+        assert_eq!(
+            output.base_commit.as_deref(),
+            Some(verified_commit.as_str())
+        );
+        assert_eq!(output.commit, canonical_commit);
+        assert_eq!(
+            output.learner_canonicalization,
+            Some(crate::work_model::LearnerCommitCanonicalization {
+                from_commit: verified_commit,
+                to_commit: canonical_commit.clone(),
+            })
+        );
+        let candidate = &stored.merge_candidates[0];
+        assert_eq!(candidate.candidate_commit, canonical_commit);
+        assert!(stored.attempts[0].learning.as_ref().unwrap().is_succeeded());
+        candidate.validate_advancement(&stored).unwrap();
+    }
+
+    #[test]
+    fn learner_handoff_failure_preserves_no_change_writer_identity() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (store, project_root, workspace, verified_commit) =
+            make_learner_passing_fixture(tmp.path(), 2);
+        mark_latest_writer_as_verified_no_change(&store, &verified_commit);
+        let handoff_path =
+            project_root.join(crate::learner::handoff_path_rel("work-1", "attempt-1"));
+        fs::create_dir_all(&handoff_path).unwrap();
+
+        let run_coder = |request: &LearnerCoderRequest<'_>| -> Result<()> {
+            let expertise = request.workspace_path.join(".fluent/expertise");
+            fs::create_dir_all(&expertise).unwrap();
+            fs::write(expertise.join("publication-failure.md"), "learned").unwrap();
+            write_valid_learner_draft(request);
+            Ok(())
+        };
+
+        let outcome = run_pre_land_learner_outcome(&project_root, &store, &run_coder);
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::LearnerNotReady { .. }
+        ));
+
+        let canonical_commit =
+            git::run_stdout(&workspace, &["rev-parse", "HEAD"], "canonical HEAD").unwrap();
+        let stored = store.read_work_item("work-1").unwrap();
+        stored.validate().unwrap();
+        let output = stored.attempts[0]
+            .tasks
+            .iter()
+            .rev()
+            .find(|task| task.kind == TaskKind::Write)
+            .and_then(|task| task.output.as_ref())
+            .unwrap();
+        assert_eq!(
+            output.base_commit.as_deref(),
+            Some(verified_commit.as_str())
+        );
+        assert_eq!(output.commit, canonical_commit);
+        assert_eq!(
+            output
+                .learner_canonicalization
+                .as_ref()
+                .map(|transition| (&transition.from_commit, &transition.to_commit)),
+            Some((&verified_commit, &canonical_commit))
+        );
+        assert_eq!(
+            stored.merge_candidates[0].candidate_commit,
+            canonical_commit
+        );
+        let learning = stored.attempts[0].learning.as_ref().unwrap();
+        assert!(learning.is_failed());
+        assert_eq!(
+            learning.failure_stage,
+            Some(crate::work_model::LearningFailureStage::HandoffPublication)
+        );
+        assert!(
+            stored.merge_candidates[0]
+                .validate_advancement(&stored)
+                .is_err(),
+            "publication failure withholds landing readiness"
         );
     }
 
@@ -8285,6 +29272,7 @@ mod tests {
             Some(LearnerConfig {
                 run_coder: &run_coder,
                 codex_worker: None,
+                no_sandbox: false,
             }),
         )
         .unwrap();
@@ -8368,6 +29356,7 @@ mod tests {
             Some(LearnerConfig {
                 run_coder,
                 codex_worker: None,
+                no_sandbox: false,
             }),
         )
         .unwrap()
@@ -8527,12 +29516,13 @@ mod tests {
                 learning.handoff.is_none(),
                 "{name}: no handoff is referenced"
             );
+            let failure = learning.last_failure.as_deref().unwrap();
             assert!(
-                learning
-                    .last_failure
-                    .as_deref()
-                    .unwrap()
-                    .contains("pointer-identity check failed before advancing Learning"),
+                if name.starts_with("reviewed SHA") {
+                    failure.contains("Learner candidate gate could not verify")
+                } else {
+                    failure.contains("pointer-identity check failed before advancing Learning")
+                },
                 "{name}: the exact postflight contradiction is stored: {:?}",
                 learning.last_failure
             );
@@ -9273,9 +30263,13 @@ mod tests {
         item.attempts[0].status = AttemptStatus::Complete;
         item.attempts[0].review_state = Some(AttemptReviewState::Passed);
 
-        // A final-round Tester context at the reviewed SHA.
-        let tester_path = work_artifact_path("work-1", "attempt-1", "attempt-1-tester");
-        let mut tester = tester_task("attempt-1-tester", &tester_path);
+        // The base fixture already carries the final Tester; bind its context to
+        // the reviewed SHA rather than creating a duplicate Task identity.
+        let tester = item.attempts[0]
+            .tasks
+            .iter_mut()
+            .find(|task| task.kind == TaskKind::Tester)
+            .expect("base fixture final Tester");
         tester.review_context = Some(ReviewContext {
             candidate_workspace_id: "candidate".to_string(),
             candidate_workspace_path: "../work-1-candidate".to_string(),
@@ -9283,21 +30277,9 @@ mod tests {
             candidate_commit: base.to_string(),
             base_commit: None,
         });
-        item.attempts[0].tasks.push(tester);
 
-        // A final-round context for every built-in reviewer beyond the `tests`
-        // reviewer the base fixture already carries.
-        for role in crate::review::REVIEWERS {
-            if *role == "tests" {
-                continue;
-            }
-            let id = format!("attempt-1-review-1-{role}");
-            let path = work_artifact_path("work-1", "attempt-1", &id);
-            let mut task = review_task_with_artifact(&id, role, &path);
-            task.review_context.as_mut().unwrap().candidate_commit = base.to_string();
-            item.attempts[0].tasks.push(task);
-        }
-
+        // The base fixture supplies every ordinary role in the final round.
+        // Preserve those identities so the mutation targets the reviewed Task.
         item.create_or_get_merge_candidate("attempt-1").unwrap();
         mutate(&mut item);
         item.attempts[0].learning = Some(AttemptLearning::handoff_pending(1));
@@ -10806,6 +31788,11 @@ mod tests {
         let subject =
             git::run_stdout(&workspace, &["log", "-1", "--format=%s"], "subject").unwrap();
         assert_eq!(subject, "Update expertise");
+        let body = git::run_stdout(&workspace, &["log", "-1", "--format=%b"], "body").unwrap();
+        assert_eq!(
+            body,
+            "- Record durable project guidance from the accepted candidate."
+        );
         let tree =
             git::run_stdout(&workspace, &["ls-tree", "-r", "--name-only", "HEAD"], "ls").unwrap();
         assert!(tree.contains(".fluent/expertise/note.md"));
@@ -11003,7 +31990,22 @@ git update-ref HEAD "$replacement" "$host"
             .and_then(|task| task.output.as_mut())
             .expect("completed Write output")
             .commit = baseline.clone();
+        for task in &mut item.attempts[0].tasks {
+            if let Some(context) = task.review_context.as_mut() {
+                context.candidate_commit = baseline.clone();
+            }
+        }
         store.write_work_item(&item).unwrap();
+        let results = latest_tester_results_path(&project_root, &item.attempts[0]).unwrap();
+        let tester_dir = results.parent().unwrap();
+        crate::tester::run(
+            &workspace,
+            tester_dir,
+            true,
+            &ContentResolver::new(Some(&workspace)),
+        )
+        .unwrap();
+        crate::tester::bind_candidate_commit(tester_dir, &baseline).unwrap();
 
         let run_coder = |request: &LearnerCoderRequest<'_>| -> Result<()> {
             fs::remove_file(request.workspace_path.join(".fluent/expertise/obsolete.md")).unwrap();

@@ -41,6 +41,7 @@ pub struct HookContext {
     pub task_id: Option<String>,
     pub merge_candidate_id: Option<String>,
     pub candidate_commit: Option<String>,
+    pub base_commit: Option<String>,
     pub artifact_dir: Option<PathBuf>,
     pub reviewer_artifact_dir: Option<PathBuf>,
     /// Where to write `<hook-name>.log`. Created if missing.
@@ -117,6 +118,9 @@ pub fn run_hook(
     }
     if let Some(commit) = &context.candidate_commit {
         cmd.env("FLUENT_CANDIDATE_COMMIT", commit);
+    }
+    if let Some(commit) = &context.base_commit {
+        cmd.env("FLUENT_BASE_COMMIT", commit);
     }
     if let Some(dir) = &context.artifact_dir {
         cmd.env("FLUENT_ARTIFACT_DIR", dir.to_string_lossy().to_string());
@@ -215,6 +219,26 @@ mod tests {
     }
 
     #[test]
+    fn passes_base_commit_to_hook() {
+        let tmp = TempDir::new().unwrap();
+        write_hook(
+            tmp.path(),
+            "check-pre-merge",
+            "#!/bin/sh\nprintf '%s' \"$FLUENT_BASE_COMMIT\"\n",
+        );
+        let log_dir = tmp.path().join("logs");
+        let context = HookContext {
+            base_commit: Some("base-123".to_string()),
+            log_dir: log_dir.clone(),
+            ..Default::default()
+        };
+        let outcome = run_hook(tmp.path(), "check-pre-merge", tmp.path(), &context)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fs::read_to_string(outcome.log_path).unwrap(), "base-123");
+    }
+
+    #[test]
     fn reports_non_zero_exit() {
         let tmp = TempDir::new().unwrap();
         write_hook(
@@ -240,9 +264,10 @@ mod tests {
         write_hook(
             tmp.path(),
             "check-pre-merge",
-            "#!/bin/sh\nprintf 'work=%s attempt=%s task=%s candidate=%s commit=%s\\n' \
+            "#!/bin/sh\nprintf 'work=%s attempt=%s task=%s candidate=%s commit=%s base=%s\\n' \
                 \"$FLUENT_WORK_ITEM_ID\" \"$FLUENT_ATTEMPT_ID\" \"$FLUENT_TASK_ID\" \
-                \"$FLUENT_MERGE_CANDIDATE_ID\" \"$FLUENT_CANDIDATE_COMMIT\"\nexit 0\n",
+                \"$FLUENT_MERGE_CANDIDATE_ID\" \"$FLUENT_CANDIDATE_COMMIT\" \
+                \"$FLUENT_BASE_COMMIT\"\nexit 0\n",
         );
         let log_dir = tmp.path().join("logs");
         let context = HookContext {
@@ -251,6 +276,7 @@ mod tests {
             task_id: Some("attempt-1-write-1".into()),
             merge_candidate_id: Some("cand-1".into()),
             candidate_commit: Some("abc123".into()),
+            base_commit: Some("base456".into()),
             log_dir,
             ..Default::default()
         };
@@ -259,7 +285,9 @@ mod tests {
             .unwrap();
         let log = fs::read_to_string(&outcome.log_path).unwrap();
         assert!(
-            log.contains("work=work-1 attempt=attempt-1 task=attempt-1-write-1 candidate=cand-1 commit=abc123"),
+            log.contains(
+                "work=work-1 attempt=attempt-1 task=attempt-1-write-1 candidate=cand-1 commit=abc123 base=base456"
+            ),
             "log was: {log}"
         );
     }

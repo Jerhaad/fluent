@@ -176,6 +176,29 @@ When sharing a result in a code review or task handoff, reference the saved path
 
 Use a runner with per-test isolation and parallel execution. Isolation runs each test in its own process so global state — env vars, filesystem, in-process singletons — can't leak between them. Parallelism distributes the suite across cores so it stays fast enough to run often.
 
+For a code-producing Fluent Attempt, domain review intentionally runs before
+the canonical final Tester. Before that Tester exists for the exact candidate,
+assess coverage and test quality from the changed tests and the Writer's
+candidate-bound focused evidence. Do not fail a review solely because the full
+configured suite has not yet run for that candidate; Fluent runs it after every
+domain reviewer passes.
+
+When Fluent supplies a host-owned Tester result, treat it as authoritative for
+the candidate named in that result. Compare failures with the Attempt's
+immutable baseline when that evidence is supplied. Baseline-covered failures
+are not candidate regressions; only new, changed, leaking, ambiguous, or
+otherwise unexplained failures block. Do not rerun the full suite in each
+domain review. If the tests reviewer needs one omitted result to decide a
+concrete finding, request or run one named check through the candidate-keyed
+shared cache and record the command and result; never put a build cache in the
+review artifact directory.
+
+Open candidate and evidence files through the exact absolute paths Fluent
+supplies. Their parent directories and unnamed sibling artifacts can remain
+intentionally unreadable. A failed parent-directory listing does not prove that
+the supplied file or candidate path is inaccessible; try the exact path before
+reporting an evidence boundary.
+
 For Rust, `cargo nextest run` does both — it spawns each test in its own process and parallelizes aggressively. Equivalent runners exist for other ecosystems (pytest-xdist for Python, jest with worker processes for JavaScript). Look for a "slow test" indicator in the runner's output — those are the wall-clock floor and worth tightening.
 
 Run tests in parallel by default. The runner picks a sensible thread count automatically; serializing (e.g., `--test-threads=1`, `--runInBand`) trades real time for an isolation property the tests should provide themselves. If a test fails under parallel execution because it shares global state, fix the test — or scope its state per-test — rather than serializing the suite.
