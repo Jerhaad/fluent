@@ -807,7 +807,7 @@ pub fn render_profile_for_scoped_codex_provider(
 
 /// Admit installed tools read-only while allowing compiled workspace programs.
 /// Keep these grants separate from the provider's private mutable home.
-pub(crate) fn render_profile_for_scoped_codex_provider_with_tools(
+pub fn render_profile_for_scoped_codex_provider_with_tools(
     resolver: &ContentResolver,
     private_home: &Path,
     writable_roots: &[PathBuf],
@@ -817,27 +817,60 @@ pub(crate) fn render_profile_for_scoped_codex_provider_with_tools(
 ) -> Result<SandboxProfile> {
     let mut readable = readable_roots.to_vec();
     readable.extend_from_slice(installed_tools);
-    let profile = render_profile_for_scoped_codex_provider(
+    let profile = render_profile_for_scoped_codex_provider_with_tools_and_exclusions(
         resolver,
         private_home,
         writable_roots,
         &readable,
         codex_home,
+        installed_tools,
+        &[],
     )?;
-    let mut content = std::fs::read_to_string(&profile.path)?;
-    for root in writable_roots.iter().chain(installed_tools) {
-        content.push_str(&format!(
-            "\n(allow file-map-executable (subpath {}))",
-            sbpl_string(root)
-        ));
+    Ok(profile)
+}
+
+/// Render a scoped Codex provider profile and withhold writes to installed tools.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_profile_for_scoped_codex_provider_with_tools_and_exclusions(
+    resolver: &ContentResolver,
+    private_home: &Path,
+    writable_roots: &[PathBuf],
+    readable_roots: &[PathBuf],
+    codex_home: &Path,
+    installed_tools: &[PathBuf],
+    denied_write_paths: &[PathBuf],
+) -> Result<SandboxProfile> {
+    let mut readable = readable_roots.to_vec();
+    readable.extend_from_slice(installed_tools);
+    let profile = render_profile_for_access_with_exclusions(
+        resolver,
+        &private_home.to_string_lossy(),
+        writable_roots,
+        &readable,
+        &[],
+        Some(CoderKind::Codex),
+        Some(codex_home),
+        false,
+        denied_write_paths,
+        &[],
+        &[],
+    )?;
+    if backend() == SandboxBackend::Seatbelt {
+        let mut content = std::fs::read_to_string(&profile.path)?;
+        for root in writable_roots.iter().chain(installed_tools) {
+            content.push_str(&format!(
+                "\n(allow file-map-executable (subpath {}))",
+                sbpl_string(root)
+            ));
+        }
+        for root in installed_tools {
+            content.push_str(&format!(
+                "\n(deny file-write* (subpath {}))",
+                sbpl_string(root)
+            ));
+        }
+        std::fs::write(&profile.path, content)?;
     }
-    for root in installed_tools {
-        content.push_str(&format!(
-            "\n(deny file-write* (subpath {}))",
-            sbpl_string(root)
-        ));
-    }
-    std::fs::write(&profile.path, content)?;
     Ok(profile)
 }
 
@@ -850,7 +883,15 @@ pub fn render_profile_for_access_for_autonomous_claude(
     writable_roots: &[PathBuf],
     readable_roots: &[PathBuf],
 ) -> Result<SandboxProfile> {
-    let profile = render_profile_for_access(
+    let source_home_path = PathBuf::from(source_home);
+    let canonical_source_home =
+        std::fs::canonicalize(&source_home_path).unwrap_or_else(|_| source_home_path.clone());
+    let mut source_projects = vec![source_home_path.join(".claude/projects")];
+    let canonical_projects = canonical_source_home.join(".claude/projects");
+    if canonical_projects != source_projects[0] {
+        source_projects.push(canonical_projects);
+    }
+    let profile = render_profile_for_access_with_exclusions(
         resolver,
         source_home,
         writable_roots,
@@ -859,30 +900,27 @@ pub fn render_profile_for_access_for_autonomous_claude(
         Some(CoderKind::Claude),
         None,
         true,
+        &source_projects,
+        &source_projects,
+        &[],
     )?;
-    let source_home = PathBuf::from(source_home);
-    let canonical_source_home =
-        std::fs::canonicalize(&source_home).unwrap_or_else(|_| source_home.clone());
-    let mut source_projects = vec![source_home.join(".claude/projects")];
-    let canonical_projects = canonical_source_home.join(".claude/projects");
-    if canonical_projects != source_projects[0] {
-        source_projects.push(canonical_projects);
+    if backend() == SandboxBackend::Seatbelt {
+        let deny = source_projects
+            .iter()
+            .flat_map(|projects| {
+                [
+                    format!("(deny file-read* (subpath {}))", sbpl_string(projects)),
+                    format!("(deny file-write* (subpath {}))", sbpl_string(projects)),
+                ]
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        // File rules are resolved by the most specific matching operation and
+        // filter. Keep these explicit denials after the shared Claude grants so a
+        // broad home or macOS temp allowance cannot win for the project tree.
+        let content = format!("{}\n{deny}\n", std::fs::read_to_string(&profile.path)?);
+        std::fs::write(&profile.path, content)?;
     }
-    let deny = source_projects
-        .iter()
-        .flat_map(|projects| {
-            [
-                format!("(deny file-read* (subpath {}))", sbpl_string(projects)),
-                format!("(deny file-write* (subpath {}))", sbpl_string(projects)),
-            ]
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    // File rules are resolved by the most specific matching operation and
-    // filter. Keep these explicit denials after the shared Claude grants so a
-    // broad home or macOS temp allowance cannot win for the project tree.
-    let content = format!("{}\n{deny}\n", std::fs::read_to_string(&profile.path)?);
-    std::fs::write(&profile.path, content)?;
     Ok(profile)
 }
 
@@ -1004,25 +1042,39 @@ pub fn render_profile_common_only_with_denied_access(
     denied_read_roots: &[PathBuf],
     denied_write_roots: &[PathBuf],
 ) -> Result<SandboxProfile> {
-    let profile = render_profile_common_only(resolver, home, writable_roots, readable_roots)?;
-    let mut rules = Vec::new();
-    rules.extend(
-        denied_read_roots
-            .iter()
-            .map(|root| format!("(deny file-read* (subpath {}))", sbpl_string(root))),
-    );
-    rules.extend(
-        denied_write_roots
-            .iter()
-            .map(|root| format!("(deny file-write* (subpath {}))", sbpl_string(root))),
-    );
-    if !rules.is_empty() {
-        let content = format!(
-            "{}\n{}\n",
-            std::fs::read_to_string(&profile.path)?,
-            rules.join("\n")
+    let profile = render_profile_for_access_with_exclusions(
+        resolver,
+        home,
+        writable_roots,
+        readable_roots,
+        &[],
+        None,
+        None,
+        true,
+        denied_write_roots,
+        denied_read_roots,
+        &[],
+    )?;
+    if backend() == SandboxBackend::Seatbelt {
+        let mut rules = Vec::new();
+        rules.extend(
+            denied_read_roots
+                .iter()
+                .map(|root| format!("(deny file-read* (subpath {}))", sbpl_string(root))),
         );
-        std::fs::write(&profile.path, content)?;
+        rules.extend(
+            denied_write_roots
+                .iter()
+                .map(|root| format!("(deny file-write* (subpath {}))", sbpl_string(root))),
+        );
+        if !rules.is_empty() {
+            let content = format!(
+                "{}\n{}\n",
+                std::fs::read_to_string(&profile.path)?,
+                rules.join("\n")
+            );
+            std::fs::write(&profile.path, content)?;
+        }
     }
     Ok(profile)
 }

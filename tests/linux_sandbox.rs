@@ -286,6 +286,100 @@ fn linux_writer_confinement_matches_seatbelt_probe() {
 }
 
 #[test]
+fn autonomous_claude_profile_denies_operator_project_state_on_linux() {
+    let root = fixture_root();
+    let home = root.path().join("home");
+    let projects = home.join(".claude/projects");
+    let worker_home = root.path().join("worker-home");
+    std::fs::create_dir_all(&projects).unwrap();
+    std::fs::create_dir_all(worker_home.join(".claude/projects")).unwrap();
+
+    let policy = fluent::os::render_profile_for_access_for_autonomous_claude(
+        &fluent::content::ContentResolver::new(None),
+        &home.to_string_lossy(),
+        std::slice::from_ref(&worker_home),
+        &[],
+    )
+    .unwrap();
+    let text = std::fs::read_to_string(policy.path).unwrap();
+    let policy: linux_sandbox::Policy = serde_json::from_str(&text).unwrap();
+    assert!(
+        !policy.rules.iter().any(|rule| {
+            rule.path == projects
+                && matches!(
+                    rule.access,
+                    linux_sandbox::Access::ReadWrite | linux_sandbox::Access::Read
+                )
+        }),
+        "the operator project tree was readable or writable: {policy:?}"
+    );
+}
+
+#[test]
+fn common_only_with_denied_access_withholds_paths_on_linux() {
+    let root = fixture_root();
+    let scratch = root.path().join("scratch");
+    let denied = root.path().join("denied");
+    let readable = root.path().join("readable");
+    std::fs::create_dir_all(&scratch).unwrap();
+    std::fs::create_dir_all(&denied).unwrap();
+    std::fs::create_dir_all(&readable).unwrap();
+    std::fs::create_dir_all(readable.join("denied")).unwrap();
+    let denied = readable.join("denied");
+
+    let policy = fluent::os::render_profile_common_only_with_denied_access(
+        &fluent::content::ContentResolver::new(None),
+        &root.path().to_string_lossy(),
+        std::slice::from_ref(&scratch),
+        std::slice::from_ref(&readable),
+        std::slice::from_ref(&denied),
+        std::slice::from_ref(&denied),
+    )
+    .unwrap();
+    let text = std::fs::read_to_string(policy.path).unwrap();
+    let policy: linux_sandbox::Policy = serde_json::from_str(&text).unwrap();
+    assert!(
+        !policy.rules.iter().any(|rule| {
+            rule.path == denied
+                && matches!(
+                    rule.access,
+                    linux_sandbox::Access::ReadWrite | linux_sandbox::Access::Read
+                )
+        }),
+        "the denied path was readable or writable: {policy:?}"
+    );
+}
+
+#[test]
+fn scoped_codex_provider_with_tools_withholds_installed_writes_on_linux() {
+    let root = fixture_root();
+    let private = root.path().join("private");
+    let installed = root.path().join("installed");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir_all(&private).unwrap();
+    std::fs::create_dir_all(&installed).unwrap();
+    std::fs::create_dir_all(&workspace).unwrap();
+
+    let profile = fluent::os::render_profile_for_scoped_codex_provider_with_tools(
+        &fluent::content::ContentResolver::new(None),
+        &private,
+        std::slice::from_ref(&workspace),
+        &[],
+        &private,
+        std::slice::from_ref(&installed),
+    )
+    .unwrap();
+    let text = std::fs::read_to_string(profile.path).unwrap();
+    let policy: linux_sandbox::Policy = serde_json::from_str(&text).unwrap();
+    assert!(
+        !policy.rules.iter().any(|rule| {
+            rule.path == installed && rule.access == linux_sandbox::Access::ReadWrite
+        }),
+        "the installed tool tree was writable: {policy:?}"
+    );
+}
+
+#[test]
 fn a_kernel_without_landlock_is_reported_rather_than_run_unconfined() {
     if kernel_enforces_landlock() {
         return;
