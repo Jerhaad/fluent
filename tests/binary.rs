@@ -783,6 +783,18 @@ fn fluent_cmd() -> LoggedCommand {
     cmd
 }
 
+/// How long the peer verification may take before the test calls it blocked.
+///
+/// The peer has to finish while the slow verification holds the project
+/// landing lock, and the slow verification waits up to two minutes for its
+/// release. A peer that blocked behind the lock would therefore take minutes,
+/// so this bound only has to be long enough for the launch the host performs:
+/// the Landlock backend re-executes the binary and applies a ruleset, which
+/// is slower than the Seatbelt launch.
+fn peer_deadline() -> std::time::Duration {
+    std::time::Duration::from_secs(30)
+}
+
 /// Pin the Seatbelt backend for the current test.
 ///
 /// Several upstream tests assert on the rendered Seatbelt profile's text: the
@@ -54675,7 +54687,7 @@ fn verification_worker_does_not_block_unrelated_attempt_progress() {
         .env("FLUENT_NO_UPDATE_CHECK", "1")
         .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "pass")
         .current_dir(&fixture.project)
-        .timeout(std::time::Duration::from_secs(3))
+        .timeout(peer_deadline())
         .args([
             "attempt",
             "evidence",
@@ -54691,7 +54703,7 @@ fn verification_worker_does_not_block_unrelated_attempt_progress() {
         .env("FLUENT_NO_UPDATE_CHECK", "1")
         .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "pass")
         .current_dir(&fixture.project)
-        .timeout(std::time::Duration::from_secs(3))
+        .timeout(peer_deadline())
         .env(
             "FLUENT_TEST_FOCUSED_EVIDENCE_SANDBOX_EXEC",
             fixture.bin.join("sandbox-exec"),
