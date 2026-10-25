@@ -353,11 +353,12 @@ fn common_only_with_denied_access_withholds_paths_on_linux() {
     let readable = root.path().join("readable");
     std::fs::create_dir_all(&scratch).unwrap();
     std::fs::create_dir_all(&readable).unwrap();
-    std::fs::create_dir_all(readable.join("denied")).unwrap();
-    let denied = readable.join("denied");
-    // A second denied path under the shared temp tree: the temporary
-    // directory grant encloses it, so the carve-out has to reach that grant
-    // too.
+    // A denied path inside the writable root, beside a path the root grants.
+    // The sibling is what proves the carve-out is narrow.
+    std::fs::create_dir_all(scratch.join("denied")).unwrap();
+    let denied = scratch.join("denied");
+    // A denied path inside the shared temp tree: the temporary directory grant
+    // encloses it, so the carve-out has to reach that grant too.
     let temp = tempfile::TempDir::new().unwrap();
     let temp_denied = temp.path().join("denied");
     std::fs::create_dir_all(&temp_denied).unwrap();
@@ -387,10 +388,7 @@ fn common_only_with_denied_access_withholds_paths_on_linux() {
         );
         let (ok, stderr) = run_confined(
             policy_file.path(),
-            &format!(
-                "printf written > {}",
-                readable.join("allowed.txt").display()
-            ),
+            &format!("printf written > {}", scratch.join("allowed.txt").display()),
         );
         assert!(ok, "a write to a granted sibling was refused: {stderr}");
     } else {
