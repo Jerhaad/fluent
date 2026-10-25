@@ -183,17 +183,50 @@ pub fn render(request: &PolicyRequest<'_>) -> Result<Policy> {
     }
 
     let withheld = withheld_paths(request);
+    // One exclusion set for every grant. Landlock unions the rules on a path's
+    // ancestry, so an exclusion that reaches only the caller's own roots
+    // leaves the system, home, and coder grants still covering it. Every
+    // read-write grant therefore carries the same write exclusions, and every
+    // read grant the same read exclusions.
+    let write_exclusions = write_exclusions(request, &withheld);
+    let read_exclusions = read_exclusions(request, &withheld);
     let mut rules = Vec::new();
-    push_system_rules(request, &withheld, &mut rules)?;
-    push_home_rules(request, &withheld, &mut rules)?;
-    push_coder_rules(request, &mut rules);
-    push_root_rules(request, &mut rules)?;
+    push_system_rules(request, &write_exclusions, &read_exclusions, &mut rules)?;
+    push_home_rules(request, &write_exclusions, &read_exclusions, &mut rules)?;
+    push_coder_rules(request, &write_exclusions, &read_exclusions, &mut rules)?;
+    push_root_rules(request, &write_exclusions, &read_exclusions, &mut rules)?;
+    // Re-allowed paths come last: they are the caller's explicit grant inside
+    // an excluded tree, so nothing after them may take it away.
+    for path in request.reallowed_write_paths {
+        grant_excluding(path, Access::ReadWrite, &write_exclusions, &mut rules)?;
+    }
 
     Ok(Policy {
         version: POLICY_VERSION,
         rules: merge_rules(rules),
         scope_to_sandbox: true,
     })
+}
+
+/// Paths no read-write grant may cover.
+///
+/// The caller's own withheld paths join its denied roots and denied paths:
+/// all three name a subtree the renderer must not hand back.
+fn write_exclusions(
+    request: &PolicyRequest<'_>,
+    withheld: &BTreeSet<PathBuf>,
+) -> BTreeSet<PathBuf> {
+    let mut exclusions = withheld.clone();
+    exclusions.extend(request.denied_write_roots.iter().cloned());
+    exclusions.extend(request.denied_write_paths.iter().cloned());
+    canonical_forms(exclusions)
+}
+
+/// Paths no read grant may cover.
+fn read_exclusions(request: &PolicyRequest<'_>, withheld: &BTreeSet<PathBuf>) -> BTreeSet<PathBuf> {
+    let mut exclusions = withheld.clone();
+    exclusions.extend(request.denied_read_paths.iter().cloned());
+    canonical_forms(exclusions)
 }
 
 /// Add the canonical form of every path that exists.
@@ -234,28 +267,26 @@ fn withheld_paths(request: &PolicyRequest<'_>) -> BTreeSet<PathBuf> {
 /// would otherwise hand back every secret the home rules withhold.
 fn push_system_rules(
     request: &PolicyRequest<'_>,
-    withheld: &BTreeSet<PathBuf>,
+    write_exclusions: &BTreeSet<PathBuf>,
+    read_exclusions: &BTreeSet<PathBuf>,
     rules: &mut Vec<Rule>,
 ) -> Result<()> {
     for path in SYSTEM_READ {
-        grant_excluding(Path::new(path), Access::Read, withheld, rules)?;
+        grant_excluding(Path::new(path), Access::Read, read_exclusions, rules)?;
     }
     rules.push(Rule::optional("/dev", Access::Read));
     for path in DEVICE_WRITE {
         rules.push(Rule::optional(path, Access::ReadWrite));
     }
     if request.grant_shared_temp {
-        let mut unwritable = withheld.clone();
-        unwritable.extend(request.denied_write_roots.iter().cloned());
-        let unwritable = canonical_forms(unwritable);
         for path in SYSTEM_WRITE {
-            grant_excluding(Path::new(path), Access::ReadWrite, &unwritable, rules)?;
+            grant_excluding(Path::new(path), Access::ReadWrite, write_exclusions, rules)?;
         }
         if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
             grant_excluding(
                 Path::new(&runtime_dir),
                 Access::ReadWrite,
-                &unwritable,
+                write_exclusions,
                 rules,
             )?;
         }
@@ -265,58 +296,76 @@ fn push_system_rules(
 
 fn push_home_rules(
     request: &PolicyRequest<'_>,
-    withheld: &BTreeSet<PathBuf>,
+    write_exclusions: &BTreeSet<PathBuf>,
+    read_exclusions: &BTreeSet<PathBuf>,
     rules: &mut Vec<Rule>,
 ) -> Result<()> {
-    grant_excluding(request.home, Access::Read, withheld, rules)?;
+    grant_excluding(request.home, Access::Read, read_exclusions, rules)?;
 
     for relative in SSH_READABLE {
         rules.push(Rule::optional(request.home.join(relative), Access::Read));
     }
     for relative in HOME_WRITE {
-        rules.push(Rule::optional(
-            request.home.join(relative),
+        let mut granted = Vec::new();
+        grant_excluding(
+            &request.home.join(relative),
             Access::ReadWrite,
-        ));
+            write_exclusions,
+            &mut granted,
+        )?;
+        rules.append(&mut granted);
     }
     Ok(())
 }
 
-fn push_coder_rules(request: &PolicyRequest<'_>, rules: &mut Vec<Rule>) {
+/// The coder's own configuration trees are writable, and each is carved
+/// around the same exclusions: a grant on `~/.claude` would otherwise hand
+/// back the project tree the autonomous Claude profile withholds.
+fn push_coder_rules(
+    request: &PolicyRequest<'_>,
+    write_exclusions: &BTreeSet<PathBuf>,
+    read_exclusions: &BTreeSet<PathBuf>,
+    rules: &mut Vec<Rule>,
+) -> Result<()> {
     let home = request.home;
+    let write = |path: PathBuf, rules: &mut Vec<Rule>| -> Result<()> {
+        grant_excluding(&path, Access::ReadWrite, write_exclusions, rules)
+    };
+    let read = |path: PathBuf, rules: &mut Vec<Rule>| -> Result<()> {
+        grant_excluding(&path, Access::Read, read_exclusions, rules)
+    };
     match request.coder_kind {
         Some(CoderKind::Claude) => {
             for relative in [".claude", ".claude.json", ".claude.json.lock"] {
-                rules.push(Rule::optional(home.join(relative), Access::ReadWrite));
+                write(home.join(relative), rules)?;
             }
-            rules.push(Rule::optional(
-                home.join("Workspace/skills"),
-                Access::ReadWrite,
-            ));
+            write(home.join("Workspace/skills"), rules)?;
         }
         Some(CoderKind::Codex) => {
             let codex_home = request
                 .codex_home
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|| home.join(".codex"));
-            rules.push(Rule::optional(codex_home, Access::ReadWrite));
+            write(codex_home, rules)?;
         }
         Some(CoderKind::Pi) => {
-            rules.push(Rule::optional(home.join(".pi"), Access::Read));
-            rules.push(Rule::optional(home.join(".pi/agent"), Access::ReadWrite));
+            read(home.join(".pi"), rules)?;
+            write(home.join(".pi/agent"), rules)?;
         }
         None => {}
     }
+    Ok(())
 }
 
-fn push_root_rules(request: &PolicyRequest<'_>, rules: &mut Vec<Rule>) -> Result<()> {
-    let mut exclusions: BTreeSet<PathBuf> = request.denied_write_roots.iter().cloned().collect();
-    exclusions.extend(request.denied_write_paths.iter().cloned());
-    let exclusions = canonical_forms(exclusions);
-
+fn push_root_rules(
+    request: &PolicyRequest<'_>,
+    write_exclusions: &BTreeSet<PathBuf>,
+    read_exclusions: &BTreeSet<PathBuf>,
+    rules: &mut Vec<Rule>,
+) -> Result<()> {
     for root in request.writable_roots {
         let mut granted = Vec::new();
-        grant_excluding(root, Access::ReadWrite, &exclusions, &mut granted)?;
+        grant_excluding(root, Access::ReadWrite, write_exclusions, &mut granted)?;
         for rule in &mut granted {
             rule.required = true;
         }
@@ -330,19 +379,11 @@ fn push_root_rules(request: &PolicyRequest<'_>, rules: &mut Vec<Rule>) -> Result
     }
     for root in request.readable_roots {
         let mut granted = Vec::new();
-        grant_excluding(
-            root,
-            Access::Read,
-            &canonical_forms(request.denied_read_paths.iter().cloned().collect()),
-            &mut granted,
-        )?;
+        grant_excluding(root, Access::Read, read_exclusions, &mut granted)?;
         for rule in &mut granted {
             rule.required = true;
         }
         rules.append(&mut granted);
-    }
-    for path in canonical_forms(request.reallowed_write_paths.iter().cloned().collect()) {
-        rules.push(Rule::optional(path, Access::ReadWrite));
     }
     Ok(())
 }
@@ -667,6 +708,47 @@ mod tests {
             Some(Access::ReadWrite),
             "the logical tree was writable: {policy:?}"
         );
+    }
+
+    #[test]
+    fn a_denied_write_path_reaches_every_grant_that_encloses_it() {
+        // Each excluded path sits under a different grant: the shared temp
+        // tree, a home write entry, and the Claude coder's own configuration.
+        let home = fixture_home();
+        let temp = tempfile::TempDir::new().unwrap();
+        let temp_excluded = temp.path().join("excluded");
+        let home_excluded = home.path().join(".local/state/excluded");
+        let claude_excluded = home.path().join(".claude/projects/excluded");
+        for path in [&temp_excluded, &home_excluded, &claude_excluded] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+        let roots = vec![home.path().join("code")];
+
+        let policy = render(&PolicyRequest {
+            denied_write_paths: &[
+                temp_excluded.clone(),
+                home_excluded.clone(),
+                claude_excluded.clone(),
+            ],
+            ..request(home.path(), &roots)
+        })
+        .unwrap();
+
+        for excluded in [&temp_excluded, &home_excluded, &claude_excluded] {
+            assert_ne!(
+                effective_access(&policy, excluded),
+                Some(Access::ReadWrite),
+                "{excluded:?} was writable through an ancestor grant: {policy:?}"
+            );
+            for ancestor in excluded.ancestors().skip(1) {
+                assert_ne!(
+                    effective_access(&policy, ancestor),
+                    Some(Access::ReadWrite),
+                    "{ancestor:?} granted write over {excluded:?}: {policy:?}"
+                );
+            }
+        }
     }
 
     #[test]
