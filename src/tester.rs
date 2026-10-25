@@ -1553,6 +1553,7 @@ mod tests {
     #[cfg(feature = "test-support")]
     #[test]
     fn launch_handoff_route_nested_commands_run_through_rendered_sandbox() {
+        let _seatbelt = crate::os::BackendPin::seatbelt();
         let workspace = TempDir::new().unwrap();
         let artifact_dir = TempDir::new().unwrap();
         make_workspace(workspace.path());
@@ -1755,6 +1756,7 @@ mod tests {
     #[cfg(feature = "test-support")]
     #[test]
     fn guarded_tester_grants_canonical_settlement_to_rendered_sandbox() {
+        let _seatbelt = crate::os::BackendPin::seatbelt();
         let workspace = TempDir::new().unwrap();
         let artifact_dir = TempDir::new().unwrap();
         make_workspace(workspace.path());
@@ -3153,6 +3155,7 @@ echo '[{"id": "my_test", "test_harness": "cargo-nextest", "status": "pass", "dur
 
     #[test]
     fn tester_sandbox_reads_but_cannot_write_linked_worktree_git_metadata() {
+        let _seatbelt = crate::os::BackendPin::seatbelt();
         let tmp = TempDir::new().unwrap();
         let main = tmp.path().join("main");
         fs::create_dir_all(&main).unwrap();

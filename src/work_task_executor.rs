@@ -11867,6 +11867,7 @@ mod tests {
 
     #[test]
     fn writer_sandbox_confines_dependency_writes_to_the_exact_attempt_cache() {
+        let _seatbelt = crate::os::BackendPin::seatbelt();
         let tmp = tempfile::tempdir().unwrap();
         let project_root = tmp.path();
         let workspace = project_root.join("workspace");
@@ -11924,6 +11925,7 @@ mod tests {
 
     #[test]
     fn writer_assignment_safety_sandbox_excludes_task_record() {
+        let _seatbelt = crate::os::BackendPin::seatbelt();
         let project_root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let workspace = project_root.join(".scratch/writer-assignment-sandbox-workspace");
 
@@ -23141,6 +23143,7 @@ while time.monotonic() < deadline:
 
     #[test]
     fn learner_profile_reads_host_evidence_without_granting_write_access() {
+        let _seatbelt = crate::os::BackendPin::seatbelt();
         let tmp = tempfile::tempdir().unwrap();
         let workspace = tmp.path().join("workspace");
         let handoff_dir = tmp.path().join("learner/runs/run-1/staging");
@@ -24375,6 +24378,7 @@ while time.monotonic() < deadline:
 
     #[test]
     fn learner_sandbox_confines_expertise_handoff_and_git_writes() {
+        let _seatbelt = crate::os::BackendPin::seatbelt();
         let tmp = tempfile::TempDir::new().unwrap();
         let workspace = tmp.path().join("workspace");
         let expertise_dir = workspace.join(".fluent/expertise");
@@ -24478,6 +24482,7 @@ while time.monotonic() < deadline:
 
     #[test]
     fn preserved_work_item_input_parent_is_read_only_in_sandbox() {
+        let _seatbelt = crate::os::BackendPin::seatbelt();
         let tmp = tempfile::TempDir::new().unwrap();
         let workspace = tmp.path().join("workspace");
         let input_parent = tmp.path().join(".fluent/work/artifacts/work-1/inputs");
@@ -24506,6 +24511,7 @@ while time.monotonic() < deadline:
 
     #[test]
     fn pre_land_no_expertise_denies_expertise_candidate_and_live_git_writes() {
+        let _seatbelt = crate::os::BackendPin::seatbelt();
         // A pre-land no-expertise run reuses the confined denied-writes profile:
         // only the managed handoff staging surface is writable, while expertise,
         // the candidate workspace, and shared Git metadata stay readable but denied
