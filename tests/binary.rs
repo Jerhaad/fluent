@@ -54667,14 +54667,11 @@ impl Drop for VerificationConcurrencyExecution {
 
 #[test]
 fn verification_worker_does_not_block_unrelated_attempt_progress() {
-    // The assertions below read the rendered Seatbelt profile.
-    let _seatbelt = seatbelt_backend();
     let tmp = TempDir::new().unwrap();
     let mut fixture = VerificationConcurrencyFixture::new(&tmp);
     fixture.wait_until_blocked();
     // Scheduling takes the real project landing lock; command timeout catches a regression.
     assert_cmd::Command::new(assert_cmd::cargo::cargo_bin!("fluent"))
-        .env("FLUENT_SANDBOX_BACKEND", "seatbelt")
         .env("FLUENT_NO_UPDATE_CHECK", "1")
         .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "pass")
         .current_dir(&fixture.project)
@@ -54691,7 +54688,6 @@ fn verification_worker_does_not_block_unrelated_attempt_progress() {
         .assert()
         .success();
     assert_cmd::Command::new(assert_cmd::cargo::cargo_bin!("fluent"))
-        .env("FLUENT_SANDBOX_BACKEND", "seatbelt")
         .env("FLUENT_NO_UPDATE_CHECK", "1")
         .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "pass")
         .current_dir(&fixture.project)
