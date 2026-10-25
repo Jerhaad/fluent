@@ -1242,16 +1242,21 @@ pub fn render_profile_common_only_with_denied_access(
     denied_read_roots: &[PathBuf],
     denied_write_roots: &[PathBuf],
 ) -> Result<SandboxProfile> {
+    // Landlock has no deny rule, so a withheld tree has to be an exclusion the
+    // renderer enumerates around. Naming it a denied write root rather than a
+    // denied write path also keeps the shared temporary trees away: they are a
+    // channel around whatever the profile withholds.
+    let landlock = backend() == SandboxBackend::Landlock;
     let profile = render_profile_for_access_with_exclusions(
         resolver,
         home,
         writable_roots,
         readable_roots,
-        &[],
+        if landlock { denied_write_roots } else { &[] },
         None,
         None,
         true,
-        denied_write_roots,
+        if landlock { &[] } else { denied_write_roots },
         denied_read_roots,
         &[],
     )?;
@@ -1443,6 +1448,11 @@ fn render_profile_for_access_with_exclusions_and_shared_temp(
 }
 
 /// Render a Landlock policy and write it where the launcher will read it.
+///
+/// The shared temporary trees are a channel around whatever the profile
+/// withholds, so they are granted only to a profile that withholds no write
+/// root. A renderer that withholds one anyway asks for it explicitly, and the
+/// scoped renderers ask for none.
 fn render_landlock_policy(
     home: &str,
     writable_roots: &[PathBuf],
@@ -1462,7 +1472,7 @@ fn render_landlock_policy(
         denied_write_roots,
         coder_kind,
         codex_home,
-        grant_shared_temp,
+        grant_shared_temp: grant_shared_temp && denied_write_roots.is_empty(),
         denied_write_paths,
         denied_read_paths,
         reallowed_write_paths,

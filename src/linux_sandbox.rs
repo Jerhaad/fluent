@@ -373,8 +373,13 @@ fn push_root_rules(
     }
 
     // A denied write root keeps the read access every other rule grants it;
-    // only the write half is withheld.
+    // only the write half is withheld. A root the read exclusions withhold
+    // keeps nothing: naming it here would hand back the read access the
+    // caller's own denial removed.
     for root in request.denied_write_roots {
+        if read_exclusions.contains(root) {
+            continue;
+        }
         rules.push(Rule::optional(root, Access::Read));
     }
     for root in request.readable_roots {

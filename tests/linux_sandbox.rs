@@ -403,6 +403,102 @@ fn common_only_with_denied_access_withholds_paths_on_linux() {
 }
 
 #[test]
+fn a_denied_write_root_keeps_the_shared_temp_trees_closed_on_linux() {
+    // The renderer's denied write root is what closes the shared temp trees.
+    // A profile that withholds a root must not also hand back a writable
+    // `/tmp`, because that tree is a channel around whatever it withholds.
+    let root = fixture_root();
+    let home = root.path().join("home");
+    let scratch = root.path().join("scratch");
+    let denied = root.path().join("workspace");
+    for path in [&home, &scratch, &denied] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    std::fs::write(scratch.join("allowed.txt"), "granted").unwrap();
+
+    let profile = fluent::os::render_profile_for_access_for_coder_with_denied_writes(
+        &fluent::content::ContentResolver::new(None),
+        &home.to_string_lossy(),
+        std::slice::from_ref(&scratch),
+        &[],
+        std::slice::from_ref(&denied),
+        CoderKind::Claude,
+    )
+    .unwrap();
+    let policy_file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::copy(profile.path, policy_file.path()).unwrap();
+    // A fresh path under the shared temp tree. It does not exist when the
+    // policy is rendered, so only the grant itself can make it writable.
+    let shared = tempfile::TempDir::new().unwrap();
+    let escape = shared.path().join("escape.txt");
+
+    if kernel_enforces_landlock() {
+        assert_denied(
+            policy_file.path(),
+            &format!("printf escaped > {}", escape.display()),
+            "a profile with a denied write root left the shared temp tree writable",
+        );
+        assert!(!escape.exists(), "the escape file was written anyway");
+        let (ok, stderr) = run_confined(
+            policy_file.path(),
+            &format!("printf written > {}", scratch.join("allowed.txt").display()),
+        );
+        assert!(ok, "a write to the granted root was refused: {stderr}");
+    } else {
+        let (ok, stderr) = run_confined(policy_file.path(), "true");
+        assert!(!ok, "a kernel with no Landlock ran the coder anyway");
+        assert!(stderr.contains(NOT_ENFORCED), "{stderr}");
+    }
+}
+
+#[test]
+fn common_only_with_denied_access_keeps_the_shared_temp_trees_closed_on_linux() {
+    // The denied-access renderer withholds the operator's own trees. A writable
+    // `/tmp` reaches around that denial, so the profile closes the shared temp
+    // trees as well.
+    let root = fixture_root();
+    let scratch = root.path().join("scratch");
+    let readable = root.path().join("readable");
+    let denied = root.path().join("denied");
+    for path in [&scratch, &readable, &denied] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    std::fs::write(scratch.join("allowed.txt"), "granted").unwrap();
+
+    let profile = fluent::os::render_profile_common_only_with_denied_access(
+        &fluent::content::ContentResolver::new(None),
+        &root.path().to_string_lossy(),
+        std::slice::from_ref(&scratch),
+        std::slice::from_ref(&readable),
+        &[],
+        std::slice::from_ref(&denied),
+    )
+    .unwrap();
+    let policy_file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::copy(profile.path, policy_file.path()).unwrap();
+    let shared = tempfile::TempDir::new().unwrap();
+    let escape = shared.path().join("escape.txt");
+
+    if kernel_enforces_landlock() {
+        assert_denied(
+            policy_file.path(),
+            &format!("printf escaped > {}", escape.display()),
+            "the denied-access profile left the shared temp tree writable",
+        );
+        assert!(!escape.exists(), "the escape file was written anyway");
+        let (ok, stderr) = run_confined(
+            policy_file.path(),
+            &format!("printf written > {}", scratch.join("allowed.txt").display()),
+        );
+        assert!(ok, "a write to the granted root was refused: {stderr}");
+    } else {
+        let (ok, stderr) = run_confined(policy_file.path(), "true");
+        assert!(!ok, "a kernel with no Landlock ran the command anyway");
+        assert!(stderr.contains(NOT_ENFORCED), "{stderr}");
+    }
+}
+
+#[test]
 fn scoped_codex_provider_without_shared_temp_confines_tmp_on_linux() {
     let root = fixture_root();
     let private = root.path().join("private");
