@@ -9,9 +9,10 @@ Seatbelt and Landlock resolve overlapping rules in opposite directions, and code
 
 Seatbelt evaluates rules in order and the first match wins, so `common.sb` grants a broad subtree and then denies the sensitive paths inside it. Landlock has no deny rule at all: one layer grants access to a path if *any* rule on that path's ancestry grants it. Adding a narrower rule to take access back is not merely ineffective — it silently widens nothing and leaves the grant standing.
 
-Every withheld path in `src/linux_sandbox.rs` is therefore enumerated rather than denied. `grant_excluding` walks down from a root only as far as an exclusion forces, granting the siblings that lead nowhere near it. Three consequences follow, and each has bitten:
+Every withheld path in `src/linux_sandbox.rs` is therefore enumerated rather than denied. `grant_excluding` walks down from a root only as far as an exclusion forces, granting the siblings that lead nowhere near it. Four consequences follow, and each has bitten:
 
-- **The exclusion set applies to every hierarchy, not just `$HOME`.** A home under a granted system tree — a scratch checkout under `/tmp` — hands back every secret the home rules withhold, because the `/tmp` grant unions with them. `push_system_rules` carves the same exclusions out of the system hierarchies for this reason.
+- **The exclusion set applies to every grant, not just the caller's own roots.** A grant on an ancestor covers everything under it, so an exclusion that reaches only the roots the caller named leaves the system, home, and coder grants still covering it: a `~/.claude` grant hands back the project tree an autonomous Claude withholds, and a `/tmp` grant hands back the source checkout a Writer denies. `render` therefore builds one write exclusion set and one read exclusion set and routes every grant — system, temp, home, coder, and the caller's own — through them. A per-call-site carve-out is the same bug in a new place.
+- **An excluded path is withheld under both of its spellings.** The kernel resolves the path a process actually opens, so a tree reached through a symlink stays writable when only its logical spelling is excluded. `render` canonicalizes every excluded and re-allowed path, so each carve-out covers the physical tree too.
 - **An enumerated directory keeps `Access::List`.** Without it, carving `~/.ssh` out of `$HOME` also stops anything from listing `$HOME`. Listing is what Seatbelt's paired metadata grants allow too: a withheld directory stays discoverable, its file contents do not.
 - **Enumeration reads the filesystem, so it is a point-in-time snapshot.** A directory created after rendering falls outside every rule and the sandbox fails closed on it.
 
@@ -21,6 +22,6 @@ Two mechanisms are deliberately absent. Landlock's network support (ABI 4) filte
 
 Probe support with a hard requirement, never best-effort. Landlock is commonly compiled into a kernel but left out of the boot `lsm=` list; there the syscall fails with `EOPNOTSUPP` while a best-effort ruleset reports success and enforces nothing. `restrict_self` returning `RulesetStatus::NotEnforced` fails the launch rather than running a coder unconfined.
 
-Tests that assert a forbidden action failed prove nothing on such a host — the launcher refused to start, so nothing was confined. `tests/linux_sandbox.rs` names which of the two outcomes each assertion expects.
+A test that asserts a forbidden action failed proves nothing on such a host — the launcher refused to start, so nothing was confined. `tests/linux_sandbox.rs` names which of the two outcomes each assertion expects. A test that only asserts that no *rule names* a withheld path is worse than vacuous: a rule on an ancestor grants the path anyway, so the assertions have to resolve through the ancestry the way the kernel does, or run a confined write and watch it fail.
 
 Related: [[canonicalize-confinement-paths]], [[strict-sandbox-capability-selection]], [[sandbox-tests-assert-invariant-in-both-host-branches]]

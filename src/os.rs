@@ -37,11 +37,64 @@ pub enum SandboxBackend {
 /// Backend this host confines with, unless `FLUENT_SANDBOX_BACKEND` names
 /// `seatbelt` or `landlock`.
 pub fn backend() -> SandboxBackend {
+    #[cfg(test)]
+    if let Some(forced) = test_backend_override() {
+        return forced;
+    }
     match env::var("FLUENT_SANDBOX_BACKEND").as_deref() {
         Ok("seatbelt") => SandboxBackend::Seatbelt,
         Ok("landlock") => SandboxBackend::Landlock,
         _ if cfg!(target_os = "macos") => SandboxBackend::Seatbelt,
         _ => SandboxBackend::Landlock,
+    }
+}
+
+/// The backend a test pins for its own thread.
+///
+/// Several upstream tests assert on the Seatbelt profile's text. That profile
+/// is what the macOS host renders, but a Linux host renders the Landlock
+/// policy instead, so those assertions would read the wrong artifact. The
+/// override lives in a thread-local because the tests run in parallel and an
+/// environment variable would leak across them.
+#[cfg(test)]
+thread_local! {
+    static TEST_BACKEND_OVERRIDE: std::cell::Cell<Option<SandboxBackend>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn test_backend_override() -> Option<SandboxBackend> {
+    TEST_BACKEND_OVERRIDE.with(|override_backend| override_backend.get())
+}
+
+/// Pin the sandbox backend for the current thread.
+///
+/// A test that asserts on a rendered profile has to name the backend it
+/// inspects, because the two backends write different artifacts. The pin
+/// lasts until the returned guard is dropped.
+#[cfg(test)]
+pub(crate) struct BackendPin {
+    previous: Option<SandboxBackend>,
+}
+
+#[cfg(test)]
+impl BackendPin {
+    pub(crate) fn seatbelt() -> Self {
+        Self::pin(SandboxBackend::Seatbelt)
+    }
+
+    fn pin(backend: SandboxBackend) -> Self {
+        let previous =
+            TEST_BACKEND_OVERRIDE.with(|override_backend| override_backend.replace(Some(backend)));
+        Self { previous }
+    }
+}
+
+#[cfg(test)]
+impl Drop for BackendPin {
+    fn drop(&mut self) {
+        let previous = self.previous;
+        TEST_BACKEND_OVERRIDE.with(|override_backend| override_backend.set(previous));
     }
 }
 
@@ -895,6 +948,18 @@ pub fn render_profile_for_scoped_codex_provider(
         false,
     )?;
     let mut content = std::fs::read_to_string(&profile.path)?;
+    remove_shared_filesystem_grants(&mut content);
+    std::fs::write(&profile.path, content)?;
+    Ok(profile)
+}
+
+/// Drop the shared filesystem grants a scoped provider must not receive.
+///
+/// A scoped provider works inside its private home and its declared scope
+/// roots. The shared temporary trees and the mounted volumes are a channel
+/// around that boundary, so the broad grants in the common profile are
+/// removed rather than narrowed.
+fn remove_shared_filesystem_grants(content: &mut String) {
     for broad_grant in [
         "(allow file-read* (subpath \"/private/var\"))",
         "(allow file-read* (subpath \"/private/tmp\"))",
@@ -905,13 +970,11 @@ pub fn render_profile_for_scoped_codex_provider(
         "(allow file-write* (subpath \"/private/tmp\"))",
         "(allow file-read* (subpath \"/Volumes\"))",
     ] {
-        content = content.replace(
+        *content = content.replace(
             broad_grant,
             "; scoped providers do not receive shared filesystem access",
         );
     }
-    std::fs::write(&profile.path, content)?;
-    Ok(profile)
 }
 
 /// Admit installed tools read-only while allowing compiled workspace programs.
@@ -969,6 +1032,10 @@ pub(crate) fn render_profile_for_scoped_codex_provider_with_tools_and_exclusions
     )?;
     if backend() == SandboxBackend::Seatbelt {
         let mut content = std::fs::read_to_string(&profile.path)?;
+        // A scoped provider receives no shared filesystem access. Upstream's
+        // scoped renderer removes those grants; this renderer replaced it, so
+        // it has to remove them too.
+        remove_shared_filesystem_grants(&mut content);
         for root in writable_roots.iter().chain(installed_tools) {
             content.push_str(&format!(
                 "\n(allow file-map-executable (subpath {}))",
@@ -1525,6 +1592,7 @@ mod tests {
 
     #[test]
     fn scoped_writer_tools_allow_mapping_and_deny_installed_writes() {
+        let _seatbelt = crate::os::BackendPin::seatbelt();
         let tmp = tempfile::TempDir::new().unwrap();
         let private = tmp.path().join("private");
         let installed = tmp.path().join("installed");
@@ -1734,6 +1802,7 @@ mod tests {
 
     #[test]
     fn codex_preflight_grants_private_home_ancestor_metadata_only() {
+        let _seatbelt = crate::os::BackendPin::seatbelt();
         let home = PathBuf::from("/private/var/folders/isolated/T/worker/codex");
         let profile = render_profile_for_scoped_codex_provider(
             &ContentResolver::new(None),
@@ -1776,6 +1845,7 @@ mod tests {
 
     #[test]
     fn test_render_profile_contains_seatbelt_version() {
+        let _seatbelt = crate::os::BackendPin::seatbelt();
         let resolver = ContentResolver::new(None);
         let profile = render_profile(&resolver, "/Users/test", "/Users/test/project").unwrap();
 
@@ -1807,6 +1877,7 @@ mod tests {
 
     #[test]
     fn test_render_profile_contains_read_only_roots() {
+        let _seatbelt = crate::os::BackendPin::seatbelt();
         let resolver = ContentResolver::new(None);
         let writable_root = PathBuf::from("/Users/test/workspace/artifacts");
         let readable_root = PathBuf::from("/Users/test/workspace/candidate");
@@ -1888,6 +1959,7 @@ mod tests {
 
     #[test]
     fn external_launcher_root_grants_only_metadata_to_enclosing_home() {
+        let _seatbelt = crate::os::BackendPin::seatbelt();
         let resolver = ContentResolver::new(None);
         let operator_home = PathBuf::from("/Users/operator");
         let launcher_root = operator_home.join(".nvm/versions/node/lib/node_modules/@openai/codex");
@@ -1918,6 +1990,7 @@ mod tests {
 
     #[test]
     fn test_render_profile_uses_codex_specific_layer() {
+        let _seatbelt = crate::os::BackendPin::seatbelt();
         let resolver = ContentResolver::new(None);
         let profile = render_profile_for_roots_for_coder(
             &resolver,
@@ -1975,6 +2048,7 @@ mod tests {
 
     #[test]
     fn rendered_profile_with_no_overlay_uses_common_only() {
+        let _seatbelt = crate::os::BackendPin::seatbelt();
         let resolver = ContentResolver::new(None);
         let profile = render_profile_common_only(
             &resolver,
@@ -2003,6 +2077,7 @@ mod tests {
 
     #[test]
     fn rendered_profile_grants_workspace_and_artifact_writable() {
+        let _seatbelt = crate::os::BackendPin::seatbelt();
         let resolver = ContentResolver::new(None);
         let workspace = PathBuf::from("/Users/test/workspace/candidate");
         let artifact = PathBuf::from("/Users/test/.fluent/artifacts/tester");
@@ -2028,6 +2103,7 @@ mod tests {
 
     #[test]
     fn writer_profile_blocks_actual_source_write_in_temporary_checkout() {
+        let _seatbelt = crate::os::BackendPin::seatbelt();
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source");
         let candidate = root.path().join("candidate");
@@ -2150,6 +2226,7 @@ mod tests {
 
     #[test]
     fn rendered_profile_grants_private_ancestor_metadata() {
+        let _seatbelt = crate::os::BackendPin::seatbelt();
         // git's realpath() lstats the bare /private node while resolving a
         // /private/var/folders temp path; without metadata access it fails with
         // "Invalid path '/private'". Tests that git-init in system temp rely on this.
@@ -2172,6 +2249,7 @@ mod tests {
 
     #[test]
     fn test_render_profile_uses_claude_specific_layer() {
+        let _seatbelt = crate::os::BackendPin::seatbelt();
         let resolver = ContentResolver::new(None);
         let profile = render_profile_for_roots_for_coder(
             &resolver,
@@ -2188,6 +2266,7 @@ mod tests {
 
     #[test]
     fn autonomous_claude_profile_denies_operator_project_state() {
+        let _seatbelt = crate::os::BackendPin::seatbelt();
         let resolver = ContentResolver::new(None);
         let worker_home = PathBuf::from("/workspace/artifacts/claude-home");
         let profile = render_profile_for_access_for_autonomous_claude(
