@@ -14,6 +14,7 @@ LOG_DIR="${PROJECT_DIR}/tests/output/$(basename "$0" .sh)"
 setup_test_project() {
   TEST_DIR="$(mktemp -d -t fluent-work-sibling-workspaces-XXXXXX)"
   mkdir -p "$TEST_DIR/project" "$TEST_DIR/bin"
+  install_review_inspection_provider_helper "$TEST_DIR/bin"
   cd "$TEST_DIR/project"
   TEST_PROJECT_PWD="$(pwd -P)"
   git init -b main > /dev/null 2>&1
@@ -42,6 +43,7 @@ cleanup_test_project() {
 write_mock_codex() {
   cat > "${TEST_DIR}/bin/codex" <<'MOCK_SCRIPT'
 #!/usr/bin/env bash
+trap 'status=$?; fluent-test-review-inspection codex "$status" "$@" || exit $?; exit "$status"' EXIT
 if [[ "$*" == *"login status"* ]]; then
   exit 0
 fi

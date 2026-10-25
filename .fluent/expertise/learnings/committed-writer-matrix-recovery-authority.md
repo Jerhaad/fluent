@@ -1,0 +1,37 @@
+---
+name: committed-writer-matrix-recovery-authority
+description: Distinguish matrix-bound Writer-completion recovery from older audits by its source digest and operation Task binding
+metadata:
+  type: architecture
+---
+
+Writer-completion recovery keeps two compatible authority shapes under the
+persisted schema. Older audits omit `source_matrix_sha256` and bind the recovery
+operation to the Task named by `task_id`. An audit for a completed Writer's
+malformed matrix or unfinished Writer-owned work after a no-change completion
+includes `source_matrix_sha256`: `task_id` names the new corrective Writer,
+while the operation binds `source_writer_task_id`, the completed source Writer.
+The optional digest selects this interpretation; do not infer it from Task
+order or change the binding for older audits.
+
+The committed-matrix authority also binds the immutable requirement contract,
+source assignment, transcript, output, candidate, and original matrix bytes.
+The source matrix remains in the completed Task's artifact area; the audit
+stores its digest rather than a copy. Revalidate the bound evidence when
+authorizing or replaying the recovery and before the corrective Writer starts.
+Keep the completed source Task and its artifacts intact, and give the corrective
+Writer a fresh matrix from the contract. Approval schedules a Writer; a
+separate resume executes it.
+
+A valid no-change output does not itself finish every completion requirement.
+Validate the matrix against the immutable contract and review findings, then
+schedule a separate Writer only when a row assigned to the Writer remains
+pending. Pending host-owned, review, Tester, or Learner work follows its own
+route. A historical no-change approval that reserved no successor remains
+valid history; a distinct current decision must bind the source before
+scheduling a new Task. Foreground resume and queued admission and claim must
+revalidate that authority before launch.
+
+Related: [[recovery-contracts-form-neutral-boundary]],
+[[reused-recovery-authority-revalidates-publication]],
+[[corrective-writers-preserve-candidate-lineage]].

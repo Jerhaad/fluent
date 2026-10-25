@@ -8,32 +8,40 @@ metadata:
 For an Attempt with a `ProgressContract`, `progress.md` serves two different
 purposes that must stay structurally separate:
 
-- `## Required completion` is a closed, host-materialized manifest. Its stable
-  ids, requirement text, and order come from required Plan rows. Writers may
-  only check those rows and append concrete `Evidence:`; they must not use this
-  section as a general work queue.
+- `## Required completion` is a closed, host-owned projection. Its stable ids,
+  requirement text, and order come from Writer-owned required Plan rows. For a
+  matrix-backed Attempt, Writers do not edit this section. They report completion
+  in the task-owned matrix, and the host replaces the section with exact
+  Writer-owned Plan text and links to validated matrix rows before review.
 - `## Review follow-ups` is the mutable queue for findings from later review
   rounds. Follow-up Writers address its unchecked entries before returning to
   required or ordinary plan work.
 
-When a follow-up Writer encounters an old `progress.md` whose required section
-contains `Address review finding:` rows, move each row together with its nested
-evidence and commit notes into `## Review follow-ups`. Preserve its checked
-state and wording. Do not reconstruct, delete, reorder, or reword any required
-manifest row while migrating review history.
+The full completion contract retains host, review, Tester, and Learner
+obligations. Their matrix rows remain pending with empty evidence arrays in
+Writer output and pass through their separate host or workflow gates. An absent
+responsibility retains legacy Writer semantics. Projecting Writer progress must
+neither erase external obligations nor require the Writer to claim them complete.
 
-The advancement gate keeps backward compatibility deliberately narrow. It may
-ignore an already-checked top-level row with the exact legacy
-`- [x] Address review finding:` prefix inside `## Required completion`, because
-that row is settled historical metadata. An unchecked legacy review row must
-still block advancement, and every other extra or malformed top-level row must
-fail closed through normal manifest reconciliation. Broadly ignoring unknown
-rows would let arbitrary content bypass the manifest's exact-set guarantee.
+The host replaces only the required section and preserves every separate
+level-two section. Current open findings also appear as matrix finding rows, so
+the Writer does not need to move review records through the host-owned section.
+Checked legacy rows and nested notes inside that section may disappear when the
+host projects current matrix evidence; they are historical round notes, not
+advancement authority.
 
-Prompt changes around review rounds must distinguish Attempts that carry a
-required-progress contract from legacy Attempts that do not. Required-manifest
-terminology and selection rules belong only to the contract-aware branch; both
-branches may maintain a separate review-follow-up queue.
+The advancement gate keeps backward compatibility deliberately narrow. An
+Attempt without a Writer completion contract still uses its Writer-owned
+required-progress section. That legacy gate may ignore an already-checked
+top-level row with the exact `- [x] Address review finding:` prefix because the
+row is settled historical metadata. An unchecked legacy review row still
+blocks advancement, and every other extra or malformed top-level row fails
+closed through normal manifest reconciliation.
+
+Prompt changes around review rounds must distinguish matrix-backed Attempts
+from legacy Attempts that carry only a required-progress contract. The former
+must not tell Writers to toggle, annotate, migrate, or repair the host-owned
+section. Both branches may maintain a separate review-follow-up queue.
 
 Related: [[backward-compatible-serde-fields]],
 [[mode-specific-prompts-replace-conflicting-base-instructions]].

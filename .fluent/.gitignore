@@ -1,0 +1,9 @@
+# Fluent working state: everything here is ignored by default.
+# Durable content is re-included below.
+/*
+!/.gitignore
+!/expertise/
+!/hooks/
+!/Dockerfile
+!/tester.yaml
+!/extract-tester-results

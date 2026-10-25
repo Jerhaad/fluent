@@ -1,8 +1,10 @@
 use anyhow::{Context, Result, bail};
-use std::collections::BTreeMap;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
-use std::io::ErrorKind;
-use std::path::{Component, Path, PathBuf};
+use std::io::{ErrorKind, Read};
+use std::os::unix::ffi::OsStringExt;
+use std::path::{Path, PathBuf};
 
 use crate::coder::{CoderKind, CoderSandbox};
 use crate::content::ContentResolver;
@@ -13,8 +15,10 @@ use crate::os;
 use crate::prep;
 use crate::review_diff_command::render_review_diff_command;
 use crate::work_model::{
-    ArtifactRef, AttemptKind, AttemptStatus, TaskKind, TaskOutput, TaskStatus, WorkItem,
-    WorkModelStorageError, WorkModelStore, WorkspaceRef, resolve_expected_candidate_workspace_path,
+    ArtifactRef, AttemptKind, AttemptStatus, DurableTransitionMetadata, DurableTransitionOrigin,
+    NoChangeOutput, NoChangeVerification, NoChangeVerificationResult, PauseKind, PauseRecovery,
+    Task, TaskKind, TaskOutput, TaskStatus, WorkItem, WorkModelError, WorkModelStorageError,
+    WorkModelStore, WorkspaceRef, resolve_expected_candidate_workspace_path,
     resolve_managed_sibling_workspace_path, to_json_pretty, work_artifact_path,
 };
 use crate::worktree;
@@ -35,6 +39,176 @@ pub struct WorkTaskRunConfig<'a> {
 pub struct WorkTaskRunResult {
     pub task_id: String,
     pub output: String,
+}
+
+const NO_CHANGE_DECLARATION_FILE: &str = "no-change.json";
+pub(crate) const WRITER_COMPLETION_MATRIX_FILE: &str =
+    crate::recovery_contracts::WRITER_COMPLETION_MATRIX_FILE;
+const REVIEW_ARTIFACT_WARN_BYTES: u64 = 16 * 1024 * 1024;
+const EXECUTION_CONTEXT_MAX_BYTES: usize = 128 * 1024;
+const EXECUTION_CONTEXT_MAX_FINDING_TITLE_BYTES: usize = 300;
+const EXECUTION_CONTEXT_MAX_CHANGED_FILES: usize = 100;
+const EXECUTION_CONTEXT_MAX_EVIDENCE: usize = 25;
+const EXECUTION_CONTEXT_MAX_COMMANDS: usize = 25;
+const TESTER_CANDIDATE_MUTATION_FILE: &str = "candidate-mutation.json";
+const TESTER_CANDIDATE_MUTATION_SCHEMA_VERSION: u32 = 1;
+
+fn task_executor_transition() -> DurableTransitionMetadata {
+    DurableTransitionMetadata {
+        origin: DurableTransitionOrigin::TaskExecutor,
+        reason: None,
+        evidence_ref: None,
+    }
+}
+
+fn write_task_work_item(
+    store: &WorkModelStore,
+    item: &WorkItem,
+) -> Result<(), WorkModelStorageError> {
+    store.write_work_item_with_transition(item, &task_executor_transition())
+}
+
+fn mutate_task_work_item<T>(
+    store: &WorkModelStore,
+    id: &str,
+    reducer: impl FnOnce(&mut WorkItem) -> Result<T, WorkModelError>,
+) -> Result<T, WorkModelStorageError> {
+    store.mutate_work_item_with_transition(id, &task_executor_transition(), |item| {
+        let stopped = item
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.cancellation_requested())
+            .cloned()
+            .collect::<Vec<_>>();
+        let result = reducer(item)?;
+        for prior in stopped {
+            if item.attempts.iter().find(|attempt| attempt.id == prior.id) != Some(&prior) {
+                prior.ensure_not_canceled()?;
+            }
+        }
+        Ok(result)
+    })
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct ReviewArtifactUsage {
+    artifact_bytes: u64,
+    managed_cache_bytes: u64,
+    warning: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct ExecutionContextV1 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    verification: Option<ExecutionContextVerificationRecord>,
+    schema_version: u32,
+    candidate_commit: String,
+    base_commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    correction_lineage: Option<ExecutionContextCorrectionLineage>,
+    changed_files: Vec<String>,
+    unresolved_steps: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pending_writer_rows: Vec<crate::work_model::WriterCompletionRow>,
+    current_findings: Vec<ExecutionContextFinding>,
+    passing_evidence: Vec<ExecutionContextEvidence>,
+    executed_commands: Vec<String>,
+    historical_artifacts: Vec<String>,
+    omitted: ExecutionContextOmitted,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+enum ExecutionContextVerificationRecord {
+    Compact(ExecutionContextVerification),
+    Legacy(LegacyExecutionContextVerification),
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyExecutionContextVerification {
+    candidate_commit: String,
+    references: Vec<crate::verification_assessment::RequirementAssessment>,
+    commands: Vec<crate::verification_assessment::RequirementAssessment>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct ExecutionContextVerification {
+    candidate_commit: String,
+    references: Vec<crate::verification_assessment::RequirementAssessment>,
+    commands: Vec<crate::verification_assessment::RequirementAssessment>,
+    satisfied_references: usize,
+    satisfied_commands: usize,
+    full_assessment: crate::work_model::BoundRecheckArtifact,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum ExecutionContextCorrectionLineageMode {
+    AppendOnly,
+    TreeIdenticalMetadataRewrite,
+}
+
+impl ExecutionContextCorrectionLineageMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AppendOnly => "append-only",
+            Self::TreeIdenticalMetadataRewrite => "tree-identical-metadata-rewrite",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct ExecutionContextCorrectionLineage {
+    mode: ExecutionContextCorrectionLineageMode,
+    prior_candidate_commit: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    protected_base_commit: Option<String>,
+}
+
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct ExecutionContextOmitted {
+    changed_files: usize,
+    unresolved_steps: usize,
+    current_findings: usize,
+    passing_evidence: usize,
+    executed_commands: usize,
+    historical_artifacts: usize,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct ExecutionContextFinding {
+    role: String,
+    identity: String,
+    title: String,
+    artifact: String,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct ExecutionContextEvidence {
+    path: String,
+    summary: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct NoChangeDeclaration {
+    schema_version: u32,
+    reason: String,
+    verification: Vec<NoChangeVerification>,
+    #[serde(default)]
+    inspected_artifacts: Vec<NoChangeInspectedArtifact>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct NoChangeInspectedArtifact {
+    path: String,
+    digest: String,
 }
 
 /// A Task start lost the precedence race: a peer already took the Attempt
@@ -122,6 +296,12 @@ struct TaskStartReservation {
     receipt: ReservationReceipt,
 }
 
+#[cfg(all(test, feature = "test-support"))]
+thread_local! {
+    static TEST_TESTER_ROLLBACK_PERSISTENCE_FAILURE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
 fn plan_coder_kind(item: &WorkItem, attempt_id: &str, task_kind: TaskKind) -> Result<CoderKind> {
     item.attempts
         .iter()
@@ -130,16 +310,12 @@ fn plan_coder_kind(item: &WorkItem, attempt_id: &str, task_kind: TaskKind) -> Re
         .ok_or_else(|| anyhow::anyhow!("Attempt {attempt_id:?} not found"))
 }
 
-fn prepare_codex_worker(
+fn prepare_provider_readiness(
     coder_kind: CoderKind,
-) -> Result<Option<crate::codex_worker::CodexWorkerEnvironment>> {
-    if coder_kind != CoderKind::Codex {
-        return Ok(None);
-    }
-    let worker =
-        crate::codex_worker::CodexWorkerEnvironment::prepare().map_err(anyhow::Error::new)?;
-    worker.preflight().map_err(anyhow::Error::new)?;
-    Ok(Some(worker))
+    project_root: &Path,
+) -> Result<crate::provider_readiness::ProviderReadiness> {
+    crate::provider_readiness::ProviderReadiness::prepare_for_project(coder_kind, project_root)
+        .map_err(anyhow::Error::new)
 }
 
 /// Plan a Task start WITHOUT any durable write: validate identity, kind, and
@@ -165,6 +341,7 @@ fn plan_task_start(
     let (attempt_index, task_index) = find_attempt_task_indexes(&item, attempt_id, task_id)
         .ok_or_else(|| anyhow::anyhow!("Task {task_id:?} not found"))?;
     let attempt = &item.attempts[attempt_index];
+    attempt.ensure_not_canceled()?;
     let task = &attempt.tasks[task_index];
     if task.kind != expected_kind {
         bail!(
@@ -206,6 +383,7 @@ fn plan_task_start(
 /// [`with_reservation_rollback`] guard, which reverts this reservation via an
 /// exact expected-state CAS.
 fn reserve_task_start(
+    project_root: &Path,
     store: &WorkModelStore,
     work_item_id: &str,
     attempt_id: &str,
@@ -214,12 +392,34 @@ fn reserve_task_start(
     active_status: AttemptStatus,
     expected_coder: CoderKind,
 ) -> Result<TaskStartReservation> {
+    reserve_task_start_with_coder(
+        project_root,
+        store,
+        work_item_id,
+        attempt_id,
+        task_id,
+        expected_kind,
+        active_status,
+        Some(expected_coder),
+    )
+}
+
+fn reserve_task_start_with_coder(
+    project_root: &Path,
+    store: &WorkModelStore,
+    work_item_id: &str,
+    attempt_id: &str,
+    task_id: &str,
+    expected_kind: TaskKind,
+    active_status: AttemptStatus,
+    expected_coder: Option<CoderKind>,
+) -> Result<TaskStartReservation> {
     enum Decision {
         Reserved(Box<TaskStartReservation>),
         Rejected,
     }
 
-    let decision = store.mutate_work_item(work_item_id, |item| {
+    let decision = mutate_task_work_item(store, work_item_id, |item| {
         // Revalidate the abandonment and identity/kind contracts under the model
         // lock, not just the read-only plan, so a concurrent change since the plan
         // cannot slip a mismatched Task into an Executing reservation.
@@ -228,7 +428,62 @@ fn reserve_task_start(
             .ok_or_else(|| crate::work_model::WorkModelError::TaskNotFound {
                 id: task_id.to_string(),
             })?;
+        crate::recovery_contracts::context_retry::validate_start(
+            project_root,
+            item,
+            attempt_id,
+            task_id,
+            true,
+        )
+        .map_err(|e| WorkModelError::AttemptResumeIneligible {
+            attempt_id: attempt_id.into(),
+            reason: format!("{e:#}"),
+        })?;
+        crate::usage_limit_contracts::validate_start(project_root, item, attempt_id, task_id, true)
+            .map_err(|e| WorkModelError::AttemptResumeIneligible {
+                attempt_id: attempt_id.into(),
+                reason: format!("{e:#}"),
+            })?;
+        if expected_kind == TaskKind::Write {
+            crate::recovery_contracts::migrate_legacy_code_change_review_digest(
+                project_root,
+                item,
+                attempt_id,
+                Some(task_id),
+            )
+            .map_err(|reason| {
+                crate::work_model::WorkModelError::HostEvidenceRecoveryIneligible {
+                    attempt_id: attempt_id.to_string(),
+                    reason,
+                }
+            })?;
+            crate::recovery_contracts::validate_code_change_writer_start(
+                project_root,
+                item,
+                attempt_id,
+                task_id,
+            )?;
+        }
         let attempt = &item.attempts[attempt_index];
+        attempt.ensure_not_canceled()?;
+        if expected_kind == TaskKind::Review {
+            crate::recovery_contracts::review_evidence::validate(
+                project_root,
+                attempt,
+                &attempt.tasks[task_index],
+            )
+            .map_err(|error| WorkModelError::HostEvidenceRecoveryIneligible {
+                attempt_id: attempt_id.into(),
+                reason: format!("{error:#}"),
+            })?;
+            crate::recovery_contracts::validate_owned_plan_evidence_review(project_root, attempt)
+                .map_err(
+                |error| crate::work_model::WorkModelError::HostEvidenceRecoveryIneligible {
+                    attempt_id: attempt_id.into(),
+                    reason: format!("{error:#}"),
+                },
+            )?;
+        }
         if attempt.tasks[task_index].kind != expected_kind {
             return Err(crate::work_model::WorkModelError::TaskNotFound {
                 id: task_id.to_string(),
@@ -239,22 +494,24 @@ fn reserve_task_start(
         if attempt.tasks[task_index].status != TaskStatus::Planned {
             return Ok(Decision::Rejected);
         }
-        let mapping = attempt.coder_mapping.for_task_kind(expected_kind);
-        let coder = mapping.coder;
-        // The Codex boundary was prepared for this exact mapping before the
-        // reservation. A concurrent provider change must replan instead of
-        // launching an un-preflighted coder.
-        if coder != expected_coder {
-            return Ok(Decision::Rejected);
-        }
-        let model = if mapping.model.is_empty() {
-            None
+        let (coder, model, effort) = if let Some(expected_coder) = expected_coder {
+            let mapping = attempt.coder_mapping.for_task_kind(expected_kind);
+            if mapping.coder != expected_coder {
+                return Ok(Decision::Rejected);
+            }
+            (
+                mapping.coder,
+                (!mapping.model.is_empty()).then(|| mapping.model.clone()),
+                mapping.effort.clone(),
+            )
         } else {
-            Some(mapping.model.clone())
+            // Deterministic Tasks carry no provider authority and never use this field.
+            (CoderKind::Codex, None, None)
         };
-        let effort = mapping.effort.clone();
         let attempt_kind = attempt.kind.clone();
-        let is_first_write = !attempt.tasks.iter().any(|t| t.kind == TaskKind::Tester);
+        let is_first_write = !attempt.tasks[..task_index]
+            .iter()
+            .any(|task| task.kind == TaskKind::Write);
 
         // Capture the exact state the reservation is about to overwrite.
         let prior_task = attempt.tasks[task_index].clone();
@@ -269,6 +526,23 @@ fn reserve_task_start(
         ) {
             return Ok(Decision::Rejected);
         }
+        if let Some(area) = &item.attempts[attempt_index].tasks[task_index].artifact_area {
+            let path =
+                resolve_managed_artifact_area_path(project_root, &area.path).and_then(|area| {
+                    crate::execution::prepare_launch(
+                        &area.join("transcript.jsonl"),
+                        Some(crate::execution::AttemptExecutionOwner {
+                            project_root: project_root.to_path_buf(),
+                            work_item_id: work_item_id.into(),
+                            attempt_id: attempt_id.into(),
+                        }),
+                    )
+                });
+            path.map_err(|error| WorkModelError::AttemptResumeIneligible {
+                attempt_id: attempt_id.into(),
+                reason: format!("publish local execution identity: {error:#}"),
+            })?;
+        }
         let task = &mut item.attempts[attempt_index].tasks[task_index];
         task.status = TaskStatus::Executing;
         // Clear any residual timestamp first so mark_task_started stamps a fresh
@@ -278,6 +552,21 @@ fn reserve_task_start(
         crate::work_model::mark_task_started(task);
         task.output = None;
 
+        crate::usage_limit_recovery::record_start(project_root, item, attempt_id, task_id)
+            .map_err(|e| WorkModelError::AttemptResumeIneligible {
+                attempt_id: attempt_id.into(),
+                reason: format!("{e:#}"),
+            })?;
+        crate::writer_completion_recovery::record_context_retry_start(
+            project_root,
+            item,
+            attempt_id,
+            task_id,
+        )
+        .map_err(|e| WorkModelError::AttemptResumeIneligible {
+            attempt_id: attempt_id.into(),
+            reason: format!("{e:#}"),
+        })?;
         // Capture the exact state the reservation wrote, for the CAS rollback.
         let written_task = item.attempts[attempt_index].tasks[task_index].clone();
         let written_attempt = &item.attempts[attempt_index];
@@ -322,7 +611,14 @@ fn rollback_reservation(
     task_id: &str,
     receipt: &ReservationReceipt,
 ) -> Result<(), WorkModelStorageError> {
-    store.mutate_work_item(work_item_id, |item| {
+    #[cfg(all(test, feature = "test-support"))]
+    if TEST_TESTER_ROLLBACK_PERSISTENCE_FAILURE.with(std::cell::Cell::get) {
+        return Err(WorkModelStorageError::WriteFile {
+            path: store.work_item_path(work_item_id)?,
+            source: std::io::Error::other("test-injected Tester rollback persistence failure"),
+        });
+    }
+    mutate_task_work_item(store, work_item_id, |item| {
         // The reservation wrote this exact Attempt/Task, so a structurally missing
         // entity during rollback is a model-integrity fault, not a tolerable
         // concurrent state — fail rather than silently reporting a clean rollback.
@@ -360,6 +656,20 @@ fn rollback_reservation(
     Ok(())
 }
 
+/// Identifies a setup failure whose receipt-scoped rollback could not persist.
+/// Callers must durably settle the already-reserved Task instead of returning
+/// this error through a path that could leave it executing.
+#[derive(Debug)]
+struct ReservationRollbackFailure;
+
+impl std::fmt::Display for ReservationRollbackFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "failed to roll back the reserved Task")
+    }
+}
+
+impl std::error::Error for ReservationRollbackFailure {}
+
 /// Run side-effectful setup after the reservation; on failure, CAS-revert the
 /// reservation via its receipt before returning the setup error.
 fn with_reservation_rollback<T>(
@@ -382,6 +692,7 @@ fn with_reservation_rollback<T>(
                 // typed storage error stay recoverable and the primary is never masked.
                 return Err(error
                     .context(rollback_error)
+                    .context(ReservationRollbackFailure)
                     .context("failed to normalize the reserved Task after a setup failure"));
             }
             Err(error)
@@ -445,34 +756,100 @@ fn preflight_write_worktree(
 /// terminal state, rather than reviving the Attempt or auto-reopening the pause.
 /// No Task was mutated and no coder or tester launched.
 pub fn run_task(config: WorkTaskRunConfig<'_>) -> Result<WorkTaskRunResult> {
+    let project_root = config.project_root;
+    let store = config.store;
+    let work_item_id = config.work_item_id;
+    let task_id = config.task_id;
     let item = read_work_item_or_not_found(config.store, config.work_item_id)?;
+    item.ensure_mutation_compatible()?;
     item.ensure_not_abandoned()?;
     let (attempt_index, task_index) =
         find_attempt_task_indexes(&item, config.attempt_id, config.task_id)
             .ok_or_else(|| anyhow::anyhow!("Task {:?} not found", config.task_id))?;
 
+    if item.attempts[attempt_index].tasks[task_index].kind == TaskKind::Review {
+        crate::recovery_contracts::review_evidence::validate(
+            project_root,
+            &item.attempts[attempt_index],
+            &item.attempts[attempt_index].tasks[task_index],
+        )?;
+        crate::recovery_contracts::validate_owned_plan_evidence_review(
+            project_root,
+            &item.attempts[attempt_index],
+        )?;
+    }
+    if !config.extra_args.is_empty()
+        && item.attempts[attempt_index].tasks[task_index]
+            .input_artifacts
+            .iter()
+            .any(|a| {
+                matches!(
+                    a.producer_id.as_str(),
+                    "usage-limit-writer-approval" | "writer-completion-context-retry"
+                )
+            })
+    {
+        bail!("usage-limit retry cannot introduce new provider arguments");
+    }
+    crate::recovery_contracts::context_retry::validate_start(
+        project_root,
+        &item,
+        config.attempt_id,
+        task_id,
+        false,
+    )?;
+    crate::usage_limit_contracts::validate_start(
+        project_root,
+        &item,
+        config.attempt_id,
+        task_id,
+        false,
+    )?;
+    let _owner = item.attempts[attempt_index].tasks[task_index]
+        .artifact_area
+        .as_ref()
+        .map(|area| {
+            resolve_managed_artifact_area_path(project_root, &area.path)
+                .map(|path| crate::execution::TaskOwner::enter(path.join("transcript.jsonl")))
+        })
+        .transpose()?;
     // Route by kind only; the coder mapping is resolved fresh under the model
     // lock when the atomic start reserves the Task, not from this early read.
     let task_kind = item.attempts[attempt_index].tasks[task_index].kind;
-    match task_kind {
+    let result = match task_kind {
         TaskKind::Write => run_write_task(config),
         TaskKind::Review => run_review_task(config),
-        TaskKind::BehaviorTests => {
-            bail!("BehaviorTests tasks are retired; use Tester tasks instead")
-        }
         TaskKind::Tester => run_tester_task(config),
+        TaskKind::Verification => run_verification_task(config),
         kind => bail!(
             "Task {:?} is kind {kind}; unsupported by task run",
             config.task_id
         ),
+    };
+    if let Err(error) = read_work_item_or_not_found(store, work_item_id).and_then(|item| {
+        crate::work_status::refresh_persisted_task_metrics(project_root, &item, task_id)
+    }) {
+        eprintln!(
+            "warning: could not refresh persisted metrics for Task {task_id}: {error:#}; run `fluent work-item rebuild-metrics {work_item_id}`"
+        );
     }
+    result
 }
 
 fn run_write_task(config: WorkTaskRunConfig<'_>) -> Result<WorkTaskRunResult> {
+    run_write_task_with_coder(config, None)
+}
+
+/// Run a Writer Task, optionally injecting the coder factory for deterministic
+/// full-route tests.
+fn run_write_task_with_coder(
+    config: WorkTaskRunConfig<'_>,
+    coder_override: Option<&dyn Fn(CoderSandbox) -> Box<dyn crate::coder::Coder>>,
+) -> Result<WorkTaskRunResult> {
     // Read the Work Item once for WorkItem-level prompt context (instructions and
     // planning), which is immutable across the run. Every Task/Attempt execution
     // input instead derives from the plan snapshot.
-    let item = read_work_item_or_not_found(config.store, config.work_item_id)?;
+    let mut item = read_work_item_or_not_found(config.store, config.work_item_id)?;
 
     // Inputs independent of the aggregate: the source branch (git) and the Task
     // branch name (ids).
@@ -492,7 +869,7 @@ fn run_write_task(config: WorkTaskRunConfig<'_>) -> Result<WorkTaskRunResult> {
     // loop's terminal check rejects the start here with a typed StartRejected
     // error — so no worktree is created, no baseline is persisted, the baseline
     // Tester never runs, and no coder launches.
-    let plan = plan_task_start(
+    let mut plan = plan_task_start(
         config.store,
         config.work_item_id,
         config.attempt_id,
@@ -520,14 +897,66 @@ fn run_write_task(config: WorkTaskRunConfig<'_>) -> Result<WorkTaskRunResult> {
         config.work_item_id,
         config.attempt_id,
     )?;
-    let prior_reviews =
-        resolve_input_artifact_paths(config.project_root, &plan.task.input_artifacts)?;
+    let prior_reviews = resolve_writer_readable_inputs(config.project_root, &item, &plan.task)?;
     preflight_write_worktree(config.project_root, &workspace_path, &branch_name)?;
+    if plan.task.role == crate::work_model::TESTER_HARNESS_REPAIR_ROLE {
+        inspect_tester_harness_repair_start(config.project_root, &plan.task, &workspace_path)?;
+    }
+    let writer_cache = crate::writer_cache::preflight_writer_dependency_cache(
+        config.project_root,
+        config.work_item_id,
+        config.attempt_id,
+    )?;
 
-    // Authenticate autonomous Codex before reserving execution.  A login failure
+    // Verify the selected provider before reserving execution. A readiness failure
     // leaves this Task unstarted and pauses the existing Attempt for recovery.
-    let codex_worker =
-        match prepare_codex_worker(plan_coder_kind(&item, config.attempt_id, TaskKind::Write)?) {
+    let coder_kind = plan_coder_kind(&item, config.attempt_id, TaskKind::Write)?;
+    let mut provider_readiness = match prepare_provider_readiness(coder_kind, config.project_root) {
+        Ok(worker) => worker,
+        Err(error) => {
+            mark_task_failed_attempt_needs_user(
+                config.store,
+                config.project_root,
+                config.work_item_id,
+                config.attempt_id,
+                config.task_id,
+                &classify_task_failure(&error),
+                &crate::notify::notify,
+            )?;
+            return Err(error);
+        }
+    };
+    let claude_home = (coder_kind == CoderKind::Claude).then(|| {
+        config
+            .project_root
+            .join(".fluent/work/artifacts")
+            .join(config.work_item_id)
+            .join(config.attempt_id)
+            .join("claude-home")
+    });
+    let prior_snapshot = match previous_writer_codex_session_snapshot(
+        &item,
+        config.attempt_id,
+        config.project_root,
+    ) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            eprintln!(
+                "warning: prior Codex Writer session cannot be resolved; starting a fresh session: {error:#}"
+            );
+            None
+        }
+    };
+    if let (Some(worker), Some(snapshot)) = (provider_readiness.codex_worker(), prior_snapshot)
+        && let Err(error) = worker.restore_sessions_from(&snapshot)
+    {
+        eprintln!(
+            "warning: prior Codex Writer session cannot be restored; starting a fresh session: {error:#}"
+        );
+        // Discard the possibly partial temporary home. Re-preparing preserves
+        // authentication isolation and guarantees session selection sees no
+        // stale rollout material.
+        provider_readiness = match prepare_provider_readiness(coder_kind, config.project_root) {
             Ok(worker) => worker,
             Err(error) => {
                 mark_task_failed_attempt_needs_user(
@@ -542,19 +971,84 @@ fn run_write_task(config: WorkTaskRunConfig<'_>) -> Result<WorkTaskRunResult> {
                 return Err(error);
             }
         };
+    }
+
+    // Render and apply the exact Writer boundary while the Task is still Planned.
+    // All roots below are deterministic from the start plan, including paths the
+    // post-reservation setup creates.  Keep the profile alive and hand it to every
+    // Writer launch so the coder is enclosed by the boundary we just proved the
+    // host can apply.
+    let sandbox_profile = match preflight_write_sandbox_profile(
+        &plan.task,
+        config.project_root,
+        &workspace_path,
+        &prior_reviews,
+        config.resolver,
+        config.no_sandbox,
+        coder_kind,
+        provider_readiness.codex_worker(),
+        claude_home.as_deref(),
+        &writer_cache,
+    ) {
+        Ok(profile) => profile,
+        Err(error) => {
+            mark_task_failed_attempt_needs_user(
+                config.store,
+                config.project_root,
+                config.work_item_id,
+                config.attempt_id,
+                config.task_id,
+                &classify_task_failure(&error),
+                &crate::notify::notify,
+            )?;
+            return Err(error);
+        }
+    };
+
+    // Admit the complete logical Writer run before reserving durable execution.
+    // The lease spans provider-internal recovery and Task-level retries, and a
+    // capacity wait therefore consumes neither Task nor Writer-round state.
+    let _provider_lease = acquire_task_provider_capacity(&config, coder_kind, "Writer")?;
+
+    // Publish the host-owned assignment after deterministic preflight succeeds
+    // but before the Writer reservation. The attempt loop normally publishes it
+    // with the corrective Task transaction; this fallback covers a directly
+    // resumed Task created by an older caller.
+    let before_assignment = item.clone();
+    crate::recovery_contracts::prepare_writer_correction_assignments(
+        config.project_root,
+        &mut item,
+    )?;
+    if item != before_assignment {
+        config.store.write_work_item(&item)?;
+        let (_, task_index) = find_attempt_task_indexes(&item, config.attempt_id, config.task_id)
+            .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Task {:?} disappeared while publishing assignment",
+                config.task_id
+            )
+        })?;
+        let attempt = item
+            .attempts
+            .iter()
+            .find(|attempt| attempt.id == config.attempt_id)
+            .expect("planned Writer Attempt remains present");
+        plan.task = attempt.tasks[task_index].clone();
+    }
 
     // The preflight passed: reserve the start in one lock-held transaction. A peer
     // that took the Attempt terminal rejects the reservation here with a typed
     // StartRejected error and nothing mutated. The fresh coder mapping and the
     // rollback receipt come from the reservation.
     let reservation = reserve_task_start(
+        config.project_root,
         config.store,
         config.work_item_id,
         config.attempt_id,
         config.task_id,
         TaskKind::Write,
         AttemptStatus::Executing,
-        plan_coder_kind(&item, config.attempt_id, TaskKind::Write)?,
+        coder_kind,
     )?;
 
     // Side-effectful setup after the reservation. Only non-deterministic failures
@@ -567,12 +1061,24 @@ fn run_write_task(config: WorkTaskRunConfig<'_>) -> Result<WorkTaskRunResult> {
         config.task_id,
         &reservation.receipt,
         || {
+            crate::writer_cache::prepare_writer_dependency_cache_for_launch(
+                &writer_cache,
+                config.store,
+                crate::writer_cache::canonical_cargo_home_from_env().as_deref(),
+            )?;
             prepare_task_worktree(
                 config.project_root,
                 &workspace_path,
                 &branch_name,
                 &source_branch,
             )?;
+            if reservation.task.role == crate::work_model::TESTER_HARNESS_REPAIR_ROLE {
+                prepare_tester_harness_repair_start(
+                    config.project_root,
+                    &reservation.task,
+                    &workspace_path,
+                )?;
+            }
             worktree::disable_commit_signing(&workspace_path)?;
             let baseline_commit = resolve_or_persist_write_baseline(
                 config.project_root,
@@ -597,31 +1103,31 @@ fn run_write_task(config: WorkTaskRunConfig<'_>) -> Result<WorkTaskRunResult> {
     // retry loop, and thread the same immutable config into every attempt so a config
     // change between retries can never swap this role's capture mid-run.
     let pump_config = crate::transcript_pump::resolve_config(config.project_root);
-    let mut run_result = run_task_coder(
-        &item,
-        config.attempt_id,
-        config.task_id,
-        config.project_root,
-        &workspace_path,
-        &prior_reviews,
-        config.resolver,
-        config.extra_args,
-        reservation.coder,
-        config.no_sandbox,
-        reservation.model.as_deref(),
-        reservation.effort.as_deref(),
-        &pump_config,
-        codex_worker.as_ref(),
-    );
-    let mut retries = 0;
-    while should_retry_coder_error(&run_result) && retries < max_task_retries() {
-        retries += 1;
-        eprintln!(
-            "  Retrying coder (attempt {}/{})",
-            retries + 1,
-            max_task_retries() + 1
-        );
-        run_result = run_task_coder(
+    let transcript = plan.task.artifact_area.as_ref().map(|area| {
+        config
+            .project_root
+            .join(&area.path)
+            .join("transcript.jsonl")
+    });
+    let source_before = match source_product_snapshot(config.project_root) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            mark_task_failed_attempt_needs_user(
+                config.store,
+                config.project_root,
+                config.work_item_id,
+                config.attempt_id,
+                config.task_id,
+                &TaskFailure::WriterCompletion(format!(
+                    "Cannot verify source checkout before Writer launch: {error:#}"
+                )),
+                &crate::notify::notify,
+            )?;
+            return Err(error);
+        }
+    };
+    let mut run_result = provider_pause_error(
+        run_task_coder_with_optional_coder(
             &item,
             config.attempt_id,
             config.task_id,
@@ -635,8 +1141,80 @@ fn run_write_task(config: WorkTaskRunConfig<'_>) -> Result<WorkTaskRunResult> {
             reservation.model.as_deref(),
             reservation.effort.as_deref(),
             &pump_config,
-            codex_worker.as_ref(),
+            provider_readiness.codex_worker(),
+            claude_home.as_deref(),
+            &writer_cache,
+            sandbox_profile.as_ref(),
+            coder_override,
+            None,
+        ),
+        reservation.coder,
+        transcript.clone(),
+    );
+    if let Err(error) = ensure_source_product_unchanged(config.project_root, &source_before) {
+        mark_task_failed_attempt_needs_user(
+            config.store,
+            config.project_root,
+            config.work_item_id,
+            config.attempt_id,
+            config.task_id,
+            &TaskFailure::WriterCompletion(error.to_string()),
+            &crate::notify::notify,
+        )?;
+        return Err(error);
+    }
+    let mut retries = 0;
+    while !plan
+        .task
+        .input_artifacts
+        .iter()
+        .any(|a| a.producer_id == crate::recovery_contracts::context_retry::APPROVE)
+        && should_retry_coder_error(&run_result)
+        && retries < max_task_retries()
+    {
+        retries += 1;
+        eprintln!(
+            "  Retrying coder (attempt {}/{})",
+            retries + 1,
+            max_task_retries() + 1
         );
+        run_result = provider_pause_error(
+            run_task_coder_with_optional_coder(
+                &item,
+                config.attempt_id,
+                config.task_id,
+                config.project_root,
+                &workspace_path,
+                &prior_reviews,
+                config.resolver,
+                config.extra_args,
+                reservation.coder,
+                config.no_sandbox,
+                reservation.model.as_deref(),
+                reservation.effort.as_deref(),
+                &pump_config,
+                provider_readiness.codex_worker(),
+                claude_home.as_deref(),
+                &writer_cache,
+                sandbox_profile.as_ref(),
+                coder_override,
+                None,
+            ),
+            reservation.coder,
+            transcript.clone(),
+        );
+        if let Err(error) = ensure_source_product_unchanged(config.project_root, &source_before) {
+            mark_task_failed_attempt_needs_user(
+                config.store,
+                config.project_root,
+                config.work_item_id,
+                config.attempt_id,
+                config.task_id,
+                &TaskFailure::WriterCompletion(error.to_string()),
+                &crate::notify::notify,
+            )?;
+            return Err(error);
+        }
     }
 
     if let Err(error) = run_result {
@@ -653,38 +1231,139 @@ fn run_write_task(config: WorkTaskRunConfig<'_>) -> Result<WorkTaskRunResult> {
         return Err(error);
     }
 
-    if let Err(error) = ensure_clean_worktree(&workspace_path) {
-        mark_task_failed(
-            config.store,
-            config.work_item_id,
-            config.attempt_id,
-            config.task_id,
-        )?;
-        return Err(error);
-    }
-    let produced_count = match commits_ahead(&workspace_path, &baseline_commit) {
-        Ok(count) => count,
+    let mut handoff = match writer_handoff_result(&config, &workspace_path, &baseline_commit) {
+        Ok(state) => state,
         Err(error) => {
-            mark_task_failed(
+            mark_task_failed_attempt_needs_user(
                 config.store,
+                config.project_root,
                 config.work_item_id,
                 config.attempt_id,
                 config.task_id,
+                &TaskFailure::WriterCompletion(format!(
+                    "Writer candidate state is unverifiable: {error:#}"
+                )),
+                &crate::notify::notify,
             )?;
             return Err(error);
         }
     };
-    if produced_count == 0 {
-        mark_task_failed(
+    if let Err(first_error) = &handoff {
+        let feedback = format!(
+            "The Writer handoff is incomplete: {first_error:#}. Work only in {}. Commit all intended changes, or, for an authorized follow-up with no changes, write a valid no-change declaration. Then finish this same Task.",
+            workspace_path.display()
+        );
+        run_result = provider_pause_error(
+            run_task_coder_with_optional_coder(
+                &item,
+                config.attempt_id,
+                config.task_id,
+                config.project_root,
+                &workspace_path,
+                &prior_reviews,
+                config.resolver,
+                config.extra_args,
+                reservation.coder,
+                config.no_sandbox,
+                reservation.model.as_deref(),
+                reservation.effort.as_deref(),
+                &pump_config,
+                provider_readiness.codex_worker(),
+                claude_home.as_deref(),
+                &writer_cache,
+                sandbox_profile.as_ref(),
+                coder_override,
+                Some(&feedback),
+            ),
+            reservation.coder,
+            transcript.clone(),
+        );
+        if let Err(error) = ensure_source_product_unchanged(config.project_root, &source_before) {
+            mark_task_failed_attempt_needs_user(
+                config.store,
+                config.project_root,
+                config.work_item_id,
+                config.attempt_id,
+                config.task_id,
+                &TaskFailure::WriterCompletion(error.to_string()),
+                &crate::notify::notify,
+            )?;
+            return Err(error);
+        }
+        if let Err(error) = run_result {
+            mark_task_failed_attempt_needs_user(
+                config.store,
+                config.project_root,
+                config.work_item_id,
+                config.attempt_id,
+                config.task_id,
+                &TaskFailure::WriterCompletion(format!(
+                    "Writer handoff correction failed after {first_error:#}: {error:#}"
+                )),
+                &crate::notify::notify,
+            )?;
+            return Err(error);
+        }
+        handoff = match writer_handoff_result(&config, &workspace_path, &baseline_commit) {
+            Ok(state) => state,
+            Err(error) => {
+                mark_task_failed_attempt_needs_user(
+                    config.store,
+                    config.project_root,
+                    config.work_item_id,
+                    config.attempt_id,
+                    config.task_id,
+                    &TaskFailure::WriterCompletion(format!(
+                        "Writer candidate state is unverifiable after correction: {error:#}"
+                    )),
+                    &crate::notify::notify,
+                )?;
+                return Err(error);
+            }
+        };
+    }
+    let (_produced_count, no_change) = match handoff {
+        Ok(result) => result,
+        Err(error) => {
+            mark_task_failed_attempt_needs_user(
+                config.store,
+                config.project_root,
+                config.work_item_id,
+                config.attempt_id,
+                config.task_id,
+                &TaskFailure::WriterCompletion(format!(
+                    "Writer handoff remains incomplete after one correction: {error:#}"
+                )),
+                &crate::notify::notify,
+            )?;
+            return Err(error);
+        }
+    };
+    if plan.task.role == crate::work_model::TESTER_HARNESS_REPAIR_ROLE
+        && let Err(error) = ensure_tester_harness_repair_scope(&workspace_path, &baseline_commit)
+    {
+        let error = match reject_and_restore_tester_harness_repair(
+            config.project_root,
+            &plan.task,
+            &workspace_path,
+            &baseline_commit,
+            &error,
+        ) {
+            Ok(()) => error,
+            Err(restore_error) => anyhow::anyhow!(
+                "{error:#}; additionally failed to restore the approved Tester-harness candidate: {restore_error:#}"
+            ),
+        };
+        mark_task_failed_attempt_needs_user(
             config.store,
+            config.project_root,
             config.work_item_id,
             config.attempt_id,
             config.task_id,
+            &TaskFailure::WriterCompletion(error.to_string()),
+            &crate::notify::notify,
         )?;
-        bail!(
-            "Task {:?} has no committed Task output; commit the Task output before completing",
-            config.task_id
-        );
+        return Err(error);
     }
     // Route every post-reservation completion failure — head lookup, completion
     // read/find, and the terminal write — through one durable terminal-state
@@ -695,6 +1374,7 @@ fn run_write_task(config: WorkTaskRunConfig<'_>) -> Result<WorkTaskRunResult> {
         &workspace_path,
         source_branch,
         baseline_commit,
+        no_change,
     );
     match completion {
         Ok(result) => Ok(result),
@@ -704,6 +1384,7 @@ fn run_write_task(config: WorkTaskRunConfig<'_>) -> Result<WorkTaskRunResult> {
                 config.work_item_id,
                 config.attempt_id,
                 config.task_id,
+                config.store_lock.is_some(),
             );
             Err(error)
         }
@@ -719,6 +1400,7 @@ fn complete_write_task(
     workspace_path: &Path,
     source_branch: String,
     baseline_commit: String,
+    no_change: Option<NoChangeOutput>,
 ) -> Result<WorkTaskRunResult> {
     let commit = head_commit(workspace_path)?;
 
@@ -728,6 +1410,8 @@ fn complete_write_task(
         source_branch,
         base_commit: Some(baseline_commit),
         commit: commit.clone(),
+        no_change,
+        learner_canonicalization: None,
     };
     let mut completed_item = read_work_item_or_not_found(config.store, config.work_item_id)?;
     let (attempt_index, task_index) =
@@ -744,10 +1428,8 @@ fn complete_write_task(
             producer_id: config.task_id.to_string(),
             path: commit.clone(),
         });
-    let all_complete = completed_item.attempts[attempt_index]
-        .tasks
-        .iter()
-        .all(|task| task.status == TaskStatus::Complete);
+    let all_complete =
+        completed_item.attempts[attempt_index].all_tasks_complete_or_approach_superseded();
     let (next_status, next_pause) = if all_complete {
         (AttemptStatus::Complete, None)
     } else {
@@ -761,7 +1443,7 @@ fn complete_write_task(
         next_status,
         next_pause,
     );
-    config.store.write_work_item(&completed_item)?;
+    write_task_work_item(config.store, &completed_item)?;
 
     Ok(WorkTaskRunResult {
         task_id: config.task_id.to_string(),
@@ -769,8 +1451,182 @@ fn complete_write_task(
     })
 }
 
+/// Validate the fresh Task-owned evidence that lets a corrective Writer retain
+/// the previous completed Writer commit without producing a new commit.
+fn validate_followup_no_change(
+    config: &WorkTaskRunConfig<'_>,
+    workspace_path: &Path,
+) -> Result<NoChangeOutput> {
+    let item = read_work_item_or_not_found(config.store, config.work_item_id)?;
+    let (attempt_index, task_index) =
+        find_attempt_task_indexes(&item, config.attempt_id, config.task_id)
+            .ok_or_else(|| anyhow::anyhow!("Task {:?} not found", config.task_id))?;
+    let task = &item.attempts[attempt_index].tasks[task_index];
+    let previous_output = item.attempts[attempt_index].tasks[..task_index]
+        .iter()
+        .rev()
+        .find(|candidate| {
+            candidate.kind == TaskKind::Write && candidate.status == TaskStatus::Complete
+        })
+        .and_then(|candidate| candidate.output.as_ref())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Task {:?} has no committed Task output; commit the Task output before completing",
+                config.task_id
+            )
+        })?;
+
+    let head = head_commit(workspace_path)?;
+    if head != previous_output.commit {
+        bail!(
+            "Task {:?} cannot complete as no-change: workspace HEAD {head} does not equal the previous completed Writer commit {}",
+            config.task_id,
+            previous_output.commit
+        );
+    }
+
+    let artifact_area = task.artifact_area.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Task {:?} requires an artifact area for a valid no-change declaration",
+            config.task_id
+        )
+    })?;
+    let artifact_dir =
+        resolve_managed_artifact_area_path(config.project_root, &artifact_area.path)?;
+    let declaration_path = artifact_dir.join(NO_CHANGE_DECLARATION_FILE);
+    let bytes = fs::read(&declaration_path).with_context(|| {
+        format!(
+            "Task {:?} produced no commit; a valid no-change declaration is required at {}",
+            config.task_id,
+            declaration_path.display()
+        )
+    })?;
+    let declaration: NoChangeDeclaration = serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "Task {:?} produced no commit; {} must be a valid schema-version-1 no-change declaration",
+            config.task_id,
+            declaration_path.display()
+        )
+    })?;
+    if declaration.schema_version != 1 {
+        bail!(
+            "Task {:?} produced no commit; {} must use no-change schema_version 1",
+            config.task_id,
+            declaration_path.display()
+        );
+    }
+    if declaration.reason.trim().is_empty() {
+        bail!(
+            "Task {:?} produced no commit; {} must contain a non-empty reason",
+            config.task_id,
+            declaration_path.display()
+        );
+    }
+    if declaration.verification.is_empty()
+        || declaration
+            .verification
+            .iter()
+            .any(|entry| entry.command.trim().is_empty())
+    {
+        bail!(
+            "Task {:?} produced no commit; {} must contain one or more passing verification entries with non-empty commands",
+            config.task_id,
+            declaration_path.display()
+        );
+    }
+    validate_failed_tester_no_change_inspection(
+        config.project_root,
+        task,
+        &declaration.inspected_artifacts,
+        &declaration_path,
+    )?;
+    debug_assert!(
+        declaration
+            .verification
+            .iter()
+            .all(|entry| entry.result == NoChangeVerificationResult::Pass)
+    );
+
+    Ok(NoChangeOutput {
+        schema_version: declaration.schema_version,
+        declaration_path: format!(
+            "{}/{}",
+            artifact_area.path.trim_end_matches('/'),
+            NO_CHANGE_DECLARATION_FILE
+        ),
+        reason: declaration.reason,
+        verification: declaration.verification,
+    })
+}
+
+/// Pin accepted host proof and its exact sources for newly planned Tests Reviews.
+pub fn prepare_ordinary_review_evidence(
+    project_root: &Path,
+    item: &mut WorkItem,
+    attempt_id: &str,
+    task_ids: &[String],
+) -> Result<()> {
+    let attempt = item
+        .attempts
+        .iter_mut()
+        .find(|attempt| attempt.id == attempt_id)
+        .unwrap();
+    if !attempt.tasks.iter().any(|task| {
+        task_ids.contains(&task.id)
+            && task.kind == TaskKind::Review
+            && task.role == "tests"
+            && task.evidence_review_context.is_none()
+    }) {
+        return Ok(());
+    }
+    let proofs = crate::recovery_contracts::review_evidence::current(project_root, attempt);
+    if proofs.is_empty() {
+        return Ok(());
+    }
+    let bytes = serde_json::to_vec_pretty(&proofs)?;
+    let digest = format!("{:x}", Sha256::digest(&bytes));
+    let path = format!(
+        ".fluent/work/artifacts/{}/{}/ordinary-review-evidence/{digest}.json",
+        attempt.work_item_id, attempt.id
+    );
+    crate::work_model::publish_recovery_snapshot(project_root, &path, &bytes)?;
+    for task in attempt.tasks.iter_mut().filter(|task| {
+        task_ids.contains(&task.id)
+            && task.kind == TaskKind::Review
+            && task.role == "tests"
+            && task.evidence_review_context.is_none()
+    }) {
+        task.input_artifacts.push(ArtifactRef {
+            producer_id: crate::recovery_contracts::review_evidence::PRODUCER.into(),
+            path: path.clone(),
+        });
+        for binding in proofs.iter().flat_map(|proof| &proof.bindings) {
+            if !task
+                .input_artifacts
+                .iter()
+                .any(|artifact| artifact.path == binding.path)
+            {
+                task.input_artifacts.push(ArtifactRef {
+                    producer_id: crate::recovery_contracts::review_evidence::SOURCE_PRODUCER.into(),
+                    path: binding.path.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 fn run_review_task(config: WorkTaskRunConfig<'_>) -> Result<WorkTaskRunResult> {
-    run_review_task_with_coder(config, None)
+    run_review_task_with_coder(
+        config,
+        None,
+        &FilesystemReviewerCacheAdmission,
+        &report_reviewer_cache,
+    )
+}
+
+fn report_reviewer_cache(message: &str) {
+    eprintln!("{message}");
 }
 
 /// Run a Review Task, optionally injecting the reviewer coder factory.
@@ -783,6 +1639,8 @@ fn run_review_task(config: WorkTaskRunConfig<'_>) -> Result<WorkTaskRunResult> {
 fn run_review_task_with_coder(
     config: WorkTaskRunConfig<'_>,
     coder_override: Option<&dyn Fn(CoderSandbox) -> Box<dyn crate::coder::Coder>>,
+    cache_admission: &dyn ReviewerCacheAdmission,
+    cache_reporter: &dyn Fn(&str),
 ) -> Result<WorkTaskRunResult> {
     let lock_path =
         crate::lease::task_lock_path(config.project_root, config.work_item_id, config.task_id);
@@ -845,6 +1703,8 @@ fn run_review_task_with_coder(
         .clone()
         .expect("review context validated present while planning the start");
     let candidate_commit = review_context.candidate_commit.clone();
+    let reviewer_cache_dir = (role == "tests" && !attempt_kind.is_review_only_like())
+        .then(|| candidate_reviewer_cache_dir(config.project_root, &candidate_commit));
     let artifact_area = plan
         .task
         .artifact_area
@@ -858,6 +1718,8 @@ fn run_review_task_with_coder(
     // candidate fails byte-identically before the reservation.
     let artifact_dir = resolve_managed_artifact_area_path(config.project_root, &artifact_area)?;
     let review_path = artifact_dir.join("review.md");
+    let review_inspection_path =
+        artifact_dir.join(crate::review_inspection::REVIEW_INSPECTION_FILE);
     let input_artifacts =
         resolve_input_artifact_paths(config.project_root, &plan.task.input_artifacts)?;
     ReviewReadableWorkspaces::preflight(
@@ -875,13 +1737,19 @@ fn run_review_task_with_coder(
             review_path.display()
         );
     }
+    if review_inspection_path.exists() && !review_inspection_path.is_file() {
+        bail!(
+            "Review Task {:?} inspection artifact path exists but is not a file: {}",
+            config.task_id,
+            review_inspection_path.display()
+        );
+    }
 
     let planned_item = read_work_item_or_not_found(config.store, config.work_item_id)?;
-    let codex_worker = match prepare_codex_worker(plan_coder_kind(
-        &planned_item,
-        config.attempt_id,
-        TaskKind::Review,
-    )?) {
+    let provider_readiness = match prepare_provider_readiness(
+        plan_coder_kind(&planned_item, config.attempt_id, TaskKind::Review)?,
+        config.project_root,
+    ) {
         Ok(worker) => worker,
         Err(error) => {
             mark_task_failed_attempt_needs_user(
@@ -890,24 +1758,59 @@ fn run_review_task_with_coder(
                 config.work_item_id,
                 config.attempt_id,
                 config.task_id,
-                &classify_task_failure(&error),
+                &classify_reviewer_launch_failure(&error, &review_path),
                 &crate::notify::notify,
             )?;
             return Err(error);
         }
     };
 
+    let sandbox_profile = match preflight_review_sandbox_profile(
+        config.project_root,
+        config.work_item_id,
+        config.attempt_id,
+        &attempt_kind,
+        &workspace_reads,
+        &input_artifacts,
+        &artifact_dir,
+        reviewer_cache_dir.as_deref(),
+        config.resolver,
+        config.no_sandbox,
+        plan_coder_kind(&planned_item, config.attempt_id, TaskKind::Review)?,
+        provider_readiness.codex_worker(),
+    ) {
+        Ok(profile) => profile,
+        Err(error) => {
+            mark_task_failed_attempt_needs_user(
+                config.store,
+                config.project_root,
+                config.work_item_id,
+                config.attempt_id,
+                config.task_id,
+                &classify_reviewer_launch_failure(&error, &review_path),
+                &crate::notify::notify,
+            )?;
+            return Err(error);
+        }
+    };
+
+    let reviewer_coder = plan_coder_kind(&planned_item, config.attempt_id, TaskKind::Review)?;
+    // Preserve reviewer parallelism while the shared pool bounds actual provider
+    // use across Attempts, processes, and projects.
+    let _provider_lease = acquire_task_provider_capacity(&config, reviewer_coder, "Reviewer")?;
+
     // The preflight passed: reserve the start in one lock-held transaction. A peer
     // that took the Attempt terminal rejects the reservation here, leaving prior
     // review.md evidence untouched.
     let reservation = reserve_task_start(
+        config.project_root,
         config.store,
         config.work_item_id,
         config.attempt_id,
         config.task_id,
         TaskKind::Review,
         AttemptStatus::Reviewing,
-        plan_coder_kind(&planned_item, config.attempt_id, TaskKind::Review)?,
+        reviewer_coder,
     )?;
     // Every launch input derives from the reservation's fresh lock-held snapshot,
     // not the read-only plan used for the preflight.
@@ -932,6 +1835,9 @@ fn run_review_task_with_coder(
             fs::create_dir_all(&artifact_dir)?;
             if review_path.is_file() {
                 fs::remove_file(&review_path)?;
+            }
+            if review_inspection_path.is_file() {
+                fs::remove_file(&review_inspection_path)?;
             }
             let item = read_work_item_or_not_found(config.store, config.work_item_id)?;
             materialize_planning_files(&item, config.project_root)?;
@@ -973,14 +1879,27 @@ fn run_review_task_with_coder(
         }
     };
     let readable_workspace_paths = readable_workspaces.paths();
+    let candidate_workspace = workspace_reads
+        .iter()
+        .zip(readable_workspace_paths.iter())
+        .find(|(workspace, _)| workspace.id == review_context.candidate_workspace_id)
+        .map(|(_, path)| path.clone())
+        .expect("validated Review Task candidate workspace must resolve");
 
-    if let Some(candidate_path) = readable_workspace_paths.first() {
+    if let (Some(candidate_path), Some(cache_dir)) = (
+        readable_workspace_paths.first(),
+        reviewer_cache_dir.as_deref(),
+    ) {
         prepare_reviewer_build_cache(
+            config.project_root,
             candidate_path,
             &artifact_dir,
+            cache_dir,
             config.work_item_id,
             config.attempt_id,
             config.task_id,
+            cache_admission,
+            cache_reporter,
         );
     }
 
@@ -988,35 +1907,9 @@ fn run_review_task_with_coder(
     // retry loop, and thread the same immutable config into every attempt so a config
     // change between retries can never swap this role's capture mid-run.
     let pump_config = crate::transcript_pump::resolve_config(config.project_root);
-    let mut run_result = run_review_coder(
-        &item,
-        config.attempt_id,
-        config.task_id,
-        config.project_root,
-        &artifact_dir,
-        &review_path,
-        &readable_workspace_paths,
-        &input_artifacts,
-        attempt_kind.is_review_only_like(),
-        config.resolver,
-        config.extra_args,
-        reservation.coder,
-        config.no_sandbox,
-        reservation.model.as_deref(),
-        reservation.effort.as_deref(),
-        &pump_config,
-        codex_worker.as_ref(),
-        coder_override,
-    );
-    let mut retries = 0;
-    while should_retry_coder_error(&run_result) && retries < max_task_retries() {
-        retries += 1;
-        eprintln!(
-            "  Retrying coder (attempt {}/{})",
-            retries + 1,
-            max_task_retries() + 1
-        );
-        run_result = run_review_coder(
+    let transcript = artifact_dir.join("transcript.jsonl");
+    let mut run_result = provider_pause_error(
+        run_review_coder(
             &item,
             config.attempt_id,
             config.task_id,
@@ -1033,8 +1926,45 @@ fn run_review_task_with_coder(
             reservation.model.as_deref(),
             reservation.effort.as_deref(),
             &pump_config,
-            codex_worker.as_ref(),
+            provider_readiness.codex_worker(),
+            sandbox_profile.as_ref(),
             coder_override,
+        ),
+        reservation.coder,
+        Some(transcript.clone()),
+    );
+    let mut retries = 0;
+    while should_retry_coder_error(&run_result) && retries < max_task_retries() {
+        retries += 1;
+        eprintln!(
+            "  Retrying coder (attempt {}/{})",
+            retries + 1,
+            max_task_retries() + 1
+        );
+        run_result = provider_pause_error(
+            run_review_coder(
+                &item,
+                config.attempt_id,
+                config.task_id,
+                config.project_root,
+                &artifact_dir,
+                &review_path,
+                &readable_workspace_paths,
+                &input_artifacts,
+                attempt_kind.is_review_only_like(),
+                config.resolver,
+                config.extra_args,
+                reservation.coder,
+                config.no_sandbox,
+                reservation.model.as_deref(),
+                reservation.effort.as_deref(),
+                &pump_config,
+                provider_readiness.codex_worker(),
+                sandbox_profile.as_ref(),
+                coder_override,
+            ),
+            reservation.coder,
+            Some(transcript.clone()),
         );
     }
 
@@ -1043,13 +1973,56 @@ fn run_review_task_with_coder(
     // failure must never mask or erase a coder/pump failure, and no raw `?` after
     // the reservation may leave the Task Executing.
     let cleanup_result = readable_workspaces.finish();
-    finalize_review_outcome(
+    let outcome = finalize_review_outcome(
         &config,
         run_result,
         cleanup_result,
         &review_path,
+        &review_inspection_path,
+        &transcript,
+        &candidate_workspace,
+        &candidate_commit,
+        &role,
         &crate::notify::notify,
-    )
+    );
+    if let Err(error) = record_review_artifact_usage(&artifact_dir, cache_reporter) {
+        cache_reporter(&format!(
+            "  Review artifacts  {} accounting failed: {error:#}",
+            config.task_id
+        ));
+    }
+    outcome
+}
+
+fn record_review_artifact_usage(artifact_dir: &Path, reporter: &dyn Fn(&str)) -> Result<()> {
+    let usage_path = artifact_dir.join("artifact-usage.json");
+    if usage_path.is_file() {
+        fs::remove_file(&usage_path)?;
+    }
+    let artifact_bytes = prep::logical_bytes(artifact_dir)?;
+    let managed_cache_bytes = prep::managed_cache_bytes(artifact_dir)?;
+    let warning = if managed_cache_bytes > 0 {
+        Some(format!(
+            "review artifact contains {managed_cache_bytes} bytes of managed build cache"
+        ))
+    } else if artifact_bytes > REVIEW_ARTIFACT_WARN_BYTES {
+        Some(format!(
+            "review artifact exceeds {} bytes",
+            REVIEW_ARTIFACT_WARN_BYTES
+        ))
+    } else {
+        None
+    };
+    let usage = ReviewArtifactUsage {
+        artifact_bytes,
+        managed_cache_bytes,
+        warning,
+    };
+    crate::atomic_write::atomic_write(&usage_path, to_json_pretty(&usage)?.as_bytes())?;
+    if let Some(warning) = &usage.warning {
+        reporter(&format!("  Review artifacts  warning: {warning}"));
+    }
+    Ok(())
 }
 
 /// A terminal review failure that a supported resume can retry: an expired auth
@@ -1059,7 +2032,12 @@ fn run_review_task_with_coder(
 fn is_resumable_task_failure(error: &anyhow::Error) -> bool {
     matches!(
         classify_task_failure(error),
-        TaskFailure::Auth(_) | TaskFailure::TranscriptPump(_)
+        TaskFailure::Auth(_)
+            | TaskFailure::TranscriptPump(_)
+            | TaskFailure::HostSandbox(_)
+            | TaskFailure::TesterHarness
+            | TaskFailure::TesterNestedSwiftPmSandbox
+            | TaskFailure::ProviderUnavailable(_)
     )
 }
 
@@ -1104,6 +2082,11 @@ fn finalize_review_outcome(
     run_result: Result<()>,
     cleanup_result: Result<()>,
     review_path: &Path,
+    review_inspection_path: &Path,
+    transcript_path: &Path,
+    candidate_workspace: &Path,
+    candidate_commit: &str,
+    role: &str,
     notify_fn: &dyn Fn(&str, &str),
 ) -> Result<WorkTaskRunResult> {
     // A resumable typed primary (transcript-pump/auth) wins over a cleanup failure:
@@ -1167,7 +2150,7 @@ fn finalize_review_outcome(
     // A non-resumable coder error with a clean workspace pauses the Task for
     // needs-user handling.
     if let Err(error) = run_result {
-        let failure = classify_task_failure(&error);
+        let failure = classify_reviewer_launch_failure(&error, review_path);
         if let Err(state_error) = lock_mark_task_failed_attempt_needs_user(
             config.store,
             config.store_lock,
@@ -1208,7 +2191,25 @@ fn finalize_review_outcome(
     // Route every post-reservation completion failure — completion read/find and the
     // terminal write — through one durable terminal boundary. The completion helper
     // takes and releases the store lock itself, so terminalization never deadlocks.
-    match complete_review_task(config, review_path) {
+    let completion = (|| {
+        let review_source = fs::read_to_string(review_path)
+            .with_context(|| format!("reading Review Task report {}", review_path.display()))?;
+        let inspection_artifact =
+            if crate::review::extract_verdict(&review_source) == crate::review::Verdict::Pass {
+                crate::review_inspection::validate(
+                    review_inspection_path,
+                    candidate_workspace,
+                    transcript_path,
+                    candidate_commit,
+                    role,
+                )?;
+                Some(review_inspection_path)
+            } else {
+                None
+            };
+        complete_review_task(config, review_path, inspection_artifact)
+    })();
+    match completion {
         Ok(result) => Ok(result),
         Err(error) => {
             if let Err(state_error) = lock_mark_task_failed(
@@ -1233,71 +2234,63 @@ fn finalize_review_outcome(
 fn complete_review_task(
     config: &WorkTaskRunConfig<'_>,
     review_path: &Path,
+    review_inspection_path: Option<&Path>,
 ) -> Result<WorkTaskRunResult> {
     {
         let _lock = config
             .store_lock
             .map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
-        let mut completed_item = read_work_item_or_not_found(config.store, config.work_item_id)?;
-        let (attempt_index, task_index) =
-            find_attempt_task_indexes(&completed_item, config.attempt_id, config.task_id)
-                .ok_or_else(|| anyhow::anyhow!("Task {:?} not found", config.task_id))?;
-        crate::work_model::set_task_terminal(
-            &mut completed_item.attempts[attempt_index].tasks[task_index],
-            TaskStatus::Complete,
-        );
-        completed_item.attempts[attempt_index]
-            .artifacts
-            .push(ArtifactRef {
-                producer_id: config.task_id.to_string(),
-                path: path_for_model(config.project_root, review_path),
-            });
-        let all_complete = completed_item.attempts[attempt_index]
-            .tasks
-            .iter()
-            .all(|task| task.status == TaskStatus::Complete);
-        let next_status = if all_complete {
-            AttemptStatus::Complete
-        } else {
-            AttemptStatus::Reviewing
-        };
-        // Under the store lock, advance only through the precedence boundary so a
-        // reviewer finishing after a peer recorded a terminal pause/failure
-        // updates its own Task but never overwrites the terminal Attempt.
-        crate::work_model::transition_attempt(
-            &mut completed_item.attempts[attempt_index],
-            next_status,
-            None,
-        );
-        config.store.write_work_item(&completed_item)?;
+        let review_artifact = path_for_model(config.project_root, review_path);
+        let inspection_artifact =
+            review_inspection_path.map(|path| path_for_model(config.project_root, path));
+        mutate_task_work_item(config.store, config.work_item_id, |item| {
+            let (attempt_index, task_index) =
+                find_attempt_task_indexes(item, config.attempt_id, config.task_id).ok_or_else(
+                    || WorkModelError::TaskNotFound {
+                        id: config.task_id.to_string(),
+                    },
+                )?;
+            crate::work_model::set_task_terminal(
+                &mut item.attempts[attempt_index].tasks[task_index],
+                TaskStatus::Complete,
+            );
+            for path in std::iter::once(&review_artifact).chain(inspection_artifact.as_ref()) {
+                if !item.attempts[attempt_index]
+                    .artifacts
+                    .iter()
+                    .any(|artifact| {
+                        artifact.producer_id == config.task_id && artifact.path == *path
+                    })
+                {
+                    item.attempts[attempt_index].artifacts.push(ArtifactRef {
+                        producer_id: config.task_id.to_string(),
+                        path: path.clone(),
+                    });
+                }
+            }
+            let all_complete =
+                item.attempts[attempt_index].all_tasks_complete_or_approach_superseded();
+            let next_status = if all_complete {
+                AttemptStatus::Complete
+            } else {
+                AttemptStatus::Reviewing
+            };
+            // Advance only through the precedence boundary so a reviewer finishing
+            // after a peer recorded a terminal pause/failure updates its own Task
+            // but never overwrites the terminal Attempt.
+            crate::work_model::transition_attempt(
+                &mut item.attempts[attempt_index],
+                next_status,
+                None,
+            );
+            Ok(())
+        })?;
     }
 
     Ok(WorkTaskRunResult {
         task_id: config.task_id.to_string(),
         output: path_for_model(config.project_root, review_path),
     })
-}
-
-/// Paths the candidate changed since the Attempt's base commit.
-///
-/// `None` when the base is unrecorded or Git cannot answer, which runs every
-/// scoped command rather than silently narrowing the suite.
-fn candidate_changed_paths(workspace: &Path, base_commit: Option<&str>) -> Option<Vec<String>> {
-    let base = base_commit?;
-    let output = crate::git::run_stdout(
-        workspace,
-        &["diff", "--name-only", base, "HEAD"],
-        "listing the candidate's changed paths",
-    )
-    .ok()?;
-    Some(
-        output
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(str::to_string)
-            .collect(),
-    )
 }
 
 fn capture_baseline_tester(
@@ -1311,21 +2304,94 @@ fn capture_baseline_tester(
     let baseline_artifact = format!("{attempt_id}-baseline-tester");
     let artifact_rel = work_artifact_path(work_item_id, attempt_id, &baseline_artifact);
     let artifact_dir = project_root.join(&artifact_rel);
-    if let Err(e) = fs::create_dir_all(&artifact_dir) {
-        eprintln!("  Baseline tester: failed to create artifact dir: {e:#}");
-        return;
-    }
-    eprintln!("  Baseline tester   running on pre-write workspace");
-    // The baseline runs before the Writer, so nothing has changed yet and a
-    // change set would skip every scoped command. Passing none runs them all,
-    // which is what gives a scoped gate a baseline to be compared against.
-    if let Err(e) = crate::tester::run(candidate_workspace, &artifact_dir, no_sandbox, resolver, None)
-    {
-        eprintln!("  Baseline tester: run failed: {e:#}");
+    eprintln!("  Baseline tester   resolving pre-write evidence");
+    match crate::baseline_cache::capture(
+        project_root,
+        candidate_workspace,
+        &artifact_dir,
+        no_sandbox,
+        resolver,
+    ) {
+        Ok(crate::baseline_cache::CaptureDisposition::AttemptLocal) => {
+            eprintln!("  Baseline tester   captured Attempt-local evidence");
+        }
+        Ok(crate::baseline_cache::CaptureDisposition::Published { cache_key }) => {
+            eprintln!("  Baseline tester   published shared {}", &cache_key[..12]);
+        }
+        Ok(crate::baseline_cache::CaptureDisposition::Reused { cache_key }) => {
+            eprintln!("  Baseline tester   reused shared {}", &cache_key[..12]);
+        }
+        Ok(crate::baseline_cache::CaptureDisposition::ReusedLanded { cache_key }) => {
+            eprintln!("  Baseline tester   reused landed {}", &cache_key[..12]);
+        }
+        Err(e) => {
+            eprintln!("  Baseline tester: run failed: {e:#}");
+        }
     }
 }
 
+fn run_verification_task(config: WorkTaskRunConfig<'_>) -> Result<WorkTaskRunResult> {
+    let _lease = crate::lease::acquire(&crate::lease::task_lock_path(
+        config.project_root,
+        config.work_item_id,
+        config.task_id,
+    ))?;
+    let plan = plan_task_start(
+        config.store,
+        config.work_item_id,
+        config.attempt_id,
+        config.task_id,
+        TaskKind::Verification,
+        |task| crate::verification::validate_context(config.project_root, task, config.resolver),
+    )?;
+    let reservation = reserve_task_start_with_coder(
+        config.project_root,
+        config.store,
+        config.work_item_id,
+        config.attempt_id,
+        config.task_id,
+        TaskKind::Verification,
+        AttemptStatus::Reviewing,
+        None,
+    )?;
+    let result =
+        crate::verification::execute(config.project_root, &reservation.task, config.resolver);
+    mutate_task_work_item(config.store, config.work_item_id, |item| {
+        let (a, t) = find_attempt_task_indexes(item, config.attempt_id, config.task_id)
+            .ok_or_else(|| WorkModelError::TaskNotFound {
+                id: config.task_id.into(),
+            })?;
+        let task = &mut item.attempts[a].tasks[t];
+        if task.status == TaskStatus::Executing {
+            crate::work_model::set_task_terminal(
+                task,
+                if result.is_ok() {
+                    TaskStatus::Complete
+                } else {
+                    TaskStatus::NeedsUser
+                },
+            );
+        }
+        Ok(())
+    })?;
+    result?;
+    Ok(WorkTaskRunResult {
+        task_id: plan.task.id,
+        output: "verification receipt published".into(),
+    })
+}
+
 fn run_tester_task(config: WorkTaskRunConfig<'_>) -> Result<WorkTaskRunResult> {
+    run_tester_task_with_settlement_preparer(config, crate::tester::prepare_settlement_directories)
+}
+
+fn run_tester_task_with_settlement_preparer(
+    config: WorkTaskRunConfig<'_>,
+    prepare_settlement: impl FnOnce(
+        &Path,
+        &crate::tester::TesterPlan,
+    ) -> Result<crate::tester::TesterSettlement>,
+) -> Result<WorkTaskRunResult> {
     let lock_path =
         crate::lease::task_lock_path(config.project_root, config.work_item_id, config.task_id);
     let _lease = crate::lease::acquire(&lock_path)
@@ -1361,10 +2427,50 @@ fn run_tester_task(config: WorkTaskRunConfig<'_>) -> Result<WorkTaskRunResult> {
     // Read-only preflight: resolve the artifact area WITHOUT creating it, so a bad
     // path fails byte-identically before the reservation.
     let artifact_dir = resolve_managed_artifact_area_path(config.project_root, &artifact_area)?;
+    let review_context = plan.task.review_context.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Tester Task {:?} must declare review context",
+            config.task_id
+        )
+    })?;
+    let candidate_workspace = resolve_workspace_path(
+        config.project_root,
+        &review_context.candidate_workspace_path,
+    );
+    let candidate_guard = TesterCandidateGuard::begin(
+        candidate_workspace.clone(),
+        &review_context.candidate_commit,
+    )?;
+    // Parse the Tester configuration without creating a settlement directory.
+    // The immutable plan crosses the reservation boundary so the later sandbox
+    // grants exactly the paths authorized for this Task start.
+    let recheck = plan_failed_command_recheck(
+        config.project_root,
+        config.store,
+        config.work_item_id,
+        config.attempt_id,
+        &plan.task,
+        review_context,
+        &candidate_workspace,
+    )?;
+    let tester_plan = match &recheck {
+        Some(recheck) => recheck.plan.clone(),
+        None => crate::tester::plan(&candidate_workspace)?,
+    };
+    // Use the rebuildable dependency boundary shared by Writer rounds and the
+    // final Tester. Resolve the exact Attempt path before reservation;
+    // preparation happens below only after the Task has durably reserved
+    // permission to launch.
+    let tester_cache = crate::writer_cache::preflight_writer_dependency_cache(
+        config.project_root,
+        config.work_item_id,
+        config.attempt_id,
+    )?;
 
     // The preflight passed: reserve the start in one lock-held transaction. A peer
     // that took the Attempt terminal rejects the reservation here.
     let reservation = reserve_task_start(
+        config.project_root,
         config.store,
         config.work_item_id,
         config.attempt_id,
@@ -1378,9 +2484,10 @@ fn run_tester_task(config: WorkTaskRunConfig<'_>) -> Result<WorkTaskRunResult> {
         )?,
     )?;
 
-    // Side-effectful setup after the reservation: create the artifact directory. A
-    // failure CAS-reverts the reservation.
-    with_reservation_rollback(
+    // Create and canonicalize every guarded settlement directory only after the
+    // durable reservation succeeds. A filesystem setup failure CAS-reverts the
+    // reservation so this Task remains recoverable.
+    let tester_settlement = match with_reservation_rollback(
         config.store,
         config.work_item_id,
         config.attempt_id,
@@ -1388,9 +2495,64 @@ fn run_tester_task(config: WorkTaskRunConfig<'_>) -> Result<WorkTaskRunResult> {
         &reservation.receipt,
         || {
             fs::create_dir_all(&artifact_dir)?;
-            Ok(())
+            let settlement = prepare_settlement(&artifact_dir, &tester_plan)?;
+            crate::writer_cache::prepare_writer_dependency_cache_for_launch(
+                &tester_cache,
+                config.store,
+                crate::writer_cache::canonical_cargo_home_from_env().as_deref(),
+            )?;
+            if let Some(recheck) = &recheck {
+                let manifest = crate::tester::FailedCommandRecheckManifest {
+                    schema_version: crate::tester::FAILED_COMMAND_RECHECK_SCHEMA_VERSION,
+                    candidate_commit: review_context.candidate_commit.clone(),
+                    source_results: recheck.source_results.clone(),
+                    failed_command_indexes: recheck.failed_command_indexes.clone(),
+                };
+                let bytes = serde_json::to_vec_pretty(&manifest)?;
+                crate::atomic_write::atomic_write(
+                    &artifact_dir.join("failed-command-recheck.json"),
+                    &bytes,
+                )?;
+            }
+            Ok(settlement)
         },
-    )?;
+    ) {
+        Ok(settlement) => settlement,
+        Err(error) => {
+            if error.downcast_ref::<ReservationRollbackFailure>().is_some() {
+                if let Err(finalize_error) = lock_mark_task_failed(
+                    config.store,
+                    config.store_lock,
+                    config.work_item_id,
+                    config.attempt_id,
+                    config.task_id,
+                ) {
+                    return Err(error.context(finalize_error).context(
+                        "durably failing Tester Task after its reservation rollback failed",
+                    ));
+                }
+            }
+            return Err(error);
+        }
+    };
+
+    // A sandbox render or host preflight failure is a recoverable Tester harness
+    // failure after reservation: do not launch a command or fall back to an
+    // unsandboxed boundary.
+    let tester_sandbox = match crate::tester::render_sandbox_profile_with_cache(
+        &candidate_workspace,
+        &artifact_dir,
+        config.no_sandbox,
+        config.resolver,
+        tester_settlement,
+        Some(&tester_cache),
+    ) {
+        Ok(sandbox) => sandbox,
+        Err(error) => {
+            settle_tester_harness_failure(&config, TesterHarnessFailureKind::Environment)?;
+            return Err(error);
+        }
+    };
 
     let item = read_work_item_or_not_found(config.store, config.work_item_id)?;
     let (attempt_index, task_index) =
@@ -1404,11 +2566,6 @@ fn run_tester_task(config: WorkTaskRunConfig<'_>) -> Result<WorkTaskRunResult> {
         )
     })?;
 
-    let candidate_workspace = resolve_workspace_path(
-        config.project_root,
-        &review_context.candidate_workspace_path,
-    );
-
     eprintln!("  Fluent           work task run");
     eprintln!("  Work Item         {}", item.id);
     eprintln!("  Attempt           {}", config.attempt_id);
@@ -1418,16 +2575,8 @@ fn run_tester_task(config: WorkTaskRunConfig<'_>) -> Result<WorkTaskRunResult> {
 
     let results_path = artifact_dir.join("tester-results.json");
 
-    let changed_paths =
-        candidate_changed_paths(&candidate_workspace, review_context.base_commit.as_deref());
-
-    let mut tester_result = crate::tester::run(
-        &candidate_workspace,
-        &artifact_dir,
-        config.no_sandbox,
-        config.resolver,
-        changed_paths.as_deref(),
-    );
+    let mut tester_result =
+        run_tester_with_candidate_guard(&candidate_guard, &artifact_dir, &tester_sandbox);
     let mut retries = 0;
     while tester_result.is_err() && retries < max_task_retries() {
         retries += 1;
@@ -1436,41 +2585,53 @@ fn run_tester_task(config: WorkTaskRunConfig<'_>) -> Result<WorkTaskRunResult> {
             retries + 1,
             max_task_retries() + 1
         );
-        tester_result = crate::tester::run(
-            &candidate_workspace,
-            &artifact_dir,
-            config.no_sandbox,
-            config.resolver,
-            changed_paths.as_deref(),
-        );
+        tester_result =
+            run_tester_with_candidate_guard(&candidate_guard, &artifact_dir, &tester_sandbox);
     }
 
     match tester_result {
-        Ok(()) => {}
+        Ok(crate::tester::TesterOutcome::Passed | crate::tester::TesterOutcome::TestFailures) => {}
+        Ok(crate::tester::TesterOutcome::HarnessError) => {
+            let error = anyhow::anyhow!("Tester harness could not produce trustworthy evidence");
+            let nested_swiftpm = crate::tester::is_nested_swiftpm_harness_error(&artifact_dir);
+            let project_repair =
+                crate::tester::harness_error_requires_project_repair(&artifact_dir);
+            let failure_kind = if nested_swiftpm {
+                TesterHarnessFailureKind::NestedSwiftPm
+            } else if project_repair {
+                TesterHarnessFailureKind::ProjectRepair
+            } else {
+                TesterHarnessFailureKind::Environment
+            };
+            settle_tester_harness_failure(&config, failure_kind)?;
+            return Err(error);
+        }
         Err(error) => {
             eprintln!("  Tester error: {error:#}");
-            lock_mark_task_failed_attempt_needs_user(
-                config.store,
-                config.store_lock,
-                config.project_root,
-                config.work_item_id,
-                config.attempt_id,
-                config.task_id,
-                &TaskFailure::Generic,
-                &crate::notify::notify,
-            )?;
+            settle_tester_harness_failure(&config, TesterHarnessFailureKind::Environment)?;
             return Err(error);
         }
     }
 
+    if let Err(error) =
+        crate::tester::bind_candidate_commit(&artifact_dir, &review_context.candidate_commit)
+    {
+        settle_tester_harness_failure(&config, TesterHarnessFailureKind::Environment)?;
+        return Err(error);
+    }
+
+    if recheck.is_none() {
+        if let Err(error) = crate::baseline_cache::record_final_tester_seed(
+            &candidate_workspace,
+            &artifact_dir,
+            config.no_sandbox,
+        ) {
+            eprintln!("  Warning: final Tester baseline seed was not recorded: {error:#}");
+        }
+    }
+
     if !results_path.is_file() {
-        lock_mark_task_failed(
-            config.store,
-            config.store_lock,
-            config.work_item_id,
-            config.attempt_id,
-            config.task_id,
-        )?;
+        settle_tester_harness_failure(&config, TesterHarnessFailureKind::Environment)?;
         bail!(
             "Tester Task {:?} completed without writing {}",
             config.task_id,
@@ -1484,16 +2645,341 @@ fn run_tester_task(config: WorkTaskRunConfig<'_>) -> Result<WorkTaskRunResult> {
     match complete_tester_task(&config, &results_path) {
         Ok(result) => Ok(result),
         Err(error) => {
-            lock_mark_task_failed(
-                config.store,
-                config.store_lock,
-                config.work_item_id,
-                config.attempt_id,
-                config.task_id,
-            )?;
+            settle_tester_harness_failure(&config, TesterHarnessFailureKind::Environment)?;
             Err(error)
         }
     }
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct TesterCandidateMutationEvidence {
+    schema_version: u32,
+    candidate_commit: String,
+    tracked_status: Vec<String>,
+    restored: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct TesterCandidateGuard {
+    path: PathBuf,
+    candidate_commit: String,
+}
+
+impl TesterCandidateGuard {
+    pub(crate) fn begin(path: PathBuf, candidate_commit: &str) -> Result<Self> {
+        ensure_tester_candidate_head(&path, candidate_commit)?;
+        ensure_tester_candidate_tracked_clean(&path)?;
+        Ok(Self {
+            path,
+            candidate_commit: candidate_commit.to_string(),
+        })
+    }
+
+    fn prepare_run(&self) -> Result<()> {
+        ensure_tester_candidate_head(&self.path, &self.candidate_commit)?;
+        ensure_tester_candidate_tracked_clean(&self.path)
+    }
+
+    fn restore_after_run(&self, artifact_dir: &Path) -> Result<()> {
+        ensure_tester_candidate_head(&self.path, &self.candidate_commit)?;
+        let tracked_status = tester_candidate_tracked_status(&self.path)?;
+        if tracked_status.is_empty() {
+            return Ok(());
+        }
+
+        let evidence_path = artifact_dir.join(TESTER_CANDIDATE_MUTATION_FILE);
+        let initial_evidence_error = write_tester_candidate_mutation_evidence(
+            &evidence_path,
+            &TesterCandidateMutationEvidence {
+                schema_version: TESTER_CANDIDATE_MUTATION_SCHEMA_VERSION,
+                candidate_commit: self.candidate_commit.clone(),
+                tracked_status: tracked_status.clone(),
+                restored: false,
+            },
+        )
+        .err();
+
+        let restore = git::run_raw(
+            &self.path,
+            &["restore", "--staged", "--worktree", "--", "."],
+        )?;
+        if !restore.status.success() {
+            let error = anyhow::anyhow!(
+                "Failed to restore tracked candidate changes created during Tester execution: {}",
+                String::from_utf8_lossy(&restore.stderr)
+            );
+            return match initial_evidence_error {
+                Some(evidence_error) => Err(error.context(format!(
+                    "Failed to persist Tester candidate-mutation diagnostic: {evidence_error:#}"
+                ))),
+                None => Err(error),
+            };
+        }
+        ensure_tester_candidate_head(&self.path, &self.candidate_commit)?;
+        let remaining = tester_candidate_tracked_status(&self.path)?;
+        if !remaining.is_empty() {
+            bail!(
+                "Tester candidate still has tracked changes after restoration:\n{}",
+                remaining.join("\n")
+            );
+        }
+
+        write_tester_candidate_mutation_evidence(
+            &evidence_path,
+            &TesterCandidateMutationEvidence {
+                schema_version: TESTER_CANDIDATE_MUTATION_SCHEMA_VERSION,
+                candidate_commit: self.candidate_commit.clone(),
+                tracked_status,
+                restored: true,
+            },
+        )
+    }
+}
+
+pub(crate) fn run_tester_with_candidate_guard(
+    guard: &TesterCandidateGuard,
+    artifact_dir: &Path,
+    sandbox: &crate::tester::TesterSandbox,
+) -> Result<crate::tester::TesterOutcome> {
+    guard.prepare_run()?;
+    let tester_result = crate::tester::run_with_sandbox_profile(&guard.path, artifact_dir, sandbox);
+    let restore_result = guard.restore_after_run(artifact_dir);
+    match (tester_result, restore_result) {
+        (Ok(outcome), Ok(())) => Ok(outcome),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(restore_error)) => Err(restore_error),
+        (Err(run_error), Err(restore_error)) => Err(restore_error.context(format!(
+            "Tester execution also failed before candidate restoration: {run_error:#}"
+        ))),
+    }
+}
+
+fn tester_candidate_tracked_status(workspace_path: &Path) -> Result<Vec<String>> {
+    let output = git_status_output(workspace_path, &["--porcelain", "--untracked-files=no"])?;
+    if !output.status.success() {
+        bail!(
+            "Failed to read Tester candidate tracked status: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect())
+}
+
+fn ensure_tester_candidate_tracked_clean(workspace_path: &Path) -> Result<()> {
+    let status = tester_candidate_tracked_status(workspace_path)?;
+    if status.is_empty() {
+        Ok(())
+    } else {
+        bail!(
+            "Tester candidate has tracked changes before execution; refusing to overwrite them:\n{}",
+            status.join("\n")
+        )
+    }
+}
+
+fn ensure_tester_candidate_head(workspace_path: &Path, expected: &str) -> Result<()> {
+    let actual = head_commit(workspace_path)?;
+    if actual == expected {
+        Ok(())
+    } else {
+        bail!(
+            "Tester candidate HEAD changed from expected commit {expected} to {actual}; refusing restoration"
+        )
+    }
+}
+
+fn write_tester_candidate_mutation_evidence(
+    path: &Path,
+    evidence: &TesterCandidateMutationEvidence,
+) -> Result<()> {
+    crate::atomic_write::atomic_write(path, &serde_json::to_vec_pretty(evidence)?)?;
+    Ok(())
+}
+
+pub(crate) fn recover_completed_tester_candidate_mutation(
+    workspace_path: &Path,
+    artifact_dir: &Path,
+    candidate_commit: &str,
+    expected_tracked_status: &[String],
+) -> Result<()> {
+    ensure_tester_candidate_head(workspace_path, candidate_commit)?;
+    let current_status = tester_candidate_tracked_status(workspace_path)?;
+    let normalized_current = current_status.join("\n").trim().to_string();
+    let normalized_expected = expected_tracked_status.join("\n").trim().to_string();
+    if normalized_current != normalized_expected {
+        bail!(
+            "candidate tracked state changed after the final-Tester gate; refusing recovery:\nexpected:\n{}\ncurrent:\n{}",
+            expected_tracked_status.join("\n"),
+            current_status.join("\n")
+        );
+    }
+    if current_status.is_empty() {
+        return Ok(());
+    }
+    TesterCandidateGuard {
+        path: workspace_path.to_path_buf(),
+        candidate_commit: candidate_commit.to_string(),
+    }
+    .restore_after_run(artifact_dir)
+}
+
+struct FailedCommandRecheckPlan {
+    plan: crate::tester::TesterPlan,
+    source_results: String,
+    failed_command_indexes: Vec<usize>,
+}
+
+fn plan_failed_command_recheck(
+    project_root: &Path,
+    store: &WorkModelStore,
+    work_item_id: &str,
+    attempt_id: &str,
+    task: &Task,
+    review_context: &crate::work_model::ReviewContext,
+    candidate_workspace: &Path,
+) -> Result<Option<FailedCommandRecheckPlan>> {
+    if !task.is_failed_command_recheck() {
+        return Ok(None);
+    }
+    let [source] = task.input_artifacts.as_slice() else {
+        bail!(
+            "failed-command recheck Task {:?} must attach exactly one source Tester result",
+            task.id
+        );
+    };
+    if task.depends_on.as_deref() != Some(source.producer_id.as_str())
+        || !source.path.ends_with("/tester-results.json")
+    {
+        bail!(
+            "failed-command recheck Task {:?} is not bound to its source Tester result",
+            task.id
+        );
+    }
+    let item = read_work_item_or_not_found(store, work_item_id)?;
+    let attempt = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == attempt_id)
+        .ok_or_else(|| anyhow::anyhow!("Attempt {attempt_id:?} not found"))?;
+    let source_task = attempt
+        .tasks
+        .iter()
+        .find(|candidate| candidate.id == source.producer_id)
+        .filter(|candidate| {
+            candidate.kind == TaskKind::Tester && candidate.status == TaskStatus::Complete
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "failed-command recheck Task {:?} has no completed source Tester {:?}",
+                task.id,
+                source.producer_id
+            )
+        })?;
+    let expected_source = source_task
+        .artifact_area
+        .as_ref()
+        .map(|area| format!("{}/tester-results.json", area.path));
+    let source_candidate = source_task
+        .review_context
+        .as_ref()
+        .map(|context| context.candidate_commit.as_str());
+    if expected_source.as_deref() != Some(source.path.as_str())
+        || source_candidate != Some(review_context.candidate_commit.as_str())
+    {
+        bail!(
+            "failed-command recheck Task {:?} source Tester context does not match its candidate and result",
+            task.id
+        );
+    }
+    let source_path = resolve_input_artifact_path(project_root, &source.path)?;
+    let bytes = fs::read(&source_path).with_context(|| {
+        format!(
+            "read failed-command recheck source {}",
+            source_path.display()
+        )
+    })?;
+    let results: crate::tester::TesterResults =
+        serde_json::from_slice(&bytes).with_context(|| {
+            format!(
+                "parse failed-command recheck source {}",
+                source_path.display()
+            )
+        })?;
+    if results.candidate_commit.as_deref() != Some(review_context.candidate_commit.as_str()) {
+        bail!(
+            "failed-command recheck source is not bound to candidate {}",
+            review_context.candidate_commit
+        );
+    }
+    let (plan, failed_command_indexes) = if source_task.is_failed_command_recheck() {
+        crate::tester::plan_chained_failed_commands(candidate_workspace, &results)?
+    } else {
+        crate::tester::plan_failed_commands(candidate_workspace, &results)?
+    };
+    Ok(Some(FailedCommandRecheckPlan {
+        plan,
+        source_results: source.path.clone(),
+        failed_command_indexes,
+    }))
+}
+
+/// Settle an unlaunched or failed Tester through the recoverable pause boundary.
+/// If that persistence fails, record a hard Task failure so this reservation is
+/// never left executing.
+#[derive(Clone, Copy)]
+enum TesterHarnessFailureKind {
+    Environment,
+    ProjectRepair,
+    NestedSwiftPm,
+}
+
+fn settle_tester_harness_failure(
+    config: &WorkTaskRunConfig<'_>,
+    failure_kind: TesterHarnessFailureKind,
+) -> Result<()> {
+    settle_tester_harness_failure_with_notify(config, failure_kind, &crate::notify::notify)
+}
+
+fn settle_tester_harness_failure_with_notify(
+    config: &WorkTaskRunConfig<'_>,
+    failure_kind: TesterHarnessFailureKind,
+    notify_fn: &dyn Fn(&str, &str),
+) -> Result<()> {
+    let failure = match failure_kind {
+        TesterHarnessFailureKind::Environment => TaskFailure::TesterHarness,
+        TesterHarnessFailureKind::ProjectRepair => TaskFailure::TesterProjectHarness,
+        TesterHarnessFailureKind::NestedSwiftPm => TaskFailure::TesterNestedSwiftPmSandbox,
+    };
+    if let Err(pause_error) = lock_mark_task_failed_attempt_needs_user(
+        config.store,
+        config.store_lock,
+        config.project_root,
+        config.work_item_id,
+        config.attempt_id,
+        config.task_id,
+        &failure,
+        notify_fn,
+    ) {
+        if pause_error
+            .downcast_ref::<CurrentHandoffPublicationError>()
+            .is_some()
+        {
+            return Err(pause_error).context("publishing Tester harness recovery");
+        }
+        lock_mark_task_failed(
+            config.store,
+            config.store_lock,
+            config.work_item_id,
+            config.attempt_id,
+            config.task_id,
+        )
+        .context("durably failing Tester Task after its recoverable pause failed")?;
+        return Err(pause_error).context("pausing Tester Task for harness recovery");
+    }
+    Ok(())
 }
 
 /// Persist a Tester Task's successful completion under the store lock, returning
@@ -1520,10 +3006,8 @@ fn complete_tester_task(
                 producer_id: config.task_id.to_string(),
                 path: path_for_model(config.project_root, results_path),
             });
-        let all_complete = completed_item.attempts[attempt_index]
-            .tasks
-            .iter()
-            .all(|task| task.status == TaskStatus::Complete);
+        let all_complete =
+            completed_item.attempts[attempt_index].all_tasks_complete_or_approach_superseded();
         let next_status = if all_complete {
             AttemptStatus::Complete
         } else {
@@ -1536,7 +3020,7 @@ fn complete_tester_task(
             next_status,
             None,
         );
-        config.store.write_work_item(&completed_item)?;
+        write_task_work_item(config.store, &completed_item)?;
     }
 
     Ok(WorkTaskRunResult {
@@ -1748,26 +3232,51 @@ fn mark_task_failed(
     work_item_id: &str,
     attempt_id: &str,
     task_id: &str,
+    defer_parallel_review_outcome: bool,
 ) -> Result<()> {
-    let mut item = read_work_item_or_not_found(store, work_item_id)?;
-    if let Some((attempt_index, task_index)) = find_attempt_task_indexes(&item, attempt_id, task_id)
-    {
+    mutate_task_work_item(store, work_item_id, |item| {
+        let Some((attempt_index, task_index)) =
+            find_attempt_task_indexes(item, attempt_id, task_id)
+        else {
+            return Ok(());
+        };
+        let task_kind = item.attempts[attempt_index].tasks[task_index].kind;
         crate::work_model::set_task_terminal(
             &mut item.attempts[attempt_index].tasks[task_index],
             TaskStatus::Failed,
         );
-        crate::work_model::set_attempt_terminal(
-            &mut item.attempts[attempt_index],
-            AttemptStatus::Failed,
-        );
-        store.write_work_item(&item)?;
-    }
+        let parallel_review_peer_is_open = defer_parallel_review_outcome
+            && task_kind == TaskKind::Review
+            && item.attempts[attempt_index]
+                .tasks
+                .iter()
+                .enumerate()
+                .any(|(index, task)| {
+                    index != task_index
+                        && task.kind == TaskKind::Review
+                        && task.status == TaskStatus::Executing
+                        && task.review_context
+                            == item.attempts[attempt_index].tasks[task_index].review_context
+                });
+        if !parallel_review_peer_is_open {
+            crate::work_model::set_attempt_terminal(
+                &mut item.attempts[attempt_index],
+                AttemptStatus::Failed,
+            );
+        }
+        Ok(())
+    })?;
     Ok(())
 }
 
 fn is_auth_error(result: &Result<()>) -> bool {
     result.as_ref().err().map_or(false, |e| {
-        e.is::<crate::claude_auth::AuthError>() || e.is::<crate::codex_worker::CodexAuthError>()
+        e.is::<crate::claude_auth::AuthError>()
+            || e.is::<crate::codex_worker::CodexAuthError>()
+            || e.downcast_ref::<crate::provider_readiness::ProviderReadinessError>()
+                .is_some_and(
+                    crate::provider_readiness::ProviderReadinessError::is_authentication_error,
+                )
     })
 }
 
@@ -1790,15 +3299,101 @@ fn is_supervision_sidecar_error(result: &Result<()>) -> bool {
         .map_or(false, |e| e.is::<crate::coder::SupervisionSidecarError>())
 }
 
+fn is_host_sandbox_preflight_error(result: &Result<()>) -> bool {
+    result.as_ref().err().is_some_and(|e| {
+        e.is::<crate::os::HostSandboxPreflightError>()
+            || e.is::<crate::os::HostSandboxLaunchError>()
+    })
+}
+
+/// Wait for one shared provider slot while the Task remains eligible to start.
+/// The caller holds the returned lease across the complete logical role run.
+fn acquire_task_provider_capacity(
+    config: &WorkTaskRunConfig<'_>,
+    coder: CoderKind,
+    role: &str,
+) -> Result<crate::provider_admission::ProviderLease> {
+    let provider = crate::provider_admission::provider_name(coder);
+    let limits = crate::config::resolve_provider_admission_config(config.project_root, provider)
+        .map_err(anyhow::Error::new)?;
+    let user_root = crate::provider_admission::effective_user_root(config.project_root)
+        .context("resolve user Fluent directory for provider capacity")?;
+    let mut reported_wait = false;
+    loop {
+        let item = read_work_item_or_not_found(config.store, config.work_item_id)?;
+        let still_planned = find_attempt_task_indexes(&item, config.attempt_id, config.task_id)
+            .is_some_and(|(attempt_index, task_index)| {
+                item.attempts[attempt_index].tasks[task_index].status == TaskStatus::Planned
+            });
+        if !still_planned {
+            return Err(anyhow::Error::new(StartRejected::new(
+                config.attempt_id,
+                config.task_id,
+            )));
+        }
+        match crate::provider_admission::try_acquire(
+            &user_root,
+            config.project_root,
+            provider,
+            limits.shared_concurrency.value,
+            limits.project_concurrency.value,
+        )? {
+            crate::provider_admission::AdmissionAttempt::Acquired(lease) => {
+                if reported_wait {
+                    eprintln!("  {role} resumed with available {provider} capacity.");
+                }
+                return Ok(lease);
+            }
+            crate::provider_admission::AdmissionAttempt::Contended => {
+                if !reported_wait {
+                    reported_wait = true;
+                    eprintln!("  {role} waiting for {provider} provider capacity.");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+    }
+}
+
 /// Whether a failed coder run should be retried through the generic retry
 /// budget. Auth failures, transcript-pump infrastructure failures, and
 /// supervision-sidecar failures are terminal for the Task and must not spawn another
-/// coder.
+/// coder. The coder layer exclusively owns rate-limit retries, so its typed
+/// exhaustion result also bypasses this outer budget.
 fn should_retry_coder_error(result: &Result<()>) -> bool {
     result.is_err()
         && !is_auth_error(result)
         && !is_transcript_pump_error(result)
         && !is_supervision_sidecar_error(result)
+        && !is_host_sandbox_preflight_error(result)
+        && !result.as_ref().err().is_some_and(|error| {
+            error
+                .downcast_ref::<crate::provider_readiness::ProviderReadinessError>()
+                .is_some_and(|readiness| readiness.claude_failure().is_some())
+        })
+        && !result
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.is::<crate::coder::RateLimitExhaustedError>())
+        && !result
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.is::<crate::coder::ClaudeNoProgressExhaustedError>())
+        && !result.as_ref().err().is_some_and(|error| {
+            error.is::<crate::coder::ClaudeNoProgressCleanupUnconfirmedError>()
+        })
+        && !result.as_ref().err().is_some_and(|error| {
+            error.is::<crate::coder::CodexResponseLivenessExhaustedError>()
+                || error.is::<crate::coder::CodexResponseCleanupUnconfirmedError>()
+        })
+        && !result
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.is::<crate::provider_evidence::ProviderUnavailableError>())
+        && !result
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.is::<crate::coder::ProviderArgumentError>())
 }
 
 /// How a Task's terminal failure should be recorded in durable Attempt state and
@@ -1813,21 +3408,179 @@ enum TaskFailure {
     /// failure is not retried in-process; a supported resume retries after the
     /// operator fixes the transport.
     TranscriptPump(String),
+    /// The enclosing host sandbox rejected Fluent's production profile, or a
+    /// provider runtime could not initialize inside that exact boundary.
+    HostSandbox(String),
+    /// Tester sandbox, environment, extraction, or result persistence failed
+    /// without evidence that proves a tracked repair is required.
+    TesterHarness,
+    /// Persisted Tester evidence identifies a tracked extractor or normalized
+    /// result defect that must return through an audited repair Writer.
+    TesterProjectHarness,
+    /// Xcode's embedded SwiftPM could not create its manifest sandbox inside
+    /// Fluent's outer Tester sandbox. An explicit one-dispatch approval may
+    /// retry the same Tester Task without the outer sandbox.
+    TesterNestedSwiftPmSandbox,
+    /// The Writer returned without a commit and its required no-change evidence
+    /// was missing or malformed. Resume retries the same Writer Task after the
+    /// operator inspects the completion failure.
+    WriterCompletion(String),
+    ProviderUnavailable(String),
+    /// The provider rejected pass-through CLI arguments before producing work.
+    ProviderArguments(String),
     /// Any other persistent failure (generic coder error at the retry cap, a
     /// tester error, and the like).
     Generic,
 }
 
+#[derive(Debug)]
+struct CurrentHandoffPublicationError(String);
+
+impl std::fmt::Display for CurrentHandoffPublicationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CurrentHandoffPublicationError {}
+
 /// Classify a terminal coder error for durable persistence and resume.
 fn classify_task_failure(error: &anyhow::Error) -> TaskFailure {
-    if let Some(auth) = error.downcast_ref::<crate::claude_auth::AuthError>() {
-        TaskFailure::Auth(auth.user_message())
+    if error.is::<crate::coder::ClaudeNoProgressCleanupUnconfirmedError>() {
+        TaskFailure::ProviderUnavailable(format!(
+            "{}. Inspect the provider cleanup evidence, then run 'fluent attempt run' to retry this same Task in the same Attempt.",
+            error
+        ))
+    } else if error.is::<crate::coder::ClaudeNoProgressExhaustedError>() {
+        TaskFailure::ProviderUnavailable(format!(
+            "{}. Run 'fluent attempt run' to retry this same Task in the same Attempt.",
+            error
+        ))
+    } else if error.is::<crate::coder::CodexResponseCleanupUnconfirmedError>() {
+        TaskFailure::ProviderUnavailable(format!(
+            "{}. Inspect the provider cleanup evidence, then run 'fluent attempt run' to retry this same Task in the same Attempt.",
+            error
+        ))
+    } else if error.is::<crate::coder::CodexResponseLivenessExhaustedError>() {
+        TaskFailure::ProviderUnavailable(format!(
+            "{}. Run 'fluent attempt run' to retry this same Task in the same Attempt.",
+            error
+        ))
+    } else if error.is::<crate::provider_evidence::ProviderUnavailableError>() {
+        TaskFailure::ProviderUnavailable(format!(
+            "{}. Run 'fluent attempt run' to resume the same Task.",
+            error
+        ))
+    } else if let Some(auth) = error.downcast_ref::<crate::claude_auth::AuthError>() {
+        match auth.probe_failure() {
+            Some(failure) if failure.is_host_boundary() => {
+                TaskFailure::HostSandbox(failure.summary("credential refresh"))
+            }
+            _ if auth.is_authentication_error() => TaskFailure::Auth(auth.user_message()),
+            _ => TaskFailure::ProviderUnavailable(auth.user_message()),
+        }
     } else if let Some(auth) = error.downcast_ref::<crate::codex_worker::CodexAuthError>() {
         TaskFailure::Auth(auth.to_string())
+    } else if let Some(readiness) =
+        error.downcast_ref::<crate::provider_readiness::ProviderReadinessError>()
+    {
+        if let Some(failure) = readiness.claude_failure() {
+            if failure.is_authentication() {
+                TaskFailure::Auth(failure.task_user_message("readiness"))
+            } else if failure.is_host_boundary() {
+                TaskFailure::HostSandbox(failure.summary("readiness"))
+            } else {
+                TaskFailure::ProviderUnavailable(failure.task_user_message("readiness"))
+            }
+        } else if readiness.is_authentication_error() {
+            TaskFailure::Auth(readiness.to_string())
+        } else {
+            TaskFailure::Generic
+        }
     } else if let Some(pump) = error.downcast_ref::<crate::transcript_pump::TranscriptPumpError>() {
         TaskFailure::TranscriptPump(pump.message().to_string())
+    } else if let Some(host) = error.downcast_ref::<crate::os::HostSandboxPreflightError>() {
+        TaskFailure::HostSandbox(host.message().to_string())
+    } else if let Some(host) = error.downcast_ref::<crate::os::HostSandboxLaunchError>() {
+        TaskFailure::HostSandbox(host.message().to_string())
     } else {
         TaskFailure::Generic
+    }
+}
+
+/// Treat invalid pass-through arguments as recoverable only before a Reviewer
+/// has produced its review artifact. Writer and post-artifact Reviewer errors
+/// remain ordinary failures because they are outside the launch frontier.
+fn classify_reviewer_launch_failure(error: &anyhow::Error, review_path: &Path) -> TaskFailure {
+    if !review_path.exists()
+        && let Some(provider) = error.downcast_ref::<crate::coder::ProviderArgumentError>()
+    {
+        TaskFailure::ProviderArguments(format!(
+            "{provider}. Remove or correct the pass-through provider arguments, then run 'fluent attempt run' to retry the same Task."
+        ))
+    } else {
+        classify_task_failure(error)
+    }
+}
+
+fn provider_pause_error(
+    result: Result<()>,
+    coder: CoderKind,
+    transcript: Option<std::path::PathBuf>,
+) -> Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            // Infrastructure errors already carry the authoritative typed
+            // failure. Their transcript may contain evidence from an earlier
+            // provider phase, but that evidence must not replace the later
+            // transport, supervision, or host-boundary failure.
+            if error.is::<crate::transcript_pump::TranscriptPumpError>()
+                || error.is::<crate::coder::SupervisionSidecarError>()
+                || error.is::<crate::os::HostSandboxPreflightError>()
+                || error.is::<crate::os::HostSandboxLaunchError>()
+                || error.is::<crate::claude_auth::AuthError>()
+                || error.is::<crate::codex_worker::CodexAuthError>()
+                || error.is::<crate::provider_readiness::ProviderReadinessError>()
+                || error.is::<crate::coder::ClaudeNoProgressExhaustedError>()
+                || error.is::<crate::coder::ClaudeNoProgressCleanupUnconfirmedError>()
+                || error.is::<crate::coder::CodexResponseLivenessExhaustedError>()
+                || error.is::<crate::coder::CodexResponseCleanupUnconfirmedError>()
+            {
+                return Err(error);
+            }
+            if coder == CoderKind::Claude
+                && let Some(auth) = transcript
+                    .as_deref()
+                    .and_then(crate::claude_auth::classify_transcript_auth_failure)
+            {
+                return Err(anyhow::Error::new(auth).context(error));
+            }
+            if coder == CoderKind::Claude
+                && let Some(host) = transcript.as_deref().and_then(|path| {
+                    crate::os::classify_host_sandbox_launch_stderr(
+                        &crate::coder::provider_stderr_path(path),
+                    )
+                })
+            {
+                return Err(anyhow::Error::new(host).context(error));
+            }
+            match transcript.as_deref().and_then(|path| {
+                crate::provider_evidence::classify_provider_unavailable(coder, path).or_else(|| {
+                    (coder == CoderKind::Codex)
+                        .then(|| {
+                            crate::provider_evidence::classify_codex_transport_unavailable(path)
+                        })
+                        .flatten()
+                })
+            }) {
+                Some(evidence) => Err(anyhow::Error::new(
+                    crate::provider_evidence::ProviderUnavailableError(evidence),
+                )
+                .context(error)),
+                None => Err(error),
+            }
+        }
     }
 }
 
@@ -1840,11 +3593,13 @@ fn mark_task_failed_attempt_needs_user(
     failure: &TaskFailure,
     notify_fn: &dyn Fn(&str, &str),
 ) -> Result<()> {
-    let transitioned = store.mutate_work_item(work_item_id, |item| {
+    let pause_kind = task_failure_pause_kind(failure);
+    let pause_recovery = task_failure_pause_recovery(failure);
+    let (transitioned, owns_pause) = mutate_task_work_item(store, work_item_id, |item| {
         let Some((attempt_index, task_index)) =
             find_attempt_task_indexes(item, attempt_id, task_id)
         else {
-            return Ok(false);
+            return Ok((false, false));
         };
         // A preflight failure owns a Planned Task; a later coder auth failure
         // owns its Executing Task. Do not overwrite a peer's terminal state.
@@ -1852,56 +3607,51 @@ fn mark_task_failed_attempt_needs_user(
             item.attempts[attempt_index].tasks[task_index].status,
             TaskStatus::Planned | TaskStatus::Executing
         ) {
-            return Ok(false);
+            return Ok((false, false));
         }
         // A resumable Auth/transcript failure gets durable `NeedsUser` Task state,
         // distinct from a hard `Failed`, so a supported resume can reopen exactly
         // that Task and reject a mixed hard-Failed/still-live Attempt.
         let task_terminal = match failure {
-            TaskFailure::Auth(_) | TaskFailure::TranscriptPump(_) => TaskStatus::NeedsUser,
+            TaskFailure::Auth(_)
+            | TaskFailure::TranscriptPump(_)
+            | TaskFailure::HostSandbox(_)
+            | TaskFailure::TesterHarness
+            | TaskFailure::TesterProjectHarness
+            | TaskFailure::TesterNestedSwiftPmSandbox
+            | TaskFailure::WriterCompletion(_) => TaskStatus::NeedsUser,
+            TaskFailure::ProviderUnavailable(_) | TaskFailure::ProviderArguments(_) => {
+                TaskStatus::NeedsUser
+            }
             TaskFailure::Generic => TaskStatus::Failed,
         };
         crate::work_model::set_task_terminal(
             &mut item.attempts[attempt_index].tasks[task_index],
             task_terminal,
         );
-        let pause_kind = match failure {
-            TaskFailure::Auth(_) => crate::work_model::PauseKind::Auth,
-            TaskFailure::TranscriptPump(_) => crate::work_model::PauseKind::TranscriptPump,
-            TaskFailure::Generic => crate::work_model::PauseKind::RoundCap,
-        };
         // Route through the precedence boundary so a resumable pause cannot mask
         // a harder terminal state a peer Task already recorded.
-        crate::work_model::transition_attempt(
+        let pause_applied = crate::work_model::transition_attempt(
             &mut item.attempts[attempt_index],
             crate::work_model::AttemptStatus::NeedsUser,
-            Some(pause_kind),
+            Some(pause_kind.clone()),
         );
-        Ok(true)
+        if pause_applied {
+            item.attempts[attempt_index].pause_recovery = pause_recovery;
+        }
+        let attempt = &item.attempts[attempt_index];
+        let owns_pause = pause_applied
+            && attempt.status == AttemptStatus::NeedsUser
+            && attempt.pause_kind.as_ref() == Some(&pause_kind)
+            && attempt.pause_recovery == pause_recovery;
+        Ok((true, owns_pause))
     })?;
 
     // Persist the authoritative terminal Task/Attempt state before any auxiliary
     // handoff or notification. A later effect failure cannot undo the pause.
     if transitioned {
-        match failure {
-            TaskFailure::Auth(message) => {
-                let message = if message.contains("codex login") {
-                    message.as_str()
-                } else {
-                    "Claude authentication needs attention. Run 'claude /login' to re-authenticate, then 'fluent attempt run'."
-                };
-                notify_fn("Fluent", message)
-            }
-            TaskFailure::TranscriptPump(_) => notify_fn(
-                "Fluent",
-                "Transcript capture failed. Fix the console/transcript transport, then 'fluent attempt run' to retry.",
-            ),
-            TaskFailure::Generic => {}
-        }
-
-        // Write the auxiliary handoff and attach its reference in a second durable
-        // mutation, both best-effort. A handoff or attach failure preserves — never
-        // rolls back — the authoritative terminal state persisted above.
+        // Preserve one immutable handoff for this Task even when another peer owns
+        // the aggregate Attempt pause.
         match write_task_error_handoff(project_root, work_item_id, attempt_id, task_id, failure) {
             Ok(handoff_path) => {
                 // Attach the reference through a FRESH lock-held mutation that
@@ -1912,7 +3662,7 @@ fn mark_task_failed_attempt_needs_user(
                 // the notification effect below) is preserved instead of clobbered.
                 // The attach is idempotent — the reference is added only when absent
                 // — so a supported resume that re-runs this path never duplicates it.
-                let attach = store.mutate_work_item(work_item_id, |item| {
+                let attach = mutate_task_work_item(store, work_item_id, |item| {
                     let Some((attempt_index, _task_index)) =
                         find_attempt_task_indexes(item, attempt_id, task_id)
                     else {
@@ -1946,8 +3696,123 @@ fn mark_task_failed_attempt_needs_user(
                 );
             }
         }
+
+        // Only the Task whose pause still owns the aggregate Attempt may replace
+        // the managed current handoff. Publish it atomically, then notify: the
+        // terminal must never report a recovery action that was not recorded.
+        if owns_pause {
+            let still_owns = store
+                .read_work_item(work_item_id)?
+                .attempts
+                .iter()
+                .find(|attempt| attempt.id == attempt_id)
+                .is_some_and(|attempt| {
+                    attempt.status == AttemptStatus::NeedsUser
+                        && attempt.pause_kind.as_ref() == Some(&pause_kind)
+                        && attempt.pause_recovery == pause_recovery
+                });
+            if still_owns {
+                if let Err(error) = write_current_task_error_handoff(
+                    project_root,
+                    work_item_id,
+                    attempt_id,
+                    task_id,
+                    failure,
+                ) {
+                    return Err(anyhow::Error::new(CurrentHandoffPublicationError(format!(
+                        "recorded the {pause_kind:?} pause but could not publish its current needs-user handoff: {error:#}"
+                    ))));
+                }
+                notify_task_failure(notify_fn, work_item_id, attempt_id, failure);
+            }
+        }
     }
     Ok(())
+}
+
+fn task_failure_pause_kind(failure: &TaskFailure) -> PauseKind {
+    match failure {
+        TaskFailure::Auth(_) => PauseKind::Auth,
+        TaskFailure::TranscriptPump(_) => PauseKind::TranscriptPump,
+        TaskFailure::HostSandbox(_) => PauseKind::HostSandbox,
+        TaskFailure::TesterHarness
+        | TaskFailure::TesterProjectHarness
+        | TaskFailure::TesterNestedSwiftPmSandbox => PauseKind::TesterHarness,
+        TaskFailure::WriterCompletion(_) => PauseKind::WriterCompletion,
+        TaskFailure::ProviderUnavailable(_) => PauseKind::ProviderUnavailable,
+        TaskFailure::ProviderArguments(_) => PauseKind::ProviderUnavailable,
+        TaskFailure::Generic => PauseKind::RoundCap,
+    }
+}
+
+fn task_failure_pause_recovery(failure: &TaskFailure) -> Option<PauseRecovery> {
+    matches!(failure, TaskFailure::TesterNestedSwiftPmSandbox)
+        .then_some(PauseRecovery::TesterNoSandbox)
+}
+
+fn notify_task_failure(
+    notify_fn: &dyn Fn(&str, &str),
+    work_item_id: &str,
+    attempt_id: &str,
+    failure: &TaskFailure,
+) {
+    match failure {
+        TaskFailure::Auth(message) => notify_fn("Fluent", message),
+        TaskFailure::TranscriptPump(_) => notify_fn(
+            "Fluent",
+            "Transcript capture failed. Fix the console/transcript transport, then 'fluent attempt run' to retry.",
+        ),
+        TaskFailure::HostSandbox(_) => {
+            notify_fn("Fluent", crate::os::HOST_SANDBOX_RECOVERY_GUIDANCE)
+        }
+        TaskFailure::TesterHarness => notify_fn(
+            "Fluent",
+            &format!(
+                "Tester harness failed. For an environment-only repair, resume with 'fluent attempt run {work_item_id} {attempt_id}'. If tracked Tester files must change, use the audited repair command in the handoff."
+            ),
+        ),
+        TaskFailure::TesterProjectHarness => notify_fn(
+            "Fluent",
+            &format!(
+                "Tester harness failed. Approve a tracked project Tester repair with 'fluent attempt repair-tester {work_item_id} {attempt_id} --resolution \"<repair needed>\"'."
+            ),
+        ),
+        TaskFailure::TesterNestedSwiftPmSandbox => notify_fn(
+            "Fluent",
+            &format!(
+                "Xcode's embedded SwiftPM cannot create its sandbox inside Fluent's Tester sandbox. To trust and retry this exact Tester Task without Fluent's outer sandbox, run 'fluent queue resume {work_item_id} --attempt {attempt_id} --no-sandbox', then run or reuse 'fluent scheduler run' from a host shell that is not itself sandboxed."
+            ),
+        ),
+        TaskFailure::WriterCompletion(_) => notify_fn(
+            "Fluent",
+            "Writer completion evidence is missing or invalid. Inspect the handoff, then resume the same Writer Task.",
+        ),
+        TaskFailure::ProviderUnavailable(message) => notify_fn("Fluent", message),
+        TaskFailure::ProviderArguments(message) => notify_fn("Fluent", message),
+        TaskFailure::Generic => {}
+    }
+}
+
+/// Pause an unlaunched Task when the enclosing macOS sandbox rejects Fluent's
+/// production Seatbelt boundary.  Role-specific planners use this shared
+/// transition so every host-sandbox handoff carries the same Attempt semantics.
+pub(crate) fn pause_task_for_host_sandbox(
+    store: &WorkModelStore,
+    project_root: &Path,
+    work_item_id: &str,
+    attempt_id: &str,
+    task_id: &str,
+    error: &crate::os::HostSandboxPreflightError,
+) -> Result<()> {
+    mark_task_failed_attempt_needs_user(
+        store,
+        project_root,
+        work_item_id,
+        attempt_id,
+        task_id,
+        &TaskFailure::HostSandbox(error.message().to_string()),
+        &|_, _| {},
+    )
 }
 
 fn write_task_error_handoff(
@@ -1963,7 +3828,45 @@ fn write_task_error_handoff(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let body = match failure {
+    let body = crate::work_status::append_pause_record_to_handoff(
+        project_root,
+        work_item_id,
+        attempt_id,
+        render_task_error_handoff(work_item_id, attempt_id, task_id, failure),
+    );
+    fs::write(&path, body)?;
+    Ok(relative_path)
+}
+
+fn write_current_task_error_handoff(
+    project_root: &Path,
+    work_item_id: &str,
+    attempt_id: &str,
+    task_id: &str,
+    failure: &TaskFailure,
+) -> Result<String> {
+    let relative_path = work_artifact_path(work_item_id, attempt_id, "needs-user.md");
+    let path = project_root.join(&relative_path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let body = crate::work_status::append_pause_record_to_handoff(
+        project_root,
+        work_item_id,
+        attempt_id,
+        render_task_error_handoff(work_item_id, attempt_id, task_id, failure),
+    );
+    crate::atomic_write::atomic_write(&path, body.as_bytes())?;
+    Ok(relative_path)
+}
+
+fn render_task_error_handoff(
+    work_item_id: &str,
+    attempt_id: &str,
+    task_id: &str,
+    failure: &TaskFailure,
+) -> String {
+    match failure {
         TaskFailure::Auth(msg) => format!("# Attempt needs user input\n\n{msg}\n"),
         TaskFailure::TranscriptPump(diagnostic) => format!(
             "# Attempt needs user input\n\nTask {task_id:?} stopped on a transcript-pump \
@@ -1972,14 +3875,34 @@ fn write_task_error_handoff(
              budget. Fix the transcript/console transport (for example free disk space or an \
              unwritable transcript path), then re-run `fluent attempt run` to retry.\n"
         ),
+        TaskFailure::HostSandbox(diagnostic) => format!(
+            "# Attempt needs user input\n\nTask {task_id:?} could not perform usable work because a macOS sandbox boundary blocked Fluent's production Seatbelt execution:\n\n    {diagnostic}\n\nNo usable coder or Tester work was recorded, and this did not consume a write round. {} Then run `fluent attempt run {work_item_id}` to resume this same Attempt.\n",
+            crate::os::HOST_SANDBOX_RECOVERY_GUIDANCE
+        ),
+        TaskFailure::TesterHarness => format!(
+            "# Tester needs diagnosis\n\nTester Task {task_id:?} could not produce trustworthy evidence, but its persisted result does not prove whether the repair belongs to the host environment or tracked project files.\n\nIf the candidate can stay unchanged, repair the environment and run `fluent queue resume {work_item_id} --attempt {attempt_id}` for scheduler recovery, or `fluent attempt run {work_item_id} {attempt_id}` in the foreground. Fluent will retry the same Tester Task.\n\nIf the diagnosis requires a tracked change to `.fluent/tester.yaml` or `.fluent/extract-tester-results`, approve an audited repair Writer instead:\n\n    fluent attempt repair-tester {work_item_id} {attempt_id} --resolution \"<describe the Tester repair>\"\n"
+        ),
+        TaskFailure::TesterProjectHarness => format!(
+            "# Tester needs repair\n\nTester Task {task_id:?} could not produce trustworthy test evidence. Ordinary resume keeps the reviewed candidate immutable, so a tracked project Tester repair must return through an audited Writer. Approve that bounded repair with:\n\n    fluent attempt repair-tester {work_item_id} {attempt_id} --resolution \"<describe the Tester repair>\"\n\nThe repair Writer may change `.fluent/tester.yaml` and `.fluent/extract-tester-results`, commits the repair on the existing candidate workspace, and causes Fluent to bind fresh review and Tester evidence to the repaired commit. Then run `fluent queue resume {work_item_id} --attempt {attempt_id}` for scheduler recovery, or `fluent attempt run {work_item_id} {attempt_id}` in the foreground.\n"
+        ),
+        TaskFailure::TesterNestedSwiftPmSandbox => format!(
+            "# Tester needs explicit sandbox approval\n\nTester Task {task_id:?} could not produce trustworthy evidence because Xcode's embedded SwiftPM cannot create its manifest sandbox inside Fluent's Tester sandbox. Fluent kept its sandbox enabled and did not modify the project.\n\nIf you trust this candidate, approve one exact scheduler recovery with:\n\n    fluent queue resume {work_item_id} --attempt {attempt_id} --no-sandbox\n\nThen run or reuse `fluent scheduler run` from a host shell that is not itself sandboxed. Fluent will retry this same Tester Task without its outer Tester sandbox; the candidate's test commands will run with the scheduler process's host permissions. Any enclosing agent sandbox still applies and can reproduce the same Xcode failure. The approval is recorded on this resume dispatch only.\n"
+        ),
+        TaskFailure::WriterCompletion(diagnostic) => format!(
+            "# Writer completion needs repair\n\nWriter Task {task_id:?} returned without a commit, but its no-change evidence was not valid:\n\n    {diagnostic}\n\nInspect the candidate and resume this same Attempt to retry the Writer Task.\n"
+        ),
+        TaskFailure::ProviderUnavailable(message) => format!(
+            "# Provider unavailable\n\nTask {task_id:?} paused before usable model progress:\n\n{message}\n"
+        ),
+        TaskFailure::ProviderArguments(message) => format!(
+            "# Provider arguments need repair\n\nTask {task_id:?} paused before usable model progress:\n\n{message}\n"
+        ),
         TaskFailure::Generic => format!(
             "# Attempt needs user input\n\nTask {task_id:?} failed after {} retries. \
              The coder execution errored persistently.\n",
             max_task_retries()
         ),
-    };
-    fs::write(&path, body)?;
-    Ok(relative_path)
+    }
 }
 
 fn lock_mark_task_failed(
@@ -1990,7 +3913,13 @@ fn lock_mark_task_failed(
     task_id: &str,
 ) -> Result<()> {
     let _lock = store_lock.map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
-    mark_task_failed(store, work_item_id, attempt_id, task_id)
+    mark_task_failed(
+        store,
+        work_item_id,
+        attempt_id,
+        task_id,
+        store_lock.is_some(),
+    )
 }
 
 fn lock_mark_task_failed_attempt_needs_user(
@@ -2003,6 +3932,20 @@ fn lock_mark_task_failed_attempt_needs_user(
     failure: &TaskFailure,
     notify_fn: &dyn Fn(&str, &str),
 ) -> Result<()> {
+    #[cfg(feature = "test-support")]
+    if std::env::var("FLUENT_TEST_TESTER_PAUSE_PERSISTENCE")
+        .ok()
+        .as_deref()
+        == Some("fail")
+        && matches!(
+            failure,
+            TaskFailure::TesterHarness
+                | TaskFailure::TesterProjectHarness
+                | TaskFailure::TesterNestedSwiftPmSandbox
+        )
+    {
+        bail!("test-injected Tester pause persistence failure");
+    }
     let _lock = store_lock.map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
     mark_task_failed_attempt_needs_user(
         store,
@@ -2091,61 +4034,11 @@ pub(crate) fn resolve_managed_artifact_area_path(
     project_root: &Path,
     path: &str,
 ) -> Result<PathBuf> {
-    let relative_path = Path::new(path);
-    if relative_path.is_absolute() {
-        bail!("Task artifact area path must be relative: {path}");
-    }
-
-    let mut components = Vec::new();
-    for component in relative_path.components() {
-        match component {
-            Component::Normal(part) => components.push(part.to_owned()),
-            _ => bail!("Task artifact area path must stay under .fluent/work/artifacts: {path}"),
-        }
-    }
-
-    let managed_prefix = [
-        std::ffi::OsStr::new(".fluent"),
-        std::ffi::OsStr::new("work"),
-        std::ffi::OsStr::new("artifacts"),
-    ];
-    if components.len() <= managed_prefix.len()
-        || !components
-            .iter()
-            .zip(managed_prefix.iter())
-            .all(|(actual, expected)| actual == expected)
-    {
-        bail!("Task artifact area path must stay under .fluent/work/artifacts: {path}");
-    }
-
-    Ok(resolve_workspace_path(project_root, path))
+    crate::recovery_contracts::resolve_managed_artifact_area_path(project_root, path)
 }
 
 fn resolve_input_artifact_path(project_root: &Path, path: &str) -> Result<PathBuf> {
-    let relative_path = Path::new(path);
-    if relative_path.is_absolute() {
-        bail!("Input artifact path must be relative: {path}");
-    }
-    let mut components = Vec::new();
-    for component in relative_path.components() {
-        match component {
-            Component::Normal(part) => components.push(part.to_owned()),
-            _ => bail!(
-                "Input artifact path must stay under .fluent/work/artifacts/ or .fluent/work/progress/: {path}"
-            ),
-        }
-    }
-    let valid = components.len() >= 3
-        && components[0] == std::ffi::OsStr::new(".fluent")
-        && components[1] == std::ffi::OsStr::new("work")
-        && (components[2] == std::ffi::OsStr::new("artifacts")
-            || components[2] == std::ffi::OsStr::new("progress"));
-    if !valid {
-        bail!(
-            "Input artifact path must be under .fluent/work/artifacts/ or .fluent/work/progress/: {path}"
-        );
-    }
-    Ok(resolve_workspace_path(project_root, path))
+    crate::recovery_contracts::resolve_input_artifact_path(project_root, path)
 }
 
 fn resolve_input_artifact_paths(
@@ -2172,6 +4065,42 @@ fn resolve_input_artifact_paths(
         resolved.push(path);
     }
     Ok(resolved)
+}
+
+/// Admit exact assignment files only after validating their saved bindings and
+/// recovery proofs. Share this input set between Writer launches and probes.
+fn resolve_writer_readable_inputs(
+    project_root: &Path,
+    item: &WorkItem,
+    task: &Task,
+) -> Result<Vec<PathBuf>> {
+    let mut inputs = readable_input_artifacts_only(&resolve_input_artifact_paths(
+        project_root,
+        &task.input_artifacts,
+    )?);
+    if let Some(recovery) =
+        crate::writer_completion_recovery::validated_writer_context(project_root, item, task)?
+    {
+        for artifact in recovery.artifacts {
+            inputs.push(resolve_input_artifact_path(project_root, &artifact.path)?);
+        }
+    }
+    if let Some(assignment) = &task.writer_correction_assignment {
+        crate::recovery_contracts::validate_writer_continuation_lineage(project_root, item, task)?;
+        for input in assignment
+            .source_task_inputs
+            .iter()
+            .chain(&assignment.evidence)
+        {
+            inputs.push(resolve_input_artifact_path(
+                project_root,
+                &input.artifact.path,
+            )?);
+        }
+    }
+    inputs.sort();
+    inputs.dedup();
+    Ok(inputs)
 }
 
 fn prepare_task_worktree(
@@ -2231,40 +4160,11 @@ fn git_branch_exists(project_root: &Path, branch_name: &str) -> Result<bool> {
 }
 
 fn ensure_same_git_repository(project_root: &Path, workspace_path: &Path) -> Result<()> {
-    let source_common = fs::canonicalize(worktree::git_common_dir(project_root)?)?;
-    let workspace_common = fs::canonicalize(worktree::git_common_dir(workspace_path)?)?;
-    if source_common != workspace_common {
-        bail!(
-            "Workspace {} belongs to a different git repository",
-            workspace_path.display()
-        );
-    }
-    Ok(())
+    worktree::ensure_same_git_repository(project_root, workspace_path)
 }
 
 fn ensure_registered_worktree(project_root: &Path, workspace_path: &Path) -> Result<()> {
-    let expected = fs::canonicalize(workspace_path)?;
-    let output = git::run_raw(project_root, &["worktree", "list", "--porcelain"])?;
-    if !output.status.success() {
-        bail!(
-            "Failed to list git worktrees: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let Some(path) = line.strip_prefix("worktree ") else {
-            continue;
-        };
-        if fs::canonicalize(path).is_ok_and(|actual| actual == expected) {
-            return Ok(());
-        }
-    }
-
-    bail!(
-        "Workspace {} exists but is not a registered git worktree",
-        workspace_path.display()
-    )
+    worktree::ensure_registered_worktree(project_root, workspace_path)
 }
 
 fn capture_coder_info(coder_kind: CoderKind, model: &str, artifact_dir: &Path) {
@@ -2306,8 +4206,479 @@ fn capture_coder_info(coder_kind: CoderKind, model: &str, artifact_dir: &Path) {
     }
 }
 
+/// Resolve the Rust installation independently of the private dependency cache.
+fn installed_writer_tool_roots(
+    source_home: &Path,
+    rustup_home: Option<&std::ffi::OsStr>,
+    search_path: Option<&std::ffi::OsStr>,
+) -> Result<Vec<PathBuf>> {
+    let mut roots = Vec::new();
+    let mut paths = vec![
+        source_home.join(".cargo/bin"),
+        rustup_home
+            .map(PathBuf::from)
+            .unwrap_or_else(|| source_home.join(".rustup")),
+    ];
+    if let Some(search_path) = search_path {
+        for tool in ["cargo", "rustc", "rustup"] {
+            if let Some(executable) = std::env::split_paths(search_path)
+                .map(|root| root.join(tool))
+                .find(|path| path.is_file())
+            {
+                paths.push(executable);
+            }
+        }
+    }
+    for path in paths {
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                let target = fs::canonicalize(&path)
+                    .with_context(|| format!("resolve installed Writer tool {}", path.display()))?;
+                anyhow::ensure!(
+                    target.parent().is_some() && target != source_home,
+                    "installed Writer tool must have a bounded path: {}",
+                    target.display()
+                );
+                roots.push(path);
+                roots.push(target);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("inspect installed Writer tools"),
+        }
+    }
+    roots.sort();
+    roots.dedup();
+    Ok(roots)
+}
+
+/// Resolve exact Git configuration files without collecting other setting values.
+fn installed_writer_git_config_roots(workspace: &Path, scratch: &Path) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for include_paths in [false, true] {
+        let mut args = vec!["config", "--null", "--includes", "--show-origin"];
+        if include_paths {
+            // Origins alone omit empty included files, which Git still opens.
+            // Let Git expand ~/ and %(prefix)/ rather than interpreting them here.
+            args.extend([
+                "--type=path",
+                "--get-regexp",
+                r"^(include|includeif\..*)\.path$",
+            ]);
+        } else {
+            args.extend(["--name-only", "--list"]);
+        }
+        let output = git::run_raw(workspace, &args)?;
+        if include_paths && output.status.code() == Some(1) && output.stdout.is_empty() {
+            continue;
+        }
+        // Git errors can contain configuration values. Keep those out of logs.
+        anyhow::ensure!(
+            output.status.success(),
+            "could not resolve Writer Git configuration files (exit {:?})",
+            output.status.code()
+        );
+        let text = std::str::from_utf8(&output.stdout)
+            .context("Writer Git configuration paths must be UTF-8")?;
+        let fields = text.split_terminator('\0').collect::<Vec<_>>();
+        anyhow::ensure!(
+            fields.len() % 2 == 0 && (text.is_empty() || text.ends_with('\0')),
+            "malformed Writer Git configuration origins"
+        );
+        for record in fields.chunks_exact(2) {
+            let origin = record[0]
+                .strip_prefix("file:")
+                .map(|file| workspace.join(file));
+            if let Some(origin) = &origin {
+                paths.push(origin.clone());
+            }
+            if include_paths {
+                let (key, value) = record[1]
+                    .split_once('\n')
+                    .context("missing Writer Git configuration include path")?;
+                if let Some(condition) = key
+                    .strip_prefix("includeif.")
+                    .and_then(|key| key.strip_suffix(".path"))
+                {
+                    // Git reports inactive declarations too. Re-evaluate the
+                    // condition before treating its target as read authority.
+                    if !writer_git_include_is_active(
+                        workspace,
+                        origin.as_deref(),
+                        condition,
+                        scratch,
+                    )? {
+                        continue;
+                    }
+                }
+                let path = Path::new(value);
+                paths.push(if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    origin
+                        .as_deref()
+                        .and_then(Path::parent)
+                        .context("relative Git configuration include has no file origin")?
+                        .join(path)
+                });
+            }
+        }
+    }
+    let mut roots = Vec::new();
+    for path in paths {
+        let target = match fs::canonicalize(&path) {
+            Ok(target) => target,
+            // Git permits absent optional includes. Grant no root for them.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).context("resolve Writer Git configuration file"),
+        };
+        anyhow::ensure!(
+            target.is_file() && target.to_str().is_some(),
+            "Writer Git configuration must resolve to a regular UTF-8 file"
+        );
+        roots.push(path);
+        roots.push(target);
+    }
+    roots.sort();
+    roots.dedup();
+    Ok(roots)
+}
+
+/// Ask Git to evaluate an include condition without opening its target.
+fn writer_git_include_is_active(
+    workspace: &Path,
+    origin: Option<&Path>,
+    condition: &str,
+    scratch: &Path,
+) -> Result<bool> {
+    let mut condition = condition.to_string();
+    for prefix in ["gitdir:", "gitdir/i:"] {
+        if let Some(pattern) = condition.strip_prefix(&format!("{prefix}./")) {
+            // Git resolves ./ against the real origin and treats that prefix
+            // literally. Preserve both rules when moving the probe to scratch.
+            let origin = origin
+                .context("relative Git include condition has no file origin")?
+                .canonicalize()
+                .context("resolve Git include condition origin")?;
+            let parent = origin
+                .parent()
+                .and_then(Path::to_str)
+                .context("Git include condition origin must have a UTF-8 parent")?;
+            let escaped = parent.chars().fold(String::new(), |mut text, ch| {
+                if matches!(ch, '\\' | '*' | '?' | '[') {
+                    text.push('\\');
+                }
+                text.push(ch);
+                text
+            });
+            condition = format!("{prefix}{escaped}/{pattern}");
+            break;
+        }
+    }
+    let probe = tempfile::Builder::new()
+        .prefix("git-include-probe-")
+        .tempdir_in(scratch)
+        .context("create private Git include probe")?;
+    let marker = probe.path().join("marker");
+    let config = probe.path().join("config");
+    fs::write(&marker, "[fluent-quota-probe]\n active = true\n")?;
+    let quoted = condition
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\t', "\\t");
+    // A relative marker path avoids interpreting characters in the scratch path.
+    fs::write(
+        &config,
+        format!("[includeIf \"{quoted}\"]\n path = marker\n"),
+    )?;
+    let output = git::run_raw(
+        workspace,
+        &[
+            "-c",
+            &format!("include.path={}", config.display()),
+            "config",
+            "--null",
+            "--includes",
+            "--show-origin",
+            "--name-only",
+            "--get-regexp",
+            "^fluent-quota-probe\\.active$",
+        ],
+    )?;
+    if output.status.code() == Some(1) && output.stdout.is_empty() {
+        return Ok(false);
+    }
+    anyhow::ensure!(
+        output.status.success(),
+        "could not evaluate Writer Git include condition"
+    );
+    let text = std::str::from_utf8(&output.stdout)
+        .context("Writer Git include probe origins must be UTF-8")?;
+    let fields = text.split_terminator('\0').collect::<Vec<_>>();
+    anyhow::ensure!(
+        fields.len() % 2 == 0 && text.ends_with('\0'),
+        "malformed Writer Git include probe origins"
+    );
+    let marker_origin = format!("file:{}", marker.display());
+    Ok(fields
+        .chunks_exact(2)
+        .any(|record| record[0] == marker_origin))
+}
+
+/// Keep compiler temporary files and platform caches inside the retry's cache.
+fn usage_limit_writer_tool_env(
+    cache: &crate::writer_cache::WriterDependencyCache,
+) -> Result<Vec<(String, String)>> {
+    let mut env = cache.launch_env();
+    for (name, directory) in [("TMPDIR", "tool-tmp"), ("CFFIXED_USER_HOME", "tool-home")] {
+        let path = cache.root().join(directory);
+        if let Ok(metadata) = fs::symlink_metadata(&path) {
+            anyhow::ensure!(
+                metadata.is_dir() && !metadata.file_type().is_symlink(),
+                "Writer tool scratch must be a real directory: {}",
+                path.display()
+            );
+        }
+        fs::create_dir_all(&path).context("create private Writer tool scratch")?;
+        env.push((name.to_string(), path.to_string_lossy().into_owned()));
+    }
+    Ok(env)
+}
+
+/// Render and probe the Writer profile from its immutable start plan.
+///
+/// The profile includes only deterministic paths.  In particular, the candidate
+/// worktree, progress directory, and transcript directory may not exist yet; the
+/// production profile deliberately grants those future paths, so rendering them
+/// does not create a workspace or artifact before the Task reservation.
 #[allow(clippy::too_many_arguments)]
-fn run_task_coder(
+fn preflight_write_sandbox_profile(
+    task: &Task,
+    project_root: &Path,
+    workspace_path: &Path,
+    prior_reviews: &[PathBuf],
+    resolver: &ContentResolver,
+    no_sandbox: bool,
+    coder_kind: CoderKind,
+    codex_worker: Option<&crate::codex_worker::CodexWorkerEnvironment>,
+    claude_home: Option<&Path>,
+    writer_cache: &crate::writer_cache::WriterDependencyCache,
+) -> Result<Option<os::SandboxProfile>> {
+    // Test-support may exercise a nested Codex route without applying a
+    // Seatbelt profile. Keep that exception explicit and feature-gated: the
+    // production Codex worker continues to require its source-home boundary.
+    if no_sandbox && (codex_worker.is_none() || test_hermetic_no_sandbox()) {
+        return Ok(None);
+    }
+
+    let home = std::env::var("HOME").unwrap_or_default();
+    let common_git_dir = worktree::git_common_dir(project_root)?;
+    let mut readable_roots = declared_file_readable_roots(prior_reviews, project_root)?;
+    readable_roots.push(planning_files_dir(project_root, &task.work_item_id));
+    readable_roots.push(general_expertise_dir(project_root));
+    readable_roots.extend(writer_handoff_model_readable_roots(project_root, task)?);
+    if let Some(worker) = codex_worker {
+        readable_roots.extend(worker.launcher().readable_roots().iter().cloned());
+    }
+
+    let mut writable_roots = vec![
+        workspace_path.to_path_buf(),
+        common_git_dir,
+        progress_md_dir(
+            project_root,
+            &task.work_item_id,
+            task.attempt_id.as_deref().unwrap_or_default(),
+        ),
+    ];
+    if let Some(artifact_area) = task.artifact_area.as_ref() {
+        writable_roots.push(project_root.join(&artifact_area.path));
+    }
+    writable_roots.extend(claude_home.map(Path::to_path_buf));
+    writable_roots.push(writer_cache.root().to_path_buf());
+
+    // Pick the profile the Writer renders for. The macOS and Landlock
+    // backends render the same choice, so the selection happens once: each
+    // kind carries its own denials, and the Landlock render adds the
+    // Writer's source exclusions on top.
+    let usage_limit_retry = task.input_artifacts.iter().any(|a| {
+        matches!(
+            a.producer_id.as_str(),
+            "usage-limit-writer-approval" | "writer-completion-context-retry"
+        )
+    });
+    let profile_kind = if coder_kind == CoderKind::Claude {
+        os::WriterProfileKind::AutonomousClaude
+    } else if usage_limit_retry {
+        let worker = codex_worker.context("usage-limit retry requires its private Codex home")?;
+        let installed_tools = installed_writer_tool_roots(
+            Path::new(&home),
+            std::env::var_os("RUSTUP_HOME").as_deref(),
+            std::env::var_os("PATH").as_deref(),
+        )?;
+        // A retry retains its existing worktree, so resolve includeIf rules
+        // there, not against the coordinator's different Git directory/branch.
+        readable_roots.extend(installed_writer_git_config_roots(
+            workspace_path,
+            worker.home(),
+        )?);
+        // Read the default Git config and macOS tool-selection links without
+        // granting their parent trees. xcrun needs the developer link itself
+        // as well as its resolved directory to locate the SDK and linker.
+        for path in [
+            Path::new(&home).join(".gitconfig"),
+            PathBuf::from("/private/var/select/sh"),
+            PathBuf::from("/var/select/developer_dir"),
+            PathBuf::from("/private/var/select/developer_dir"),
+            PathBuf::from("/private/var/db/xcode_select_link"),
+        ] {
+            if path.exists() {
+                readable_roots.push(path.clone());
+                readable_roots.push(fs::canonicalize(path)?);
+            }
+        }
+        os::WriterProfileKind::ScopedCodex {
+            private_home: worker.home().to_path_buf(),
+            installed_tools,
+        }
+    } else {
+        os::WriterProfileKind::Coder {
+            coder_kind,
+            codex_home: codex_worker.map(|worker| worker.home().to_path_buf()),
+        }
+    };
+    let task_artifact = task
+        .artifact_area
+        .as_ref()
+        .context("Writer Task has no artifact area for sandbox grant")?;
+    let task_artifact_path = project_root.join(&task_artifact.path);
+    if os::backend() == os::SandboxBackend::Landlock {
+        let confinement = os::writer_confinement(
+            project_root,
+            workspace_path,
+            &task_artifact_path,
+            writer_cache.root(),
+        )?;
+        let profile = os::render_writer_profile_for_landlock(
+            resolver,
+            &profile_kind,
+            &home,
+            &writable_roots,
+            &readable_roots,
+            &confinement,
+        )?;
+        #[cfg(not(test))]
+        if let Some(worker) = codex_worker {
+            os::preflight_codex_launcher(&profile, worker)?;
+        } else {
+            os::preflight_profile(&profile)?;
+        }
+        os::preflight_readable_paths(&profile, prior_reviews)?;
+        return Ok(Some(profile));
+    }
+    let profile = match &profile_kind {
+        os::WriterProfileKind::AutonomousClaude => {
+            os::render_profile_for_access_for_autonomous_claude(
+                resolver,
+                &home,
+                &writable_roots,
+                &readable_roots,
+            )?
+        }
+        os::WriterProfileKind::ScopedCodex {
+            private_home,
+            installed_tools,
+        } => os::render_profile_for_scoped_codex_provider_with_tools(
+            resolver,
+            private_home,
+            &writable_roots,
+            &readable_roots,
+            private_home,
+            installed_tools,
+        )?,
+        os::WriterProfileKind::Coder {
+            coder_kind,
+            codex_home,
+        } => os::render_profile_for_access_for_coder_with_codex_home(
+            resolver,
+            &home,
+            &writable_roots,
+            &readable_roots,
+            *coder_kind,
+            codex_home.as_deref(),
+        )?,
+    };
+    os::deny_writer_source_entries(
+        &profile,
+        project_root,
+        workspace_path,
+        &project_root.join(&task_artifact.path),
+        writer_cache.root(),
+    )?;
+    #[cfg(not(test))]
+    if let Some(worker) = codex_worker {
+        os::preflight_codex_launcher(&profile, worker)?;
+    } else {
+        os::preflight_profile(&profile)?;
+    }
+    os::preflight_readable_paths(&profile, prior_reviews)?;
+    Ok(Some(profile))
+}
+
+/// Use the same private tool environment as a real retry launch.
+#[cfg(feature = "test-support")]
+pub fn usage_limit_tool_env_for_test(project: &Path, task: &Task) -> Result<Vec<(String, String)>> {
+    let project = fs::canonicalize(project)?;
+    let cache = crate::writer_cache::preflight_writer_dependency_cache(
+        &project,
+        &task.work_item_id,
+        task.attempt_id.as_deref().context("missing Attempt")?,
+    )?;
+    usage_limit_writer_tool_env(&cache)
+}
+
+/// Render the production retry boundary for the separate trusted-host probe.
+#[cfg(feature = "test-support")]
+pub fn usage_limit_profile_for_test(
+    project_root: &Path,
+    task: &Task,
+    worker: &crate::codex_worker::CodexWorkerEnvironment,
+) -> Result<os::SandboxProfile> {
+    // The CLI enters from a physical current directory. Match that path
+    // identity when a fixture reaches us through /var or another alias;
+    // Seatbelt matches the resolved filesystem paths.
+    let project_root =
+        fs::canonicalize(project_root).context("resolve the retry sandbox probe's project root")?;
+    let project_root = project_root.as_path();
+    let workspace = resolve_managed_workspace_path(
+        project_root,
+        &task.workspace_access.writes[0].path,
+        &task.work_item_id,
+        task.attempt_id.as_deref().context("missing Attempt")?,
+    )?;
+    let item = WorkModelStore::new(project_root).read_work_item_snapshot(&task.work_item_id)?;
+    let inputs = resolve_writer_readable_inputs(project_root, &item, task)?;
+    let cache = crate::writer_cache::preflight_writer_dependency_cache(
+        project_root,
+        &task.work_item_id,
+        task.attempt_id.as_deref().unwrap(),
+    )?;
+    preflight_write_sandbox_profile(
+        task,
+        project_root,
+        &workspace,
+        &inputs,
+        &ContentResolver::new(Some(project_root)),
+        false,
+        CoderKind::Codex,
+        Some(worker),
+        None,
+        &cache,
+    )?
+    .context("missing retry profile")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_task_coder_with_optional_coder(
     item: &WorkItem,
     attempt_id: &str,
     task_id: &str,
@@ -2322,11 +4693,13 @@ fn run_task_coder(
     effort: Option<&str>,
     pump_config: &crate::transcript_pump::TranscriptPumpConfig,
     codex_worker: Option<&crate::codex_worker::CodexWorkerEnvironment>,
+    claude_home: Option<&Path>,
+    writer_cache: &crate::writer_cache::WriterDependencyCache,
+    sandbox_profile: Option<&os::SandboxProfile>,
+    coder_override: Option<&dyn Fn(CoderSandbox) -> Box<dyn crate::coder::Coder>>,
+    handoff_feedback: Option<&str>,
 ) -> Result<()> {
-    // Production launches the resolved coder; the `_with_coder` seam lets route
-    // tests inject a recording coder to prove the resolved capture threads through
-    // this route unchanged, mirroring the Learner and rebase launch seams.
-    run_task_coder_with_coder(
+    run_task_coder_with_coder_with_feedback(
         item,
         attempt_id,
         task_id,
@@ -2341,7 +4714,19 @@ fn run_task_coder(
         effort,
         pump_config,
         codex_worker,
-        move |sandbox| coder_kind.boxed_with_model(sandbox, model, effort),
+        claude_home,
+        writer_cache,
+        sandbox_profile,
+        handoff_feedback,
+        move |sandbox, _executable| match coder_override {
+            Some(make) => make(sandbox),
+            None => coder_kind.boxed_with_model_and_executable(
+                sandbox,
+                model,
+                effort,
+                codex_worker.map(|worker| worker.launcher().execution_executable()),
+            ),
+        },
     )
 }
 
@@ -2361,18 +4746,80 @@ fn run_task_coder_with_coder(
     effort: Option<&str>,
     pump_config: &crate::transcript_pump::TranscriptPumpConfig,
     codex_worker: Option<&crate::codex_worker::CodexWorkerEnvironment>,
-    make_coder: impl FnOnce(CoderSandbox) -> Box<dyn crate::coder::Coder>,
+    claude_home: Option<&Path>,
+    writer_cache: &crate::writer_cache::WriterDependencyCache,
+    sandbox_profile: Option<&os::SandboxProfile>,
+    make_coder: impl FnOnce(CoderSandbox, Option<&Path>) -> Box<dyn crate::coder::Coder>,
 ) -> Result<()> {
-    if !no_sandbox || codex_worker.is_some() {
-        os::check_prerequisites_for(coder_kind)?;
+    run_task_coder_with_coder_with_feedback(
+        item,
+        attempt_id,
+        task_id,
+        project_root,
+        workspace_path,
+        prior_reviews,
+        resolver,
+        extra_args,
+        coder_kind,
+        no_sandbox,
+        model,
+        effort,
+        pump_config,
+        codex_worker,
+        claude_home,
+        writer_cache,
+        sandbox_profile,
+        None,
+        make_coder,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_task_coder_with_coder_with_feedback(
+    item: &WorkItem,
+    attempt_id: &str,
+    task_id: &str,
+    project_root: &Path,
+    workspace_path: &Path,
+    prior_reviews: &[PathBuf],
+    resolver: &ContentResolver,
+    extra_args: &[String],
+    coder_kind: CoderKind,
+    no_sandbox: bool,
+    model: Option<&str>,
+    effort: Option<&str>,
+    pump_config: &crate::transcript_pump::TranscriptPumpConfig,
+    codex_worker: Option<&crate::codex_worker::CodexWorkerEnvironment>,
+    claude_home: Option<&Path>,
+    writer_cache: &crate::writer_cache::WriterDependencyCache,
+    sandbox_profile: Option<&os::SandboxProfile>,
+    handoff_feedback: Option<&str>,
+    make_coder: impl FnOnce(CoderSandbox, Option<&Path>) -> Box<dyn crate::coder::Coder>,
+) -> Result<()> {
+    let needs_sandbox_host_preparation =
+        !no_sandbox || (codex_worker.is_some() && !test_hermetic_no_sandbox());
+    if needs_sandbox_host_preparation {
+        if codex_worker.is_some() {
+            os::check_sandbox_prerequisite()?;
+        } else {
+            os::check_prerequisites_for(coder_kind)?;
+        }
         credential::inject_credentials()?;
         credential::setup_git_signing();
+    } else if needs_managed_claude_credential_bridge(coder_kind, claude_home) {
+        credential::inject_claude_credentials()?;
     }
 
     let mut launch_env: Vec<(String, String)> = Vec::new();
     if let Some(worker) = codex_worker {
         launch_env.push(worker.launch_env());
     }
+    if let Some(home) = claude_home {
+        fs::create_dir_all(home)
+            .with_context(|| format!("creating confined Claude home {}", home.display()))?;
+        launch_env.push(("HOME".to_string(), home.to_string_lossy().into_owned()));
+    }
+    launch_env.extend(writer_cache.launch_env());
 
     let task = item
         .attempts
@@ -2380,24 +4827,16 @@ fn run_task_coder_with_coder(
         .find(|attempt| attempt.id == attempt_id)
         .and_then(|attempt| attempt.tasks.iter().find(|task| task.id == task_id))
         .ok_or_else(|| anyhow::anyhow!("Task {task_id:?} not found"))?;
+    if task.input_artifacts.iter().any(|artifact| {
+        matches!(
+            artifact.producer_id.as_str(),
+            "usage-limit-writer-approval" | "writer-completion-context-retry"
+        )
+    }) {
+        launch_env.extend(usage_limit_writer_tool_env(writer_cache)?);
+    }
     materialize_planning_files(item, project_root)?;
     materialize_general_expertise(project_root)?;
-
-    if should_seed_project_model(task.kind, workspace_path) && coder_kind != CoderKind::Codex {
-        if let Err(err) = run_seed_project_model(
-            workspace_path,
-            resolver,
-            extra_args,
-            coder_kind,
-            no_sandbox,
-            model,
-            effort,
-        ) {
-            eprintln!(
-                "  Warning: seed project model failed, continuing without project expertise: {err}"
-            );
-        }
-    }
 
     let progress_dir = progress_md_dir(project_root, &item.id, attempt_id);
     fs::create_dir_all(&progress_dir).with_context(|| {
@@ -2406,21 +4845,163 @@ fn run_task_coder_with_coder(
             progress_dir.display()
         )
     })?;
-    // Materialize the authoritative `## Required completion` section BEFORE the
-    // first Writer launches, so a marked Attempt's current checklist reflects its
-    // immutable manifest and the Writer preserves and checks those stable ids.
-    // Idempotent and crash-safe: an existing section is left untouched.
+    // Materialize the host-owned `## Required completion` projection BEFORE the
+    // first Writer launches, so the Writer can use the immutable Plan order. The
+    // completed-Writer gate later replaces this section from validated matrix
+    // claims. Idempotent and crash-safe: an existing section is left untouched.
     if task.kind == TaskKind::Write {
         materialize_required_progress_before_writer(project_root, item, attempt_id)?;
+        materialize_writer_completion_before_writer(project_root, item, attempt_id, task_id)?;
     }
-    let prompt = build_write_task_prompt_with_workspace(
-        item,
-        attempt_id,
-        task_id,
-        prior_reviews,
-        Some(workspace_path),
-        Some(project_root),
-    );
+    let previous_writer_continues = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == attempt_id)
+        .and_then(|attempt| attempt.writer_runs.last())
+        .is_some_and(|run| run.outcome == crate::work_model::WriterOutcome::Continue);
+    let has_correction_artifacts = !correction_artifacts_only(prior_reviews).is_empty();
+    let (mut prompt, prompt_kind) = if has_correction_artifacts {
+        (
+            build_reviewed_correction_prompt(
+                item,
+                attempt_id,
+                task_id,
+                prior_reviews,
+                workspace_path,
+                project_root,
+            )?,
+            crate::writer_context::WriterPromptKind::ReviewedCorrection,
+        )
+    } else if previous_writer_continues {
+        (
+            build_writer_continuation_prompt(
+                item,
+                attempt_id,
+                task_id,
+                prior_reviews,
+                workspace_path,
+                project_root,
+            )?,
+            crate::writer_context::WriterPromptKind::PreReviewContinuation,
+        )
+    } else {
+        (
+            build_write_task_prompt_with_workspace(
+                item,
+                attempt_id,
+                task_id,
+                prior_reviews,
+                Some(workspace_path),
+                Some(project_root),
+            ),
+            crate::writer_context::WriterPromptKind::Initial,
+        )
+    };
+
+    if let Some(feedback) = handoff_feedback {
+        prompt.push_str("\n\n## Writer handoff correction\n\n");
+        prompt.push_str(feedback);
+    }
+
+    let attempt = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == attempt_id)
+        .context("Writer context Attempt is missing")?;
+    if attempt.writer_completion_contract.is_some() {
+        let pending =
+            crate::recovery_contracts::pending_writer_completion_rows(project_root, attempt, task)?;
+        let area = task
+            .artifact_area
+            .as_ref()
+            .context("Writer context needs an artifact area")?;
+        let artifact_dir = resolve_managed_artifact_area_path(project_root, &area.path)?;
+        let context_path = if prompt_kind == crate::writer_context::WriterPromptKind::Initial {
+            let candidate = head_commit(workspace_path)?;
+            let base = writer_context_base_commit(item, attempt_id, workspace_path);
+            write_execution_context(
+                &artifact_dir,
+                workspace_path,
+                &candidate,
+                base.as_deref(),
+                &[],
+                prior_reviews,
+                None,
+            )?
+        } else {
+            artifact_dir.join("execution-context.json")
+        };
+        let mut context: ExecutionContextV1 = serde_json::from_slice(&fs::read(&context_path)?)?;
+        if let Some(assignment) = &task.writer_correction_assignment {
+            // The immutable assignment remains authoritative even when current
+            // verification no longer reproduces its original defect.
+            context.current_findings = assignment
+                .findings
+                .iter()
+                .filter(|finding| pending.iter().any(|row| row.id == finding.id))
+                .map(|finding| ExecutionContextFinding {
+                    identity: finding.id.clone(),
+                    role: finding.role.clone(),
+                    title: finding.requirement.clone(),
+                    artifact: finding.source.clone(),
+                })
+                .collect();
+        }
+        context.pending_writer_rows = pending;
+        let serialized = bounded_execution_context_json(&mut context)?;
+        crate::atomic_write::atomic_write(&context_path, serialized.as_bytes())?;
+        prompt.push_str(&format!("\n\nRead the authoritative pending Writer rows and assigned findings in {}. Their exact identities remain required regardless of progress checkboxes or current verification results. External rows remain read-only and uncredited.\n", context_path.display()));
+    }
+
+    if let Some(recovery) =
+        crate::writer_completion_recovery::validated_writer_context(project_root, item, task)?
+    {
+        let files = recovery
+            .artifacts
+            .iter()
+            .map(|artifact| project_root.join(&artifact.path))
+            .collect::<Vec<_>>();
+        declared_file_readable_roots(&files, project_root)?;
+        anyhow::ensure!(
+            files.iter().all(|path| prior_reviews.contains(path)),
+            "Writer-completion recovery authority is missing from declared sandbox inputs"
+        );
+        let area = task
+            .artifact_area
+            .as_ref()
+            .context("recovered Writer has no artifact area")?;
+        let declaration = resolve_managed_artifact_area_path(project_root, &area.path)?
+            .join(NO_CHANGE_DECLARATION_FILE);
+        prompt.push_str(&format!(
+            "\n\n## Authorized Writer recovery\n\n{}\n\nRead the exact recovery evidence:\n{}\n\nIf focused verification proves no change is justified, preserve the clean recorded candidate and write {} with fresh evidence:\n\n```json\n{{\"schema_version\":1,\"reason\":\"<why the candidate already satisfies the work>\",\"verification\":[{{\"command\":\"<focused command>\",\"result\":\"pass\"}}]}}\n```\n\nUse nonempty reason and command values and at least one passing verification. Fluent removes stale declarations before launch and validates this declaration against the previous completed Writer and a clean unchanged workspace. This declaration does not complete pending matrix rows; preserve the completion contract and report only verified Writer work.\n",
+            recovery.instructions, prior_reviews_block(&files, "- "), declaration.display(),
+        ));
+        anyhow::ensure!(
+            prompt.len() <= crate::writer_context::REVIEWED_CORRECTION_PROMPT_MAX_BYTES,
+            "Writer recovery prompt is {} bytes; limit is {} bytes",
+            prompt.len(),
+            crate::writer_context::REVIEWED_CORRECTION_PROMPT_MAX_BYTES
+        );
+    }
+
+    if let Some((instructions, audit)) =
+        crate::recovery_contracts::classified_writer_delivery(project_root, item, task_id)?
+    {
+        anyhow::ensure!(
+            prior_reviews.contains(&audit),
+            "classification audit is missing from declared Writer inputs"
+        );
+        prompt.push_str(&format!(
+            "\n\n## Current host-evidence assignment\n\nCurrent assigned action: source correction. The prior request for more host evidence remains historical context. Read the complete authorized instructions and candidate-bound evidence in {} before changing the candidate.\n\nAuthorized instructions:\n{}\n",
+            audit.display(), instructions,
+        ));
+        anyhow::ensure!(
+            prompt.len() <= crate::writer_context::REVIEWED_CORRECTION_PROMPT_MAX_BYTES,
+            "classified Writer prompt is {} bytes; limit is {} bytes",
+            prompt.len(),
+            crate::writer_context::REVIEWED_CORRECTION_PROMPT_MAX_BYTES
+        );
+    }
 
     let transcript_path = task
         .artifact_area
@@ -2428,20 +5009,39 @@ fn run_task_coder_with_coder(
         .map(|a| project_root.join(&a.path).join("transcript.jsonl"));
     if let Some(parent) = transcript_path.as_ref().and_then(|p| p.parent()) {
         fs::create_dir_all(parent).context("Failed to create writer transcript artifact dir")?;
+        let execution_context = parent.join("execution-context.json");
+        crate::writer_context::record_writer_context_launch(
+            parent,
+            prompt_kind,
+            &prompt,
+            execution_context
+                .is_file()
+                .then_some(execution_context.as_path()),
+        )?;
     }
 
     let workspace_resolver = ContentResolver::new(Some(workspace_path));
     let system_prompt = workspace_resolver
         .resolve_content("prompts/write-system.md")
         .unwrap_or_default();
-    let (sandbox, _sandbox_profile) = if no_sandbox && codex_worker.is_none() {
+    let (sandbox, _sandbox_profile) = if let Some(profile) = sandbox_profile {
+        (
+            CoderSandbox::SeatbeltProfile(profile.path.to_string_lossy().to_string()),
+            None,
+        )
+    } else if no_sandbox && (codex_worker.is_none() || test_hermetic_no_sandbox()) {
         (CoderSandbox::None, None)
     } else {
         let common_git_dir = worktree::git_common_dir(workspace_path)?;
-        let mut readable_roots = input_artifact_readable_roots(prior_reviews);
+        let mut readable_roots = declared_file_readable_roots(prior_reviews, project_root)?;
         readable_roots.push(planning_files_dir(project_root, &item.id));
         readable_roots.push(general_expertise_dir(project_root));
+        readable_roots.extend(writer_handoff_model_readable_roots(project_root, task)?);
+        if let Some(worker) = codex_worker {
+            readable_roots.extend(worker.launcher().readable_roots().iter().cloned());
+        }
         let mut additional_writable = vec![common_git_dir, progress_dir.clone()];
+        additional_writable.push(writer_cache.root().to_path_buf());
         if let Some(ref tp) = transcript_path {
             if let Some(artifact_dir) = tp.parent() {
                 additional_writable.push(artifact_dir.to_path_buf());
@@ -2478,7 +5078,11 @@ fn run_task_coder_with_coder(
         }
     }
 
-    let coder = make_coder(sandbox);
+    clear_no_change_declaration(project_root, task)?;
+    let coder = make_coder(
+        sandbox,
+        codex_worker.map(|worker| worker.launcher().execution_executable()),
+    );
     // Use the capture config the caller resolved once per logical role run, so every
     // outer retry threads the SAME immutable config — a config change or a concurrent
     // launch between attempts can never hand this role a different capture mid-run.
@@ -2489,18 +5093,55 @@ fn run_task_coder_with_coder(
     // take its terminal outcome: an unconfirmed group sweep lands in
     // coder-supervision.json rather than being dropped with the ManagedChild, and a
     // sidecar obstruction rides along as a typed non-retryable secondary.
-    let completion = coder.run_captured_reported(
+    let codex_snapshot_available = codex_worker
+        .map(crate::codex_worker::CodexWorkerEnvironment::has_sessions)
+        // Injected route tests have no production worker home; preserve their
+        // ability to exercise the selected session value directly.
+        .unwrap_or(true);
+    let correction_session = handoff_feedback
+        .and_then(|_| transcript_path.as_deref())
+        .and_then(crate::work_attempt_loop::writer_session_id);
+    let session = correction_session
+        .as_deref()
+        .map(crate::coder::CoderSession::Resume)
+        .unwrap_or_else(|| {
+            writer_coder_session_with_codex_snapshot(
+                item,
+                attempt_id,
+                coder_kind,
+                codex_snapshot_available,
+            )
+        });
+    let _handoff_correction =
+        crate::execution::HandoffCorrection::enter(handoff_feedback.is_some());
+    let completion = coder.run_captured_reported_session(
         &prompt,
         &system_prompt,
         workspace_path,
         extra_args,
         &launch_env,
         capture.as_ref(),
+        session,
     );
-    let exit_code = match transcript_path.as_deref().and_then(Path::parent) {
+    let completed = match transcript_path.as_deref().and_then(Path::parent) {
         Some(artifact_dir) => crate::coder::finish_supervised_coder_run(completion, artifact_dir)?,
         None => completion.into_result()?,
     };
+    if let (Some(worker), Some(artifact_dir)) = (
+        codex_worker,
+        transcript_path.as_deref().and_then(Path::parent),
+    ) && worker.has_sessions()
+    {
+        if let Err(error) = worker.snapshot_sessions_to(&artifact_dir.join("codex-session")) {
+            // The coder has already completed. Session material improves the
+            // next continuation but is not execution evidence, so never rerun
+            // model work merely because this best-effort snapshot failed.
+            eprintln!(
+                "warning: Codex Writer session could not be saved; a continuation will start fresh: {error:#}"
+            );
+        }
+    }
+    let exit_code = completed;
     if let Some(tp) = &transcript_path {
         crate::usage::log_usage_from_transcript(
             tp,
@@ -2509,12 +5150,140 @@ fn run_task_coder_with_coder(
             attempt_id,
             task_id,
         );
+        if let Some(artifact_dir) = tp.parent()
+            && let Err(error) = crate::writer_context::finalize_writer_context_usage(artifact_dir)
+        {
+            eprintln!("warning: Writer context usage persistence failed: {error:#}");
+        }
     }
     if exit_code == 0 {
         Ok(())
     } else {
         bail!("Coder exited with code {exit_code}")
     }
+}
+
+fn needs_managed_claude_credential_bridge(
+    coder_kind: CoderKind,
+    claude_home: Option<&Path>,
+) -> bool {
+    coder_kind == CoderKind::Claude && claude_home.is_some()
+}
+
+fn writer_coder_session<'a>(
+    item: &'a WorkItem,
+    attempt_id: &str,
+    coder_kind: CoderKind,
+) -> crate::coder::CoderSession<'a> {
+    item.attempts
+        .iter()
+        .find(|attempt| attempt.id == attempt_id)
+        .and_then(|attempt| resumable_writer_run(attempt, coder_kind))
+        .and_then(|run| run.session_id.as_deref())
+        .filter(|session_id| !session_id.trim().is_empty())
+        .map(crate::coder::CoderSession::Resume)
+        .unwrap_or(crate::coder::CoderSession::FreshPersistent)
+}
+
+fn resumable_writer_run(
+    attempt: &crate::work_model::Attempt,
+    coder_kind: CoderKind,
+) -> Option<&crate::work_model::WriterRun> {
+    let run = attempt.writer_runs.last()?;
+    let candidate_gate_correction = run.outcome == crate::work_model::WriterOutcome::Blocked
+        && attempt
+            .tasks
+            .iter()
+            .rev()
+            .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Planned)
+            .is_some_and(|task| {
+                task.input_artifacts.iter().any(|artifact| {
+                    artifact.producer_id == run.task_id
+                        && artifact
+                            .path
+                            .ends_with(crate::candidate_gate::CANDIDATE_GATE_FILE)
+                })
+            });
+    (run.provider == coder_kind.as_str()
+        && (matches!(
+            run.outcome,
+            crate::work_model::WriterOutcome::Complete | crate::work_model::WriterOutcome::Continue
+        ) || candidate_gate_correction))
+        .then_some(run)
+}
+
+fn writer_coder_session_with_codex_snapshot<'a>(
+    item: &'a WorkItem,
+    attempt_id: &str,
+    coder_kind: CoderKind,
+    codex_snapshot_available: bool,
+) -> crate::coder::CoderSession<'a> {
+    if coder_kind == CoderKind::Codex && !codex_snapshot_available {
+        crate::coder::CoderSession::FreshPersistent
+    } else {
+        writer_coder_session(item, attempt_id, coder_kind)
+    }
+}
+
+fn previous_writer_codex_session_snapshot(
+    item: &WorkItem,
+    attempt_id: &str,
+    project_root: &Path,
+) -> Result<Option<PathBuf>> {
+    let Some(attempt) = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == attempt_id)
+    else {
+        return Ok(None);
+    };
+    let Some(run) = resumable_writer_run(attempt, CoderKind::Codex).filter(|run| {
+        run.session_id
+            .as_deref()
+            .is_some_and(|id| !id.trim().is_empty())
+    }) else {
+        return Ok(None);
+    };
+    let Some(area) = attempt
+        .tasks
+        .iter()
+        .find(|task| task.id == run.task_id)
+        .and_then(|task| task.artifact_area.as_ref())
+    else {
+        return Ok(None);
+    };
+    let snapshot =
+        resolve_managed_artifact_area_path(project_root, &area.path)?.join("codex-session");
+    Ok(snapshot.is_dir().then_some(snapshot))
+}
+
+/// Remove only the declaration a prior launch could have left behind. The next
+/// coder must create fresh evidence for this launch; transcripts and every other
+/// Task artifact remain untouched.
+fn clear_no_change_declaration(project_root: &Path, task: &Task) -> Result<()> {
+    let Some(area) = task.artifact_area.as_ref() else {
+        return Ok(());
+    };
+    let declaration = resolve_managed_artifact_area_path(project_root, &area.path)?
+        .join(NO_CHANGE_DECLARATION_FILE);
+    match fs::remove_file(&declaration) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(anyhow::Error::new(error).context(format!(
+            "remove stale no-change declaration at {}",
+            declaration.display()
+        ))),
+    }
+}
+
+#[cfg(feature = "test-support")]
+fn test_hermetic_no_sandbox() -> bool {
+    std::env::var_os("FLUENT_TEST_HERMETIC_NO_SANDBOX").is_some()
+}
+
+#[cfg(not(feature = "test-support"))]
+fn test_hermetic_no_sandbox() -> bool {
+    false
 }
 
 /// The immutable execution context a derived corrective Work Item renders into
@@ -2544,14 +5313,33 @@ fn build_write_task_prompt_with_workspace(
     workspace_path: Option<&Path>,
     project_root: Option<&Path>,
 ) -> String {
-    let task = item
+    let attempt = item
         .attempts
         .iter()
         .find(|a| a.id == attempt_id)
-        .and_then(|a| a.tasks.iter().find(|t| t.id == task_id))
+        .expect("Attempt must exist");
+    let task_index = attempt
+        .tasks
+        .iter()
+        .position(|task| task.id == task_id)
         .expect("Task must exist");
+    let task = attempt.tasks.get(task_index).expect("Task must exist");
+    let is_followup_writer = attempt.tasks[..task_index]
+        .iter()
+        .any(|candidate| candidate.kind == TaskKind::Write);
+    let is_followup_writer_value = if is_followup_writer { "yes" } else { "" };
+    let no_change_declaration_path = project_root
+        .zip(task.artifact_area.as_ref())
+        .map(|(root, area)| root.join(&area.path).join(NO_CHANGE_DECLARATION_FILE))
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
     let task_json = to_json_pretty(task).unwrap_or_default();
-    let prior_reviews_list = prior_reviews_block(prior_reviews, "   ");
+    let work_item_inputs = project_root
+        .map(|root| work_item_inputs_only(item, root))
+        .unwrap_or_default();
+    let prior_reviews = correction_artifacts_only(prior_reviews);
+    let prior_reviews_list = prior_reviews_block(&prior_reviews, "   ");
+    let work_item_inputs_list = prior_reviews_block(&work_item_inputs, "   ");
     let progress_md_pathbuf = project_root.and_then(|root| {
         item.attempts
             .iter()
@@ -2573,7 +5361,39 @@ fn build_write_task_prompt_with_workspace(
         .and_then(|a| a.progress_contract.as_ref())
         .is_some();
     let has_required_progress_value = if has_required_progress { "yes" } else { "" };
+    let writer_completion_matrix_pathbuf = project_root.and_then(|root| {
+        item.attempts
+            .iter()
+            .find(|attempt| attempt.id == attempt_id)
+            .filter(|attempt| attempt.writer_completion_contract.is_some())
+            .and_then(|_| writer_completion_matrix_path(root, task))
+    });
+    let writer_completion_matrix_path = writer_completion_matrix_pathbuf
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+    let has_writer_completion_matrix = writer_completion_matrix_pathbuf.is_some();
+    let has_writer_completion_matrix_value = if has_writer_completion_matrix {
+        "yes"
+    } else {
+        ""
+    };
+    let writer_completion_allowed_constraints =
+        writer_completion_allowed_constraints(item, attempt_id);
+    let has_matrix_backed_required_progress_value =
+        if has_required_progress && has_writer_completion_matrix {
+            "yes"
+        } else {
+            ""
+        };
+    let has_legacy_required_progress_value =
+        if has_required_progress && !has_writer_completion_matrix {
+            "yes"
+        } else {
+            ""
+        };
     let has_prior_reviews = !prior_reviews.is_empty();
+    let has_work_item_inputs = !work_item_inputs.is_empty();
     let planning = project_root
         .map(|root| compute_planning_paths(item, root))
         .unwrap_or_default();
@@ -2608,6 +5428,7 @@ fn build_write_task_prompt_with_workspace(
         ""
     };
     let has_prior_reviews_value = if has_prior_reviews { "yes" } else { "" };
+    let has_work_item_inputs_value = if has_work_item_inputs { "yes" } else { "" };
     let has_prior_reviews_with_required_progress_value =
         if has_prior_reviews && has_required_progress {
             "yes"
@@ -2644,20 +5465,36 @@ fn build_write_task_prompt_with_workspace(
             ("work_item_title", &item.title),
             ("attempt_id", attempt_id),
             ("task_id", task_id),
+            (
+                "candidate_checkout_path",
+                &workspace_path
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default(),
+            ),
+            (
+                "source_checkout_path",
+                &project_root
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default(),
+            ),
             ("role", &task.role),
             ("brief_path", &brief_path),
             ("behaviors_path", &behaviors_path),
             ("approach_path", &approach_path),
             ("plan_path", &plan_path),
             ("prior_reviews_list", &prior_reviews_list),
+            ("work_item_inputs_list", &work_item_inputs_list),
             ("progress_md_path", &progress_md_path),
             ("task_json", &task_json),
+            ("is_followup_writer", is_followup_writer_value),
+            ("no_change_declaration_path", &no_change_declaration_path),
             ("is_corrective", is_corrective_value),
             ("corrective_context", &corrective_context),
             ("bootstrap_anything", bootstrap_anything_value),
             ("bootstrap_tester_yaml", bootstrap_yaml_value),
             ("bootstrap_extract_script", bootstrap_extract_value),
             ("has_prior_reviews", has_prior_reviews_value),
+            ("has_work_item_inputs", has_work_item_inputs_value),
             (
                 "has_prior_reviews_with_required_progress",
                 has_prior_reviews_with_required_progress_value,
@@ -2669,6 +5506,26 @@ fn build_write_task_prompt_with_workspace(
             ("has_no_prior_reviews", has_no_prior_reviews_value),
             ("has_progress_md", has_progress_md_value),
             ("has_required_progress", has_required_progress_value),
+            (
+                "has_matrix_backed_required_progress",
+                has_matrix_backed_required_progress_value,
+            ),
+            (
+                "has_legacy_required_progress",
+                has_legacy_required_progress_value,
+            ),
+            (
+                "writer_completion_matrix_path",
+                &writer_completion_matrix_path,
+            ),
+            (
+                "has_writer_completion_matrix",
+                has_writer_completion_matrix_value,
+            ),
+            (
+                "writer_completion_allowed_constraints",
+                &writer_completion_allowed_constraints,
+            ),
             ("general_expertise_index", &general_expertise_index),
             ("project_expertise_index", &project_expertise_index),
             (
@@ -2678,6 +5535,956 @@ fn build_write_task_prompt_with_workspace(
         ],
     )
     .expect("write-user.md template must render with the documented context")
+}
+
+fn build_writer_continuation_prompt(
+    item: &WorkItem,
+    attempt_id: &str,
+    task_id: &str,
+    prior_reviews: &[PathBuf],
+    workspace_path: &Path,
+    project_root: &Path,
+) -> Result<String> {
+    let progress_path = progress_md_path_for(project_root, &item.id, attempt_id);
+    let unresolved_steps = fs::read_to_string(&progress_path)
+        .ok()
+        .map(|source| unresolved_progress_steps(&source))
+        .unwrap_or_default();
+    let unresolved_progress = if unresolved_steps.is_empty() {
+        "Read the completion matrix and generated context for authoritative unresolved work."
+            .to_string()
+    } else {
+        unresolved_steps
+            .iter()
+            .map(|step| format!("- [ ] {step}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let task = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == attempt_id)
+        .and_then(|attempt| attempt.tasks.iter().find(|task| task.id == task_id))
+        .ok_or_else(|| anyhow::anyhow!("continuation Task {task_id:?} not found"))?;
+    let artifact_area = task.artifact_area.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("continuation Task {task_id:?} must declare an artifact area")
+    })?;
+    let artifact_dir = project_root.join(&artifact_area.path);
+    let candidate_commit = git_stdout(workspace_path, &["rev-parse", "HEAD"]);
+    let base_commit = writer_context_base_commit(item, attempt_id, workspace_path).filter(|base| {
+        !git_stdout(
+            workspace_path,
+            &["rev-parse", "--verify", &format!("{base}^{{commit}}")],
+        )
+        .is_empty()
+    });
+    let lineage = correction_lineage(project_root, &candidate_commit, prior_reviews);
+    let context_path = write_execution_context(
+        &artifact_dir,
+        workspace_path,
+        &candidate_commit,
+        base_commit.as_deref(),
+        &unresolved_steps,
+        prior_reviews,
+        Some(lineage.clone()),
+    )?;
+    let has_writer_completion_matrix = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == attempt_id)
+        .is_some_and(|attempt| attempt.writer_completion_contract.is_some());
+    let writer_completion_matrix_path = has_writer_completion_matrix
+        .then(|| writer_completion_matrix_path(project_root, task))
+        .flatten()
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+    let has_writer_completion_matrix_value = if has_writer_completion_matrix {
+        "yes"
+    } else {
+        ""
+    };
+    let writer_completion_allowed_constraints =
+        writer_completion_allowed_constraints(item, attempt_id);
+    let planning = compute_planning_paths(item, project_root);
+    let brief_path = planning.brief();
+    let behaviors_path = planning.behaviors();
+    let approach_path = planning.approach();
+    let plan_path = planning.plan();
+    let template = ContentResolver::new(Some(workspace_path))
+        .resolve_content("prompts/write-continuation-user.md")
+        .expect("bundled write-continuation-user.md must resolve");
+    crate::content::render_template(
+        &template,
+        &[
+            ("work_item_id", &item.id),
+            ("work_item_title", &item.title),
+            ("attempt_id", attempt_id),
+            ("task_id", task_id),
+            (
+                "candidate_checkout_path",
+                &workspace_path.display().to_string(),
+            ),
+            ("source_checkout_path", &project_root.display().to_string()),
+            ("prior_candidate_commit", &candidate_commit),
+            (
+                "protected_base_commit",
+                lineage.protected_base_commit.as_deref().unwrap_or_default(),
+            ),
+            (
+                "correction_lineage_append_only",
+                if lineage.mode == ExecutionContextCorrectionLineageMode::AppendOnly {
+                    "yes"
+                } else {
+                    ""
+                },
+            ),
+            (
+                "correction_lineage_metadata_rewrite",
+                if lineage.mode
+                    == ExecutionContextCorrectionLineageMode::TreeIdenticalMetadataRewrite
+                {
+                    "yes"
+                } else {
+                    ""
+                },
+            ),
+            ("progress_md_path", &progress_path.display().to_string()),
+            (
+                "writer_completion_matrix_path",
+                &writer_completion_matrix_path,
+            ),
+            (
+                "has_writer_completion_matrix",
+                has_writer_completion_matrix_value,
+            ),
+            (
+                "writer_completion_allowed_constraints",
+                &writer_completion_allowed_constraints,
+            ),
+            ("brief_path", &brief_path),
+            ("behaviors_path", &behaviors_path),
+            ("approach_path", &approach_path),
+            ("plan_path", &plan_path),
+            ("unresolved_progress", &unresolved_progress),
+            (
+                "execution_context_path",
+                &context_path.display().to_string(),
+            ),
+        ],
+    )
+    .context("write-continuation-user.md template must render with the documented context")
+}
+
+fn build_reviewed_correction_prompt(
+    item: &WorkItem,
+    attempt_id: &str,
+    task_id: &str,
+    correction_artifacts: &[PathBuf],
+    workspace_path: &Path,
+    project_root: &Path,
+) -> Result<String> {
+    let progress_path = progress_md_path_for(project_root, &item.id, attempt_id);
+    let unresolved_steps = fs::read_to_string(&progress_path)
+        .ok()
+        .map(|source| unresolved_progress_steps(&source))
+        .unwrap_or_default();
+    let attempt = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == attempt_id)
+        .ok_or_else(|| anyhow::anyhow!("Attempt {attempt_id:?} not found"))?;
+    let task = attempt
+        .tasks
+        .iter()
+        .find(|task| task.id == task_id)
+        .ok_or_else(|| anyhow::anyhow!("corrective Writer Task {task_id:?} not found"))?;
+    let artifact_area = task.artifact_area.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("corrective Writer Task {task_id:?} must declare an artifact area")
+    })?;
+    let artifact_dir = resolve_managed_artifact_area_path(project_root, &artifact_area.path)?;
+    let candidate_commit = head_commit(workspace_path)?;
+    let base_commit = writer_context_base_commit(item, attempt_id, workspace_path);
+    let correction_lineage =
+        correction_lineage(project_root, &candidate_commit, correction_artifacts);
+    let recovered_protected_base =
+        latest_candidate_ancestry_protected_base(item, attempt_id).unwrap_or_default();
+    let context_path = write_execution_context_with_finding_policy(
+        &artifact_dir,
+        workspace_path,
+        &candidate_commit,
+        base_commit.as_deref(),
+        &unresolved_steps,
+        correction_artifacts,
+        Some(correction_lineage.clone()),
+        task.role != crate::work_model::TESTER_HARNESS_REPAIR_ROLE,
+    )?;
+    let corrective_authority_path = if let Some(authority) = corrective_execution_context(item) {
+        let path = artifact_dir.join("corrective-authority.md");
+        crate::atomic_write::atomic_write(&path, authority.as_bytes())
+            .with_context(|| format!("write corrective authority snapshot {}", path.display()))?;
+        path.display().to_string()
+    } else {
+        String::new()
+    };
+    let has_writer_completion_matrix = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == attempt_id)
+        .is_some_and(|attempt| attempt.writer_completion_contract.is_some());
+    let writer_completion_matrix_path = has_writer_completion_matrix
+        .then(|| writer_completion_matrix_path(project_root, task))
+        .flatten()
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+    let writer_completion_allowed_constraints =
+        writer_completion_allowed_constraints(item, attempt_id);
+    let correction_artifacts_list = prior_reviews_block(correction_artifacts, "  ");
+    let tester_harness_repair = task.role == crate::work_model::TESTER_HARNESS_REPAIR_ROLE;
+    let tester_harness_repair_instructions = if tester_harness_repair {
+        task.instructions.as_deref().unwrap_or_default()
+    } else {
+        ""
+    };
+    let human_resolution = attempt
+        .round_cap_extensions
+        .iter()
+        .rev()
+        .find(|extension| {
+            !extension.human_resolution.is_empty()
+                && extension
+                    .failed_reviews
+                    .iter()
+                    .all(|review| task.input_artifacts.contains(&review.artifact))
+        })
+        .map(|extension| extension.human_resolution.as_str())
+        .unwrap_or_default();
+    let failed_tester_inspection_inputs = required_failed_tester_inspection_inputs(task);
+    let failed_tester_inspection_list = failed_tester_inspection_inputs
+        .iter()
+        .map(|artifact| format!("  - {}", artifact.path))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let candidate_metadata_rewrite_authority = task
+        .input_artifacts
+        .iter()
+        .find(|artifact| {
+            artifact.producer_id == crate::candidate_metadata_recovery::PRODUCER
+                && artifact.path.ends_with("/repair.json")
+        })
+        .map(|artifact| artifact.path.as_str())
+        .unwrap_or_default();
+    let planning = compute_planning_paths(item, project_root);
+    let template = ContentResolver::new(Some(workspace_path))
+        .resolve_content("prompts/write-correction-user.md")
+        .expect("bundled write-correction-user.md must resolve");
+    let prompt = crate::content::render_template(
+        &template,
+        &[
+            ("work_item_id", &item.id),
+            ("work_item_title", &item.title),
+            ("attempt_id", attempt_id),
+            ("task_id", task_id),
+            (
+                "candidate_checkout_path",
+                &workspace_path.display().to_string(),
+            ),
+            ("source_checkout_path", &project_root.display().to_string()),
+            ("brief_path", &planning.brief()),
+            ("behaviors_path", &planning.behaviors()),
+            ("approach_path", &planning.approach()),
+            ("plan_path", &planning.plan()),
+            ("progress_md_path", &progress_path.display().to_string()),
+            (
+                "writer_completion_matrix_path",
+                &writer_completion_matrix_path,
+            ),
+            (
+                "has_writer_completion_matrix",
+                if has_writer_completion_matrix {
+                    "yes"
+                } else {
+                    ""
+                },
+            ),
+            (
+                "writer_completion_allowed_constraints",
+                &writer_completion_allowed_constraints,
+            ),
+            (
+                "execution_context_path",
+                &context_path.display().to_string(),
+            ),
+            ("correction_lineage_mode", correction_lineage.mode.as_str()),
+            (
+                "prior_candidate_commit",
+                &correction_lineage.prior_candidate_commit,
+            ),
+            (
+                "correction_lineage_append_only",
+                if correction_lineage.mode == ExecutionContextCorrectionLineageMode::AppendOnly {
+                    "yes"
+                } else {
+                    ""
+                },
+            ),
+            (
+                "correction_lineage_metadata_rewrite",
+                if correction_lineage.mode
+                    == ExecutionContextCorrectionLineageMode::TreeIdenticalMetadataRewrite
+                {
+                    "yes"
+                } else {
+                    ""
+                },
+            ),
+            (
+                "protected_base_commit",
+                correction_lineage
+                    .protected_base_commit
+                    .as_deref()
+                    .unwrap_or_default(),
+            ),
+            (
+                "has_recovered_protected_base",
+                if recovered_protected_base.is_empty() {
+                    ""
+                } else {
+                    "yes"
+                },
+            ),
+            ("recovered_protected_base", &recovered_protected_base),
+            ("correction_artifacts_list", &correction_artifacts_list),
+            (
+                "candidate_metadata_rewrite_authority_path",
+                candidate_metadata_rewrite_authority,
+            ),
+            (
+                "has_candidate_metadata_rewrite_authority",
+                if candidate_metadata_rewrite_authority.is_empty() {
+                    ""
+                } else {
+                    "yes"
+                },
+            ),
+            (
+                "is_tester_harness_repair",
+                if tester_harness_repair { "yes" } else { "" },
+            ),
+            (
+                "tester_harness_repair_instructions",
+                tester_harness_repair_instructions,
+            ),
+            ("human_resolution", human_resolution),
+            (
+                "has_human_resolution",
+                if human_resolution.is_empty() {
+                    ""
+                } else {
+                    "yes"
+                },
+            ),
+            (
+                "has_failed_tester_inspection",
+                if failed_tester_inspection_inputs.is_empty() {
+                    ""
+                } else {
+                    "yes"
+                },
+            ),
+            (
+                "failed_tester_inspection_list",
+                &failed_tester_inspection_list,
+            ),
+            ("artifact_dir", &artifact_dir.display().to_string()),
+            (
+                "no_change_declaration_path",
+                &artifact_dir
+                    .join(NO_CHANGE_DECLARATION_FILE)
+                    .display()
+                    .to_string(),
+            ),
+            ("corrective_authority_path", &corrective_authority_path),
+            (
+                "has_corrective_authority",
+                if corrective_authority_path.is_empty() {
+                    ""
+                } else {
+                    "yes"
+                },
+            ),
+        ],
+    )
+    .context("write-correction-user.md template must render with the documented context")?;
+    if prompt.len() > crate::writer_context::REVIEWED_CORRECTION_PROMPT_MAX_BYTES {
+        bail!(
+            "reviewed correction prompt is {} bytes; limit is {} bytes",
+            prompt.len(),
+            crate::writer_context::REVIEWED_CORRECTION_PROMPT_MAX_BYTES
+        );
+    }
+    Ok(prompt)
+}
+
+fn correction_lineage(
+    project_root: &Path,
+    prior_candidate_commit: &str,
+    correction_artifacts: &[PathBuf],
+) -> ExecutionContextCorrectionLineage {
+    let candidate_gates = correction_artifacts
+        .iter()
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name == crate::candidate_gate::CANDIDATE_GATE_FILE)
+        })
+        .collect::<Vec<_>>();
+    // A corrective Writer can receive more than one historical gate (for
+    // example after a mixed finding was repaired append-only).  Only the gate
+    // that names the exact candidate at this frontier can authorize the
+    // tree-identical metadata exception; older gates remain readable history,
+    // but must not downgrade the current Writer to append-only guidance.
+    let protected_base_commit = candidate_gates.iter().rev().find_map(|path| {
+        crate::candidate_gate::authorized_tree_identical_metadata_rewrite_base(
+            path,
+            prior_candidate_commit,
+        )
+        .or_else(|| {
+            crate::candidate_metadata_recovery::authorized_derived_project_check_metadata_rewrite_base(
+                project_root,
+                path,
+                prior_candidate_commit,
+            )
+            })
+    }).or_else(|| {
+        correction_artifacts.iter().rev().find_map(|path| {
+            let is_metadata_authority = path
+                .file_name()
+                .is_some_and(|name| name == "repair.json")
+                && path
+                    .to_string_lossy()
+                    .contains("/candidate-metadata-repairs/");
+            if !is_metadata_authority {
+                return None;
+            }
+            crate::candidate_metadata_recovery::authorized_metadata_rewrite_base(
+                project_root,
+                path,
+                prior_candidate_commit,
+            )
+        })
+    });
+    let mode = if protected_base_commit.is_some() {
+        ExecutionContextCorrectionLineageMode::TreeIdenticalMetadataRewrite
+    } else {
+        ExecutionContextCorrectionLineageMode::AppendOnly
+    };
+    ExecutionContextCorrectionLineage {
+        mode,
+        prior_candidate_commit: prior_candidate_commit.to_string(),
+        protected_base_commit,
+    }
+}
+
+fn latest_candidate_ancestry_protected_base(item: &WorkItem, attempt_id: &str) -> Option<String> {
+    item.attempts
+        .iter()
+        .find(|attempt| attempt.id == attempt_id)?
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| {
+            task.kind == TaskKind::Write
+                && task.role == crate::work_model::CANDIDATE_ANCESTRY_REPAIR_ROLE
+                && task.status == TaskStatus::Complete
+        })?
+        .output
+        .as_ref()?
+        .base_commit
+        .clone()
+}
+
+fn writer_completion_allowed_constraints(item: &WorkItem, attempt_id: &str) -> String {
+    item.attempts
+        .iter()
+        .find(|attempt| attempt.id == attempt_id)
+        .and_then(|attempt| attempt.writer_completion_contract.as_ref())
+        .map(|contract| {
+            contract
+                .applicable_constraint_ids()
+                .map(|id| format!("- `{id}`"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .filter(|ids| !ids.is_empty())
+        .unwrap_or_else(|| {
+            "- No planning constraint IDs are available; use `none: <specific reason>`.".to_string()
+        })
+}
+
+fn writer_context_base_commit(
+    item: &WorkItem,
+    attempt_id: &str,
+    workspace_path: &Path,
+) -> Option<String> {
+    let attempt = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == attempt_id)?;
+    if let Some(base) = attempt
+        .tasks
+        .iter()
+        .filter(|task| task.kind == TaskKind::Write)
+        .filter_map(|task| task.output.as_ref())
+        .find_map(|output| output.base_commit.as_deref())
+        .filter(|base| !base.is_empty())
+    {
+        return Some(base.to_string());
+    }
+    let source_branch = attempt
+        .tasks
+        .iter()
+        .filter(|task| task.kind == TaskKind::Write)
+        .filter_map(|task| task.output.as_ref())
+        .next()
+        .map(|output| output.source_branch.as_str())?;
+    let base = git_stdout(workspace_path, &["merge-base", source_branch, "HEAD"]);
+    (!base.is_empty()).then_some(base)
+}
+
+fn unresolved_progress_steps(source: &str) -> Vec<String> {
+    let mut include_nested = false;
+    let mut unresolved = Vec::new();
+    for line in source.lines() {
+        if line.starts_with("- [ ]") {
+            include_nested = true;
+            unresolved.push(line.trim_start_matches("- [ ]").trim_start().to_string());
+        } else if line.starts_with("- [") || line.starts_with("## ") {
+            include_nested = false;
+        } else if include_nested && (line.starts_with("  ") || line.trim().is_empty()) {
+            if let Some(step) = unresolved.last_mut() {
+                step.push('\n');
+                step.push_str(line);
+            }
+        }
+    }
+    unresolved
+}
+
+fn git_stdout(workspace: &Path, args: &[&str]) -> String {
+    crate::git::run_stdout(workspace, args, "building bounded execution context")
+        .unwrap_or_default()
+}
+
+fn write_execution_context(
+    artifact_dir: &Path,
+    workspace: &Path,
+    candidate_commit: &str,
+    base_commit: Option<&str>,
+    unresolved_steps: &[String],
+    input_artifacts: &[PathBuf],
+    correction_lineage: Option<ExecutionContextCorrectionLineage>,
+) -> Result<PathBuf> {
+    write_execution_context_with_finding_policy(
+        artifact_dir,
+        workspace,
+        candidate_commit,
+        base_commit,
+        unresolved_steps,
+        input_artifacts,
+        correction_lineage,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_execution_context_with_finding_policy(
+    artifact_dir: &Path,
+    workspace: &Path,
+    candidate_commit: &str,
+    base_commit: Option<&str>,
+    unresolved_steps: &[String],
+    input_artifacts: &[PathBuf],
+    correction_lineage: Option<ExecutionContextCorrectionLineage>,
+    include_tester_findings: bool,
+) -> Result<PathBuf> {
+    let changed_files = if let Some(base_commit) = base_commit.filter(|value| !value.is_empty()) {
+        git_stdout(
+            workspace,
+            &["diff", "--name-only", base_commit, candidate_commit],
+        )
+    } else {
+        git_stdout(
+            workspace,
+            &[
+                "diff-tree",
+                "--root",
+                "--no-commit-id",
+                "--name-only",
+                "-r",
+                "HEAD",
+            ],
+        )
+    }
+    .lines()
+    .filter(|line| !line.is_empty())
+    .map(|line| truncate_utf8(line, 240))
+    .collect::<Vec<_>>();
+    let unresolved_steps = unresolved_steps
+        .iter()
+        .map(|step| truncate_utf8(step, 500))
+        .collect::<Vec<_>>();
+    let current = current_verification_for_context(artifact_dir, candidate_commit)?;
+    let root = current
+        .as_ref()
+        .map(|(root, _)| root.as_path())
+        .unwrap_or(workspace);
+    let inputs = input_artifacts
+        .iter()
+        .map(|path| ArtifactRef {
+            producer_id: String::new(),
+            path: std::path::absolute(path)
+                .unwrap_or_else(|_| path.clone())
+                .display()
+                .to_string(),
+        })
+        .collect::<Vec<_>>();
+    let current_findings = crate::recovery_contracts::findings_from_inputs(
+        root,
+        &inputs,
+        include_tester_findings,
+        current.as_ref().map(|(_, view)| view),
+    )?
+    .into_iter()
+    .map(|finding| ExecutionContextFinding {
+        identity: finding
+            .id
+            .strip_prefix(&format!("finding:{}:", finding.role))
+            .unwrap_or(&finding.id)
+            .to_string(),
+        role: finding.role,
+        title: truncate_utf8(
+            &finding.requirement,
+            EXECUTION_CONTEXT_MAX_FINDING_TITLE_BYTES,
+        ),
+        artifact: finding.source,
+    })
+    .collect();
+    let verification = current
+        .map(|(_, view)| {
+            compact_execution_verification(artifact_dir, view)
+                .map(ExecutionContextVerificationRecord::Compact)
+        })
+        .transpose()?;
+    let (passing_evidence, executed_commands) =
+        execution_context_evidence(input_artifacts, candidate_commit);
+    let historical_artifacts = input_artifacts
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
+    let (changed_files, omitted_changed_files) =
+        bounded_vec(changed_files, EXECUTION_CONTEXT_MAX_CHANGED_FILES);
+    let (passing_evidence, omitted_passing_evidence) =
+        bounded_vec(passing_evidence, EXECUTION_CONTEXT_MAX_EVIDENCE);
+    let (executed_commands, omitted_executed_commands) =
+        bounded_vec(executed_commands, EXECUTION_CONTEXT_MAX_COMMANDS);
+    let mut context = ExecutionContextV1 {
+        schema_version: if verification.is_some() { 3 } else { 1 },
+        verification,
+        candidate_commit: truncate_utf8(candidate_commit, 128),
+        base_commit: base_commit
+            .filter(|value| !value.is_empty())
+            .map(|value| truncate_utf8(value, 128)),
+        correction_lineage,
+        changed_files,
+        unresolved_steps,
+        pending_writer_rows: Vec::new(),
+        current_findings,
+        passing_evidence,
+        executed_commands,
+        historical_artifacts,
+        omitted: ExecutionContextOmitted {
+            changed_files: omitted_changed_files,
+            unresolved_steps: 0,
+            current_findings: 0,
+            passing_evidence: omitted_passing_evidence,
+            executed_commands: omitted_executed_commands,
+            historical_artifacts: 0,
+        },
+    };
+    let serialized = bounded_execution_context_json(&mut context)?;
+    fs::create_dir_all(artifact_dir)?;
+    let path = artifact_dir.join("execution-context.json");
+    crate::atomic_write::atomic_write(&path, serialized.as_bytes())?;
+    Ok(path)
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
+}
+
+fn bounded_vec<T>(mut values: Vec<T>, max: usize) -> (Vec<T>, usize) {
+    let omitted = values.len().saturating_sub(max);
+    values.truncate(max);
+    (values, omitted)
+}
+
+fn compact_execution_verification(
+    artifact_dir: &Path,
+    assessment: crate::verification_assessment::VerificationAssessment,
+) -> Result<ExecutionContextVerification> {
+    let bytes = to_json_pretty(&assessment)?.into_bytes();
+    fs::create_dir_all(artifact_dir)?;
+    let path = artifact_dir.join("verification-assessment.json");
+    crate::atomic_write::atomic_write(&path, &bytes)?;
+    let full_assessment = crate::work_model::BoundRecheckArtifact {
+        path: std::path::absolute(&path)?.display().to_string(),
+        digest: format!("sha256:{:x}", Sha256::digest(&bytes)),
+    };
+    let satisfied_references = assessment
+        .references
+        .iter()
+        .filter(|row| row.satisfied)
+        .count();
+    let satisfied_commands = assessment
+        .commands
+        .iter()
+        .filter(|row| row.satisfied)
+        .count();
+    Ok(ExecutionContextVerification {
+        candidate_commit: assessment.candidate_commit,
+        references: assessment
+            .references
+            .into_iter()
+            .filter(|row| !row.satisfied)
+            .collect(),
+        commands: assessment
+            .commands
+            .into_iter()
+            .filter(|row| !row.satisfied)
+            .collect(),
+        satisfied_references,
+        satisfied_commands,
+        full_assessment,
+    })
+}
+
+fn bounded_execution_context_json(context: &mut ExecutionContextV1) -> Result<String> {
+    loop {
+        let serialized = to_json_pretty(context)?;
+        if serialized.len() <= EXECUTION_CONTEXT_MAX_BYTES {
+            return Ok(serialized);
+        }
+        if context.executed_commands.pop().is_some() {
+            context.omitted.executed_commands += 1;
+        } else if context.changed_files.pop().is_some() {
+            context.omitted.changed_files += 1;
+        } else if context.passing_evidence.pop().is_some() {
+            context.omitted.passing_evidence += 1;
+        } else {
+            anyhow::bail!(
+                "execution context core exceeds {EXECUTION_CONTEXT_MAX_BYTES} bytes (actual: {} bytes)",
+                serialized.len()
+            );
+        }
+    }
+}
+
+fn current_verification_for_context(
+    artifact_dir: &Path,
+    candidate: &str,
+) -> Result<
+    Option<(
+        PathBuf,
+        crate::verification_assessment::VerificationAssessment,
+    )>,
+> {
+    let Some(fluent) = artifact_dir
+        .ancestors()
+        .find(|path| path.file_name().is_some_and(|name| name == ".fluent"))
+    else {
+        return Ok(None);
+    };
+    let root = fluent.parent().context("missing project root")?;
+    let parts = artifact_dir
+        .strip_prefix(fluent.join("work/artifacts"))?
+        .components()
+        .collect::<Vec<_>>();
+    // Only a Task's own artifact directory identifies its Attempt. Temporary
+    // projects nested in a Tester run must not read the enclosing Work record.
+    if parts.len() != 3 {
+        return Ok(None);
+    }
+    if let Err(error) = fs::symlink_metadata(
+        root.join(".fluent/work/items")
+            .join(format!("{}.json", parts[0].as_os_str().to_string_lossy())),
+    ) {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(error.into());
+    }
+    let work_id = parts[0].as_os_str().to_string_lossy();
+    let item = crate::recovery_contracts::read_settled_work_item_snapshot(root, &work_id)?;
+    let attempt = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == parts[1].as_os_str().to_string_lossy())
+        .context("missing context Attempt")?;
+    // A current candidate can still be awaiting its first Tester. Use the
+    // shared pending assessment instead of promoting retained failures to work.
+    if attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+        .and_then(|task| task.output.as_ref())
+        .is_none_or(|output| output.commit != candidate)
+    {
+        return Ok(None);
+    }
+    Ok(Some((
+        root.into(),
+        crate::verification_assessment::assess_current_verification(root, attempt)?,
+    )))
+}
+
+/// Exercise the same declared inputs and profile builder as ordinary Review launch.
+#[cfg(feature = "test-support")]
+pub fn ordinary_review_profile_for_test(
+    project_root: &Path,
+    attempt: &crate::work_model::Attempt,
+    task: &Task,
+) -> Result<os::SandboxProfile> {
+    let project_root = fs::canonicalize(project_root)?;
+    crate::recovery_contracts::review_evidence::validate(&project_root, attempt, task)?;
+    let inputs = resolve_input_artifact_paths(&project_root, &task.input_artifacts)?;
+    preflight_review_sandbox_profile(
+        &project_root,
+        &task.work_item_id,
+        &attempt.id,
+        &attempt.kind,
+        &task.workspace_access.reads,
+        &inputs,
+        &project_root.join(
+            &task
+                .artifact_area
+                .as_ref()
+                .context("missing Review area")?
+                .path,
+        ),
+        None,
+        &ContentResolver::new(Some(&project_root)),
+        false,
+        CoderKind::Claude,
+        None,
+    )?
+    .context("missing Review profile")
+}
+
+#[cfg(feature = "test-support")]
+pub fn accepted_review_evidence_for_test(
+    project_root: &Path,
+    attempt: &crate::work_model::Attempt,
+    now: Option<&str>,
+) -> serde_json::Value {
+    let now = now
+        .map(|value| {
+            chrono::DateTime::parse_from_rfc3339(value)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        })
+        .unwrap_or_else(crate::check_applicability::evaluation_time);
+    serde_json::to_value(crate::recovery_contracts::review_evidence::current_at(
+        project_root,
+        attempt,
+        now,
+    ))
+    .unwrap()
+}
+
+#[cfg(feature = "test-support")]
+pub fn verification_views_for_test(
+    project_root: &Path,
+    attempt: &crate::work_model::Attempt,
+    workspace: &Path,
+) -> (
+    Vec<crate::work_model::WriterCompletionFinding>,
+    serde_json::Value,
+) {
+    let task = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Write)
+        .unwrap();
+    let output = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+        .unwrap()
+        .output
+        .as_ref()
+        .unwrap();
+    let inputs = resolve_input_artifact_paths(project_root, &task.input_artifacts).unwrap();
+    let findings = writer_completion_findings(project_root, task).unwrap();
+    let path = write_execution_context(
+        &project_root.join(&task.artifact_area.as_ref().unwrap().path),
+        workspace,
+        &output.commit,
+        output.base_commit.as_deref(),
+        &[],
+        &inputs,
+        None,
+    )
+    .unwrap();
+    (
+        findings,
+        serde_json::from_slice(&fs::read(path).unwrap()).unwrap(),
+    )
+}
+
+fn execution_context_evidence(
+    input_artifacts: &[PathBuf],
+    candidate_commit: &str,
+) -> (Vec<ExecutionContextEvidence>, Vec<String>) {
+    let mut evidence = Vec::new();
+    let mut commands = BTreeSet::new();
+    for path in input_artifacts.iter().filter(|path| {
+        path.file_name()
+            .is_some_and(|name| name == "tester-results.json")
+    }) {
+        let Ok(source) = fs::read_to_string(path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&source) else {
+            continue;
+        };
+        for command in value["commands"].as_array().into_iter().flatten() {
+            if let Some(command) = command["command"].as_str() {
+                commands.insert(truncate_utf8(command, 500));
+            }
+        }
+        if value["candidate_commit"].as_str() == Some(candidate_commit)
+            && value["error"].is_null()
+            && value["summary"]["fail"].as_u64() == Some(0)
+        {
+            evidence.push(ExecutionContextEvidence {
+                path: truncate_utf8(&path.display().to_string(), 240),
+                summary: format!(
+                    "{} passing tests",
+                    value["summary"]["pass"].as_u64().unwrap_or(0)
+                ),
+            });
+        }
+    }
+    (evidence, commands.into_iter().collect())
 }
 
 #[derive(Default, Debug, Clone)]
@@ -2717,6 +6524,79 @@ impl PlanningFilePaths {
 
 fn planning_files_dir(project_root: &Path, work_item_id: &str) -> PathBuf {
     project_root.join(".fluent/work/items").join(work_item_id)
+}
+
+/// Read only this Work Item's published records and transaction marker so an
+/// active Writer can assess its host-owned binding without mutating model state.
+fn writer_handoff_model_readable_roots(project_root: &Path, task: &Task) -> Result<Vec<PathBuf>> {
+    let store = WorkModelStore::new(project_root);
+    let attempt_id = task
+        .attempt_id
+        .as_deref()
+        .context("Writer Task has no Attempt ID")?;
+    let item = store.work_item_path(&task.work_item_id)?;
+    let attempts = store
+        .work_attempt_path(&task.work_item_id, attempt_id)?
+        .parent()
+        .context("Attempt record has no item directory")?
+        .to_path_buf();
+    let tasks = store
+        .work_task_path(&task.work_item_id, attempt_id, &task.id)?
+        .parent()
+        .and_then(Path::parent)
+        .context("Task record has no item directory")?
+        .to_path_buf();
+    let candidates = store
+        .work_merge_candidate_path(&task.work_item_id, "candidate")?
+        .parent()
+        .context("Merge Candidate record has no item directory")?
+        .to_path_buf();
+    let transaction = store.work_dir().join("transactions").join(
+        item.file_name()
+            .context("Work Item record has no file name")?,
+    );
+    Ok(vec![item, attempts, tasks, candidates, transaction])
+}
+
+#[cfg(test)]
+mod writer_handoff_model_access_tests {
+    use super::*;
+
+    #[test]
+    fn writer_handoff_model_access_stays_with_assigned_work_item() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut item = WorkItem::planned("work-1", "Check handoff access");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let task = &item.attempts[0].tasks[0];
+        let store = WorkModelStore::new(tmp.path());
+        let roots = writer_handoff_model_readable_roots(tmp.path(), task).unwrap();
+        assert!(roots.contains(&store.work_item_path("work-1").unwrap()));
+        assert!(
+            roots.contains(
+                &store
+                    .work_attempt_path("work-1", "attempt-1")
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .to_path_buf()
+            )
+        );
+        assert!(
+            roots.contains(
+                &store
+                    .work_task_path("work-1", "attempt-1", &task.id)
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .to_path_buf()
+            )
+        );
+        assert!(!roots.contains(&store.work_items_dir()));
+        assert!(!roots.contains(&store.work_attempts_dir()));
+        assert!(!roots.contains(&store.work_tasks_dir()));
+    }
 }
 
 fn general_expertise_dir(project_root: &Path) -> PathBuf {
@@ -2776,76 +6656,6 @@ pub fn materialize_skill(skill_name: &str, dest_dir: &Path) -> Result<PathBuf> {
     Ok(skill_dir)
 }
 
-fn should_seed_project_model(task_kind: TaskKind, workspace_path: &Path) -> bool {
-    task_kind == TaskKind::Write && !workspace_path.join(".fluent/expertise/INDEX.md").is_file()
-}
-
-fn run_seed_project_model(
-    workspace_path: &Path,
-    resolver: &ContentResolver,
-    extra_args: &[String],
-    coder_kind: CoderKind,
-    no_sandbox: bool,
-    model: Option<&str>,
-    effort: Option<&str>,
-) -> Result<()> {
-    eprintln!("  Seeding project expertise model…");
-
-    let workspace_resolver = ContentResolver::new(Some(workspace_path));
-    let system_prompt = workspace_resolver
-        .resolve_content("prompts/seed-system.md")
-        .unwrap_or_default();
-
-    let expertise_dir = workspace_path.join(".fluent/expertise");
-    let index_path = expertise_dir.join("INDEX.md");
-    let overview_path = expertise_dir.join("overview.md");
-
-    let template = resolver
-        .resolve_content("prompts/seed-user.md")
-        .ok_or_else(|| anyhow::anyhow!("bundled seed-user.md must resolve"))?;
-    let prompt = crate::content::render_template(
-        &template,
-        &[
-            ("index_path", &index_path.display().to_string()),
-            ("overview_path", &overview_path.display().to_string()),
-            ("workspace_path", &workspace_path.display().to_string()),
-        ],
-    )
-    .map_err(|e| anyhow::anyhow!("seed-user.md template error: {e}"))?;
-
-    let (sandbox, _sandbox_profile) = if no_sandbox {
-        (CoderSandbox::None, None)
-    } else {
-        let common_git_dir = worktree::git_common_dir(workspace_path)?;
-        build_coder_sandbox_with_writable_and_read_only_roots(
-            coder_kind,
-            resolver,
-            workspace_path,
-            &[common_git_dir],
-            &[],
-        )?
-    };
-
-    let coder = coder_kind.boxed_with_model(sandbox, model, effort);
-    let exit_code = coder.run(
-        &prompt,
-        &system_prompt,
-        workspace_path,
-        extra_args,
-        &[],
-        None,
-    )?;
-    if exit_code != 0 {
-        bail!("Seed coder exited with code {exit_code}");
-    }
-
-    if !index_path.is_file() {
-        bail!("Seed coder did not produce {}", index_path.display());
-    }
-
-    Ok(())
-}
-
 /// Inputs the Learner coder needs to refine expertise and write its handoff
 /// draft.
 pub struct LearnerRunInputs<'a> {
@@ -2875,6 +6685,17 @@ pub struct LearnerRunInputs<'a> {
     /// the coder receives the rejected draft and exact validation error and must
     /// re-emit a corrected draft, without repeating the semantic review.
     pub repair: Option<SchemaRepairInput<'a>>,
+}
+
+/// The exact Seatbelt profile that passed host preflight for a Learner launch.
+///
+/// The profile guard owns the temporary profile file, so the launch cannot outlive
+/// the boundary it preflighted.  It is intentionally crate-private: only the
+/// Attempt adapter may carry one across durable Learner reservation.
+pub(crate) struct PreparedLearnerSandbox {
+    sandbox: CoderSandbox,
+    _profile: os::SandboxProfile,
+    effectively_sandboxed: bool,
 }
 
 /// The rejected draft and exact validation error handed to a bounded schema
@@ -3091,28 +6912,46 @@ pub(crate) fn run_learner_captured_in_mode(
         mode,
         capture,
         HostPreparation::Production,
-        move |sandbox| coder_kind.boxed_with_model(sandbox, model.as_deref(), effort.as_deref()),
+        move |sandbox, executable| {
+            coder_kind.boxed_with_model_and_executable(
+                sandbox,
+                model.as_deref(),
+                effort.as_deref(),
+                executable,
+            )
+        },
     )
 }
 
-/// Run a Learner with a Codex worker environment prepared before its durable
-/// reservation. The caller retains the guard until this launch returns.
-pub(crate) fn run_learner_captured_in_mode_with_codex_worker(
+/// Run a Learner with provider readiness prepared before its durable reservation.
+/// The caller retains the readiness state until this launch returns.
+pub(crate) fn run_learner_captured_in_mode_with_provider_readiness(
     inputs: LearnerRunInputs<'_>,
     mode: LearnerExecutionMode,
     capture: Option<crate::coder::TranscriptCapture<'_>>,
     codex_worker: Option<&crate::codex_worker::CodexWorkerEnvironment>,
+    prepared_provider_readiness: Option<&crate::provider_readiness::ProviderReadiness>,
+    prepared_sandbox: Option<&PreparedLearnerSandbox>,
 ) -> Result<()> {
     let coder_kind = inputs.coder_kind;
     let model = inputs.model.map(|s| s.to_string());
     let effort = inputs.effort.map(|s| s.to_string());
-    run_learner_with_coder_with_codex_worker(
+    run_learner_with_coder_with_provider_readiness(
         inputs,
         mode,
         capture,
         codex_worker,
+        prepared_provider_readiness,
+        prepared_sandbox,
         HostPreparation::Production,
-        move |sandbox| coder_kind.boxed_with_model(sandbox, model.as_deref(), effort.as_deref()),
+        move |sandbox, executable| {
+            coder_kind.boxed_with_model_and_executable(
+                sandbox,
+                model.as_deref(),
+                effort.as_deref(),
+                executable,
+            )
+        },
     )
 }
 
@@ -3149,10 +6988,14 @@ impl HostPreparation<'_> {
     /// Run the sandboxed-host preparation for a launch. Production runs the fixed
     /// prerequisite, credential-injection, and Git-signing sequence; an injected
     /// preparation defers entirely to the recording test closure.
-    fn prepare(&mut self, coder_kind: CoderKind) -> Result<()> {
+    fn prepare(&mut self, coder_kind: CoderKind, coder_is_prepared: bool) -> Result<()> {
         match self {
             HostPreparation::Production => {
-                os::check_prerequisites_for(coder_kind)?;
+                if coder_is_prepared {
+                    os::check_sandbox_prerequisite()?;
+                } else {
+                    os::check_prerequisites_for(coder_kind)?;
+                }
                 credential::inject_credentials()?;
                 credential::setup_git_signing();
                 Ok(())
@@ -3181,42 +7024,50 @@ fn run_learner_with_coder(
     mode: LearnerExecutionMode,
     capture: Option<crate::coder::TranscriptCapture<'_>>,
     mut host_preparation: HostPreparation<'_>,
-    make_coder: impl FnOnce(CoderSandbox) -> Box<dyn crate::coder::Coder>,
+    make_coder: impl FnOnce(CoderSandbox, Option<&Path>) -> Box<dyn crate::coder::Coder>,
 ) -> Result<()> {
-    run_learner_with_coder_with_codex_worker(
+    run_learner_with_coder_with_provider_readiness(
         inputs,
         mode,
         capture,
+        None,
+        None,
         None,
         host_preparation,
         make_coder,
     )
 }
 
-fn run_learner_with_coder_with_codex_worker(
+fn run_learner_with_coder_with_provider_readiness(
     inputs: LearnerRunInputs<'_>,
     mode: LearnerExecutionMode,
     capture: Option<crate::coder::TranscriptCapture<'_>>,
     prepared_codex_worker: Option<&crate::codex_worker::CodexWorkerEnvironment>,
+    prepared_provider_readiness: Option<&crate::provider_readiness::ProviderReadiness>,
+    prepared_sandbox: Option<&PreparedLearnerSandbox>,
     mut host_preparation: HostPreparation<'_>,
-    make_coder: impl FnOnce(CoderSandbox) -> Box<dyn crate::coder::Coder>,
+    make_coder: impl FnOnce(CoderSandbox, Option<&Path>) -> Box<dyn crate::coder::Coder>,
 ) -> Result<()> {
     eprintln!("  Running the Learner after passing reviews…");
 
     // The guard survives until the process has completed, reclaiming the
     // isolated authentication copy even when launch or execution fails.
-    let local_codex_worker = if inputs.coder_kind == CoderKind::Codex
-        && prepared_codex_worker.is_none()
-        && !cfg!(test)
-    {
-        let worker =
-            crate::codex_worker::CodexWorkerEnvironment::prepare().map_err(anyhow::Error::new)?;
-        worker.preflight().map_err(anyhow::Error::new)?;
-        Some(worker)
+    let local_provider_readiness = if prepared_provider_readiness.is_none() && !cfg!(test) {
+        Some(
+            crate::provider_readiness::ProviderReadiness::prepare_for_project(
+                inputs.coder_kind,
+                inputs.workspace_path,
+            )
+            .map_err(anyhow::Error::new)?,
+        )
     } else {
         None
     };
-    let codex_worker = prepared_codex_worker.or(local_codex_worker.as_ref());
+    let codex_worker = prepared_codex_worker
+        .or(prepared_provider_readiness.and_then(|readiness| readiness.codex_worker()))
+        .or(local_provider_readiness
+            .as_ref()
+            .and_then(|readiness| readiness.codex_worker()));
 
     let workspace_path = inputs.workspace_path;
     let workspace_resolver = ContentResolver::new(Some(workspace_path));
@@ -3264,8 +7115,6 @@ fn run_learner_with_coder_with_codex_worker(
     readable_roots.dedup();
 
     let expertise_dir = workspace_path.join(".fluent/expertise");
-    fs::create_dir_all(&expertise_dir)?;
-    fs::create_dir_all(inputs.handoff_dir)?;
 
     // Only ordinary capture may honor `--no-sandbox`. A no-expertise or post-land
     // run forces the trusted boundary so a candidate cannot be retargeted or the
@@ -3274,6 +7123,35 @@ fn run_learner_with_coder_with_codex_worker(
     // must keep the source-home denial that protects its staged credentials.
     let effectively_sandboxed =
         mode.effectively_sandboxed(inputs.no_sandbox) || codex_worker.is_some();
+
+    // Render and apply the exact production boundary while every launch path is
+    // still read-only. The granted expertise, handoff, and artifact paths may not
+    // exist yet; Seatbelt profiles deliberately support such deterministic future
+    // paths. Keep this profile alive and reuse it below for the actual launch.
+    let (sandbox, _sandbox_profile, effectively_sandboxed) = if let Some(prepared) =
+        prepared_sandbox
+    {
+        (
+            prepared.sandbox.clone(),
+            None,
+            prepared.effectively_sandboxed,
+        )
+    } else {
+        let provider_artifact_dir = capture.as_ref().and_then(|capture| capture.path().parent());
+        let (sandbox, profile) = plan_learner_sandbox(
+            &inputs,
+            mode,
+            effectively_sandboxed,
+            codex_worker,
+            &expertise_dir,
+            &mut readable_roots,
+            provider_artifact_dir,
+        )?;
+        (sandbox, profile, effectively_sandboxed)
+    };
+
+    fs::create_dir_all(&expertise_dir)?;
+    fs::create_dir_all(inputs.handoff_dir)?;
 
     // The managed Learner surface is the last trusted host boundary before
     // environment filtering and Seatbelt. When the coder launches effectively
@@ -3284,98 +7162,52 @@ fn run_learner_with_coder_with_codex_worker(
     // draft evidence), and the live project roots all stay non-writable, so a
     // coder tool that needs temporary files uses its own confined scratch.
     let mut extra_env: Vec<(String, String)> = Vec::new();
-    let mut private_temp_roots: Vec<PathBuf> = Vec::new();
     // Held alive until after the coder run so the private temp is not reclaimed
     // while the launch is still using it.
     let mut _private_temp_guard: Option<tempfile::TempDir> = None;
     if effectively_sandboxed {
         // Prepare the trusted host boundary before any confinement profile is built
         // or coder constructed, so a preparation failure stops the launch here.
-        host_preparation.prepare(inputs.coder_kind)?;
+        host_preparation.prepare(inputs.coder_kind, codex_worker.is_some())?;
 
         let private_temp = create_private_launch_temp(inputs.handoff_dir)?;
         let scratch_str = private_temp.path().to_string_lossy().to_string();
         extra_env.push(("TMPDIR".to_string(), scratch_str.clone()));
         extra_env.push(("TMP".to_string(), scratch_str.clone()));
         extra_env.push(("TEMP".to_string(), scratch_str));
-        private_temp_roots.push(private_temp.path().to_path_buf());
         _private_temp_guard = Some(private_temp);
     }
     if let Some(worker) = &codex_worker {
         extra_env.push(worker.launch_env());
     }
-
-    // Every effectively sandboxed branch renders through the denied-writes
-    // helper, which strips the shared `/private/tmp` and per-user
-    // `/private/var/folders` temp grants. A coder tool that needs temporary
-    // files therefore uses its private launch scratch, never a shared tree.
-    let (sandbox, _sandbox_profile) = if !effectively_sandboxed {
-        (CoderSandbox::None, None)
-    } else {
-        let common_git_dir = worktree::git_common_dir(workspace_path)?;
-        readable_roots.push(workspace_path.to_path_buf());
-        let home = std::env::var("HOME").unwrap_or_default();
-        if mode.expertise_writable() {
-            let mut writable = vec![
-                expertise_dir.clone(),
-                inputs.handoff_dir.to_path_buf(),
-                common_git_dir,
-            ];
-            writable.extend(private_temp_roots.iter().cloned());
-            // No live root is writable here, so the staging directory is the
-            // only writable path beneath the host-owned run surface; the
-            // transcript and submitted-draft evidence are siblings the coder
-            // cannot reach.
-            let profile =
-                os::render_profile_for_access_for_coder_with_denied_writes_and_codex_home(
-                    inputs.resolver,
-                    &home,
-                    &writable,
-                    &readable_roots,
-                    &[],
-                    inputs.coder_kind,
-                    codex_worker.as_ref().map(|worker| worker.home()),
-                )?;
-            let sandbox = CoderSandbox::SeatbeltProfile(profile.path.to_string_lossy().to_string());
-            (sandbox, Some(profile))
-        } else {
-            // No-expertise and post-land handoff-only: deny expertise writes.
-            // Expertise stays readable, but only the isolated staging surface is
-            // writable. Git metadata is readable for the accepted-change diff but
-            // never writable. Both modes run against an isolated snapshot, so
-            // `--no-sandbox` cannot weaken the boundary: they use the trusted
-            // system Seatbelt launcher and fail closed when the host cannot apply
-            // that profile.
-            readable_roots.push(expertise_dir.clone());
-            readable_roots.push(common_git_dir.clone());
-            let mut denied = vec![workspace_path.to_path_buf(), common_git_dir];
-            denied.extend(inputs.denied_write_roots.iter().cloned());
-            denied.sort();
-            denied.dedup();
-            let mut writable = vec![inputs.handoff_dir.to_path_buf()];
-            writable.extend(private_temp_roots.iter().cloned());
-            let profile =
-                os::render_profile_for_access_for_coder_with_denied_writes_and_codex_home(
-                    inputs.resolver,
-                    &home,
-                    &writable,
-                    &readable_roots,
-                    &denied,
-                    inputs.coder_kind,
-                    codex_worker.as_ref().map(|worker| worker.home()),
-                )?;
-            let sandbox =
-                CoderSandbox::TrustedSeatbeltProfile(profile.path.to_string_lossy().to_string());
-            (sandbox, Some(profile))
+    // Providers and deterministic doubles must not infer the public Task identity
+    // or managed output destination from prompt wording. These values describe the
+    // same host-owned boundary already rendered into the prompt and granted by the
+    // sandbox profile.
+    extra_env.push(("FLUENT_TASK_KIND".to_string(), "learner".to_string()));
+    extra_env.push((
+        "FLUENT_LEARNER_MODE".to_string(),
+        match mode {
+            LearnerExecutionMode::Capture => "capture",
+            LearnerExecutionMode::PreLandNoExpertise => "no-expertise",
+            LearnerExecutionMode::PostLandHandoffOnly => "post-land-handoff-only",
         }
-    };
+        .to_string(),
+    ));
+    extra_env.push((
+        "FLUENT_LEARNER_DRAFT_PATH".to_string(),
+        draft_path.display().to_string(),
+    ));
 
     if let Some(parent) = capture.as_ref().and_then(|c| c.path().parent()) {
         fs::create_dir_all(parent)
             .with_context(|| format!("create Learner transcript dir at {}", parent.display()))?;
     }
 
-    let coder = make_coder(sandbox);
+    let coder = make_coder(
+        sandbox,
+        codex_worker.map(|worker| worker.launcher().execution_executable()),
+    );
     // Persist the coder's supervision report at the Learner artifact boundary, then
     // take its terminal outcome, so a group-sweep diagnostic is durable rather than
     // dropped with the ManagedChild.
@@ -3396,6 +7228,125 @@ fn run_learner_with_coder_with_codex_worker(
     }
 
     Ok(())
+}
+
+/// Render, probe, and retain the Learner's production sandbox before launch setup.
+///
+/// The profile intentionally grants deterministic paths which do not yet exist;
+/// creating those paths belongs after the enclosing host has accepted the boundary.
+fn plan_learner_sandbox(
+    inputs: &LearnerRunInputs<'_>,
+    mode: LearnerExecutionMode,
+    effectively_sandboxed: bool,
+    codex_worker: Option<&crate::codex_worker::CodexWorkerEnvironment>,
+    expertise_dir: &Path,
+    readable_roots: &mut Vec<PathBuf>,
+    provider_artifact_dir: Option<&Path>,
+) -> Result<(CoderSandbox, Option<os::SandboxProfile>)> {
+    if !effectively_sandboxed {
+        return Ok((CoderSandbox::None, None));
+    }
+
+    let common_git_dir = worktree::git_common_dir(inputs.workspace_path)?;
+    readable_roots.push(inputs.workspace_path.to_path_buf());
+    // The host owns the transcript and provider-stderr files, so the Learner may
+    // not write their directory. Claude/Bun still has to inspect the pre-opened
+    // stderr descriptor during startup; grant the exact run directory read access
+    // without widening the Learner's writable staging surface.
+    readable_roots.extend(provider_artifact_dir.map(Path::to_path_buf));
+    if let Some(worker) = codex_worker {
+        readable_roots.extend(worker.launcher().readable_roots().iter().cloned());
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    let claude_bash_temp = (inputs.coder_kind == CoderKind::Claude)
+        .then(|| os::claude_bash_temp_root(inputs.workspace_path));
+    let (profile, sandbox) = if mode.expertise_writable() {
+        let mut writable = vec![
+            expertise_dir.to_path_buf(),
+            inputs.handoff_dir.to_path_buf(),
+            common_git_dir,
+        ];
+        writable.extend(claude_bash_temp.iter().cloned());
+        let profile = os::render_profile_for_access_for_coder_with_denied_writes_and_codex_home(
+            inputs.resolver,
+            &home,
+            &writable,
+            readable_roots,
+            &[],
+            inputs.coder_kind,
+            codex_worker.map(|worker| worker.home()),
+        )?;
+        let sandbox = CoderSandbox::SeatbeltProfile(profile.path.to_string_lossy().to_string());
+        (profile, sandbox)
+    } else {
+        readable_roots.push(expertise_dir.to_path_buf());
+        readable_roots.push(common_git_dir.clone());
+        let mut denied = vec![inputs.workspace_path.to_path_buf(), common_git_dir];
+        denied.extend(inputs.denied_write_roots.iter().cloned());
+        denied.sort();
+        denied.dedup();
+        let mut writable = vec![inputs.handoff_dir.to_path_buf()];
+        writable.extend(claude_bash_temp.iter().cloned());
+        let profile = os::render_profile_for_access_for_coder_with_denied_writes_and_codex_home(
+            inputs.resolver,
+            &home,
+            &writable,
+            readable_roots,
+            &denied,
+            inputs.coder_kind,
+            codex_worker.map(|worker| worker.home()),
+        )?;
+        let sandbox =
+            CoderSandbox::TrustedSeatbeltProfile(profile.path.to_string_lossy().to_string());
+        (profile, sandbox)
+    };
+    // Unit launch-route tests exercise profile construction with injected coders
+    // and no Seatbelt launcher. Integration routes retain the production probe and
+    // supply a hermetic launcher through PATH in debug builds.
+    #[cfg(not(test))]
+    if let Some(worker) = codex_worker {
+        os::preflight_codex_launcher(&profile, worker)?;
+    } else {
+        os::preflight_profile(&profile)?;
+    }
+    Ok((sandbox, Some(profile)))
+}
+
+/// Probe the resolved Learner profile before its Attempt reserves a durable run.
+///
+/// This shares the launch planner, so a genuinely unsandboxed capture performs no
+/// host probe while forced-confinement modes retain the production Seatbelt check.
+pub(crate) fn prepare_learner_host_sandbox(
+    inputs: LearnerRunInputs<'_>,
+    mode: LearnerExecutionMode,
+    codex_worker: Option<&crate::codex_worker::CodexWorkerEnvironment>,
+    provider_artifact_dir: &Path,
+) -> Result<Option<PreparedLearnerSandbox>> {
+    let effectively_sandboxed =
+        mode.effectively_sandboxed(inputs.no_sandbox) || codex_worker.is_some();
+    let mut readable_roots = inputs
+        .review_artifact_paths
+        .iter()
+        .chain(inputs.tester_artifact_paths.iter())
+        .filter_map(|path| path.parent().map(Path::to_path_buf))
+        .collect::<Vec<_>>();
+    readable_roots.sort();
+    readable_roots.dedup();
+    let expertise_dir = inputs.workspace_path.join(".fluent/expertise");
+    let (sandbox, profile) = plan_learner_sandbox(
+        &inputs,
+        mode,
+        effectively_sandboxed,
+        codex_worker,
+        &expertise_dir,
+        &mut readable_roots,
+        Some(provider_artifact_dir),
+    )?;
+    Ok(profile.map(|profile| PreparedLearnerSandbox {
+        sandbox,
+        _profile: profile,
+        effectively_sandboxed,
+    }))
 }
 
 /// The rendered Learner system and user prompts for one invocation. Built by the
@@ -3586,10 +7537,10 @@ fn progress_md_path_for(project_root: &Path, work_item_id: &str, attempt_id: &st
 }
 
 /// Materialize an Attempt's immutable required-progress manifest into the
-/// authoritative `## Required completion` section of its progress file, atomically
-/// and idempotently, before the first Writer launches. An Attempt without a progress
-/// contract, or one whose section already exists, leaves the file untouched. This is
-/// the exact function the write route calls before launching the Writer coder.
+/// host-owned `## Required completion` projection, atomically and idempotently,
+/// before the first Writer launches. An Attempt without a progress contract, or one
+/// whose section already exists, leaves the file untouched. The completed-Writer
+/// gate later replaces this projection from validated matrix claims.
 pub(crate) fn materialize_required_progress_before_writer(
     project_root: &Path,
     item: &WorkItem,
@@ -3637,6 +7588,173 @@ pub(crate) fn materialize_required_progress_before_writer(
         },
     )?;
     Ok(())
+}
+
+fn writer_completion_matrix_path(
+    project_root: &Path,
+    task: &crate::work_model::Task,
+) -> Option<PathBuf> {
+    crate::recovery_contracts::writer_completion_matrix_path(project_root, task)
+}
+
+fn managed_writer_completion_matrix_path(
+    project_root: &Path,
+    task: &crate::work_model::Task,
+) -> Result<Option<PathBuf>> {
+    crate::recovery_contracts::managed_writer_completion_matrix_path(project_root, task)
+}
+
+pub(crate) fn writer_completion_findings(
+    project_root: &Path,
+    task: &crate::work_model::Task,
+) -> Result<Vec<crate::work_model::WriterCompletionFinding>> {
+    crate::recovery_contracts::writer_completion_findings(project_root, task)
+}
+
+/// Materialize one task-specific structured completion matrix before launching a
+/// Writer. Existing task evidence is never overwritten on retry. Planning claims
+/// carry forward from the latest prior Writer, while findings in the current
+/// review frontier always start pending.
+pub(crate) fn materialize_writer_completion_before_writer(
+    project_root: &Path,
+    item: &WorkItem,
+    attempt_id: &str,
+    task_id: &str,
+) -> Result<Option<PathBuf>> {
+    let Some(attempt) = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == attempt_id)
+    else {
+        return Ok(None);
+    };
+    let Some(contract) = attempt.writer_completion_contract.as_ref() else {
+        return Ok(None);
+    };
+    let Some(task_index) = attempt.tasks.iter().position(|task| task.id == task_id) else {
+        return Ok(None);
+    };
+    let task = &attempt.tasks[task_index];
+    let Some(path) = managed_writer_completion_matrix_path(project_root, task)? else {
+        anyhow::bail!("Writer Task {task_id:?} has no artifact area for its completion matrix");
+    };
+    let recovery_source =
+        crate::writer_completion_recovery::validated_writer_context(project_root, item, task)?
+            .map(|context| context.source_task_id);
+    let prior = attempt.tasks[..task_index]
+        .iter()
+        .rev()
+        .find(|candidate| {
+            candidate.kind == TaskKind::Write
+                && candidate.status != TaskStatus::Superseded
+                && recovery_source.as_deref() != Some(candidate.id.as_str())
+        })
+        .map(|candidate| {
+            crate::recovery_contracts::authoritative_writer_completion_matrix(
+                project_root,
+                attempt,
+                candidate,
+            )
+        })
+        .transpose()?
+        .flatten();
+    match fs::metadata(&path) {
+        Ok(metadata)
+            if metadata.len() > crate::work_model::WRITER_COMPLETION_MATRIX_MAX_BYTES as u64 =>
+        {
+            anyhow::bail!(
+                "existing Writer completion matrix is {} bytes; maximum is {} bytes: {}",
+                metadata.len(),
+                crate::work_model::WRITER_COMPLETION_MATRIX_MAX_BYTES,
+                path.display()
+            );
+        }
+        Ok(_) => {
+            if task.writer_correction_assignment.is_some() {
+                // Existing matrices are reused on retries, but their immutable
+                // host-owned assignment must still be checked against fresh
+                // evidence before the Writer can launch.
+                let _ = writer_completion_findings(project_root, task)?;
+            }
+            if task.role != crate::work_model::TESTER_HARNESS_REPAIR_ROLE {
+                if let Some(prior) = prior.as_ref() {
+                    let source = fs::read_to_string(&path).with_context(|| {
+                        format!("read existing Writer completion matrix: {}", path.display())
+                    })?;
+                    let mut existing: crate::work_model::WriterCompletionMatrix =
+                        serde_json::from_str(&source).with_context(|| {
+                            format!(
+                                "parse existing Writer completion matrix: {}",
+                                path.display()
+                            )
+                        })?;
+                    if existing.inherit_completed_planning_claims(prior) > 0 {
+                        let bytes = serde_json::to_vec_pretty(&existing)
+                            .context("serialize inherited Writer completion matrix")?;
+                        crate::atomic_write::atomic_write(&path, &bytes).with_context(|| {
+                            format!(
+                                "inherit authoritative Writer completion claims: {}",
+                                path.display()
+                            )
+                        })?;
+                    }
+                }
+                return Ok(Some(path));
+            }
+            let existing: crate::work_model::WriterCompletionMatrix =
+                serde_json::from_slice(&fs::read(&path).with_context(|| {
+                    format!("read existing Writer completion matrix: {}", path.display())
+                })?)
+                .with_context(|| {
+                    format!(
+                        "parse existing Writer completion matrix: {}",
+                        path.display()
+                    )
+                })?;
+            let imported_tester_result = existing.rows.iter().any(|row| {
+                row.kind == crate::work_model::WriterCompletionRequirementKind::Finding
+                    && Path::new(&row.source)
+                        .file_name()
+                        .is_some_and(|name| name == "tester-results.json")
+            });
+            if !imported_tester_result {
+                return Ok(Some(path));
+            }
+            // Compatibility for repair Tasks materialized by older Fluent builds:
+            // rebuild from the immutable contract and the prior Writer instead of
+            // preserving obligations that the scoped repair was never authorized
+            // to address.
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "inspect existing Writer completion matrix: {}",
+                    path.display()
+                )
+            });
+        }
+    }
+    let findings = writer_completion_findings(project_root, task)?;
+    let matrix = crate::work_model::WriterCompletionMatrix::skeleton(
+        contract,
+        task_id,
+        &findings,
+        prior.as_ref(),
+    )
+    .map_err(anyhow::Error::msg)?;
+    let bytes = serde_json::to_vec_pretty(&matrix).context("serialize Writer completion matrix")?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "create Writer completion matrix directory: {}",
+                parent.display()
+            )
+        })?;
+    }
+    crate::atomic_write::atomic_write(&path, &bytes)
+        .with_context(|| format!("install Writer completion matrix: {}", path.display()))?;
+    Ok(Some(path))
 }
 
 /// Compute the absolute paths the writer/reviewer prompts reference for each
@@ -3740,11 +7858,181 @@ fn prior_reviews_only(input_artifacts: &[PathBuf]) -> Vec<PathBuf> {
         .collect()
 }
 
-fn input_artifact_readable_roots(input_artifacts: &[PathBuf]) -> Vec<PathBuf> {
+fn correction_artifacts_only(input_artifacts: &[PathBuf]) -> Vec<PathBuf> {
     input_artifacts
         .iter()
-        .filter_map(|path| path.parent().map(Path::to_path_buf))
+        .filter(|path| crate::writer_context::is_correction_artifact(path))
+        .cloned()
         .collect()
+}
+
+fn is_failed_tester_evidence_artifact(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| {
+        name == "tester-results.json" || name == crate::candidate_gate::CANDIDATE_GATE_FILE
+    }) || crate::tester::is_command_log_path(path)
+}
+
+fn required_failed_tester_inspection_inputs(task: &Task) -> Vec<&ArtifactRef> {
+    if !task
+        .input_artifacts
+        .iter()
+        .any(|artifact| crate::tester::is_command_log_path(Path::new(&artifact.path)))
+    {
+        return Vec::new();
+    }
+    task.input_artifacts
+        .iter()
+        .filter(|artifact| is_failed_tester_evidence_artifact(Path::new(&artifact.path)))
+        .collect()
+}
+
+fn validate_failed_tester_no_change_inspection(
+    project_root: &Path,
+    task: &Task,
+    inspected_artifacts: &[NoChangeInspectedArtifact],
+    declaration_path: &Path,
+) -> Result<()> {
+    let required = required_failed_tester_inspection_inputs(task);
+    if required.is_empty() {
+        return Ok(());
+    }
+
+    let mut expected_paths = BTreeSet::new();
+    for artifact in &required {
+        if !expected_paths.insert(artifact.path.as_str()) {
+            bail!(
+                "Task {:?} has duplicate failed Tester correction input {}",
+                task.id,
+                artifact.path
+            );
+        }
+    }
+
+    let mut declared = BTreeMap::new();
+    for artifact in inspected_artifacts {
+        if declared
+            .insert(artifact.path.as_str(), artifact.digest.as_str())
+            .is_some()
+        {
+            bail!(
+                "Task {:?} produced no commit; {} contains duplicate inspected_artifacts path {}",
+                task.id,
+                declaration_path.display(),
+                artifact.path
+            );
+        }
+    }
+
+    for artifact in required {
+        let Some(declared_digest) = declared.get(artifact.path.as_str()) else {
+            bail!(
+                "Task {:?} produced no commit after failed Tester evidence; {} must declare the inspected SHA-256 digest for {}",
+                task.id,
+                declaration_path.display(),
+                artifact.path
+            );
+        };
+        let path = resolve_input_artifact_path(project_root, &artifact.path)?;
+        let bytes = fs::read(&path).with_context(|| {
+            format!(
+                "read failed Tester correction artifact for no-change validation: {}",
+                path.display()
+            )
+        })?;
+        let expected_digest = crate::follow_up::content_digest(&bytes);
+        if *declared_digest != expected_digest {
+            bail!(
+                "Task {:?} produced no commit after failed Tester evidence; {} declares digest {} for {}, but the attached bytes are {}",
+                task.id,
+                declaration_path.display(),
+                declared_digest,
+                artifact.path,
+                expected_digest
+            );
+        }
+    }
+
+    if let Some(unexpected) = declared
+        .keys()
+        .find(|path| !expected_paths.contains(**path))
+    {
+        bail!(
+            "Task {:?} produced no commit after failed Tester evidence; {} declares unexpected inspected_artifacts path {}",
+            task.id,
+            declaration_path.display(),
+            unexpected
+        );
+    }
+
+    Ok(())
+}
+
+fn readable_input_artifacts_only(input_artifacts: &[PathBuf]) -> Vec<PathBuf> {
+    input_artifacts
+        .iter()
+        .filter(|path| {
+            crate::writer_context::is_correction_artifact(path)
+                || path
+                    .parent()
+                    .and_then(Path::file_name)
+                    .is_some_and(|name| name == "inputs")
+        })
+        .cloned()
+        .collect()
+}
+
+fn work_item_inputs_only(item: &WorkItem, project_root: &Path) -> Vec<PathBuf> {
+    item.input_artifacts
+        .iter()
+        .map(|input| project_root.join(&input.snapshot_path))
+        .collect()
+}
+
+/// Return exact Seatbelt roots for host-declared files.
+///
+/// Seatbelt resolves a symlink before checking file access, so granting only
+/// the declared link path is insufficient. Add its canonical regular-file
+/// target only while that target remains confined to the canonical project
+/// root; never widen the grant to a containing directory.
+fn declared_file_readable_roots(
+    declared_files: &[PathBuf],
+    approved_workspace: &Path,
+) -> Result<Vec<PathBuf>> {
+    let approved_workspace = fs::canonicalize(approved_workspace).with_context(|| {
+        format!(
+            "resolve approved workspace for declared sandbox inputs: {}",
+            approved_workspace.display()
+        )
+    })?;
+    let mut roots = Vec::new();
+    for declared in declared_files {
+        let resolved = fs::canonicalize(declared)
+            .with_context(|| format!("resolve declared input {}", declared.display()))?;
+        if !fs::metadata(&resolved)
+            .with_context(|| format!("inspect declared input {}", declared.display()))?
+            .is_file()
+        {
+            bail!(
+                "declared input {} is not a regular file",
+                declared.display()
+            );
+        }
+        if !resolved.starts_with(&approved_workspace) {
+            bail!(
+                "declared input {} resolves outside approved workspace {}: {}",
+                declared.display(),
+                approved_workspace.display(),
+                resolved.display()
+            );
+        }
+        if !roots.contains(declared) {
+            roots.push(declared.clone());
+        }
+        if !roots.contains(&resolved) {
+            roots.push(resolved);
+        }
+    }
+    Ok(roots)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3767,6 +8055,7 @@ fn run_review_coder(
     effort: Option<&str>,
     pump_config: &crate::transcript_pump::TranscriptPumpConfig,
     codex_worker: Option<&crate::codex_worker::CodexWorkerEnvironment>,
+    sandbox_profile: Option<&os::SandboxProfile>,
     coder_override: Option<&dyn Fn(CoderSandbox) -> Box<dyn crate::coder::Coder>>,
 ) -> Result<()> {
     // Production launches the resolved coder; the `_with_coder` seam lets route
@@ -3793,9 +8082,15 @@ fn run_review_coder(
         effort,
         pump_config,
         codex_worker,
-        move |sandbox| match coder_override {
+        sandbox_profile,
+        move |sandbox, _executable| match coder_override {
             Some(make) => make(sandbox),
-            None => coder_kind.boxed_with_model(sandbox, model, effort),
+            None => coder_kind.boxed_with_model_and_executable(
+                sandbox,
+                model,
+                effort,
+                codex_worker.map(|worker| worker.launcher().execution_executable()),
+            ),
         },
     )
 }
@@ -3819,10 +8114,15 @@ fn run_review_coder_with_coder(
     effort: Option<&str>,
     pump_config: &crate::transcript_pump::TranscriptPumpConfig,
     codex_worker: Option<&crate::codex_worker::CodexWorkerEnvironment>,
-    make_coder: impl FnOnce(CoderSandbox) -> Box<dyn crate::coder::Coder>,
+    sandbox_profile: Option<&os::SandboxProfile>,
+    make_coder: impl FnOnce(CoderSandbox, Option<&Path>) -> Box<dyn crate::coder::Coder>,
 ) -> Result<()> {
     if !no_sandbox || codex_worker.is_some() {
-        os::check_prerequisites_for(coder_kind)?;
+        if codex_worker.is_some() {
+            os::check_sandbox_prerequisite()?;
+        } else {
+            os::check_prerequisites_for(coder_kind)?;
+        }
         credential::inject_credentials()?;
         credential::setup_git_signing();
     }
@@ -3842,20 +8142,37 @@ fn run_review_coder_with_coder(
         input_artifacts,
         review_only,
     })?;
+    let reviewer_cache_dir = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == attempt_id)
+        .filter(|attempt| !attempt.kind.is_review_only_like())
+        .and_then(|attempt| attempt.tasks.iter().find(|task| task.id == task_id))
+        .filter(|task| task.role == "tests")
+        .and_then(|task| task.review_context.as_ref())
+        .map(|context| candidate_reviewer_cache_dir(project_root, &context.candidate_commit));
 
-    let (sandbox, _sandbox_profile) = if no_sandbox && codex_worker.is_none() {
+    let (sandbox, _sandbox_profile) = if let Some(profile) = sandbox_profile {
+        (
+            CoderSandbox::SeatbeltProfile(profile.path.to_string_lossy().to_string()),
+            None,
+        )
+    } else if no_sandbox && codex_worker.is_none() {
         (CoderSandbox::None, None)
     } else {
-        let mut readable_roots = review_readable_sandbox_roots(readable_workspaces)?;
-        readable_roots.extend(input_artifact_readable_roots(input_artifacts));
+        let mut readable_roots = review_readable_sandbox_roots(project_root, readable_workspaces)?;
+        readable_roots.extend(declared_file_readable_roots(input_artifacts, project_root)?);
         readable_roots.push(planning_files_dir(project_root, &item.id));
         readable_roots.push(general_expertise_dir(project_root));
         readable_roots.push(review_skills_dir(project_root));
+        if let Some(worker) = codex_worker {
+            readable_roots.extend(worker.launcher().readable_roots().iter().cloned());
+        }
         build_coder_sandbox_with_writable_and_read_only_roots_and_codex_home(
             coder_kind,
             resolver,
             artifact_dir,
-            &[],
+            &reviewer_cache_dir.into_iter().collect::<Vec<_>>(),
             &readable_roots,
             codex_worker.map(|worker| worker.home()),
         )?
@@ -3876,7 +8193,10 @@ fn run_review_coder_with_coder(
     capture_coder_info(coder_kind, &effective_model, artifact_dir);
 
     let transcript_path = artifact_dir.join("transcript.jsonl");
-    let coder = make_coder(sandbox);
+    let coder = make_coder(
+        sandbox,
+        codex_worker.map(|worker| worker.launcher().execution_executable()),
+    );
     let launch_env = codex_worker
         .map(|worker| vec![worker.launch_env()])
         .unwrap_or_default();
@@ -3886,6 +8206,36 @@ fn run_review_coder_with_coder(
         crate::coder::TranscriptCapture::with_config(&transcript_path, pump_config.clone());
     // Persist the coder's supervision report beside the review transcript, then take
     // its terminal outcome, so a group-sweep diagnostic is durable rather than dropped.
+    if let Some(selected_task) = item
+        .attempts
+        .iter()
+        .flat_map(|attempt| &attempt.tasks)
+        .find(|task| {
+            task.id == task_id
+                && task.input_artifacts.iter().any(|input| {
+                    input.producer_id == crate::recovery_contracts::review_evidence::PRODUCER
+                })
+        })
+    {
+        let fresh =
+            crate::recovery_contracts::read_settled_work_item_snapshot(project_root, &item.id)?;
+        let attempt = fresh
+            .attempts
+            .iter()
+            .find(|attempt| attempt.id == attempt_id)
+            .context("missing Review Attempt")?;
+        let task = attempt
+            .tasks
+            .iter()
+            .find(|task| task.id == task_id)
+            .context("missing Review Task")?;
+        anyhow::ensure!(
+            task.input_artifacts == selected_task.input_artifacts
+                && task.review_context == selected_task.review_context,
+            "accepted host proof selection changed after Review preparation"
+        );
+        crate::recovery_contracts::review_evidence::validate(project_root, attempt, task)?;
+    }
     let completion = coder.run_captured_reported(
         &prompts.review_prompt,
         &prompts.system_prompt,
@@ -3971,10 +8321,42 @@ fn build_work_review_prompts(input: WorkReviewPromptInput<'_>) -> Result<WorkRev
         );
         render_review_diff_command(candidate_workspace, &review_range)
     };
+    let candidate_workspace_display = candidate_workspace.display().to_string();
 
     let reviewer_prior_reviews = prior_reviews_only(input.input_artifacts);
-    let reviewer_prior_reviews_list = prior_reviews_block(&reviewer_prior_reviews, "");
+    let evidence_context = task.evidence_review_context.as_ref();
+    let carried_finding_context = evidence_context.and_then(|context| {
+        input.item.attempts.iter().find(|a| a.id == input.attempt_id)
+            .and_then(|a| a.evidence_recoveries.iter().find(|r| r.id == context.recovery_id))
+            .and_then(|r| r.carried_finding.as_ref())
+    }).map(|saved| {
+        let binding = &saved.binding;
+        format!("## Selected carried finding\n\nReview only finding {} for current candidate {}. The original Review names candidate {}; preserve that history.\n\nRead these exact files:\n- Finding and assignment binding: {}\n- Original Review: {}\n- Preserved Writer completion: {}\n- Current host proof: {}\n\nThe check is `{}` in `{}`. Passing proof and your passing Review satisfy only this finding; ordinary reviews, the final Tester, and Learning remain required. Failed proof cannot satisfy the finding.\n",
+            binding.finding.id, binding.candidate_commit, binding.assignment.source_candidate_commit,
+            input.project_root.join(&saved.artifact.path).display(),
+            input.project_root.join(&binding.source_review.artifact.path).display(),
+            input.project_root.join(&binding.source_matrix.path).display(),
+            input.project_root.join(&binding.evidence.path).display(),
+            binding.command, binding.working_directory)
+    }).unwrap_or_default();
+    let evidence_review_context = evidence_context.map(|_| "yes").unwrap_or("");
+    let evidence_snapshot_path = evidence_context
+        .map(|context| context.attachment.snapshot_path.as_str())
+        .unwrap_or("");
+    let evidence_prior_review_path = evidence_context
+        .map(|context| context.prior_review_artifact.as_str())
+        .unwrap_or("");
+    let evidence_candidate_commit = evidence_context
+        .map(|context| context.candidate_commit.as_str())
+        .unwrap_or("");
     let reviewer_has_prior_reviews = if reviewer_prior_reviews.is_empty() {
+        ""
+    } else {
+        "yes"
+    };
+    let work_item_inputs = work_item_inputs_only(input.item, input.project_root);
+    let work_item_inputs_list = prior_reviews_block(&work_item_inputs, "");
+    let reviewer_has_work_item_inputs = if work_item_inputs.is_empty() {
         ""
     } else {
         "yes"
@@ -3993,6 +8375,11 @@ fn build_work_review_prompts(input: WorkReviewPromptInput<'_>) -> Result<WorkRev
     };
 
     let review_path_display = input.review_path.display().to_string();
+    let review_inspection_path_display = input
+        .artifact_dir
+        .join(crate::review_inspection::REVIEW_INSPECTION_FILE)
+        .display()
+        .to_string();
     let artifact_dir_display = input.artifact_dir.display().to_string();
 
     let planning = compute_planning_paths(input.item, input.project_root);
@@ -4030,10 +8417,174 @@ fn build_work_review_prompts(input: WorkReviewPromptInput<'_>) -> Result<WorkRev
                 .to_string()
         })
         .unwrap_or_default();
+    let has_final_tester_evidence = if tester_results_path.is_empty() {
+        ""
+    } else {
+        "yes"
+    };
+    let is_review_behaviors_with_final_tester_value =
+        if task.role == "behaviors" && !tester_results_path.is_empty() {
+            "yes"
+        } else {
+            ""
+        };
+    let is_review_behaviors_before_final_tester_value =
+        if task.role == "behaviors" && tester_results_path.is_empty() {
+            "yes"
+        } else {
+            ""
+        };
+    let writer_transcript_path = input
+        .input_artifacts
+        .iter()
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name == "transcript.jsonl")
+                && path
+                    .parent()
+                    .and_then(Path::file_name)
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains("-write-"))
+        })
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+    let writer_completion_matrix_path = input
+        .input_artifacts
+        .iter()
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name == WRITER_COMPLETION_MATRIX_FILE)
+        })
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+    let has_writer_completion_matrix = if writer_completion_matrix_path.is_empty() {
+        ""
+    } else {
+        "yes"
+    };
+    let tester_correction_evidence = input
+        .input_artifacts
+        .iter()
+        .filter(|path| {
+            let tester_results = path
+                .file_name()
+                .is_some_and(|name| name == "tester-results.json")
+                && path
+                    .parent()
+                    .and_then(Path::file_name)
+                    .is_some_and(|name| name.to_string_lossy().contains("-tester"));
+            tester_results || crate::tester::is_command_log_path(path)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let tester_correction_evidence_list = render_path_list(&tester_correction_evidence);
+    let has_tester_correction_evidence = if task.role == "tests"
+        && task.depends_on.is_none()
+        && !tester_correction_evidence.is_empty()
+    {
+        "yes"
+    } else {
+        ""
+    };
     let reviewer_progress_md_path =
         progress_md_path_for(input.project_root, &input.item.id, input.attempt_id)
             .display()
             .to_string();
+    let reviewer_cache_dir =
+        candidate_reviewer_cache_dir(input.project_root, &review_context.candidate_commit)
+            .display()
+            .to_string();
+    let unresolved_steps = fs::read_to_string(&reviewer_progress_md_path)
+        .ok()
+        .map(|source| unresolved_progress_steps(&source))
+        .unwrap_or_default();
+    let context_base_commit = review_context.base_commit.clone().or_else(|| {
+        let base = git_stdout(
+            candidate_workspace,
+            &[
+                "merge-base",
+                &review_context.source_branch,
+                &review_context.candidate_commit,
+            ],
+        );
+        (!base.is_empty()).then_some(base)
+    });
+    let execution_context_path = write_execution_context(
+        input.artifact_dir,
+        candidate_workspace,
+        &review_context.candidate_commit,
+        context_base_commit.as_deref(),
+        &unresolved_steps,
+        input.input_artifacts,
+        None,
+    )?
+    .display()
+    .to_string();
+    let mut accepted_host_evidence = String::new();
+    if task.role == "tests" && task.evidence_review_context.is_none() {
+        let attempt = input
+            .item
+            .attempts
+            .iter()
+            .find(|attempt| attempt.id == input.attempt_id)
+            .unwrap();
+        let proofs = crate::recovery_contracts::review_evidence::validate(
+            input.project_root,
+            attempt,
+            task,
+        )?;
+        if let Some(source) = task.input_artifacts.iter().find(|artifact| {
+            artifact.producer_id == crate::recovery_contracts::review_evidence::PRODUCER
+        }) {
+            let source = input.project_root.join(&source.path).display().to_string();
+            accepted_host_evidence = format!(
+                "## Current host acceptance\n\nThe completion matrix is an immutable Writer claim. Host-owned rows remain pending there. The current accepted proof below comes from the original host evidence and targeted Tests Review; it does not supply ordinary review or final Tester credit. Assess only the stated candidate and check or finding scope.\n\nFull acceptance bindings: {source}\n"
+            );
+            let mut context: ExecutionContextV1 =
+                serde_json::from_slice(&fs::read(&execution_context_path)?)?;
+            // Added proof sources explain acceptance; they do not assign the
+            // historical request's findings to this ordinary Review again.
+            context.current_findings.retain(|finding| {
+                !task.input_artifacts.iter().any(|artifact| {
+                    artifact.producer_id
+                        == crate::recovery_contracts::review_evidence::SOURCE_PRODUCER
+                        && input.project_root.join(&artifact.path).to_string_lossy()
+                            == finding.artifact
+                })
+            });
+            for proof in &proofs {
+                let summary = format!(
+                    "Accepted host proof for {} at {}: `{}` (working directory {}). Targeted acceptance only.",
+                    proof.scope, proof.candidate_commit, proof.command, proof.working_directory
+                );
+                context.passing_evidence.push(ExecutionContextEvidence {
+                    path: source.clone(),
+                    summary: truncate_utf8(&summary, 1000),
+                });
+            }
+            for proof in proofs.iter().take(EXECUTION_CONTEXT_MAX_EVIDENCE) {
+                accepted_host_evidence.push_str(&format!(
+                    "\n- {} at {}: `{}` (working directory {}).\n",
+                    proof.scope,
+                    proof.candidate_commit,
+                    truncate_utf8(&proof.command, 500),
+                    proof.working_directory
+                ));
+            }
+            if proofs.len() > EXECUTION_CONTEXT_MAX_EVIDENCE {
+                accepted_host_evidence.push_str(
+                    "\nAdditional accepted checks are listed in the full acceptance bindings.\n",
+                );
+            }
+            let serialized = bounded_execution_context_json(&mut context)?;
+            crate::atomic_write::atomic_write(
+                Path::new(&execution_context_path),
+                serialized.as_bytes(),
+            )?;
+        }
+    }
+    let recovered_protected_base =
+        latest_candidate_ancestry_protected_base(input.item, input.attempt_id).unwrap_or_default();
 
     let resolver = ContentResolver::new(input.readable_workspaces.first().map(|p| p.as_path()));
 
@@ -4072,22 +8623,61 @@ fn build_work_review_prompts(input: WorkReviewPromptInput<'_>) -> Result<WorkRev
             ),
             ("skill_path", &skill_path),
             ("has_prior_reviews", reviewer_has_prior_reviews),
+            ("has_work_item_inputs", reviewer_has_work_item_inputs),
             ("is_review_tests", is_review_tests_value),
             ("is_review_behaviors", is_review_behaviors_value),
+            (
+                "is_review_behaviors_with_final_tester",
+                is_review_behaviors_with_final_tester_value,
+            ),
+            (
+                "is_review_behaviors_before_final_tester",
+                is_review_behaviors_before_final_tester_value,
+            ),
             ("is_review_architecture", is_review_architecture_value),
             ("is_review_documentation", is_review_documentation_value),
-            ("prior_reviews_list", &reviewer_prior_reviews_list),
-            (
-                "candidate_workspace_path",
-                &review_context.candidate_workspace_path,
-            ),
+            ("work_item_inputs_list", &work_item_inputs_list),
+            ("candidate_workspace_path", &candidate_workspace_display),
             ("source_branch", &review_context.source_branch),
             ("candidate_commit", &review_context.candidate_commit),
+            (
+                "has_recovered_protected_base",
+                if recovered_protected_base.is_empty() {
+                    ""
+                } else {
+                    "yes"
+                },
+            ),
+            ("recovered_protected_base", &recovered_protected_base),
+            ("accepted_host_evidence", &accepted_host_evidence),
+            ("evidence_review_context", evidence_review_context),
+            ("carried_finding_context", &carried_finding_context),
+            ("evidence_snapshot_path", evidence_snapshot_path),
+            ("evidence_prior_review_path", evidence_prior_review_path),
+            ("evidence_candidate_commit", evidence_candidate_commit),
             ("review_diff_command", &review_diff_command),
             ("tester_results_path", &tester_results_path),
+            ("has_final_tester_evidence", has_final_tester_evidence),
+            ("writer_transcript_path", &writer_transcript_path),
+            (
+                "writer_completion_matrix_path",
+                &writer_completion_matrix_path,
+            ),
+            ("has_writer_completion_matrix", has_writer_completion_matrix),
+            (
+                "has_tester_correction_evidence",
+                has_tester_correction_evidence,
+            ),
+            (
+                "tester_correction_evidence_list",
+                &tester_correction_evidence_list,
+            ),
             ("progress_md_path", &reviewer_progress_md_path),
             ("review_path", &review_path_display),
+            ("review_inspection_path", &review_inspection_path_display),
             ("artifact_dir", &artifact_dir_display),
+            ("reviewer_cache_dir", &reviewer_cache_dir),
+            ("execution_context_path", &execution_context_path),
             ("decisions_path", &decisions_path),
         ],
     )
@@ -4139,67 +8729,442 @@ fn decisions_path(readable_workspaces: &[PathBuf]) -> String {
         .unwrap_or_default()
 }
 
+fn candidate_reviewer_cache_dir(project_root: &Path, candidate_commit: &str) -> PathBuf {
+    let digest = crate::follow_up::content_digest(candidate_commit.as_bytes());
+    let key = digest
+        .strip_prefix("sha256:")
+        .expect("content digest has a sha256 prefix");
+    project_root.join(".fluent/work/cache/reviewers").join(key)
+}
+
 fn prepare_reviewer_build_cache(
+    project_root: &Path,
     candidate_workspace: &Path,
     artifact_dir: &Path,
+    cache_dir: &Path,
     work_item_id: &str,
     attempt_id: &str,
     task_id: &str,
+    admission: &dyn ReviewerCacheAdmission,
+    reporter: &dyn Fn(&str),
 ) {
     let hook_name = "prepare-pre-review";
     if hooks::find_hook(candidate_workspace, hook_name).is_some() {
-        let log_dir = artifact_dir.join("hooks");
-        let context = hooks::HookContext {
-            work_item_id: Some(work_item_id.to_string()),
-            attempt_id: Some(attempt_id.to_string()),
-            task_id: Some(task_id.to_string()),
-            reviewer_artifact_dir: Some(artifact_dir.to_path_buf()),
-            log_dir,
-            ..Default::default()
-        };
-        match hooks::run_hook(
+        prepare_reviewer_hook_cache(
+            project_root,
             candidate_workspace,
-            hook_name,
+            artifact_dir,
+            cache_dir,
+            work_item_id,
+            attempt_id,
+            task_id,
+            admission,
+            reporter,
+        );
+    } else if let Some(toolchain) = prep::detect_toolchain(candidate_workspace) {
+        admit_reviewer_build_cache_with_admission(
+            project_root,
             candidate_workspace,
-            &context,
-        ) {
-            Ok(Some(outcome)) if outcome.passed => {
-                eprintln!(
-                    "  Reviewer prep     {hook_name} hook passed (log: {})",
-                    outcome.log_path.display()
-                );
-            }
-            Ok(Some(outcome)) => {
-                eprintln!(
-                    "  Reviewer prep     {hook_name} hook failed (exit {}, log: {})",
-                    outcome.exit_code,
-                    outcome.log_path.display()
-                );
-            }
-            Ok(None) => {}
-            Err(err) => {
-                eprintln!("  Reviewer prep     {hook_name} hook error: {err:#}");
+            cache_dir,
+            toolchain,
+            task_id,
+            admission,
+            reporter,
+        );
+    }
+}
+
+/// Run custom reviewer preparation while holding the same admission lock as the
+/// built-in cache path. The hook keeps its established contract, but canonical
+/// cache directories it creates are retained only after the bounded admission
+/// check; all other hook output remains untouched.
+fn prepare_reviewer_hook_cache(
+    project_root: &Path,
+    candidate_workspace: &Path,
+    artifact_dir: &Path,
+    cache_dir: &Path,
+    work_item_id: &str,
+    attempt_id: &str,
+    task_id: &str,
+    cache_admission: &dyn ReviewerCacheAdmission,
+    reporter: &dyn Fn(&str),
+) {
+    let admission = match crate::lease::acquire_blocking(&reviewer_cache_lock_path(project_root)) {
+        Ok(lock) => {
+            let store = WorkModelStore::new(project_root);
+            match cache_admission.reclaim_terminal_caches(project_root, &store) {
+                Ok(()) => match prep::managed_cache_bytes(cache_dir) {
+                    Ok(bytes) if bytes > 0 => {
+                        reporter(&format!(
+                            "  Reviewer prep     {task_id} reusing shared candidate cache"
+                        ));
+                        return;
+                    }
+                    Ok(_) => Some((lock, store)),
+                    Err(error) => {
+                        reporter(&format!(
+                            "  Reviewer prep     {task_id} starting cold: cache inspection failed: {error:#}"
+                        ));
+                        None
+                    }
+                },
+                Err(error) => {
+                    reporter(&format!(
+                        "  Reviewer prep     {task_id} starting cold: cache admission check failed: {error:#}"
+                    ));
+                    None
+                }
             }
         }
-    } else if let Some(toolchain) = prep::detect_toolchain(candidate_workspace) {
-        match prep::populate_reviewer_cache(candidate_workspace, artifact_dir, toolchain) {
-            Ok(()) => {
-                eprintln!(
-                    "  Reviewer prep     pre-populated {} build cache from candidate",
-                    toolchain.name,
+        Err(error) => {
+            reporter(&format!(
+                "  Reviewer prep     {task_id} starting cold: cache lock check failed: {error}"
+            ));
+            None
+        }
+    };
+
+    let context = hooks::HookContext {
+        work_item_id: Some(work_item_id.to_string()),
+        attempt_id: Some(attempt_id.to_string()),
+        task_id: Some(task_id.to_string()),
+        reviewer_artifact_dir: Some(artifact_dir.to_path_buf()),
+        log_dir: artifact_dir.join("hooks"),
+        ..Default::default()
+    };
+    let hook_result = hooks::run_hook(
+        candidate_workspace,
+        "prepare-pre-review",
+        candidate_workspace,
+        &context,
+    );
+    let hook_passed = matches!(&hook_result, Ok(Some(outcome)) if outcome.passed);
+    match hook_result {
+        Ok(Some(outcome)) if outcome.passed => {
+            eprintln!(
+                "  Reviewer prep     prepare-pre-review hook passed (log: {})",
+                outcome.log_path.display()
+            );
+        }
+        Ok(Some(outcome)) => eprintln!(
+            "  Reviewer prep     prepare-pre-review hook failed (exit {}, log: {})",
+            outcome.exit_code,
+            outcome.log_path.display()
+        ),
+        Ok(None) => {}
+        Err(error) => eprintln!("  Reviewer prep     prepare-pre-review hook error: {error:#}"),
+    }
+
+    if hook_passed {
+        if let Some((_lock, store)) = admission {
+            admit_hook_reviewer_cache_with_admission(
+                project_root,
+                artifact_dir,
+                cache_dir,
+                task_id,
+                &store,
+                cache_admission,
+                reporter,
+            );
+        } else {
+            remove_unadmitted_hook_cache(artifact_dir);
+        }
+    } else {
+        // A failed hook must not leave an unaccounted managed cache behind while
+        // the Reviewer continues to execute. Its other output remains evidence.
+        remove_unadmitted_hook_cache(artifact_dir);
+    }
+}
+
+/// Keep custom hook preparation available when cache admission itself cannot be
+/// established. Only canonical cache directories are discarded; noncanonical
+/// hook output remains available to the cold reviewer.
+fn remove_unadmitted_hook_cache(artifact_dir: &Path) {
+    if let Err(error) = prep::remove_managed_cache_dirs(artifact_dir) {
+        eprintln!(
+            "  Reviewer prep     retained cache {}: {error:#}",
+            artifact_dir.display()
+        );
+    }
+}
+
+fn reviewer_cache_lock_path(project_root: &Path) -> PathBuf {
+    project_root.join(".fluent/work/locks/reviewer-cache.lock")
+}
+
+fn reviewer_cache_root(project_root: &Path) -> PathBuf {
+    project_root.join(".fluent/work/cache/reviewers")
+}
+
+fn task_is_terminal(task: &crate::work_model::Task) -> bool {
+    matches!(
+        task.status,
+        TaskStatus::Complete | TaskStatus::Failed | TaskStatus::NeedsUser
+    )
+}
+
+fn reviewer_cache_artifact_dir(
+    project_root: &Path,
+    task: &crate::work_model::Task,
+) -> Result<PathBuf> {
+    let area = task
+        .artifact_area
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Reviewer Task {:?} has no artifact area", task.id))?;
+    resolve_managed_artifact_area_path(project_root, &area.path)
+}
+
+fn reclaim_terminal_reviewer_caches(project_root: &Path, store: &WorkModelStore) -> Result<()> {
+    let items = store.list_work_items()?;
+    let mut active_keys = HashSet::new();
+    for item in &items {
+        if !crate::cleanup::work_item_is_cleanable(item) {
+            for context in item
+                .attempts
+                .iter()
+                .flat_map(|attempt| &attempt.tasks)
+                .filter(|task| task.kind == TaskKind::Review)
+                .filter_map(|task| task.review_context.as_ref())
+            {
+                if let Some(key) =
+                    candidate_reviewer_cache_dir(project_root, &context.candidate_commit)
+                        .file_name()
+                {
+                    active_keys.insert(key.to_os_string());
+                }
+            }
+        }
+    }
+
+    let root = reviewer_cache_root(project_root);
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => Some(entries),
+        Err(error) if error.kind() == ErrorKind::NotFound => None,
+        Err(error) => return Err(error).context("read candidate reviewer cache root"),
+    };
+    if let Some(entries) = entries {
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() {
+                bail!(
+                    "candidate reviewer cache cannot be a symlink: {}",
+                    path.display()
                 );
             }
-            Err(err) => {
+            if metadata.is_dir() && !active_keys.contains(&entry.file_name()) {
+                fs::remove_dir_all(&path).with_context(|| {
+                    format!("remove retired candidate reviewer cache {}", path.display())
+                })?;
+            }
+        }
+    }
+
+    // Continue retiring canonical caches produced by older Fluent versions once
+    // their individual Reviewer Tasks are terminal. New runs never place these
+    // directories in artifact areas.
+    for item in &items {
+        for attempt in &item.attempts {
+            for task in &attempt.tasks {
+                if task.kind != TaskKind::Review || !task_is_terminal(task) {
+                    continue;
+                }
+                let artifact_dir = reviewer_cache_artifact_dir(project_root, task)?;
+                if artifact_dir.exists() {
+                    prep::remove_managed_cache_dirs(&artifact_dir)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn managed_reviewer_cache_total(project_root: &Path, store: &WorkModelStore) -> Result<u64> {
+    let mut total = 0_u64;
+    let _ = store;
+    let root = reviewer_cache_root(project_root);
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error).context("read candidate reviewer cache root"),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if metadata.file_type().is_symlink() {
+            bail!(
+                "candidate reviewer cache cannot be a symlink: {}",
+                entry.path().display()
+            );
+        }
+        if metadata.is_dir() {
+            total = total
+                .checked_add(prep::managed_cache_bytes(&entry.path())?)
+                .ok_or_else(|| anyhow::anyhow!("managed reviewer cache total overflow"))?;
+        }
+    }
+    Ok(total)
+}
+
+/// Isolate cache observations from admission policy so tests can drive the real
+/// decision with deterministic totals, capacity, and failures.
+trait ReviewerCacheAdmission: Sync {
+    fn reclaim_terminal_caches(&self, project_root: &Path, store: &WorkModelStore) -> Result<()>;
+    fn managed_cache_total(&self, project_root: &Path, store: &WorkModelStore) -> Result<u64>;
+    fn filesystem_free_bytes(&self, artifact_dir: &Path) -> Result<u64>;
+}
+
+struct FilesystemReviewerCacheAdmission;
+
+impl ReviewerCacheAdmission for FilesystemReviewerCacheAdmission {
+    fn reclaim_terminal_caches(&self, project_root: &Path, store: &WorkModelStore) -> Result<()> {
+        reclaim_terminal_reviewer_caches(project_root, store)
+    }
+
+    fn managed_cache_total(&self, project_root: &Path, store: &WorkModelStore) -> Result<u64> {
+        managed_reviewer_cache_total(project_root, store)
+    }
+
+    fn filesystem_free_bytes(&self, artifact_dir: &Path) -> Result<u64> {
+        prep::filesystem_free_bytes(artifact_dir)
+    }
+}
+
+fn admit_reviewer_build_cache_with_admission(
+    project_root: &Path,
+    candidate_workspace: &Path,
+    artifact_dir: &Path,
+    toolchain: &prep::Toolchain,
+    task_id: &str,
+    admission: &dyn ReviewerCacheAdmission,
+    reporter: &dyn Fn(&str),
+) {
+    let lock = match crate::lease::acquire_blocking(&reviewer_cache_lock_path(project_root)) {
+        Ok(lock) => lock,
+        Err(error) => {
+            reporter(&format!(
+                "  Reviewer prep     {task_id} starting cold: cache lock check failed: {error}"
+            ));
+            return;
+        }
+    };
+    let store = WorkModelStore::new(project_root);
+    let decision = (|| -> Result<Option<&'static str>> {
+        admission.reclaim_terminal_caches(project_root, &store)?;
+        if prep::managed_cache_bytes(artifact_dir)? > 0 {
+            return Ok(None);
+        }
+        let limits = crate::config::resolve_reviewer_cache_config(project_root)
+            .map_err(anyhow::Error::new)?;
+        let current = admission.managed_cache_total(project_root, &store)?;
+        let prospective = prep::toolchain_cache_bytes(candidate_workspace, toolchain)?;
+        let total = current
+            .checked_add(prospective)
+            .ok_or_else(|| anyhow::anyhow!("managed reviewer cache total overflow"))?;
+        if total > limits.max_project_bytes.value {
+            return Ok(Some("project cache budget"));
+        }
+        let free = admission.filesystem_free_bytes(project_root)?;
+        let required = prospective
+            .checked_add(limits.min_free_bytes.value)
+            .ok_or_else(|| anyhow::anyhow!("reviewer free-space requirement overflow"))?;
+        if free < required {
+            return Ok(Some("host free-space floor"));
+        }
+        fs::create_dir_all(artifact_dir).with_context(|| {
+            format!(
+                "create candidate reviewer cache at {}",
+                artifact_dir.display()
+            )
+        })?;
+        prep::populate_reviewer_cache(candidate_workspace, artifact_dir, toolchain)?;
+        Ok(None)
+    })();
+    drop(lock);
+    match decision {
+        Ok(None) => reporter(&format!(
+            "  Reviewer prep     pre-populated {} build cache from candidate",
+            toolchain.name
+        )),
+        Ok(Some(reason)) => reporter(&format!(
+            "  Reviewer prep     {task_id} starting cold: {reason} would be exceeded"
+        )),
+        Err(error) => reporter(&format!(
+            "  Reviewer prep     {task_id} starting cold: cache admission check failed: {error:#}"
+        )),
+    }
+}
+
+/// Account for canonical caches a custom preparation hook wrote into this
+/// Reviewer's artifact area. On every failed or over-limit check, remove only
+/// those rebuildable directories and leave the hook's other output intact.
+fn admit_hook_reviewer_cache_with_admission(
+    project_root: &Path,
+    artifact_dir: &Path,
+    cache_dir: &Path,
+    task_id: &str,
+    store: &WorkModelStore,
+    admission: &dyn ReviewerCacheAdmission,
+    reporter: &dyn Fn(&str),
+) {
+    let decision = (|| -> Result<Option<&'static str>> {
+        let limits = crate::config::resolve_reviewer_cache_config(project_root)
+            .map_err(anyhow::Error::new)?;
+        let current = admission.managed_cache_total(project_root, store)?;
+        let replacing = prep::managed_cache_bytes(cache_dir)?;
+        let prospective = prep::managed_cache_bytes(artifact_dir)?;
+        let total = current
+            .checked_sub(replacing)
+            .and_then(|current| current.checked_add(prospective))
+            .ok_or_else(|| anyhow::anyhow!("managed reviewer cache total overflow"))?;
+        if total > limits.max_project_bytes.value {
+            return Ok(Some("project cache budget"));
+        }
+        let free = admission.filesystem_free_bytes(project_root)?;
+        let required = prospective
+            .checked_add(limits.min_free_bytes.value)
+            .ok_or_else(|| anyhow::anyhow!("reviewer free-space requirement overflow"))?;
+        if free < required {
+            return Ok(Some("host free-space floor"));
+        }
+        prep::populate_managed_cache(artifact_dir, cache_dir)?;
+        prep::remove_managed_cache_dirs(artifact_dir)?;
+        Ok(None)
+    })();
+    match decision {
+        Ok(None) => {
+            reporter("  Reviewer prep     admitted shared prepare-pre-review managed cache")
+        }
+        Ok(Some(reason)) => {
+            if let Err(error) = prep::remove_managed_cache_dirs(artifact_dir) {
                 eprintln!(
-                    "  Reviewer prep     failed to copy {} build cache: {err:#}",
-                    toolchain.name,
+                    "  Reviewer prep     retained cache {}: {error:#}",
+                    artifact_dir.display()
                 );
             }
+            reporter(&format!(
+                "  Reviewer prep     {task_id} starting cold: {reason} would be exceeded"
+            ));
+        }
+        Err(error) => {
+            if let Err(cleanup_error) = prep::remove_managed_cache_dirs(artifact_dir) {
+                eprintln!(
+                    "  Reviewer prep     retained cache {}: {cleanup_error:#}",
+                    artifact_dir.display()
+                );
+            }
+            reporter(&format!(
+                "  Reviewer prep     {task_id} starting cold: cache admission check failed: {error:#}"
+            ));
         }
     }
 }
 
-fn review_readable_sandbox_roots(readable_workspaces: &[PathBuf]) -> Result<Vec<PathBuf>> {
+fn review_readable_sandbox_roots(
+    project_root: &Path,
+    readable_workspaces: &[PathBuf],
+) -> Result<Vec<PathBuf>> {
     let mut roots = Vec::new();
     for workspace in readable_workspaces {
         roots.push(workspace.clone());
@@ -4208,9 +9173,85 @@ fn review_readable_sandbox_roots(readable_workspaces: &[PathBuf]) -> Result<Vec<
             roots.push(common_git_dir);
         }
     }
+    roots.extend(project_instruction_readable_roots(project_root)?);
     Ok(roots)
 }
 
+fn project_instruction_readable_roots(project_root: &Path) -> Result<Vec<PathBuf>> {
+    let instructions = project_root.join("AGENTS.md");
+    match fs::symlink_metadata(&instructions) {
+        Ok(_) => declared_file_readable_roots(std::slice::from_ref(&instructions), project_root),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error)
+            .with_context(|| format!("inspect project instructions {}", instructions.display())),
+    }
+}
+
+/// Render and probe the Reviewer profile from the read-only start plan.
+///
+/// `artifact_dir` is intentionally allowed before it exists: Reviewer setup creates
+/// it only after the reservation, while Seatbelt can safely grant its deterministic
+/// future path during this side-effect-free planning phase.
+#[allow(clippy::too_many_arguments)]
+fn preflight_review_sandbox_profile(
+    project_root: &Path,
+    work_item_id: &str,
+    attempt_id: &str,
+    attempt_kind: &AttemptKind,
+    workspace_refs: &[WorkspaceRef],
+    input_artifacts: &[PathBuf],
+    artifact_dir: &Path,
+    reviewer_cache_dir: Option<&Path>,
+    resolver: &ContentResolver,
+    no_sandbox: bool,
+    coder_kind: CoderKind,
+    codex_worker: Option<&crate::codex_worker::CodexWorkerEnvironment>,
+) -> Result<Option<os::SandboxProfile>> {
+    if no_sandbox && codex_worker.is_none() {
+        return Ok(None);
+    }
+
+    let readable_workspaces = workspace_refs
+        .iter()
+        .map(|workspace| {
+            resolve_review_readable_workspace_path(
+                project_root,
+                workspace,
+                work_item_id,
+                attempt_id,
+                attempt_kind,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut readable_roots = review_readable_sandbox_roots(project_root, &readable_workspaces)?;
+    readable_roots.extend(declared_file_readable_roots(input_artifacts, project_root)?);
+    readable_roots.push(planning_files_dir(project_root, work_item_id));
+    readable_roots.push(general_expertise_dir(project_root));
+    readable_roots.push(review_skills_dir(project_root));
+    if let Some(worker) = codex_worker {
+        readable_roots.extend(worker.launcher().readable_roots().iter().cloned());
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut writable_roots = vec![artifact_dir.to_path_buf()];
+    writable_roots.extend(reviewer_cache_dir.map(Path::to_path_buf));
+    let profile = os::render_profile_for_access_for_coder_with_codex_home(
+        resolver,
+        &home,
+        &writable_roots,
+        &readable_roots,
+        coder_kind,
+        codex_worker.map(|worker| worker.home()),
+    )?;
+    if let Some(worker) = codex_worker {
+        os::preflight_codex_launcher(&profile, worker)?;
+    } else {
+        os::preflight_profile(&profile)?;
+    }
+    os::preflight_readable_paths(&profile, &readable_roots)?;
+    Ok(Some(profile))
+}
+
+#[cfg(test)]
 fn build_coder_sandbox_with_writable_and_read_only_roots(
     coder_kind: CoderKind,
     resolver: &ContentResolver,
@@ -4247,25 +9288,8 @@ fn build_coder_sandbox_with_writable_and_read_only_roots_and_codex_home(
         coder_kind,
         codex_home,
     )?;
-    let sandbox = CoderSandbox::SeatbeltProfile(profile.path.to_string_lossy().to_string());
-    Ok((sandbox, Some(profile)))
-}
-
-fn build_coder_sandbox_with_read_only_roots(
-    coder_kind: CoderKind,
-    resolver: &ContentResolver,
-    working_dir: &Path,
-    readable_roots: &[PathBuf],
-) -> Result<(CoderSandbox, Option<os::SandboxProfile>)> {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let writable_roots = vec![working_dir.to_path_buf()];
-    let profile = os::render_profile_for_access_for_coder(
-        resolver,
-        &home,
-        &writable_roots,
-        readable_roots,
-        coder_kind,
-    )?;
+    #[cfg(not(test))]
+    os::preflight_profile(&profile)?;
     let sandbox = CoderSandbox::SeatbeltProfile(profile.path.to_string_lossy().to_string());
     Ok((sandbox, Some(profile)))
 }
@@ -4286,6 +9310,152 @@ fn ensure_clean_worktree(workspace_path: &Path) -> Result<()> {
             String::from_utf8_lossy(&output.stdout)
         )
     }
+}
+
+pub(crate) fn writer_handoff_result(
+    config: &WorkTaskRunConfig<'_>,
+    workspace_path: &Path,
+    baseline_commit: &str,
+) -> Result<std::result::Result<(u32, Option<NoChangeOutput>), anyhow::Error>> {
+    let status = git_status_output(workspace_path, &["--porcelain"])?;
+    anyhow::ensure!(
+        status.status.success(),
+        "cannot inspect Writer candidate status: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let count = commits_ahead(workspace_path, baseline_commit)?;
+    if !status.stdout.is_empty() {
+        return Ok(Err(anyhow::anyhow!(
+            "Task workspace has uncommitted changes; commit or remove them before completing:\n{}",
+            String::from_utf8_lossy(&status.stdout)
+        )));
+    }
+    let no_change = if count == 0 {
+        match validate_followup_no_change(config, workspace_path) {
+            Ok(declaration) => Some(declaration),
+            Err(error) => return Ok(Err(error)),
+        }
+    } else {
+        None
+    };
+    Ok(Ok((count, no_change)))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SourceProductSnapshot {
+    head: String,
+    status: Vec<u8>,
+    content_hashes: BTreeMap<PathBuf, String>,
+}
+
+fn source_product_snapshot(source: &Path) -> Result<SourceProductSnapshot> {
+    let head = head_commit(source)?;
+    let output = git_status_output(
+        source,
+        &[
+            "--porcelain",
+            "--untracked-files=all",
+            "--",
+            ".",
+            ":(exclude).fluent/work",
+        ],
+    )?;
+    anyhow::ensure!(
+        output.status.success(),
+        "cannot inspect source checkout product status: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let files = git::run_raw(
+        source,
+        &[
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--",
+            ".",
+            ":(exclude).fluent/work",
+        ],
+    )?;
+    anyhow::ensure!(
+        files.status.success(),
+        "cannot list source checkout product files: {}",
+        String::from_utf8_lossy(&files.stderr)
+    );
+    let mut content_hashes = BTreeMap::new();
+    for raw_path in files
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+    {
+        let relative = PathBuf::from(std::ffi::OsString::from_vec(raw_path.to_vec()));
+        anyhow::ensure!(
+            relative
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_))),
+            "Git listed a noncanonical source product path: {}",
+            relative.display()
+        );
+        let path = source.join(&relative);
+        let digest = match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let target = fs::read_link(&path)?;
+                format!(
+                    "symlink:{:x}",
+                    Sha256::digest(target.as_os_str().as_encoded_bytes())
+                )
+            }
+            Ok(metadata) if metadata.is_file() => {
+                let mut file = fs::File::open(&path)
+                    .with_context(|| format!("read source product {}", path.display()))?;
+                let mut hasher = Sha256::new();
+                let mut buffer = [0_u8; 64 * 1024];
+                loop {
+                    let count = file.read(&mut buffer)?;
+                    if count == 0 {
+                        break;
+                    }
+                    hasher.update(&buffer[..count]);
+                }
+                format!("file:{:x}", hasher.finalize())
+            }
+            Ok(metadata) if metadata.is_dir() => "directory".to_string(),
+            Ok(_) => "other".to_string(),
+            Err(error) if error.kind() == ErrorKind::NotFound => "missing".to_string(),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("inspect source product {}", path.display()));
+            }
+        };
+        content_hashes.insert(relative, digest);
+    }
+    Ok(SourceProductSnapshot {
+        head,
+        status: output.stdout,
+        content_hashes,
+    })
+}
+
+fn ensure_source_product_unchanged(source: &Path, before: &SourceProductSnapshot) -> Result<()> {
+    let after = source_product_snapshot(source)?;
+    let changed_paths = before
+        .content_hashes
+        .keys()
+        .chain(after.content_hashes.keys())
+        .filter(|path| before.content_hashes.get(*path) != after.content_hashes.get(*path))
+        .collect::<BTreeSet<_>>();
+    anyhow::ensure!(
+        &after == before,
+        "Writer changed source checkout {}; preserve it for inspection and stop this Task (before HEAD {}, after HEAD {}; before status {:?}, after status {:?}; changed product paths {:?})",
+        source.display(),
+        before.head,
+        after.head,
+        String::from_utf8_lossy(&before.status),
+        String::from_utf8_lossy(&after.status),
+        changed_paths,
+    );
+    Ok(())
 }
 
 fn ensure_no_non_fluent_worktree_changes(workspace_path: &Path) -> Result<()> {
@@ -4398,7 +9568,13 @@ fn allowed_status_prefix(workspace_path: &Path, allowed_artifact_dir: &Path) -> 
 fn filtered_status_entries(entries: &[String], allowed_prefix: &Path) -> Vec<String> {
     let mut filtered = entries
         .iter()
-        .filter(|entry| !status_entry_touches_path(entry, allowed_prefix))
+        .filter(|entry| {
+            !status_entry_touches_path(entry, allowed_prefix)
+                && !status_entry_touches_path(
+                    entry,
+                    Path::new(".fluent/work/locks/reviewer-cache.lock"),
+                )
+        })
         .cloned()
         .collect::<Vec<_>>();
     filtered.sort();
@@ -4456,6 +9632,12 @@ fn collect_protected_fluent_files(
         let path = entry.path();
         let relative = path.strip_prefix(workspace_path)?.to_path_buf();
         if relative == allowed || relative.starts_with(allowed) {
+            continue;
+        }
+        if relative == Path::new(".fluent/work/locks/reviewer-cache.lock") {
+            // Cache admission owns this project-level coordination file. It can be
+            // created while a review-only source checkout is guarded, but it is
+            // never reviewer output and must not be restored or attributed to it.
             continue;
         }
         let file_type = entry.file_type()?;
@@ -4626,12 +9808,281 @@ fn commits_ahead(workspace_path: &Path, source_ref: &str) -> Result<u32> {
     Ok(stdout.parse()?)
 }
 
+fn ensure_tester_harness_repair_scope(workspace_path: &Path, baseline_commit: &str) -> Result<()> {
+    let range = format!("{baseline_commit}..HEAD");
+    let changed = git::run_stdout(
+        workspace_path,
+        &[
+            "diff",
+            "--name-only",
+            "--no-renames",
+            "--diff-filter=ACMRD",
+            &range,
+            "--",
+        ],
+        "inspect Tester-harness repair scope",
+    )?;
+    let paths = changed
+        .lines()
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        bail!("Tester-harness repair did not change tracked Tester files");
+    }
+    let outside = paths
+        .iter()
+        .copied()
+        .filter(|path| {
+            !matches!(
+                *path,
+                ".fluent/tester.yaml" | ".fluent/extract-tester-results"
+            )
+        })
+        .collect::<Vec<_>>();
+    if !outside.is_empty() {
+        bail!(
+            "Tester-harness repair changed files outside the approved Tester boundary:\n{}",
+            outside.join("\n")
+        );
+    }
+    for required in [".fluent/tester.yaml", ".fluent/extract-tester-results"] {
+        let is_regular = fs::symlink_metadata(workspace_path.join(required))
+            .is_ok_and(|metadata| metadata.file_type().is_file());
+        if !is_regular {
+            bail!(
+                "Tester-harness repair removed or replaced required regular Tester file {required}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TesterHarnessRepairStart {
+    ApprovedCandidate,
+    ScopedDescendant,
+    RejectedDescendant { reason: String },
+}
+
+fn inspect_tester_harness_repair_start(
+    project_root: &Path,
+    task: &crate::work_model::Task,
+    workspace_path: &Path,
+) -> Result<TesterHarnessRepairStart> {
+    let context = task
+        .review_context
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Tester-harness repair has no pinned candidate context"))?;
+    let writable = task.workspace_access.writes.as_slice();
+    if writable.len() != 1
+        || writable[0].id != context.candidate_workspace_id
+        || writable[0].path != context.candidate_workspace_path
+    {
+        bail!("Tester-harness repair workspace does not match its pinned candidate context");
+    }
+
+    let head = head_commit(workspace_path)?;
+    let baseline_path = task
+        .artifact_area
+        .as_ref()
+        .map(|area| {
+            resolve_managed_artifact_area_path(project_root, &area.path)
+                .map(|dir| dir.join("write-baseline-commit"))
+        })
+        .transpose()?
+        .ok_or_else(|| anyhow::anyhow!("Tester-harness repair has no artifact area"))?;
+
+    let state = match fs::read_to_string(&baseline_path) {
+        Ok(persisted) => {
+            let persisted = persisted.trim();
+            if persisted != context.candidate_commit {
+                bail!(
+                    "Tester-harness repair baseline {persisted:?} does not match approved candidate {}",
+                    context.candidate_commit
+                );
+            }
+            if head != context.candidate_commit {
+                let ancestry = git::run_raw(
+                    workspace_path,
+                    &[
+                        "merge-base",
+                        "--is-ancestor",
+                        &context.candidate_commit,
+                        &head,
+                    ],
+                )?;
+                if !ancestry.status.success() {
+                    bail!(
+                        "Tester-harness repair HEAD {head} is not descended from approved candidate {}",
+                        context.candidate_commit
+                    );
+                }
+                match ensure_tester_harness_repair_scope(workspace_path, &context.candidate_commit)
+                {
+                    Ok(()) => TesterHarnessRepairStart::ScopedDescendant,
+                    Err(error) => TesterHarnessRepairStart::RejectedDescendant {
+                        reason: error.to_string(),
+                    },
+                }
+            } else {
+                TesterHarnessRepairStart::ApprovedCandidate
+            }
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            if head != context.candidate_commit {
+                bail!(
+                    "Tester-harness repair must start at approved candidate {}; found {head}",
+                    context.candidate_commit
+                );
+            }
+            TesterHarnessRepairStart::ApprovedCandidate
+        }
+        Err(error) => {
+            return Err(anyhow::Error::new(error).context(format!(
+                "read Tester-harness repair baseline {}",
+                baseline_path.display()
+            )));
+        }
+    };
+    ensure_clean_worktree(workspace_path)?;
+    Ok(state)
+}
+
+fn prepare_tester_harness_repair_start(
+    project_root: &Path,
+    task: &crate::work_model::Task,
+    workspace_path: &Path,
+) -> Result<()> {
+    if let TesterHarnessRepairStart::RejectedDescendant { reason } =
+        inspect_tester_harness_repair_start(project_root, task, workspace_path)?
+    {
+        let baseline = task
+            .review_context
+            .as_ref()
+            .expect("inspector requires repair context")
+            .candidate_commit
+            .clone();
+        reject_and_restore_tester_harness_repair(
+            project_root,
+            task,
+            workspace_path,
+            &baseline,
+            &anyhow::anyhow!(reason),
+        )?;
+    }
+    Ok(())
+}
+
+fn reject_and_restore_tester_harness_repair(
+    project_root: &Path,
+    task: &crate::work_model::Task,
+    workspace_path: &Path,
+    baseline_commit: &str,
+    scope_error: &anyhow::Error,
+) -> Result<()> {
+    ensure_clean_worktree(workspace_path)?;
+    let rejected_commit = head_commit(workspace_path)?;
+    let artifact_dir = task
+        .artifact_area
+        .as_ref()
+        .map(|area| resolve_managed_artifact_area_path(project_root, &area.path))
+        .transpose()?
+        .ok_or_else(|| anyhow::anyhow!("Tester-harness repair has no artifact area"))?;
+    fs::create_dir_all(&artifact_dir)?;
+    let receipt = serde_json::json!({
+        "schema_version": 1,
+        "task_id": task.id,
+        "approved_candidate": baseline_commit,
+        "rejected_commit": rejected_commit,
+        "reason": scope_error.to_string(),
+    });
+    let receipt_path = artifact_dir.join(format!(
+        "rejected-repair-{}.json",
+        rejected_commit.get(..12).unwrap_or(&rejected_commit)
+    ));
+    crate::atomic_write::atomic_write(&receipt_path, &serde_json::to_vec_pretty(&receipt)?)?;
+    reset_worktree_head(workspace_path, baseline_commit)?;
+    let restored = head_commit(workspace_path)?;
+    ensure_clean_worktree(workspace_path)?;
+    if restored != baseline_commit {
+        bail!(
+            "restored Tester-harness candidate HEAD {restored} does not match approved candidate {baseline_commit}"
+        );
+    }
+    Ok(())
+}
+
 fn head_commit(workspace_path: &Path) -> Result<String> {
     git::run_stdout(
         workspace_path,
         &["rev-parse", "HEAD"],
         "resolve task workspace HEAD",
     )
+}
+
+/// Read the baseline captured outside the Writer's writable artifact area.
+pub(crate) fn host_write_baseline_path(
+    store: &WorkModelStore,
+    work_item_id: &str,
+    attempt_id: &str,
+    task_id: &str,
+) -> Result<PathBuf> {
+    Ok(store
+        .work_task_path(work_item_id, attempt_id, task_id)?
+        .with_extension("write-baseline"))
+}
+
+fn bind_host_write_baseline(
+    project_root: &Path,
+    task: &crate::work_model::Task,
+    baseline: &str,
+) -> Result<()> {
+    let store = WorkModelStore::new(project_root);
+    let attempt_id = task
+        .attempt_id
+        .as_deref()
+        .context("Writer Task has no Attempt ID")?;
+    let path = host_write_baseline_path(&store, &task.work_item_id, attempt_id, &task.id)?;
+    match fs::read_to_string(&path) {
+        Ok(saved) => anyhow::ensure!(
+            saved.trim() == baseline,
+            "Writer baseline in writable artifacts differs from the host-owned baseline at {}",
+            path.display()
+        ),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            fs::create_dir_all(path.parent().context("Writer baseline has no parent")?)?;
+            let mut file = tempfile::NamedTempFile::new_in(path.parent().unwrap())?;
+            std::io::Write::write_all(&mut file, baseline.as_bytes())?;
+            file.as_file().sync_all()?;
+            file.persist_noclobber(&path).map_err(|error| error.error)?;
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("read host Writer baseline at {}", path.display()));
+        }
+    }
+    Ok(())
+}
+
+fn verify_host_write_baseline(
+    project_root: &Path,
+    task: &crate::work_model::Task,
+    baseline: &str,
+) -> Result<()> {
+    let store = WorkModelStore::new(project_root);
+    let attempt_id = task
+        .attempt_id
+        .as_deref()
+        .context("Writer Task has no Attempt ID")?;
+    let path = host_write_baseline_path(&store, &task.work_item_id, attempt_id, &task.id)?;
+    let saved = fs::read_to_string(&path)
+        .with_context(|| format!("read host-owned Writer baseline at {}", path.display()))?;
+    anyhow::ensure!(
+        saved.trim() == baseline,
+        "Writer baseline in writable artifacts differs from the host-owned baseline at {}",
+        path.display()
+    );
+    Ok(())
 }
 
 /// Resolve the Writer's stable Git baseline for counting produced commits.
@@ -4674,6 +10125,27 @@ fn resolve_or_persist_write_baseline(
                         path.display()
                     );
                 }
+                // Older correction Tasks and a setup interrupted between the
+                // two baseline writes can have only the artifact sidecar. The
+                // immutable correction assignment independently names the
+                // source commit, so it can bind that exact value before launch.
+                let host = host_write_baseline_path(
+                    &WorkModelStore::new(project_root),
+                    &task.work_item_id,
+                    task.attempt_id
+                        .as_deref()
+                        .context("Writer Task has no Attempt ID")?,
+                    &task.id,
+                )?;
+                if !host.try_exists()?
+                    && task
+                        .writer_correction_assignment
+                        .as_ref()
+                        .is_some_and(|assignment| assignment.source_candidate_commit == trimmed)
+                {
+                    bind_host_write_baseline(project_root, task, trimmed)?;
+                }
+                verify_host_write_baseline(project_root, task, trimmed)?;
                 return Ok(trimmed.to_string());
             }
             Err(error) if error.kind() == ErrorKind::NotFound => {
@@ -4688,7 +10160,34 @@ fn resolve_or_persist_write_baseline(
         }
     }
 
-    let baseline = head_commit(workspace_path)?;
+    // Publish the host-owned binding first. If setup stopped before writing the
+    // sidecar, reuse the binding rather than adopting a later workspace HEAD.
+    let store = WorkModelStore::new(project_root);
+    let attempt_id = task
+        .attempt_id
+        .as_deref()
+        .context("Writer Task has no Attempt ID")?;
+    let host_path = host_write_baseline_path(&store, &task.work_item_id, attempt_id, &task.id)?;
+    let baseline = match fs::read_to_string(&host_path) {
+        Ok(saved) => {
+            let saved = saved.trim();
+            anyhow::ensure!(
+                !saved.is_empty(),
+                "host-owned Writer baseline at {} is empty",
+                host_path.display()
+            );
+            saved.to_string()
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            let baseline = head_commit(workspace_path)?;
+            bind_host_write_baseline(project_root, task, &baseline)?;
+            baseline
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("read host Writer baseline at {}", host_path.display()));
+        }
+    };
     if let Some(path) = baseline_path.as_ref() {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -4696,12 +10195,16 @@ fn resolve_or_persist_write_baseline(
         // Create without overwriting: only a NotFound read reaches here, and the
         // Task lease serializes writers, so an existing sidecar means a concurrent
         // or prior baseline we must not clobber with a post-commit HEAD.
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-            .with_context(|| format!("persist write baseline at {}", path.display()))?;
+        let mut file = tempfile::NamedTempFile::new_in(
+            path.parent()
+                .context("Writer baseline sidecar has no parent")?,
+        )
+        .with_context(|| format!("prepare write baseline at {}", path.display()))?;
         std::io::Write::write_all(&mut file, baseline.as_bytes())
+            .with_context(|| format!("persist write baseline at {}", path.display()))?;
+        file.as_file().sync_all()?;
+        file.persist_noclobber(path)
+            .map_err(|error| error.error)
             .with_context(|| format!("persist write baseline at {}", path.display()))?;
     }
     Ok(baseline)
@@ -4726,6 +10229,144 @@ fn current_branch(project_root: &Path) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn usage_limit_git_config_roots_resolve_worktree_includes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        git::run(&root, &["init", "--quiet"], "create config fixture").unwrap();
+        let include = root.join("included config\nwith newline");
+        fs::write(&include, "").unwrap();
+        git::run(
+            &root,
+            &["config", "include.path", include.to_str().unwrap()],
+            "include an empty config",
+        )
+        .unwrap();
+        git::run(
+            &root,
+            &[
+                "config",
+                "--add",
+                "include.path",
+                "../absent-optional-config",
+            ],
+            "include an absent optional config",
+        )
+        .unwrap();
+        let roots = installed_writer_git_config_roots(&root, &root).unwrap();
+        assert!(roots.contains(&include));
+        assert!(roots.contains(&root.join(".git/config")));
+        assert!(!roots.contains(&root));
+    }
+
+    #[test]
+    fn usage_limit_git_config_roots_filter_conditional_includes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap().join("config[*]");
+        fs::create_dir(&root).unwrap();
+        git::run(&root, &["init", "--quiet"], "create config fixture").unwrap();
+        git::run(
+            &root,
+            &["symbolic-ref", "HEAD", "refs/heads/quota=active"],
+            "select fixture branch",
+        )
+        .unwrap();
+        git::run(
+            &root,
+            &["config", "remote.origin.url", "https://example.test/repo"],
+            "set fixture remote",
+        )
+        .unwrap();
+        let config = root.join("conditional config");
+        fs::write(&config, "").unwrap();
+        git::run(
+            &root,
+            &["config", "include.path", config.to_str().unwrap()],
+            "include conditional fixture",
+        )
+        .unwrap();
+        let mut expected = Vec::new();
+        for (condition, active) in [
+            ("onbranch:quota=active", true),
+            ("onbranch:quota-inactive", false),
+            ("gitdir:./", true),
+            ("gitdir/i:./", true),
+            ("gitdir:./absent/", false),
+            ("hasconfig:remote.*.url:https://example.test/**", true),
+            ("hasconfig:remote.*.url:https://unrelated.test/**", false),
+        ] {
+            let path = root.join(format!("empty-{}", expected.len()));
+            fs::write(&path, "").unwrap();
+            git::run(
+                &root,
+                &[
+                    "config",
+                    "--file",
+                    config.to_str().unwrap(),
+                    &format!("includeIf.{condition}.path"),
+                    path.to_str().unwrap(),
+                ],
+                "set conditional fixture include",
+            )
+            .unwrap();
+            expected.push((path, active));
+        }
+        let roots = installed_writer_git_config_roots(&root, &root).unwrap();
+        for (path, active) in expected {
+            assert_eq!(roots.contains(&path), active, "include {}", path.display());
+        }
+    }
+
+    #[test]
+    fn usage_limit_git_config_roots_reject_invalid_configuration() {
+        let tmp = tempfile::tempdir().unwrap();
+        git::run(tmp.path(), &["init", "--quiet"], "create config fixture").unwrap();
+        fs::write(tmp.path().join(".git/config"), "[broken\nsecret-value\n").unwrap();
+        let error = installed_writer_git_config_roots(tmp.path(), tmp.path()).unwrap_err();
+        assert!(format!("{error:#}").contains("Git configuration"));
+        assert!(!format!("{error:#}").contains("secret-value"));
+    }
+
+    #[test]
+    fn usage_limit_tool_roots_keep_installed_targets_read_only() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("operator");
+        let bin = home.join(".cargo/bin");
+        let rustup = tmp.path().join("installed-rust");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&rustup).unwrap();
+        let executable = rustup.join("cargo");
+        std::fs::write(&executable, "installed tool").unwrap();
+        std::os::unix::fs::symlink(&executable, bin.join("cargo")).unwrap();
+        let roots =
+            installed_writer_tool_roots(&home, Some(rustup.as_os_str()), Some(bin.as_os_str()))
+                .unwrap();
+        assert!(roots.contains(&std::fs::canonicalize(&executable).unwrap()));
+        assert!(roots.contains(&std::fs::canonicalize(&rustup).unwrap()));
+        assert!(!roots.contains(&home));
+        assert!(!roots.contains(&home.join(".cargo")));
+        assert!(!roots.contains(&home.join(".cargo/registry")));
+    }
+
+    #[test]
+    fn usage_limit_launch_environment_keeps_rust_scratch_private() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = crate::writer_cache::preflight_writer_dependency_cache(
+            tmp.path(),
+            "work-1",
+            "attempt-1",
+        )
+        .unwrap();
+        let env = usage_limit_writer_tool_env(&cache).unwrap();
+        assert!(env.iter().any(|(name, value)| name == "TMPDIR" && Path::new(value).starts_with(cache.root())));
+        assert!(env.iter().any(|(name, value)| name == "CARGO_HOME" && Path::new(value) == cache.cargo_home()));
+        assert!(
+            env.iter()
+                .filter(|(name, _)| name == "TMPDIR")
+                .all(|(_, value)| Path::new(value).is_dir())
+        );
+    }
     use super::*;
     use crate::content::ContentResolver;
     use crate::work_model::{
@@ -4733,12 +10374,804 @@ mod tests {
         CorrectiveEvidenceReference, DerivedProvenance, ExecutionAuthority, TaskOutput, TaskStatus,
         WorkItem, WorkItemAbandonment, WorkLineage,
     };
+    use crate::work_model::{
+        WRITER_CORRECTION_ASSIGNMENT_SCHEMA_VERSION, WriterCompletionFinding,
+        WriterCorrectionAssignment, WriterCorrectionAssignmentInput,
+        WriterCorrectionAssignmentOrigin,
+    };
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
     use std::sync::{Arc, Mutex};
 
+    // Keep the approved behavior selector visible to the candidate gate.
+    const PROVIDER_ARGUMENT_TEST_SELECTORS: &[&str] = &[
+        "tests::reviewer_execution_propagates_typed_provider_argument_failure",
+        "tests::argument_words_without_typed_failure_remain_generic",
+    ];
+
+    fn test_writer_cache(project_root: &Path) -> crate::writer_cache::WriterDependencyCache {
+        let cache = crate::writer_cache::preflight_writer_dependency_cache(
+            project_root,
+            "work-1",
+            "attempt-1",
+        )
+        .unwrap();
+        crate::writer_cache::prepare_writer_dependency_cache(&cache, None).unwrap();
+        cache
+    }
+
     #[test]
-    fn transcript_pump_failure_is_not_retried() {
+    fn tester_candidate_guard_rejects_preexisting_tracked_changes_without_restoring_them() {
+        let root = tempfile::tempdir().unwrap();
+        crate::git::run(root.path(), &["init", "-q", "-b", "main"], "init fixture").unwrap();
+        crate::git::run(
+            root.path(),
+            &["config", "user.email", "test@example.invalid"],
+            "configure fixture",
+        )
+        .unwrap();
+        crate::git::run(
+            root.path(),
+            &["config", "user.name", "Test"],
+            "configure fixture",
+        )
+        .unwrap();
+        fs::write(root.path().join("tracked.txt"), "baseline\n").unwrap();
+        crate::git::run(root.path(), &["add", "tracked.txt"], "stage fixture").unwrap();
+        crate::git::run(
+            root.path(),
+            &["commit", "-q", "-m", "Add fixture"],
+            "commit fixture",
+        )
+        .unwrap();
+        let head = head_commit(root.path()).unwrap();
+        fs::write(root.path().join("tracked.txt"), "user change\n").unwrap();
+
+        let error = TesterCandidateGuard::begin(root.path().to_path_buf(), &head)
+            .expect_err("a preexisting tracked change must fail closed");
+
+        assert!(format!("{error:#}").contains("before execution"));
+        assert_eq!(
+            fs::read_to_string(root.path().join("tracked.txt")).unwrap(),
+            "user change\n",
+            "preflight must not overwrite a change that predates Tester execution"
+        );
+    }
+
+    #[test]
+    fn tester_candidate_guard_records_failed_restoration_and_leaves_task_untrusted() {
+        let root = tempfile::tempdir().unwrap();
+        crate::git::run(root.path(), &["init", "-q", "-b", "main"], "init fixture").unwrap();
+        crate::git::run(
+            root.path(),
+            &["config", "user.email", "test@example.invalid"],
+            "configure fixture",
+        )
+        .unwrap();
+        crate::git::run(
+            root.path(),
+            &["config", "user.name", "Test"],
+            "configure fixture",
+        )
+        .unwrap();
+        fs::write(root.path().join("tracked.txt"), "baseline\n").unwrap();
+        crate::git::run(root.path(), &["add", "tracked.txt"], "stage fixture").unwrap();
+        crate::git::run(
+            root.path(),
+            &["commit", "-q", "-m", "Add fixture"],
+            "commit fixture",
+        )
+        .unwrap();
+        let head = head_commit(root.path()).unwrap();
+        let guard = TesterCandidateGuard::begin(root.path().to_path_buf(), &head).unwrap();
+        let artifact_dir = root.path().join("artifact");
+        fs::create_dir(&artifact_dir).unwrap();
+        fs::write(root.path().join("tracked.txt"), "tester mutation\n").unwrap();
+        fs::write(root.path().join(".git/index.lock"), "held\n").unwrap();
+
+        let error = guard
+            .restore_after_run(&artifact_dir)
+            .expect_err("a failed Git restore must fail the Tester boundary");
+
+        assert!(format!("{error:#}").contains("Failed to restore tracked candidate changes"));
+        assert_eq!(
+            fs::read_to_string(root.path().join("tracked.txt")).unwrap(),
+            "tester mutation\n"
+        );
+        let evidence: TesterCandidateMutationEvidence = serde_json::from_slice(
+            &fs::read(artifact_dir.join(TESTER_CANDIDATE_MUTATION_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(evidence.candidate_commit, head);
+        assert!(!evidence.restored);
+    }
+
+    #[test]
+    fn tester_candidate_guard_does_not_rewind_a_head_change_during_execution() {
+        let root = tempfile::tempdir().unwrap();
+        crate::git::run(root.path(), &["init", "-q", "-b", "main"], "init fixture").unwrap();
+        crate::git::run(
+            root.path(),
+            &["config", "user.email", "test@example.invalid"],
+            "configure fixture",
+        )
+        .unwrap();
+        crate::git::run(
+            root.path(),
+            &["config", "user.name", "Test"],
+            "configure fixture",
+        )
+        .unwrap();
+        fs::write(root.path().join("tracked.txt"), "baseline\n").unwrap();
+        crate::git::run(root.path(), &["add", "tracked.txt"], "stage fixture").unwrap();
+        crate::git::run(
+            root.path(),
+            &["commit", "-q", "-m", "Add fixture"],
+            "commit fixture",
+        )
+        .unwrap();
+        let original_head = head_commit(root.path()).unwrap();
+        let guard = TesterCandidateGuard::begin(root.path().to_path_buf(), &original_head).unwrap();
+        fs::write(root.path().join("later.txt"), "later commit\n").unwrap();
+        crate::git::run(root.path(), &["add", "later.txt"], "stage later commit").unwrap();
+        crate::git::run(
+            root.path(),
+            &["commit", "-q", "-m", "Move candidate head"],
+            "move candidate head",
+        )
+        .unwrap();
+        let moved_head = head_commit(root.path()).unwrap();
+
+        let error = guard
+            .restore_after_run(&root.path().join("artifact"))
+            .expect_err("a moved candidate HEAD must fail closed");
+
+        assert!(format!("{error:#}").contains("HEAD changed"));
+        assert_eq!(head_commit(root.path()).unwrap(), moved_head);
+        assert!(root.path().join("later.txt").is_file());
+    }
+
+    #[test]
+    fn reviewer_project_instruction_grant_follows_an_in_project_file_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(
+            project_instruction_readable_roots(root.path()).unwrap(),
+            Vec::<PathBuf>::new()
+        );
+        fs::write(root.path().join("CLAUDE.md"), "review instructions").unwrap();
+        std::os::unix::fs::symlink("CLAUDE.md", root.path().join("AGENTS.md")).unwrap();
+        fs::write(root.path().join("private-notes.md"), "not instructions").unwrap();
+
+        assert_eq!(
+            project_instruction_readable_roots(root.path()).unwrap(),
+            vec![
+                root.path().join("AGENTS.md"),
+                fs::canonicalize(root.path().join("CLAUDE.md")).unwrap(),
+            ]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn reviewer_profile_reads_an_in_project_instruction_symlink_but_not_its_sibling() {
+        let host_preflight_override = std::env::var_os("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT");
+        unsafe { std::env::remove_var("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT") };
+        let root = tempfile::tempdir_in("target").unwrap();
+        let artifact_dir = root.path().join("review-artifact");
+        fs::create_dir(&artifact_dir).unwrap();
+        let target = root.path().join("CLAUDE.md");
+        let declared = root.path().join("AGENTS.md");
+        let sibling = root.path().join("private-notes.md");
+        fs::write(&target, "review instructions\n").unwrap();
+        fs::write(&sibling, "private\n").unwrap();
+        std::os::unix::fs::symlink("CLAUDE.md", &declared).unwrap();
+
+        let readable = project_instruction_readable_roots(root.path()).unwrap();
+        let resolver = ContentResolver::new(None);
+        let profile = os::render_profile_for_access_for_coder(
+            &resolver,
+            "/Users/test",
+            std::slice::from_ref(&artifact_dir),
+            &readable,
+            CoderKind::Codex,
+        )
+        .unwrap();
+
+        if let Err(error) = os::preflight_profile(&profile) {
+            if let Some(value) = host_preflight_override {
+                unsafe { std::env::set_var("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", value) };
+            }
+            if error.to_string().contains("Operation not permitted") {
+                return;
+            }
+            panic!("reviewer profile preflight failed: {error:#}");
+        }
+
+        os::preflight_readable_paths(&profile, &[declared, target]).unwrap();
+        let error = os::preflight_readable_paths(&profile, std::slice::from_ref(&sibling))
+            .expect_err("an undeclared sibling must remain unreadable");
+        if let Some(value) = host_preflight_override {
+            unsafe { std::env::set_var("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", value) };
+        }
+        assert!(
+            error
+                .to_string()
+                .contains("reviewer cannot read declared path"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn declared_file_grant_rejects_a_symlink_outside_its_workspace() {
+        let parent = tempfile::tempdir().unwrap();
+        let workspace = parent.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let outside = parent.path().join("outside.md");
+        fs::write(&outside, "private\n").unwrap();
+        let declared = workspace.join("AGENTS.md");
+        std::os::unix::fs::symlink(&outside, &declared).unwrap();
+
+        let error = declared_file_readable_roots(std::slice::from_ref(&declared), &workspace)
+            .expect_err("a declared input may not grant its out-of-workspace target");
+
+        assert!(
+            error
+                .to_string()
+                .contains("resolves outside approved workspace"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn declared_file_grant_rejects_missing_directory_and_cycle_targets() {
+        let workspace = tempfile::tempdir().unwrap();
+        let missing = workspace.path().join("missing");
+        let missing_error =
+            declared_file_readable_roots(std::slice::from_ref(&missing), workspace.path())
+                .expect_err("a declared exact-file input must exist");
+        assert!(missing_error.to_string().contains("resolve declared input"));
+
+        let directory = workspace.path().join("directory");
+        fs::create_dir(&directory).unwrap();
+        let directory_error =
+            declared_file_readable_roots(std::slice::from_ref(&directory), workspace.path())
+                .expect_err("a declared exact-file input may not be a directory");
+        assert!(
+            directory_error
+                .to_string()
+                .contains("is not a regular file")
+        );
+
+        let first = workspace.path().join("first");
+        let second = workspace.path().join("second");
+        std::os::unix::fs::symlink("second", &first).unwrap();
+        std::os::unix::fs::symlink("first", &second).unwrap();
+        let cycle_error =
+            declared_file_readable_roots(std::slice::from_ref(&first), workspace.path())
+                .expect_err("a declared exact-file input may not be a symlink cycle");
+        assert!(cycle_error.to_string().contains("resolve declared input"));
+    }
+
+    #[test]
+    fn capacity_wait_leaves_task_planned_and_observes_cancellation() {
+        let root = tempfile::tempdir().unwrap();
+        let project_root = root.path();
+        fs::create_dir_all(project_root.join(".fluent")).unwrap();
+        fs::write(
+            project_root.join(".fluent/config.yaml"),
+            "providers:\n  project-concurrency:\n    claude: 1\n",
+        )
+        .unwrap();
+        let store = WorkModelStore::new(project_root);
+        let mut item = WorkItem {
+            id: "capacity-wait".to_string(),
+            title: "Wait for capacity".to_string(),
+            ..Default::default()
+        };
+        item.add_initial_attempt("attempt-1").unwrap();
+        item.attempts[0].coder_mapping.write.coder = CoderKind::Claude;
+        let task_id = item.attempts[0].tasks[0].id.clone();
+        store.create_work_item(&item).unwrap();
+        let resolver = ContentResolver::new(Some(project_root));
+        let user_root = crate::provider_admission::effective_user_root(project_root).unwrap();
+        let held =
+            match crate::provider_admission::try_acquire(&user_root, project_root, "claude", 1, 1)
+                .unwrap()
+            {
+                crate::provider_admission::AdmissionAttempt::Acquired(lease) => lease,
+                crate::provider_admission::AdmissionAttempt::Contended => {
+                    panic!("fixture slot must be available")
+                }
+            };
+
+        std::thread::scope(|scope| {
+            let config = WorkTaskRunConfig {
+                project_root,
+                store: &store,
+                work_item_id: "capacity-wait",
+                attempt_id: "attempt-1",
+                task_id: &task_id,
+                resolver: &resolver,
+                extra_args: &[],
+                no_sandbox: true,
+                store_lock: None,
+            };
+            let waiter = scope.spawn(move || {
+                acquire_task_provider_capacity(&config, CoderKind::Claude, "Writer")
+            });
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            assert_eq!(
+                store.read_work_item("capacity-wait").unwrap().attempts[0].tasks[0].status,
+                TaskStatus::Planned,
+                "waiting for provider capacity must not reserve execution"
+            );
+            store
+                .mutate_work_item("capacity-wait", |fresh| {
+                    fresh.attempts[0].tasks[0].status = TaskStatus::NeedsUser;
+                    crate::work_model::transition_attempt(
+                        &mut fresh.attempts[0],
+                        AttemptStatus::NeedsUser,
+                        Some(crate::work_model::PauseKind::Interrupted),
+                    );
+                    Ok(())
+                })
+                .unwrap();
+            let error = match waiter.join().unwrap() {
+                Ok(_) => panic!("the cancelled Task must stop waiting"),
+                Err(error) => error,
+            };
+            assert!(error.is::<StartRejected>());
+        });
+        drop(held);
+    }
+
+    #[test]
+    fn tester_guarded_preflight_does_not_create_before_reservation() {
+        let workspace = tempfile::tempdir().unwrap();
+        let artifact = tempfile::tempdir().unwrap();
+        fs::create_dir_all(workspace.path().join(".fluent")).unwrap();
+        fs::write(
+            workspace.path().join(".fluent/tester.yaml"),
+            "commands:\n  - command: true\n    test_harness: shell-harness\n    reject_process_leaks: true\n",
+        )
+        .unwrap();
+
+        let _plan = crate::tester::plan(workspace.path()).unwrap();
+
+        assert!(
+            !artifact.path().join("commands/settlement").exists(),
+            "read-only Tester planning must not create guarded settlement paths"
+        );
+    }
+
+    #[test]
+    fn guarded_tester_prepares_settlement_before_sandbox_after_reservation() {
+        let workspace = tempfile::tempdir().unwrap();
+        let artifact = tempfile::tempdir().unwrap();
+        fs::create_dir_all(workspace.path().join(".fluent")).unwrap();
+        fs::write(
+            workspace.path().join(".fluent/tester.yaml"),
+            "commands:\n  - command: true\n    test_harness: shell-harness\n    reject_process_leaks: true\n",
+        )
+        .unwrap();
+        let resolver = ContentResolver::new(None);
+        let plan = crate::tester::plan(workspace.path()).unwrap();
+
+        let sandbox = crate::tester::prepare_sandbox_profile(
+            workspace.path(),
+            artifact.path(),
+            true,
+            &resolver,
+            &plan,
+        )
+        .unwrap();
+
+        let directory = sandbox.settlement_directory(0).unwrap();
+        assert_eq!(
+            directory,
+            fs::canonicalize(artifact.path().join("commands/settlement/0")).unwrap()
+        );
+    }
+
+    #[test]
+    fn legacy_scheduler_transcript_does_not_pause_current_task() {
+        let transcript = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/provider-transcripts/claude-scheduler-outage-a.jsonl");
+
+        let error = provider_pause_error(
+            Err(anyhow::anyhow!("coder failed")),
+            CoderKind::Claude,
+            Some(transcript),
+        )
+        .expect_err("legacy single-file evidence remains a current Task failure");
+
+        assert!(!error.is::<crate::provider_evidence::ProviderUnavailableError>());
+        assert_eq!(error.to_string(), "coder failed");
+    }
+
+    #[test]
+    fn structured_claude_login_failure_is_an_auth_pause_without_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("transcript.jsonl");
+        fs::write(
+            &transcript,
+            concat!(
+                "{\"type\":\"system\",\"subtype\":\"init\",\"apiKeySource\":\"none\"}\n",
+                "{\"type\":\"assistant\",\"error\":\"authentication_failed\"}\n",
+                "{\"type\":\"result\",\"is_error\":true,\"api_error_status\":null}\n"
+            ),
+        )
+        .unwrap();
+
+        let result = provider_pause_error(
+            Err(anyhow::anyhow!("Coder exited with code 1")),
+            CoderKind::Claude,
+            Some(transcript),
+        );
+
+        assert!(matches!(
+            classify_task_failure(result.as_ref().unwrap_err()),
+            TaskFailure::Auth(message) if message.contains("claude /login")
+        ));
+        assert!(
+            !should_retry_coder_error(&result),
+            "structured authentication failure must bypass the generic retry budget"
+        );
+    }
+
+    #[test]
+    fn claude_stream_startup_denial_uses_host_sandbox_pause_without_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("transcript.jsonl");
+        fs::write(&transcript, "").unwrap();
+        fs::write(
+            crate::coder::provider_stderr_path(&transcript),
+            "EPERM: operation not permitted, fstat\n    at new WriteStream\nprocess.stderr.fd\n",
+        )
+        .unwrap();
+
+        let result = provider_pause_error(
+            Err(anyhow::anyhow!("Coder exited with code 1")),
+            CoderKind::Claude,
+            Some(transcript),
+        );
+
+        assert!(matches!(
+            classify_task_failure(result.as_ref().unwrap_err()),
+            TaskFailure::HostSandbox(message) if message.contains("standard stream")
+        ));
+        assert!(
+            !should_retry_coder_error(&result),
+            "a provider startup failure caused by the sandbox must not spend the generic retry budget"
+        );
+    }
+
+    #[test]
+    fn claude_network_refresh_failure_uses_provider_pause_without_login() {
+        let result = Err(anyhow::Error::new(
+            crate::claude_auth::AuthError::RefreshFailed {
+                failure: crate::claude_diagnostics::ClaudeProbeFailure::new(
+                    crate::claude_diagnostics::ClaudeProbeFailureKind::Network,
+                    "connection refused",
+                ),
+            },
+        ));
+
+        assert!(matches!(
+            classify_task_failure(result.as_ref().unwrap_err()),
+            TaskFailure::ProviderUnavailable(message)
+                if message.contains("Restore network access") && !message.contains("/login")
+        ));
+        assert!(!should_retry_coder_error(&result));
+    }
+
+    #[test]
+    fn claude_network_readiness_failure_pauses_without_generic_retries() {
+        let result = Err(anyhow::Error::new(
+            crate::provider_readiness::ProviderReadinessError::Claude(
+                crate::claude_diagnostics::ClaudeProbeFailure::new(
+                    crate::claude_diagnostics::ClaudeProbeFailureKind::Network,
+                    "connection refused",
+                ),
+            ),
+        ));
+
+        assert!(!should_retry_coder_error(&result));
+        assert!(matches!(
+            classify_task_failure(result.as_ref().unwrap_err()),
+            TaskFailure::ProviderUnavailable(message)
+                if message.contains("Restore network access") && !message.contains("/login")
+        ));
+    }
+
+    #[test]
+    fn claude_keychain_refresh_failure_uses_host_boundary_pause() {
+        let error = anyhow::Error::new(crate::claude_auth::AuthError::RefreshFailed {
+            failure: crate::claude_diagnostics::ClaudeProbeFailure::new(
+                crate::claude_diagnostics::ClaudeProbeFailureKind::HostBoundary,
+                "securityd: Operation not permitted",
+            ),
+        });
+
+        assert!(matches!(
+            classify_task_failure(&error),
+            TaskFailure::HostSandbox(message)
+                if message.contains("FLUENT_CLAUDE_HOST_CREDENTIAL_BLOCKED")
+                    && !message.contains("/login")
+        ));
+        assert!(is_resumable_task_failure(&error));
+    }
+
+    #[test]
+    fn claude_keychain_pause_handoff_names_host_recovery_and_same_attempt() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = write_task_error_handoff(
+            tmp.path(),
+            "work-1",
+            "attempt-1",
+            "attempt-1-write-1",
+            &TaskFailure::HostSandbox(
+                "FLUENT_CLAUDE_HOST_CREDENTIAL_BLOCKED: Claude credential refresh failed."
+                    .to_string(),
+            ),
+        )
+        .unwrap();
+
+        let handoff = fs::read_to_string(tmp.path().join(path)).unwrap();
+        assert!(handoff.contains("per-command approval"), "{handoff}");
+        assert!(handoff.contains("fluent attempt run work-1"), "{handoff}");
+        assert!(!handoff.contains("/login"), "{handoff}");
+    }
+
+    #[test]
+    fn nested_swiftpm_handoff_names_exact_one_dispatch_approval() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = write_task_error_handoff(
+            tmp.path(),
+            "work-1",
+            "attempt-1",
+            "attempt-1-tester-8",
+            &TaskFailure::TesterNestedSwiftPmSandbox,
+        )
+        .unwrap();
+
+        let handoff = fs::read_to_string(tmp.path().join(path)).unwrap();
+        assert!(
+            handoff.contains("fluent queue resume work-1 --attempt attempt-1 --no-sandbox"),
+            "{handoff}"
+        );
+        assert!(handoff.contains("same Tester Task"), "{handoff}");
+        assert!(handoff.contains("host permissions"), "{handoff}");
+        assert!(handoff.contains("host shell"), "{handoff}");
+        assert!(handoff.contains("enclosing agent sandbox"), "{handoff}");
+        assert!(handoff.contains("resume dispatch only"), "{handoff}");
+    }
+
+    #[test]
+    fn tester_harness_handoff_names_eligible_repair_command() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = write_task_error_handoff(
+            tmp.path(),
+            "work-1",
+            "attempt-1",
+            "attempt-1-tester-8",
+            &TaskFailure::TesterProjectHarness,
+        )
+        .unwrap();
+
+        let handoff = fs::read_to_string(tmp.path().join(path)).unwrap();
+        assert!(
+            handoff.contains("fluent attempt repair-tester work-1 attempt-1 --resolution"),
+            "{handoff}"
+        );
+    }
+
+    #[test]
+    fn ambiguous_tester_handoff_offers_unchanged_retry_and_tracked_repair() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = write_task_error_handoff(
+            tmp.path(),
+            "work-1",
+            "attempt-1",
+            "attempt-1-tester-8",
+            &TaskFailure::TesterHarness,
+        )
+        .unwrap();
+
+        let handoff = fs::read_to_string(tmp.path().join(path)).unwrap();
+        assert!(handoff.contains("fluent attempt run work-1 attempt-1"));
+        assert!(handoff.contains("fluent attempt repair-tester work-1 attempt-1"));
+    }
+
+    #[test]
+    fn tester_pause_replaces_a_resumed_round_cap_current_handoff() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let mut item = WorkItem::planned("work-1", "Refresh the current handoff");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let attempt = &mut item.attempts[0];
+        attempt.tasks[0].kind = TaskKind::Tester;
+        attempt.tasks[0].role = "tester".to_string();
+        attempt.tasks[0].status = TaskStatus::NeedsUser;
+        crate::work_model::suspend_attempt(attempt, crate::work_model::PauseKind::RoundCap);
+        store.create_work_item(&item).unwrap();
+
+        let current_rel = work_artifact_path("work-1", "attempt-1", "needs-user.md");
+        let current_path = tmp.path().join(&current_rel);
+        fs::create_dir_all(current_path.parent().unwrap()).unwrap();
+        fs::write(
+            &current_path,
+            "# Attempt needs user input\n\nRun `fluent attempt extend work-1 attempt-1`.\n",
+        )
+        .unwrap();
+
+        store
+            .mutate_work_item("work-1", |item| {
+                crate::work_model::reopen_attempt(&mut item.attempts[0]);
+                Ok(())
+            })
+            .unwrap();
+        let task_id = store.read_work_item("work-1").unwrap().attempts[0].tasks[0]
+            .id
+            .clone();
+
+        let notified_after_publish = std::cell::Cell::new(false);
+        mark_task_failed_attempt_needs_user(
+            &store,
+            tmp.path(),
+            "work-1",
+            "attempt-1",
+            &task_id,
+            &TaskFailure::TesterNestedSwiftPmSandbox,
+            &|_, _| {
+                let current = fs::read_to_string(&current_path).unwrap();
+                notified_after_publish.set(
+                    current.contains("fluent queue resume work-1 --attempt attempt-1 --no-sandbox"),
+                );
+            },
+        )
+        .unwrap();
+
+        let current = fs::read_to_string(&current_path).unwrap();
+        assert!(
+            current.contains("fluent queue resume work-1 --attempt attempt-1 --no-sandbox"),
+            "{current}"
+        );
+        assert!(!current.contains("fluent attempt extend"), "{current}");
+        assert!(
+            notified_after_publish.get(),
+            "notification follows the durable current handoff"
+        );
+
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            stored.attempts[0].pause_recovery,
+            Some(PauseRecovery::TesterNoSandbox)
+        );
+
+        let historical = tmp.path().join(work_artifact_path(
+            "work-1",
+            "attempt-1",
+            &format!("needs-user-{task_id}.md"),
+        ));
+        assert!(
+            historical.is_file(),
+            "the per-Task handoff remains durable history"
+        );
+    }
+
+    #[test]
+    fn current_handoff_failure_surfaces_after_the_pause_is_durable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let mut item = WorkItem::planned("work-1", "Surface current handoff failure");
+        item.add_initial_attempt("attempt-1").unwrap();
+        item.attempts[0].tasks[0].kind = TaskKind::Tester;
+        let task_id = item.attempts[0].tasks[0].id.clone();
+        store.create_work_item(&item).unwrap();
+
+        let current = tmp
+            .path()
+            .join(work_artifact_path("work-1", "attempt-1", "needs-user.md"));
+        fs::create_dir_all(&current).unwrap();
+        let resolver = ContentResolver::new(Some(tmp.path()));
+        let config = WorkTaskRunConfig {
+            project_root: tmp.path(),
+            store: &store,
+            work_item_id: "work-1",
+            attempt_id: "attempt-1",
+            task_id: &task_id,
+            resolver: &resolver,
+            extra_args: &[],
+            no_sandbox: false,
+            store_lock: None,
+        };
+        let notified = std::cell::Cell::new(false);
+
+        let error = settle_tester_harness_failure_with_notify(
+            &config,
+            TesterHarnessFailureKind::NestedSwiftPm,
+            &|_, _| notified.set(true),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("current needs-user handoff"));
+        assert!(
+            !notified.get(),
+            "do not report an unrecorded recovery action"
+        );
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(stored.attempts[0].status, AttemptStatus::NeedsUser);
+        assert_eq!(stored.attempts[0].tasks[0].status, TaskStatus::NeedsUser);
+        assert_eq!(
+            stored.attempts[0].pause_recovery,
+            Some(PauseRecovery::TesterNoSandbox)
+        );
+    }
+
+    #[test]
+    fn invalid_writer_completion_evidence_pauses_the_same_task() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let mut item = WorkItem::planned("work-1", "Retry Writer completion");
+        item.add_initial_attempt("attempt-1").unwrap();
+        store.create_work_item(&item).unwrap();
+
+        mark_task_failed_attempt_needs_user(
+            &store,
+            tmp.path(),
+            "work-1",
+            "attempt-1",
+            "attempt-1-write-1",
+            &TaskFailure::WriterCompletion("no-change.json must use schema_version 1".to_string()),
+            &|_, _| {},
+        )
+        .unwrap();
+
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(stored.attempts[0].status, AttemptStatus::NeedsUser);
+        assert_eq!(
+            stored.attempts[0].pause_kind,
+            Some(crate::work_model::PauseKind::WriterCompletion)
+        );
+        assert_eq!(stored.attempts[0].tasks[0].status, TaskStatus::NeedsUser);
+        let handoff = stored.attempts[0]
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.producer_id == "attempt-1-write-1")
+            .unwrap();
+        let source = fs::read_to_string(tmp.path().join(&handoff.path)).unwrap();
+        assert!(source.contains("schema_version 1"));
+        assert!(stored.attempts[0].ensure_resume_ready().is_ok());
+    }
+
+    #[test]
+    fn transcript_pump_failure_takes_precedence_over_prior_auth_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("transcript.jsonl");
+        fs::write(
+            &transcript,
+            "{\"type\":\"assistant\",\"error\":\"authentication_failed\"}\n",
+        )
+        .unwrap();
+        let result = provider_pause_error(
+            Err(anyhow::Error::new(
+                crate::transcript_pump::TranscriptPumpError::new("late transcript write failed"),
+            )),
+            CoderKind::Claude,
+            Some(transcript),
+        );
+
+        let error = result.unwrap_err();
+        assert!(error.is::<crate::transcript_pump::TranscriptPumpError>());
+        assert!(matches!(
+            classify_task_failure(&error),
+            TaskFailure::TranscriptPump(_)
+        ));
+    }
+
+    #[test]
+    fn terminal_coder_failures_bypass_generic_retries() {
         // A transcript-pump infrastructure failure must not spawn another coder
         // through the generic retry budget, while an ordinary coder error still
         // retries and an auth error stays terminal.
@@ -4757,6 +11190,37 @@ mod tests {
             should_retry_coder_error(&ordinary),
             "an ordinary coder error is still retryable"
         );
+
+        let rate_limit: Result<()> = Err(anyhow::Error::new(
+            crate::coder::RateLimitExhaustedError::new(1),
+        ));
+        assert!(
+            !should_retry_coder_error(&rate_limit),
+            "coder-owned rate-limit exhaustion must bypass the outer retry budget"
+        );
+
+        let no_progress: Result<()> = Err(anyhow::Error::new(
+            crate::coder::ClaudeNoProgressExhaustedError::new(3),
+        ));
+        assert!(
+            !should_retry_coder_error(&no_progress),
+            "bounded Claude no-progress recovery must not multiply through generic retries"
+        );
+        assert!(matches!(
+            classify_task_failure(no_progress.as_ref().unwrap_err()),
+            TaskFailure::ProviderUnavailable(message)
+                if message.contains("same Task") && message.contains("same Attempt")
+        ));
+
+        let cleanup_unconfirmed: Result<()> = Err(anyhow::Error::new(
+            crate::coder::ClaudeNoProgressCleanupUnconfirmedError::new("unconfirmed"),
+        ));
+        assert!(!should_retry_coder_error(&cleanup_unconfirmed));
+        assert!(matches!(
+            classify_task_failure(cleanup_unconfirmed.as_ref().unwrap_err()),
+            TaskFailure::ProviderUnavailable(message)
+                if message.contains("cleanup evidence") && message.contains("same Task")
+        ));
 
         let auth: Result<()> = Err(anyhow::Error::new(crate::claude_auth::AuthError::Expired {
             expires_at: 0,
@@ -4785,6 +11249,107 @@ mod tests {
         assert!(
             !should_retry_coder_error(&sidecar),
             "a supervision-sidecar failure is terminal, never relaunches the coder"
+        );
+    }
+
+    #[test]
+    fn provider_unavailable_pauses_exact_task_without_writer_charge() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let mut item = WorkItem {
+            id: "work-1".to_string(),
+            title: "Provider pause".to_string(),
+            ..Default::default()
+        };
+        item.add_initial_attempt("attempt-1").unwrap();
+        store.create_work_item(&item).unwrap();
+        let task_id = item.attempts[0].tasks[0].id.clone();
+
+        let failure = anyhow::Error::new(crate::provider_evidence::ProviderUnavailableError(
+            crate::provider_evidence::ProviderUnavailable {
+                provider: CoderKind::Claude,
+            },
+        ));
+        assert!(
+            !should_retry_coder_error(&Err(failure)),
+            "the typed terminal result bypasses generic retries only after classification"
+        );
+        mark_task_failed_attempt_needs_user(
+            &store,
+            tmp.path(),
+            "work-1",
+            "attempt-1",
+            &task_id,
+            &TaskFailure::ProviderUnavailable(
+                "Provider capacity is unavailable before model progress. Run 'fluent attempt run' to retry the same Task."
+                    .to_string(),
+            ),
+            &|_, _| {},
+        )
+        .unwrap();
+
+        let paused = store.read_work_item("work-1").unwrap();
+        assert_eq!(paused.attempts[0].tasks[0].id, task_id);
+        assert_eq!(paused.attempts[0].tasks[0].status, TaskStatus::NeedsUser);
+        assert_eq!(
+            paused.attempts[0].pause_kind,
+            Some(crate::work_model::PauseKind::ProviderUnavailable)
+        );
+    }
+
+    #[test]
+    fn ambiguous_or_started_coder_failure_is_not_provider_pause() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("transcript.jsonl");
+        for phase in 0..2 {
+            std::fs::write(
+                transcript.with_file_name(format!("transcript.{phase}.jsonl")),
+                "{\"type\":\"rate_limit_event\",\"retry_after\":1}\n",
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            &transcript,
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\"}]}}\n",
+        )
+        .unwrap();
+        let result: Result<()> = Err(anyhow::anyhow!("Coder exited with code 1"));
+        let result = provider_pause_error(result, CoderKind::Claude, Some(transcript));
+        assert!(result.is_err());
+        assert!(
+            !result
+                .as_ref()
+                .unwrap_err()
+                .is::<crate::provider_evidence::ProviderUnavailableError>(),
+            "model progress prevents the typed provider pause"
+        );
+    }
+
+    #[test]
+    fn codex_transport_failure_before_progress_becomes_provider_pause() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("transcript.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                "{\"type\":\"thread.started\"}\n",
+                "{\"type\":\"turn.started\"}\n",
+                "{\"type\":\"error\",\"message\":\"Reconnecting... stream disconnected before completion: Connection refused (os error 61)\"}\n",
+                "{\"type\":\"turn.failed\",\"error\":{\"message\":\"stream disconnected before completion: error sending request for url (https://example.invalid)\"}}\n",
+            ),
+        )
+        .unwrap();
+
+        let result = provider_pause_error(
+            Err(anyhow::anyhow!("Codex exited with code 1")),
+            CoderKind::Codex,
+            Some(transcript),
+        );
+
+        assert!(
+            result
+                .unwrap_err()
+                .is::<crate::provider_evidence::ProviderUnavailableError>()
         );
     }
 
@@ -4966,6 +11531,92 @@ mod tests {
         recorded: Arc<Mutex<Option<(PathBuf, usize)>>>,
     }
 
+    struct RecordingEnvironmentCoder {
+        recorded: Arc<Mutex<Vec<(String, String)>>>,
+    }
+
+    struct RecordingWriterPromptCoder {
+        recorded: Arc<Mutex<Option<String>>>,
+    }
+
+    impl crate::coder::Coder for RecordingWriterPromptCoder {
+        fn run(
+            &self,
+            _prompt: &str,
+            _system_prompt: &str,
+            _working_dir: &Path,
+            _extra_args: &[String],
+            _extra_env: &[(String, String)],
+            _transcript_file: Option<&Path>,
+        ) -> Result<i32> {
+            unreachable!("the writer route launches through the session boundary")
+        }
+
+        fn run_captured_reported_session(
+            &self,
+            prompt: &str,
+            _system_prompt: &str,
+            _working_dir: &Path,
+            _extra_args: &[String],
+            _extra_env: &[(String, String)],
+            _capture: Option<&crate::coder::TranscriptCapture<'_>>,
+            _session: crate::coder::CoderSession<'_>,
+        ) -> crate::coder::CoderRunCompletion {
+            *self.recorded.lock().unwrap() = Some(prompt.to_string());
+            crate::coder::CoderRunCompletion {
+                terminal: Ok(0),
+                report: Default::default(),
+            }
+        }
+
+        fn run_interactive(
+            &self,
+            _system_prompt: &str,
+            _working_dir: &Path,
+            _extra_args: &[String],
+            _extra_env: &[(String, String)],
+        ) -> Result<i32> {
+            unreachable!("the writer route never runs interactively")
+        }
+    }
+
+    impl crate::coder::Coder for RecordingEnvironmentCoder {
+        fn run(
+            &self,
+            _prompt: &str,
+            _system_prompt: &str,
+            _working_dir: &Path,
+            _extra_args: &[String],
+            _extra_env: &[(String, String)],
+            _transcript_file: Option<&Path>,
+        ) -> Result<i32> {
+            unreachable!("the writer route launches through run_captured")
+        }
+
+        fn run_captured(
+            &self,
+            _prompt: &str,
+            _system_prompt: &str,
+            _working_dir: &Path,
+            _extra_args: &[String],
+            extra_env: &[(String, String)],
+            _capture: Option<&crate::coder::TranscriptCapture<'_>>,
+        ) -> Result<i32> {
+            *self.recorded.lock().unwrap() = extra_env.to_vec();
+            Ok(0)
+        }
+
+        fn run_interactive(
+            &self,
+            _system_prompt: &str,
+            _working_dir: &Path,
+            _extra_args: &[String],
+            _extra_env: &[(String, String)],
+        ) -> Result<i32> {
+            unreachable!("the writer route never runs interactively")
+        }
+    }
+
     impl crate::coder::Coder for RecordingLearnerCoder {
         fn run(
             &self,
@@ -5058,7 +11709,7 @@ mod tests {
             LearnerExecutionMode::Capture,
             Some(capture),
             HostPreparation::Production,
-            move |_sandbox| {
+            move |_sandbox, _executable| {
                 Box::new(RecordingLearnerCoder {
                     recorded: recorded_for_coder,
                 })
@@ -5077,6 +11728,249 @@ mod tests {
         assert_eq!(
             *limit, 7777,
             "the resolved project pump threshold must be threaded verbatim, not defaulted"
+        );
+    }
+
+    #[test]
+    fn claude_writer_launch_uses_managed_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path();
+        let workspace = project_root.join("workspace");
+        fs::create_dir_all(workspace.join(".fluent/expertise")).unwrap();
+        fs::write(workspace.join(".fluent/expertise/INDEX.md"), "# Index\n").unwrap();
+        let mut item = WorkItem {
+            id: "work-1".to_string(),
+            title: "Confine Claude home".to_string(),
+            ..Default::default()
+        };
+        item.add_initial_attempt("attempt-1").unwrap();
+        let managed_home = project_root.join(".fluent/work/artifacts/work-1/attempt-1/claude-home");
+        let resolver = ContentResolver::new(Some(project_root));
+        let pump_config = crate::transcript_pump::resolve_config(project_root);
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let recorded_for_coder = Arc::clone(&recorded);
+        let writer_cache = test_writer_cache(project_root);
+
+        run_task_coder_with_coder(
+            &item,
+            "attempt-1",
+            "attempt-1-write-1",
+            project_root,
+            &workspace,
+            &[],
+            &resolver,
+            &[],
+            CoderKind::Claude,
+            true,
+            None,
+            None,
+            &pump_config,
+            None,
+            Some(&managed_home),
+            &writer_cache,
+            None,
+            move |_sandbox, _executable| {
+                Box::new(RecordingEnvironmentCoder {
+                    recorded: recorded_for_coder,
+                })
+            },
+        )
+        .unwrap();
+
+        assert!(managed_home.is_dir());
+        let recorded = recorded.lock().unwrap();
+        assert!(
+            recorded
+                .iter()
+                .any(|(key, value)| { key == "HOME" && Path::new(value) == managed_home })
+        );
+    }
+
+    #[test]
+    fn only_managed_home_claude_launches_need_the_unsandboxed_credential_bridge() {
+        let home = Path::new("managed-claude-home");
+
+        assert!(needs_managed_claude_credential_bridge(
+            CoderKind::Claude,
+            Some(home)
+        ));
+        assert!(!needs_managed_claude_credential_bridge(
+            CoderKind::Claude,
+            None
+        ));
+        assert!(!needs_managed_claude_credential_bridge(
+            CoderKind::Codex,
+            Some(home)
+        ));
+    }
+
+    #[test]
+    fn writer_launch_uses_private_dependency_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path();
+        let workspace = project_root.join("workspace");
+        fs::create_dir_all(workspace.join(".fluent/expertise")).unwrap();
+        fs::write(workspace.join(".fluent/expertise/INDEX.md"), "# Index\n").unwrap();
+        let mut item = WorkItem {
+            id: "work-1".to_string(),
+            title: "Use private dependencies".to_string(),
+            ..Default::default()
+        };
+        item.add_initial_attempt("attempt-1").unwrap();
+        let resolver = ContentResolver::new(Some(project_root));
+        let pump_config = crate::transcript_pump::resolve_config(project_root);
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let recorded_for_coder = Arc::clone(&recorded);
+        let writer_cache = test_writer_cache(project_root);
+
+        run_task_coder_with_coder(
+            &item,
+            "attempt-1",
+            "attempt-1-write-1",
+            project_root,
+            &workspace,
+            &[],
+            &resolver,
+            &[],
+            CoderKind::Claude,
+            true,
+            None,
+            None,
+            &pump_config,
+            None,
+            None,
+            &writer_cache,
+            None,
+            move |_sandbox, _executable| {
+                Box::new(RecordingEnvironmentCoder {
+                    recorded: recorded_for_coder,
+                })
+            },
+        )
+        .unwrap();
+
+        let recorded = recorded.lock().unwrap();
+        assert!(recorded.iter().any(|(key, value)| {
+            key == "CARGO_HOME" && Path::new(value) == writer_cache.cargo_home()
+        }));
+        assert!(!recorded.iter().any(|(key, _)| key == "CARGO_TARGET_DIR"));
+        let user_cargo_home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join(".cargo"));
+        assert!(!recorded.iter().any(|(key, value)| {
+            key == "CARGO_HOME"
+                && user_cargo_home
+                    .as_ref()
+                    .is_some_and(|home| Path::new(value) == home)
+        }));
+    }
+
+    #[test]
+    fn writer_sandbox_confines_dependency_writes_to_the_exact_attempt_cache() {
+        let _seatbelt = crate::os::BackendPin::seatbelt();
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path();
+        let workspace = project_root.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        crate::git::run(
+            project_root,
+            &["init", "-q"],
+            "initialize Writer sandbox fixture",
+        )
+        .unwrap();
+
+        let mut item = WorkItem {
+            id: "work-1".to_string(),
+            title: "Confine Writer cache".to_string(),
+            ..Default::default()
+        };
+        item.add_initial_attempt("attempt-1").unwrap();
+        let task = &item.attempts[0].tasks[0];
+        let writer_cache = crate::writer_cache::preflight_writer_dependency_cache(
+            project_root,
+            "work-1",
+            "attempt-1",
+        )
+        .unwrap();
+        let resolver = ContentResolver::new(Some(project_root));
+
+        let profile = preflight_write_sandbox_profile(
+            task,
+            project_root,
+            &workspace,
+            &[],
+            &resolver,
+            false,
+            CoderKind::Claude,
+            None,
+            None,
+            &writer_cache,
+        )
+        .unwrap()
+        .expect("sandboxed Writer has a profile");
+        let profile = fs::read_to_string(profile.path).unwrap();
+        let cache_write = format!(
+            "(allow file-write* (subpath \"{}\"))",
+            writer_cache.root().display()
+        );
+        assert!(profile.contains(&cache_write));
+        if let Some(home) = std::env::var_os("HOME") {
+            let user_cargo_write = format!(
+                "(allow file-write* (subpath \"{}\"))",
+                PathBuf::from(home).join(".cargo").display()
+            );
+            assert!(!profile.contains(&user_cargo_write));
+        }
+    }
+
+    #[test]
+    fn writer_assignment_safety_sandbox_excludes_task_record() {
+        let _seatbelt = crate::os::BackendPin::seatbelt();
+        let project_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let workspace = project_root.join(".scratch/writer-assignment-sandbox-workspace");
+
+        let mut item = WorkItem::planned("work-1", "Keep assignment authority protected");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let task = &item.attempts[0].tasks[0];
+        let writer_cache = crate::writer_cache::preflight_writer_dependency_cache(
+            project_root,
+            "work-1",
+            "attempt-1",
+        )
+        .unwrap();
+        let resolver = ContentResolver::new(Some(project_root));
+        let profile = preflight_write_sandbox_profile(
+            task,
+            project_root,
+            &workspace,
+            &[],
+            &resolver,
+            false,
+            CoderKind::Claude,
+            None,
+            None,
+            &writer_cache,
+        )
+        .unwrap()
+        .expect("sandboxed Writer has a profile");
+        let profile = fs::read_to_string(profile.path).unwrap();
+        let task_record = WorkModelStore::new(project_root)
+            .work_task_path("work-1", "attempt-1", &task.id)
+            .unwrap();
+        let task_records = project_root
+            .join(".fluent/work/tasks/work-1")
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            !profile.contains(&format!(
+                "(allow file-write* (subpath \"{}\"))",
+                task_record.display()
+            )),
+            "the Writer profile must not grant the host-owned Task record: {profile}"
+        );
+        assert!(
+            !profile.contains(&format!("(allow file-write* (subpath \"{task_records}\"))")),
+            "the Writer profile must not grant writes to the Task-record subtree: {profile}"
         );
     }
 
@@ -5115,7 +12009,7 @@ mod tests {
             LearnerExecutionMode::Capture,
             Some(capture),
             HostPreparation::Production,
-            move |_sandbox| {
+            move |_sandbox, _executable| {
                 Box::new(SupervisionReportingCoder {
                     recorded_dir: recorded_for_coder,
                 })
@@ -5192,7 +12086,10 @@ mod tests {
             None,
             &pump_config,
             None,
-            move |_sandbox| {
+            None,
+            &test_writer_cache(project_root),
+            None,
+            move |_sandbox, _executable| {
                 Box::new(RecordingLearnerCoder {
                     recorded: recorded_for_coder,
                 })
@@ -5276,7 +12173,10 @@ mod tests {
             None,
             &pump_config,
             None,
-            move |_sandbox| {
+            None,
+            &test_writer_cache(project_root),
+            None,
+            move |_sandbox, _executable| {
                 Box::new(RecordingLearnerCoder {
                     recorded: recorded_for_coder,
                 })
@@ -5308,6 +12208,7 @@ mod tests {
                         message: Some("Operation not permitted".to_string()),
                     },
                 ),
+                provider_liveness: None,
             }],
         }
     }
@@ -5317,6 +12218,266 @@ mod tests {
     /// persist it as a sidecar.
     struct SupervisionReportingCoder {
         recorded_dir: Arc<Mutex<Option<PathBuf>>>,
+    }
+
+    struct SessionRecordingCoder {
+        recorded: Arc<Mutex<Option<String>>>,
+    }
+
+    impl crate::coder::Coder for SessionRecordingCoder {
+        fn run(
+            &self,
+            _prompt: &str,
+            _system_prompt: &str,
+            _working_dir: &Path,
+            _extra_args: &[String],
+            _extra_env: &[(String, String)],
+            _transcript_file: Option<&Path>,
+        ) -> Result<i32> {
+            unreachable!("the writer route launches through the session boundary")
+        }
+
+        fn run_captured_reported_session(
+            &self,
+            _prompt: &str,
+            _system_prompt: &str,
+            _working_dir: &Path,
+            _extra_args: &[String],
+            _extra_env: &[(String, String)],
+            _capture: Option<&crate::coder::TranscriptCapture<'_>>,
+            session: crate::coder::CoderSession<'_>,
+        ) -> crate::coder::CoderRunCompletion {
+            let value = match session {
+                crate::coder::CoderSession::FreshPersistent => "fresh".to_string(),
+                crate::coder::CoderSession::Resume(id) => format!("resume:{id}"),
+                crate::coder::CoderSession::Ephemeral => "ephemeral".to_string(),
+            };
+            *self.recorded.lock().unwrap() = Some(value);
+            crate::coder::CoderRunCompletion {
+                terminal: Ok(0),
+                report: Default::default(),
+            }
+        }
+
+        fn run_interactive(
+            &self,
+            _system_prompt: &str,
+            _working_dir: &Path,
+            _extra_args: &[String],
+            _extra_env: &[(String, String)],
+        ) -> Result<i32> {
+            unreachable!("the writer route never runs interactively")
+        }
+    }
+
+    #[test]
+    fn writer_route_resumes_the_matching_recorded_provider_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path();
+        let workspace = project_root.join("workspace");
+        fs::create_dir_all(workspace.join(".fluent/expertise")).unwrap();
+        fs::write(workspace.join(".fluent/expertise/INDEX.md"), "# Index\n").unwrap();
+
+        let mut item = WorkItem {
+            id: "work-1".to_string(),
+            title: "Resume Writer".to_string(),
+            ..Default::default()
+        };
+        item.add_initial_attempt("attempt-1").unwrap();
+        item.attempts[0]
+            .writer_runs
+            .push(crate::work_model::WriterRun {
+                task_id: "attempt-1-write-0".to_string(),
+                outcome: crate::work_model::WriterOutcome::Continue,
+                kind: crate::work_model::WriterRunKind::Initial,
+                provider: "codex".to_string(),
+                session_id: Some("writer-thread-1".to_string()),
+                continuation: 0,
+                checked_required: 0,
+                completed_matrix: 0,
+                candidate_commit: "commit-1".to_string(),
+            });
+
+        let resolver = ContentResolver::new(Some(project_root));
+        let pump_config = crate::transcript_pump::resolve_config(project_root);
+        let recorded = Arc::new(Mutex::new(None));
+        let recorded_for_coder = Arc::clone(&recorded);
+        run_task_coder_with_coder(
+            &item,
+            "attempt-1",
+            "attempt-1-write-1",
+            project_root,
+            &workspace,
+            &[],
+            &resolver,
+            &[],
+            CoderKind::Codex,
+            true,
+            None,
+            None,
+            &pump_config,
+            None,
+            None,
+            &test_writer_cache(project_root),
+            None,
+            move |_sandbox, _executable| {
+                Box::new(SessionRecordingCoder {
+                    recorded: recorded_for_coder,
+                })
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            recorded.lock().unwrap().as_deref(),
+            Some("resume:writer-thread-1")
+        );
+    }
+
+    #[test]
+    fn writer_session_falls_back_to_fresh_when_identity_is_unusable() {
+        let mut item = WorkItem {
+            id: "work-1".to_string(),
+            ..Default::default()
+        };
+        item.add_initial_attempt("attempt-1").unwrap();
+        item.attempts[0]
+            .writer_runs
+            .push(crate::work_model::WriterRun {
+                task_id: "attempt-1-write-0".to_string(),
+                outcome: crate::work_model::WriterOutcome::Continue,
+                kind: crate::work_model::WriterRunKind::Initial,
+                provider: "claude".to_string(),
+                session_id: Some("claude-session-1".to_string()),
+                continuation: 0,
+                checked_required: 0,
+                completed_matrix: 0,
+                candidate_commit: "commit-1".to_string(),
+            });
+
+        assert_eq!(
+            writer_coder_session(&item, "attempt-1", CoderKind::Codex),
+            crate::coder::CoderSession::FreshPersistent
+        );
+        item.attempts[0].writer_runs[0].provider = "codex".to_string();
+        item.attempts[0].writer_runs[0].session_id = None;
+        assert_eq!(
+            writer_coder_session(&item, "attempt-1", CoderKind::Codex),
+            crate::coder::CoderSession::FreshPersistent
+        );
+
+        item.attempts[0].writer_runs[0].session_id = Some("codex-thread-1".to_string());
+        assert_eq!(
+            writer_coder_session_with_codex_snapshot(&item, "attempt-1", CoderKind::Codex, false,),
+            crate::coder::CoderSession::FreshPersistent
+        );
+    }
+
+    #[test]
+    fn reviewed_correction_resumes_the_latest_compatible_writer_session() {
+        let mut item = WorkItem {
+            id: "work-1".to_string(),
+            ..Default::default()
+        };
+        item.add_initial_attempt("attempt-1").unwrap();
+        item.attempts[0]
+            .writer_runs
+            .push(crate::work_model::WriterRun {
+                task_id: "attempt-1-write-1".to_string(),
+                outcome: crate::work_model::WriterOutcome::Complete,
+                kind: crate::work_model::WriterRunKind::Initial,
+                provider: "codex".to_string(),
+                session_id: Some("writer-thread-1".to_string()),
+                continuation: 0,
+                checked_required: 1,
+                completed_matrix: 1,
+                candidate_commit: "commit-1".to_string(),
+            });
+
+        assert_eq!(
+            writer_coder_session(&item, "attempt-1", CoderKind::Codex),
+            crate::coder::CoderSession::Resume("writer-thread-1")
+        );
+    }
+
+    #[test]
+    fn candidate_gate_correction_resumes_the_blocked_writer_session() {
+        let mut item = WorkItem {
+            id: "work-1".to_string(),
+            ..Default::default()
+        };
+        item.add_initial_attempt("attempt-1").unwrap();
+        let writer = &mut item.attempts[0].tasks[0];
+        writer.status = TaskStatus::Complete;
+        writer.output = Some(TaskOutput {
+            workspace_id: "candidate".to_string(),
+            workspace_path: "../candidate".to_string(),
+            source_branch: "main".to_string(),
+            base_commit: Some("base".to_string()),
+            commit: "commit-1".to_string(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        item.attempts[0]
+            .writer_runs
+            .push(crate::work_model::WriterRun {
+                task_id: "attempt-1-write-1".to_string(),
+                outcome: crate::work_model::WriterOutcome::Blocked,
+                kind: crate::work_model::WriterRunKind::PreReviewContinuation,
+                provider: "codex".to_string(),
+                session_id: Some("writer-thread-1".to_string()),
+                continuation: 1,
+                checked_required: 0,
+                completed_matrix: 0,
+                candidate_commit: "commit-1".to_string(),
+            });
+        item.add_next_write_round(
+            "attempt-1",
+            vec![ArtifactRef {
+                producer_id: "attempt-1-write-1".to_string(),
+                path: ".fluent/work/artifacts/work-1/attempt-1/candidate-gates/attempt-1-write-1/candidate-gate.json".to_string(),
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(
+            writer_coder_session(&item, "attempt-1", CoderKind::Codex),
+            crate::coder::CoderSession::Resume("writer-thread-1")
+        );
+    }
+
+    #[test]
+    fn completed_codex_writer_snapshot_is_selected_for_reviewed_correction() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut item = review_item();
+        let writer_id = item.attempts[0].tasks[0].id.clone();
+        let artifact_path = item.attempts[0].tasks[0]
+            .artifact_area
+            .as_ref()
+            .unwrap()
+            .path
+            .clone();
+        let artifact_dir = tmp.path().join(artifact_path);
+        fs::create_dir_all(artifact_dir.join("codex-session")).unwrap();
+        item.attempts[0]
+            .writer_runs
+            .push(crate::work_model::WriterRun {
+                task_id: writer_id,
+                outcome: crate::work_model::WriterOutcome::Complete,
+                kind: crate::work_model::WriterRunKind::Initial,
+                provider: "codex".to_string(),
+                session_id: Some("writer-thread-1".to_string()),
+                continuation: 0,
+                checked_required: 1,
+                completed_matrix: 1,
+                candidate_commit: "commit-1".to_string(),
+            });
+
+        let snapshot = previous_writer_codex_session_snapshot(&item, "attempt-1", tmp.path())
+            .unwrap()
+            .expect("completed Writer snapshot remains resumable");
+
+        assert_eq!(snapshot, artifact_dir.join("codex-session"));
     }
 
     impl crate::coder::Coder for SupervisionReportingCoder {
@@ -5401,7 +12562,10 @@ mod tests {
             None,
             &pump_config,
             None,
-            move |_sandbox| {
+            None,
+            &test_writer_cache(project_root),
+            None,
+            move |_sandbox, _executable| {
                 Box::new(SupervisionReportingCoder {
                     recorded_dir: recorded_for_coder,
                 })
@@ -5523,7 +12687,10 @@ mod tests {
             None,
             &pump_config,
             None,
-            move |_sandbox| {
+            None,
+            &test_writer_cache(project_root),
+            None,
+            move |_sandbox, _executable| {
                 Box::new(CountingSupervisionCoder {
                     launches: Arc::clone(&launches_for_coder),
                 })
@@ -5566,8 +12733,7 @@ mod tests {
         .unwrap();
 
         let item = review_item_with_role("architecture");
-        // `add_review_tasks` pushes a Tester task before the review tasks, so select
-        // the review task by role rather than a positional index.
+        // Select the review task by role rather than relying on task ordering.
         let review_task_id = item.attempts[0]
             .tasks
             .iter()
@@ -5603,7 +12769,8 @@ mod tests {
             None,
             &pump_config,
             None,
-            move |_sandbox| {
+            None,
+            move |_sandbox, _executable| {
                 Box::new(RecordingLearnerCoder {
                     recorded: recorded_for_coder,
                 })
@@ -5664,7 +12831,8 @@ mod tests {
             None,
             &pump_config,
             None,
-            move |_sandbox| {
+            None,
+            move |_sandbox, _executable| {
                 Box::new(SupervisionReportingCoder {
                     recorded_dir: recorded_for_coder,
                 })
@@ -5739,7 +12907,8 @@ mod tests {
             None,
             &pump_config,
             None,
-            move |_sandbox| {
+            None,
+            move |_sandbox, _executable| {
                 Box::new(RecordingLearnerCoder {
                     recorded: recorded_for_coder,
                 })
@@ -5755,6 +12924,102 @@ mod tests {
             *limit, 7777,
             "the retry threads the resolve-once config, not the changed on-disk 4321"
         );
+    }
+
+    #[test]
+    fn writer_assignment_safety_setup_rollback_preserves_assignment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let mut item = WorkItem::planned("work-1", "Rollback the Writer reservation");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let source = &mut item.attempts[0].tasks[0];
+        let workspace = source.workspace_access.writes[0].clone();
+        source.status = TaskStatus::Complete;
+        source.output = Some(TaskOutput {
+            workspace_id: workspace.id.clone(),
+            workspace_path: workspace.path.clone(),
+            source_branch: "main".into(),
+            base_commit: None,
+            commit: "commit-initial".into(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        item.attempts[0].status = AttemptStatus::Reviewing;
+        let evidence = ArtifactRef {
+            producer_id: "review-tests".into(),
+            path: work_artifact_path("work-1", "attempt-1", "review-tests/review.md"),
+        };
+        let writer_task_id = item
+            .add_next_write_round("attempt-1", vec![evidence.clone()])
+            .unwrap();
+        item.attempts[0].tasks[1].writer_correction_assignment = Some(WriterCorrectionAssignment {
+            schema_version: WRITER_CORRECTION_ASSIGNMENT_SCHEMA_VERSION,
+            work_item_id: "work-1".into(),
+            attempt_id: "attempt-1".into(),
+            writer_task_id,
+            source_task_id: "attempt-1-write-1".into(),
+            source_candidate_commit: "commit-initial".into(),
+            source_task_inputs: Vec::new(),
+            evidence: vec![WriterCorrectionAssignmentInput {
+                artifact: evidence.clone(),
+                digest: format!("sha256:{}", "3".repeat(64)),
+            }],
+            findings: vec![WriterCompletionFinding {
+                id: "finding:tests:rollback".into(),
+                role: "tests".into(),
+                source: evidence.path.clone(),
+                requirement: "Keep the assignment during rollback".into(),
+            }],
+            origin: WriterCorrectionAssignmentOrigin::Captured,
+        });
+        item.validate().unwrap();
+        store.create_work_item(&item).unwrap();
+
+        let mut executing = store.read_work_item("work-1").unwrap();
+        let prior_task = executing.attempts[0].tasks[1].clone();
+        let prior_assignment = prior_task.writer_correction_assignment.clone().unwrap();
+        let prior_attempt_status = executing.attempts[0].status.clone();
+        let prior_attempt_pause = executing.attempts[0].pause_kind.clone();
+        let prior_attempt_completed_at = executing.attempts[0].completed_at.clone();
+        let mut written_task = prior_task.clone();
+        written_task.status = TaskStatus::Executing;
+        written_task.started_at = Some("2026-09-11T00:00:00Z".into());
+        executing.attempts[0].tasks[1] = written_task.clone();
+        executing.attempts[0].status = AttemptStatus::Executing;
+        store.write_work_item(&executing).unwrap();
+
+        let receipt = ReservationReceipt {
+            prior_task,
+            prior_attempt_status,
+            prior_attempt_pause,
+            prior_attempt_completed_at,
+            written_task,
+            written_attempt_status: AttemptStatus::Executing,
+            written_attempt_pause: executing.attempts[0].pause_kind.clone(),
+            written_attempt_completed_at: executing.attempts[0].completed_at.clone(),
+        };
+        let error = with_reservation_rollback(
+            &store,
+            "work-1",
+            "attempt-1",
+            "attempt-1-write-2",
+            &receipt,
+            || Err::<(), _>(anyhow::anyhow!("post-reservation setup failed")),
+        )
+        .expect_err("setup failure should return after restoring its reservation");
+        assert_eq!(error.to_string(), "post-reservation setup failed");
+
+        let restored = store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            restored.attempts[0].tasks[1]
+                .writer_correction_assignment
+                .as_ref(),
+            Some(&prior_assignment),
+            "rollback restores execution state without dropping host-owned authority"
+        );
+        assert_eq!(restored.attempts[0].tasks[1].status, TaskStatus::Planned);
+        assert_eq!(restored.attempts[0].tasks[1].started_at, None);
+        assert_eq!(restored.attempts[0].status, AttemptStatus::Planned);
     }
 
     #[test]
@@ -5911,6 +13176,9 @@ mod tests {
                 candidate_commit: "abc123".to_string(),
                 base_commit: None,
             }),
+            writer_correction_assignment: None,
+            verification_context: None,
+            evidence_review_context: None,
             input_artifacts: Vec::new(),
             depends_on: None,
             output: None,
@@ -5949,6 +13217,11 @@ mod tests {
             pump_primary,
             cleanup_failure,
             &tmp.path().join("does-not-exist-review.md"),
+            &tmp.path().join("does-not-exist-review-inspection.json"),
+            &tmp.path().join("does-not-exist-transcript.jsonl"),
+            &tmp.path().join("candidate-workspace"),
+            "abc123",
+            "architecture",
             &|_, _| {},
         )
         .expect_err("a composite coder+cleanup failure must return an error");
@@ -5984,6 +13257,1054 @@ mod tests {
             after.attempts[0].pause_kind,
             Some(crate::work_model::PauseKind::TranscriptPump),
             "the preserved typed pump primary classifies the pause, not the cleanup failure"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_pre_review_reclaims_only_canonical_cache_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path();
+        let artifact_relative =
+            crate::work_model::work_artifact_path("work-1", "attempt-1", "review-1");
+        let artifact = project.join(&artifact_relative);
+        let cache = candidate_reviewer_cache_dir(project, "abc123");
+        fs::create_dir_all(&artifact).unwrap();
+        fs::create_dir_all(project.join(".fluent/hooks")).unwrap();
+        fs::create_dir_all(project.join(".fluent")).unwrap();
+        fs::write(
+            project.join(".fluent/config.yaml"),
+            "reviewer-cache:\n  max-project-gib: 0\n  min-free-gib: 0\n",
+        )
+        .unwrap();
+        let hook = project.join(".fluent/hooks/prepare-pre-review");
+        fs::write(
+            &hook,
+            "#!/bin/sh\nmkdir -p \"$FLUENT_REVIEWER_ARTIFACT_DIR/target\"\nprintf cache > \"$FLUENT_REVIEWER_ARTIFACT_DIR/target/output\"\nprintf evidence > \"$FLUENT_REVIEWER_ARTIFACT_DIR/hook-note\"\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions).unwrap();
+
+        let store = WorkModelStore::new(project);
+        let mut item = WorkItem {
+            id: "work-1".to_string(),
+            title: "Hook cache".to_string(),
+            ..Default::default()
+        };
+        item.add_initial_attempt("attempt-1").unwrap();
+        let task = &mut item.attempts[0].tasks[0];
+        task.id = "review-1".to_string();
+        task.kind = TaskKind::Review;
+        task.status = TaskStatus::Executing;
+        task.workspace_access.writes.clear();
+        task.workspace_access.reads.push(WorkspaceRef {
+            id: "candidate".to_string(),
+            path: "candidate".to_string(),
+        });
+        task.review_context = Some(crate::work_model::ReviewContext {
+            candidate_workspace_id: "candidate".to_string(),
+            candidate_workspace_path: "candidate".to_string(),
+            source_branch: "main".to_string(),
+            candidate_commit: "abc123".to_string(),
+            base_commit: None,
+        });
+        task.artifact_area = Some(crate::work_model::TaskArtifactArea {
+            path: artifact_relative,
+        });
+        store.create_work_item(&item).unwrap();
+
+        prepare_reviewer_hook_cache(
+            project,
+            project,
+            &artifact,
+            &cache,
+            "work-1",
+            "attempt-1",
+            "review-1",
+            &FilesystemReviewerCacheAdmission,
+            &report_reviewer_cache,
+        );
+
+        assert!(artifact.join("hook-note").is_file());
+        assert!(
+            !artifact.join("target").exists(),
+            "over-budget hook cache must be removed while noncanonical output remains"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_prepare_pre_review_removes_managed_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path();
+        let artifact = project.join("review-artifact");
+        let cache = candidate_reviewer_cache_dir(project, "abc123");
+        fs::create_dir_all(&artifact).unwrap();
+        fs::create_dir_all(project.join(".fluent/hooks")).unwrap();
+        let hook = project.join(".fluent/hooks/prepare-pre-review");
+        fs::write(
+            &hook,
+            "#!/bin/sh\nmkdir -p \"$FLUENT_REVIEWER_ARTIFACT_DIR/target\"\nprintf cache > \"$FLUENT_REVIEWER_ARTIFACT_DIR/target/output\"\nprintf evidence > \"$FLUENT_REVIEWER_ARTIFACT_DIR/hook-note\"\nexit 1\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions).unwrap();
+
+        prepare_reviewer_hook_cache(
+            project,
+            project,
+            &artifact,
+            &cache,
+            "work-1",
+            "attempt-1",
+            "review-1",
+            &FilesystemReviewerCacheAdmission,
+            &report_reviewer_cache,
+        );
+
+        assert!(artifact.join("hook-note").is_file());
+        assert!(
+            !artifact.join("target").exists(),
+            "a failed hook must not retain an unadmitted managed cache"
+        );
+    }
+
+    struct SyntheticReviewerCacheAdmission {
+        reclaim: Result<()>,
+        total: Result<u64>,
+        free: Result<u64>,
+    }
+
+    impl ReviewerCacheAdmission for SyntheticReviewerCacheAdmission {
+        fn reclaim_terminal_caches(
+            &self,
+            _project_root: &Path,
+            _store: &WorkModelStore,
+        ) -> Result<()> {
+            self.reclaim
+                .as_ref()
+                .map(|()| ())
+                .map_err(|error| anyhow::anyhow!("{error:#}"))
+        }
+
+        fn managed_cache_total(
+            &self,
+            _project_root: &Path,
+            _store: &WorkModelStore,
+        ) -> Result<u64> {
+            self.total
+                .as_ref()
+                .map(|value| *value)
+                .map_err(|error| anyhow::anyhow!("{error:#}"))
+        }
+
+        fn filesystem_free_bytes(&self, _artifact_dir: &Path) -> Result<u64> {
+            self.free
+                .as_ref()
+                .map(|value| *value)
+                .map_err(|error| anyhow::anyhow!("{error:#}"))
+        }
+    }
+
+    struct TracingFilesystemReviewerCacheAdmission {
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl ReviewerCacheAdmission for TracingFilesystemReviewerCacheAdmission {
+        fn reclaim_terminal_caches(
+            &self,
+            project_root: &Path,
+            store: &WorkModelStore,
+        ) -> Result<()> {
+            self.events.lock().unwrap().push("reclaim");
+            reclaim_terminal_reviewer_caches(project_root, store)
+        }
+
+        fn managed_cache_total(&self, project_root: &Path, store: &WorkModelStore) -> Result<u64> {
+            self.events.lock().unwrap().push("total");
+            managed_reviewer_cache_total(project_root, store)
+        }
+
+        fn filesystem_free_bytes(&self, artifact_dir: &Path) -> Result<u64> {
+            self.events.lock().unwrap().push("free");
+            prep::filesystem_free_bytes(artifact_dir)
+        }
+    }
+
+    struct CacheObservingReviewCoder {
+        saw_warm_cache: Arc<Mutex<bool>>,
+        cache_dir: PathBuf,
+    }
+
+    impl crate::coder::Coder for CacheObservingReviewCoder {
+        fn run(
+            &self,
+            _prompt: &str,
+            _system_prompt: &str,
+            _working_dir: &Path,
+            _extra_args: &[String],
+            _extra_env: &[(String, String)],
+            _transcript_file: Option<&Path>,
+        ) -> Result<i32> {
+            unreachable!("the review route launches through run_captured")
+        }
+
+        fn run_captured(
+            &self,
+            _prompt: &str,
+            _system_prompt: &str,
+            working_dir: &Path,
+            _extra_args: &[String],
+            _extra_env: &[(String, String)],
+            _capture: Option<&crate::coder::TranscriptCapture<'_>>,
+        ) -> Result<i32> {
+            *self.saw_warm_cache.lock().unwrap() = self.cache_dir.join("target/output").is_file();
+            assert!(!working_dir.join("target").exists());
+            fs::write(working_dir.join("review.md"), "review evidence")?;
+            Ok(0)
+        }
+
+        fn run_interactive(
+            &self,
+            _system_prompt: &str,
+            _working_dir: &Path,
+            _extra_args: &[String],
+            _extra_env: &[(String, String)],
+        ) -> Result<i32> {
+            unreachable!("the review route never runs interactively")
+        }
+    }
+
+    struct ReviewerCacheRouteFixture {
+        _tmp: tempfile::TempDir,
+        project_root: PathBuf,
+        store: WorkModelStore,
+        review_task_id: String,
+        artifact_dir: PathBuf,
+        cache_dir: PathBuf,
+    }
+
+    impl ReviewerCacheRouteFixture {
+        fn new(config: &str) -> Self {
+            Self::new_with_hook(config, None)
+        }
+
+        fn new_with_hook(config: &str, hook_body: Option<&str>) -> Self {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let project_root = tmp.path().join("project");
+            fs::create_dir_all(&project_root).unwrap();
+            let git =
+                |args: &[&str]| crate::git::run(&project_root, args, "test git setup").unwrap();
+            git(&["init", "-q", "-b", "main"]);
+            git(&["config", "user.email", "t@t.co"]);
+            git(&["config", "user.name", "t"]);
+            fs::write(
+                project_root.join("Cargo.toml"),
+                "[package]\nname = \"cache-route\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .unwrap();
+            fs::write(project_root.join(".gitignore"), "/target/\n").unwrap();
+            fs::create_dir_all(project_root.join(".fluent")).unwrap();
+            fs::write(project_root.join(".fluent/config.yaml"), config).unwrap();
+            if let Some(body) = hook_body {
+                let hook_dir = project_root.join(".fluent/hooks");
+                fs::create_dir_all(&hook_dir).unwrap();
+                let hook = hook_dir.join("prepare-pre-review");
+                fs::write(&hook, body).unwrap();
+                let mut permissions = fs::metadata(&hook).unwrap().permissions();
+                permissions.set_mode(0o755);
+                fs::set_permissions(&hook, permissions).unwrap();
+            }
+            git(&["add", "."]);
+            git(&["commit", "-q", "-m", "baseline"]);
+            let head =
+                crate::git::run_stdout(&project_root, &["rev-parse", "HEAD"], "head").unwrap();
+
+            let candidate_path = tmp.path().join("work-6-work-1-attempt-1");
+            crate::git::run(
+                &project_root,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "cache-route-candidate",
+                    candidate_path.to_str().unwrap(),
+                    "HEAD",
+                ],
+                "create candidate worktree",
+            )
+            .unwrap();
+            fs::create_dir_all(candidate_path.join("target")).unwrap();
+            fs::write(candidate_path.join("target/output"), "candidate cache").unwrap();
+
+            let store = WorkModelStore::new(&project_root);
+            let mut item = WorkItem {
+                id: "work-1".to_string(),
+                title: "Reviewer cache route".to_string(),
+                ..Default::default()
+            };
+            item.add_initial_attempt("attempt-1").unwrap();
+            let write = &mut item.attempts[0].tasks[0];
+            let workspace = write.workspace_access.writes[0].clone();
+            write.status = TaskStatus::Complete;
+            write.output = Some(TaskOutput {
+                workspace_id: workspace.id,
+                workspace_path: workspace.path,
+                source_branch: "main".to_string(),
+                base_commit: None,
+                commit: head.trim().to_string(),
+                no_change: None,
+                learner_canonicalization: None,
+            });
+            item.add_review_tasks("attempt-1", &["tests"]).unwrap();
+            let review_task_id = "attempt-1-review-tests".to_string();
+            let review_task = item.attempts[0]
+                .tasks
+                .iter()
+                .find(|task| task.id == review_task_id)
+                .unwrap();
+            for input in &review_task.input_artifacts {
+                let path = project_root.join(&input.path);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                let content = if path.file_name().unwrap() == "tester-results.json" {
+                    format!("{{\"candidate_commit\":\"{}\"}}\n", head.trim())
+                } else {
+                    "# Progress\n".to_string()
+                };
+                fs::write(path, content).unwrap();
+            }
+            let artifact_dir = project_root.join(crate::work_model::work_artifact_path(
+                "work-1",
+                "attempt-1",
+                &review_task_id,
+            ));
+            store.create_work_item(&item).unwrap();
+            let cache_dir = candidate_reviewer_cache_dir(&project_root, head.trim());
+
+            Self {
+                _tmp: tmp,
+                project_root,
+                store,
+                review_task_id,
+                artifact_dir,
+                cache_dir,
+            }
+        }
+
+        fn run(&self, admission: &dyn ReviewerCacheAdmission) -> bool {
+            self.run_with_messages(admission).0
+        }
+
+        fn review_status(&self) -> TaskStatus {
+            self.store.read_work_item("work-1").unwrap().attempts[0]
+                .tasks
+                .iter()
+                .find(|task| task.id == self.review_task_id)
+                .unwrap()
+                .status
+                .clone()
+        }
+
+        fn run_with_messages(&self, admission: &dyn ReviewerCacheAdmission) -> (bool, Vec<String>) {
+            let saw_warm_cache = Arc::new(Mutex::new(false));
+            let saw_warm_cache_for_coder = Arc::clone(&saw_warm_cache);
+            let messages = Arc::new(Mutex::new(Vec::new()));
+            let messages_for_reporter = Arc::clone(&messages);
+            let make_coder = move |_sandbox: CoderSandbox| -> Box<dyn crate::coder::Coder> {
+                Box::new(CacheObservingReviewCoder {
+                    saw_warm_cache: Arc::clone(&saw_warm_cache_for_coder),
+                    cache_dir: self.cache_dir.clone(),
+                })
+            };
+            let resolver = ContentResolver::new(Some(&self.project_root));
+            run_review_task_with_coder(
+                WorkTaskRunConfig {
+                    project_root: &self.project_root,
+                    store: &self.store,
+                    work_item_id: "work-1",
+                    attempt_id: "attempt-1",
+                    task_id: &self.review_task_id,
+                    resolver: &resolver,
+                    extra_args: &[],
+                    no_sandbox: true,
+                    store_lock: None,
+                },
+                Some(&make_coder),
+                admission,
+                &move |message| {
+                    messages_for_reporter
+                        .lock()
+                        .unwrap()
+                        .push(message.to_string())
+                },
+            )
+            .unwrap();
+            (
+                *saw_warm_cache.lock().unwrap(),
+                messages.lock().unwrap().clone(),
+            )
+        }
+    }
+
+    #[test]
+    fn reviewer_cache_admission_warms_within_project_budget() {
+        let fixture = ReviewerCacheRouteFixture::new(
+            "reviewer-cache:\n  max-project-gib: 1\n  min-free-gib: 0\n",
+        );
+        let admission = SyntheticReviewerCacheAdmission {
+            reclaim: Ok(()),
+            total: Ok(0),
+            free: Ok(u64::MAX),
+        };
+
+        assert!(
+            fixture.run(&admission),
+            "the production reviewer route must receive the admitted cache"
+        );
+        assert!(
+            !fixture.artifact_dir.join("target").exists(),
+            "terminal cleanup must reclaim only the canonical cache"
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.artifact_dir.join("review.md")).unwrap(),
+            "review evidence"
+        );
+    }
+
+    #[test]
+    fn reviewer_cache_budget_starts_cold_without_pausing_review() {
+        let fixture = ReviewerCacheRouteFixture::new(
+            "reviewer-cache:\n  max-project-gib: 0\n  min-free-gib: 0\n",
+        );
+        let admission = SyntheticReviewerCacheAdmission {
+            reclaim: Ok(()),
+            total: Ok(0),
+            free: Ok(u64::MAX),
+        };
+
+        let (warmed, messages) = fixture.run_with_messages(&admission);
+        assert!(!warmed, "an over-budget Reviewer must start cold");
+        assert!(messages.iter().any(|message| {
+            message.contains(&fixture.review_task_id)
+                && message.contains("starting cold")
+                && message.contains("project cache budget")
+        }));
+        assert!(fixture.artifact_dir.join("review.md").is_file());
+        assert_eq!(fixture.review_status(), TaskStatus::Complete);
+    }
+
+    #[test]
+    fn invalid_reviewer_cache_limits_start_cold_and_name_config() {
+        let config = "reviewer-cache:\n  max-project-gib: invalid\n  min-free-gib: 0\n";
+        let fixture = ReviewerCacheRouteFixture::new(config);
+        let error =
+            crate::config::resolve_reviewer_cache_config(&fixture.project_root).unwrap_err();
+        assert_eq!(error.path, fixture.project_root.join(".fluent/config.yaml"));
+        assert_eq!(error.key, "reviewer-cache.max-project-gib");
+
+        let admission = SyntheticReviewerCacheAdmission {
+            reclaim: Ok(()),
+            total: Ok(0),
+            free: Ok(u64::MAX),
+        };
+        let (warmed, messages) = fixture.run_with_messages(&admission);
+        assert!(!warmed, "invalid limits must keep the Reviewer cold");
+        assert!(messages.iter().any(|message| {
+            message.contains(&fixture.review_task_id)
+                && message.contains("starting cold")
+                && message.contains(
+                    &fixture
+                        .project_root
+                        .join(".fluent/config.yaml")
+                        .display()
+                        .to_string(),
+                )
+                && message.contains("reviewer-cache.max-project-gib")
+        }));
+        assert!(fixture.artifact_dir.join("review.md").is_file());
+    }
+
+    #[test]
+    fn reviewer_cache_free_space_floor_starts_cold_without_pausing_review() {
+        let fixture = ReviewerCacheRouteFixture::new(
+            "reviewer-cache:\n  max-project-gib: 1\n  min-free-gib: 1\n",
+        );
+        let admission = SyntheticReviewerCacheAdmission {
+            reclaim: Ok(()),
+            total: Ok(0),
+            free: Ok(0),
+        };
+
+        let (warmed, messages) = fixture.run_with_messages(&admission);
+
+        assert!(
+            !warmed,
+            "a Reviewer below the free-space floor must start cold"
+        );
+        assert!(messages.iter().any(|message| {
+            message.contains(&fixture.review_task_id)
+                && message.contains("starting cold")
+                && message.contains("host free-space floor")
+        }));
+        assert_eq!(fixture.review_status(), TaskStatus::Complete);
+    }
+
+    #[test]
+    fn reviewer_cache_helper_warms_within_project_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path();
+        let candidate = project.join("candidate");
+        let artifact = project.join("artifact");
+        fs::create_dir_all(candidate.join("target")).unwrap();
+        fs::create_dir_all(&artifact).unwrap();
+        fs::write(candidate.join("target/output"), "cache").unwrap();
+        fs::create_dir_all(project.join(".fluent")).unwrap();
+        fs::write(
+            project.join(".fluent/config.yaml"),
+            "reviewer-cache:\n  max-project-gib: 1\n  min-free-gib: 0\n",
+        )
+        .unwrap();
+        let admission = SyntheticReviewerCacheAdmission {
+            reclaim: Ok(()),
+            total: Ok(0),
+            free: Ok(u64::MAX),
+        };
+
+        admit_reviewer_build_cache_with_admission(
+            project,
+            &candidate,
+            &artifact,
+            &prep::TOOLCHAINS[0],
+            "review-1",
+            &admission,
+            &report_reviewer_cache,
+        );
+
+        assert!(artifact.join("target/output").is_file());
+    }
+
+    #[test]
+    fn reviewer_cache_accounting_failure_starts_cold() {
+        let fixture = ReviewerCacheRouteFixture::new(
+            "reviewer-cache:\n  max-project-gib: 1\n  min-free-gib: 0\n",
+        );
+        let admission = SyntheticReviewerCacheAdmission {
+            reclaim: Ok(()),
+            total: Err(anyhow::anyhow!("synthetic accounting failure")),
+            free: Ok(u64::MAX),
+        };
+
+        let (warmed, messages) = fixture.run_with_messages(&admission);
+        assert!(!warmed);
+        assert!(messages.iter().any(|message| {
+            message.contains(&fixture.review_task_id)
+                && message.contains("starting cold")
+                && message.contains("cache admission check failed")
+                && message.contains("synthetic accounting failure")
+        }));
+        assert!(fixture.artifact_dir.join("review.md").is_file());
+    }
+
+    #[test]
+    fn reviewer_cache_reclamation_failure_starts_cold_without_pausing_review() {
+        let fixture = ReviewerCacheRouteFixture::new(
+            "reviewer-cache:\n  max-project-gib: 1\n  min-free-gib: 0\n",
+        );
+        let admission = SyntheticReviewerCacheAdmission {
+            reclaim: Err(anyhow::anyhow!("synthetic reclamation failure")),
+            total: Ok(0),
+            free: Ok(u64::MAX),
+        };
+
+        let (warmed, messages) = fixture.run_with_messages(&admission);
+
+        assert!(!warmed, "failed reclamation must leave the Reviewer cold");
+        assert!(messages.iter().any(|message| {
+            message.contains(&fixture.review_task_id)
+                && message.contains("starting cold")
+                && message.contains("cache admission check failed")
+                && message.contains("synthetic reclamation failure")
+        }));
+        assert_eq!(fixture.review_status(), TaskStatus::Complete);
+    }
+
+    #[test]
+    fn reviewer_cache_free_space_failure_starts_cold() {
+        let fixture = ReviewerCacheRouteFixture::new(
+            "reviewer-cache:\n  max-project-gib: 1\n  min-free-gib: 0\n",
+        );
+        let admission = SyntheticReviewerCacheAdmission {
+            reclaim: Ok(()),
+            total: Ok(0),
+            free: Err(anyhow::anyhow!("synthetic free-space failure")),
+        };
+
+        let (warmed, messages) = fixture.run_with_messages(&admission);
+        assert!(
+            !warmed,
+            "failed free-space inspection must leave the Reviewer cold"
+        );
+        assert!(messages.iter().any(|message| {
+            message.contains(&fixture.review_task_id)
+                && message.contains("starting cold")
+                && message.contains("cache admission check failed")
+                && message.contains("synthetic free-space failure")
+        }));
+        assert!(fixture.artifact_dir.join("review.md").is_file());
+    }
+
+    #[test]
+    fn reviewer_cache_admission_reclaims_terminal_caches_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path();
+        let candidate = project.join("candidate");
+        let new_artifact = project.join("new-artifact");
+        fs::create_dir_all(candidate.join("target")).unwrap();
+        fs::write(candidate.join("target/output"), "candidate cache").unwrap();
+        fs::create_dir_all(&new_artifact).unwrap();
+        fs::create_dir_all(project.join(".fluent")).unwrap();
+        fs::write(
+            project.join(".fluent/config.yaml"),
+            "reviewer-cache:\n  max-project-gib: 1\n  min-free-gib: 0\n",
+        )
+        .unwrap();
+        let artifact_relative =
+            crate::work_model::work_artifact_path("old-work", "attempt-1", "review-1");
+        let artifact = project.join(&artifact_relative);
+        fs::create_dir_all(artifact.join("target")).unwrap();
+        let output = fs::File::create(artifact.join("target/output")).unwrap();
+        output.set_len(2 * 1024 * 1024 * 1024).unwrap();
+        fs::write(artifact.join("review.md"), "evidence").unwrap();
+
+        let mut item = WorkItem {
+            id: "old-work".to_string(),
+            title: "Terminal reviewer cache".to_string(),
+            ..Default::default()
+        };
+        item.add_initial_attempt("attempt-1").unwrap();
+        let task = &mut item.attempts[0].tasks[0];
+        task.id = "review-1".to_string();
+        task.kind = TaskKind::Review;
+        task.status = TaskStatus::Complete;
+        task.workspace_access.writes.clear();
+        task.workspace_access.reads.push(WorkspaceRef {
+            id: "candidate".to_string(),
+            path: "candidate".to_string(),
+        });
+        task.review_context = Some(crate::work_model::ReviewContext {
+            candidate_workspace_id: "candidate".to_string(),
+            candidate_workspace_path: "candidate".to_string(),
+            source_branch: "main".to_string(),
+            candidate_commit: "abc123".to_string(),
+            base_commit: None,
+        });
+        task.artifact_area = Some(crate::work_model::TaskArtifactArea {
+            path: artifact_relative,
+        });
+        let store = WorkModelStore::new(project);
+        store.create_work_item(&item).unwrap();
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let admission = TracingFilesystemReviewerCacheAdmission {
+            events: Arc::clone(&events),
+        };
+
+        admit_reviewer_build_cache_with_admission(
+            project,
+            &candidate,
+            &new_artifact,
+            &prep::TOOLCHAINS[0],
+            "new-reviewer",
+            &admission,
+            &report_reviewer_cache,
+        );
+
+        assert!(!artifact.join("target").exists());
+        assert_eq!(
+            fs::read_to_string(artifact.join("review.md")).unwrap(),
+            "evidence"
+        );
+        assert!(new_artifact.join("target/output").is_file());
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            ["reclaim", "total", "free"],
+            "admission must reclaim before it accounts for and warms the next Reviewer"
+        );
+    }
+
+    #[test]
+    fn concurrent_reviewer_cache_admissions_serialize_project_budget() {
+        struct ConcurrentAdmission {
+            artifacts: Vec<PathBuf>,
+            observed_totals: Mutex<Vec<u64>>,
+        }
+
+        impl ReviewerCacheAdmission for ConcurrentAdmission {
+            fn reclaim_terminal_caches(
+                &self,
+                _project_root: &Path,
+                _store: &WorkModelStore,
+            ) -> Result<()> {
+                Ok(())
+            }
+
+            fn managed_cache_total(
+                &self,
+                _project_root: &Path,
+                _store: &WorkModelStore,
+            ) -> Result<u64> {
+                let total = self.artifacts.iter().try_fold(0_u64, |total, artifact| {
+                    total
+                        .checked_add(prep::managed_cache_bytes(artifact)?)
+                        .ok_or_else(|| anyhow::anyhow!("synthetic cache total overflow"))
+                })?;
+                self.observed_totals.lock().unwrap().push(total);
+                Ok(total)
+            }
+
+            fn filesystem_free_bytes(&self, _artifact_dir: &Path) -> Result<u64> {
+                Ok(u64::MAX)
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path();
+        let candidate = project.join("candidate");
+        let first_artifact = project.join("first-artifact");
+        let second_artifact = project.join("second-artifact");
+        fs::create_dir_all(candidate.join("target")).unwrap();
+        fs::File::create(candidate.join("target/output"))
+            .unwrap()
+            .set_len(1024 * 1024 * 1024)
+            .unwrap();
+        fs::create_dir_all(&first_artifact).unwrap();
+        fs::create_dir_all(&second_artifact).unwrap();
+        fs::create_dir_all(project.join(".fluent")).unwrap();
+        fs::write(
+            project.join(".fluent/config.yaml"),
+            "reviewer-cache:\n  max-project-gib: 1\n  min-free-gib: 0\n",
+        )
+        .unwrap();
+
+        let admission = ConcurrentAdmission {
+            artifacts: vec![first_artifact.clone(), second_artifact.clone()],
+            observed_totals: Mutex::new(Vec::new()),
+        };
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let candidate = candidate.as_path();
+        let admission = &admission;
+        std::thread::scope(|scope| {
+            for (task_id, artifact_dir) in [
+                ("reviewer-one", &first_artifact),
+                ("reviewer-two", &second_artifact),
+            ] {
+                let barrier = Arc::clone(&barrier);
+                let messages = Arc::clone(&messages);
+                scope.spawn(move || {
+                    barrier.wait();
+                    admit_reviewer_build_cache_with_admission(
+                        project,
+                        &candidate,
+                        artifact_dir,
+                        &prep::TOOLCHAINS[0],
+                        task_id,
+                        admission,
+                        &|message| messages.lock().unwrap().push(message.to_string()),
+                    );
+                });
+            }
+        });
+
+        let warmed = [
+            first_artifact.join("target/output"),
+            second_artifact.join("target/output"),
+        ]
+        .into_iter()
+        .filter(|path| path.is_file())
+        .count();
+        assert_eq!(
+            warmed, 1,
+            "only one concurrent Reviewer may consume the 1 GiB budget"
+        );
+        assert_eq!(
+            admission.observed_totals.lock().unwrap().as_slice(),
+            &[0, 1024 * 1024 * 1024],
+            "the second admission must observe the first admitted cache while holding the project lock"
+        );
+        assert!(messages.lock().unwrap().iter().any(|message| {
+            message.contains("starting cold") && message.contains("project cache budget")
+        }));
+    }
+
+    #[test]
+    fn parallel_reviewers_share_one_cache_and_create_no_private_targets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path();
+        let candidate = project.join("candidate");
+        let shared_cache = candidate_reviewer_cache_dir(project, "abc123");
+        let architecture_artifact = project.join("architecture-artifact");
+        let tests_artifact = project.join("tests-artifact");
+        fs::create_dir_all(candidate.join("target")).unwrap();
+        fs::write(candidate.join("target/output"), "candidate cache").unwrap();
+        fs::create_dir_all(&architecture_artifact).unwrap();
+        fs::create_dir_all(&tests_artifact).unwrap();
+        fs::create_dir_all(project.join(".fluent")).unwrap();
+        fs::write(
+            project.join(".fluent/config.yaml"),
+            "reviewer-cache:\n  max-project-gib: 1\n  min-free-gib: 0\n",
+        )
+        .unwrap();
+        WorkModelStore::new(project)
+            .create_work_item(&review_item())
+            .unwrap();
+
+        std::thread::scope(|scope| {
+            for task_id in ["review-architecture", "review-tests"] {
+                scope.spawn(|| {
+                    admit_reviewer_build_cache_with_admission(
+                        project,
+                        &candidate,
+                        &shared_cache,
+                        &prep::TOOLCHAINS[0],
+                        task_id,
+                        &FilesystemReviewerCacheAdmission,
+                        &report_reviewer_cache,
+                    );
+                });
+            }
+        });
+
+        assert!(shared_cache.join("target/output").is_file());
+        assert!(!architecture_artifact.join("target").exists());
+        assert!(!tests_artifact.join("target").exists());
+        assert_eq!(
+            managed_reviewer_cache_total(project, &WorkModelStore::new(project)).unwrap(),
+            15
+        );
+    }
+
+    #[test]
+    fn review_artifact_usage_records_bytes_and_warns_on_private_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let artifact = tmp.path().join("review-artifact");
+        fs::create_dir_all(artifact.join("target")).unwrap();
+        fs::write(artifact.join("review.md"), "Verdict: pass\n").unwrap();
+        fs::write(artifact.join("target/output"), "private cache").unwrap();
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let messages_for_reporter = Arc::clone(&messages);
+
+        record_review_artifact_usage(&artifact, &move |message| {
+            messages_for_reporter
+                .lock()
+                .unwrap()
+                .push(message.to_string())
+        })
+        .unwrap();
+
+        let usage: ReviewArtifactUsage = serde_json::from_str(
+            &fs::read_to_string(artifact.join("artifact-usage.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(usage.managed_cache_bytes, 13);
+        assert!(usage.artifact_bytes >= usage.managed_cache_bytes);
+        assert!(usage.warning.unwrap().contains("managed build cache"));
+        assert!(
+            messages
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|message| message.contains("Review artifacts  warning"))
+        );
+    }
+
+    #[test]
+    fn reviewer_cache_reclamation_skips_executing_tasks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path();
+        let artifact_relative =
+            crate::work_model::work_artifact_path("work-1", "attempt-1", "review-1");
+        let artifact = project.join(&artifact_relative);
+        fs::create_dir_all(artifact.join("target")).unwrap();
+        fs::write(artifact.join("target/output"), "cache").unwrap();
+
+        let store = WorkModelStore::new(project);
+        let mut item = WorkItem {
+            id: "work-1".to_string(),
+            title: "Executing reviewer cache".to_string(),
+            ..Default::default()
+        };
+        item.add_initial_attempt("attempt-1").unwrap();
+        let task = &mut item.attempts[0].tasks[0];
+        task.id = "review-1".to_string();
+        task.kind = TaskKind::Review;
+        task.status = TaskStatus::Executing;
+        task.workspace_access.writes.clear();
+        task.workspace_access.reads.push(WorkspaceRef {
+            id: "candidate".to_string(),
+            path: "candidate".to_string(),
+        });
+        task.review_context = Some(crate::work_model::ReviewContext {
+            candidate_workspace_id: "candidate".to_string(),
+            candidate_workspace_path: "candidate".to_string(),
+            source_branch: "main".to_string(),
+            candidate_commit: "abc123".to_string(),
+            base_commit: None,
+        });
+        task.artifact_area = Some(crate::work_model::TaskArtifactArea {
+            path: artifact_relative,
+        });
+        store.create_work_item(&item).unwrap();
+
+        reclaim_terminal_reviewer_caches(project, &store).unwrap();
+        assert!(
+            artifact.join("target/output").is_file(),
+            "reclamation must never remove an executing Reviewer's cache"
+        );
+    }
+
+    #[test]
+    fn reviewer_cache_reclamation_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path();
+        let artifact_relative =
+            crate::work_model::work_artifact_path("work-1", "attempt-1", "review-1");
+        let artifact = project.join(&artifact_relative);
+        fs::create_dir_all(artifact.join("target")).unwrap();
+        fs::write(artifact.join("target/output"), "cache").unwrap();
+
+        let store = WorkModelStore::new(project);
+        let mut item = WorkItem {
+            id: "work-1".to_string(),
+            title: "Terminal reviewer cache".to_string(),
+            ..Default::default()
+        };
+        item.add_initial_attempt("attempt-1").unwrap();
+        let task = &mut item.attempts[0].tasks[0];
+        task.id = "review-1".to_string();
+        task.kind = TaskKind::Review;
+        task.status = TaskStatus::Complete;
+        task.workspace_access.writes.clear();
+        task.workspace_access.reads.push(WorkspaceRef {
+            id: "candidate".to_string(),
+            path: "candidate".to_string(),
+        });
+        task.review_context = Some(crate::work_model::ReviewContext {
+            candidate_workspace_id: "candidate".to_string(),
+            candidate_workspace_path: "candidate".to_string(),
+            source_branch: "main".to_string(),
+            candidate_commit: "abc123".to_string(),
+            base_commit: None,
+        });
+        task.artifact_area = Some(crate::work_model::TaskArtifactArea {
+            path: artifact_relative,
+        });
+        store.create_work_item(&item).unwrap();
+
+        reclaim_terminal_reviewer_caches(project, &store).unwrap();
+        reclaim_terminal_reviewer_caches(project, &store).unwrap();
+        assert!(!artifact.join("target").exists());
+    }
+
+    #[test]
+    fn candidate_cache_remains_while_work_is_nonterminal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path();
+        let cache = candidate_reviewer_cache_dir(project, "abc123");
+        fs::create_dir_all(cache.join("target")).unwrap();
+        fs::write(cache.join("target/output"), "cache").unwrap();
+
+        let store = WorkModelStore::new(project);
+        let mut item = review_item();
+        for task in &mut item.attempts[0].tasks {
+            if task.kind == TaskKind::Review {
+                task.status = TaskStatus::Executing;
+            }
+        }
+        store.create_work_item(&item).unwrap();
+
+        reclaim_terminal_reviewer_caches(project, &store).unwrap();
+        assert!(cache.join("target/output").is_file());
+    }
+
+    #[test]
+    fn candidate_cache_retires_once_work_is_terminal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path();
+        let cache = candidate_reviewer_cache_dir(project, "abc123");
+        fs::create_dir_all(cache.join("target")).unwrap();
+        fs::write(cache.join("target/output"), "cache").unwrap();
+
+        let store = WorkModelStore::new(project);
+        let mut item = review_item();
+        for task in &mut item.attempts[0].tasks {
+            task.status = TaskStatus::Complete;
+        }
+        item.attempts[0].status = AttemptStatus::Complete;
+        item.attempts[0].review_state = Some(crate::work_model::AttemptReviewState::Passed);
+        store.create_work_item(&item).unwrap();
+
+        reclaim_terminal_reviewer_caches(project, &store).unwrap();
+        reclaim_terminal_reviewer_caches(project, &store).unwrap();
+        assert!(!cache.exists());
+    }
+
+    #[test]
+    fn reviewer_artifact_retains_evidence_without_private_cache() {
+        let fixture = ReviewerCacheRouteFixture::new(
+            "reviewer-cache:\n  max-project-gib: 1\n  min-free-gib: 0\n",
+        );
+        let admission = SyntheticReviewerCacheAdmission {
+            reclaim: Ok(()),
+            total: Ok(0),
+            free: Ok(u64::MAX),
+        };
+
+        assert!(fixture.run(&admission));
+        assert!(!fixture.artifact_dir.join("target").exists());
+        assert_eq!(
+            fs::read_to_string(fixture.artifact_dir.join("review.md")).unwrap(),
+            "review evidence"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn custom_hook_moves_cache_out_of_reviewer_artifact() {
+        let fixture = ReviewerCacheRouteFixture::new_with_hook(
+            "reviewer-cache:\n  max-project-gib: 1\n  min-free-gib: 0\n",
+            Some(
+                "#!/bin/sh\nmkdir -p \"$FLUENT_REVIEWER_ARTIFACT_DIR/target\"\nprintf cache > \"$FLUENT_REVIEWER_ARTIFACT_DIR/target/output\"\nprintf hook-output > \"$FLUENT_REVIEWER_ARTIFACT_DIR/hook-note\"\n",
+            ),
+        );
+        let admission = SyntheticReviewerCacheAdmission {
+            reclaim: Ok(()),
+            total: Ok(0),
+            free: Ok(u64::MAX),
+        };
+
+        assert!(
+            fixture.run(&admission),
+            "the admitted hook cache reaches the Reviewer"
+        );
+        assert!(
+            !fixture.artifact_dir.join("target").exists(),
+            "the hook-created canonical cache must leave the artifact area"
+        );
+        assert!(fixture.cache_dir.join("target/output").is_file());
+        assert_eq!(
+            fs::read_to_string(fixture.artifact_dir.join("hook-note")).unwrap(),
+            "hook-output"
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.artifact_dir.join("review.md")).unwrap(),
+            "review evidence"
         );
     }
 
@@ -6043,6 +14364,541 @@ mod tests {
         }
     }
 
+    struct ProviderOutageCoder {
+        launches: Arc<Mutex<usize>>,
+    }
+
+    impl crate::coder::Coder for ProviderOutageCoder {
+        fn run(
+            &self,
+            _prompt: &str,
+            _system_prompt: &str,
+            _working_dir: &Path,
+            _extra_args: &[String],
+            _extra_env: &[(String, String)],
+            _transcript_file: Option<&Path>,
+        ) -> Result<i32> {
+            unreachable!("the review route launches through run_captured")
+        }
+
+        fn run_captured(
+            &self,
+            _prompt: &str,
+            _system_prompt: &str,
+            _working_dir: &Path,
+            _extra_args: &[String],
+            _extra_env: &[(String, String)],
+            capture: Option<&crate::coder::TranscriptCapture<'_>>,
+        ) -> Result<i32> {
+            *self.launches.lock().unwrap() += 1;
+            let transcript = capture
+                .expect("task coder receives transcript capture")
+                .path();
+            let parent = transcript.parent().unwrap();
+            fs::create_dir_all(parent).unwrap();
+            for phase in 0..crate::coder::RATE_LIMIT_MAX_RETRIES {
+                fs::write(
+                    parent.join(format!("transcript.{phase}.jsonl")),
+                    "{\"type\":\"rate_limit_event\",\"retry_after\":1}\n",
+                )
+                .unwrap();
+            }
+            fs::write(
+                transcript,
+                "{\"type\":\"rate_limit_event\",\"retry_after\":1}\n",
+            )
+            .unwrap();
+            Ok(1)
+        }
+
+        fn run_interactive(
+            &self,
+            _system_prompt: &str,
+            _working_dir: &Path,
+            _extra_args: &[String],
+            _extra_env: &[(String, String)],
+        ) -> Result<i32> {
+            unreachable!("the review route never runs interactively")
+        }
+    }
+
+    struct InvalidReviewerArgumentsCoder {
+        launches: Arc<Mutex<usize>>,
+    }
+
+    impl crate::coder::Coder for InvalidReviewerArgumentsCoder {
+        fn run(
+            &self,
+            _prompt: &str,
+            _system_prompt: &str,
+            _working_dir: &Path,
+            _extra_args: &[String],
+            _extra_env: &[(String, String)],
+            _transcript_file: Option<&Path>,
+        ) -> Result<i32> {
+            unreachable!("the review route launches through run_captured")
+        }
+
+        fn run_captured(
+            &self,
+            _prompt: &str,
+            _system_prompt: &str,
+            _working_dir: &Path,
+            _extra_args: &[String],
+            _extra_env: &[(String, String)],
+            _capture: Option<&crate::coder::TranscriptCapture<'_>>,
+        ) -> Result<i32> {
+            *self.launches.lock().unwrap() += 1;
+            Err(anyhow::Error::new(crate::coder::ProviderArgumentError {
+                provider: CoderKind::Codex,
+                exit_status: 2,
+                diagnostic: "unknown argument --replacement-approach".to_string(),
+                invocation: "--replacement-approach".to_string(),
+            }))
+        }
+
+        fn run_interactive(
+            &self,
+            _system_prompt: &str,
+            _working_dir: &Path,
+            _extra_args: &[String],
+            _extra_env: &[(String, String)],
+        ) -> Result<i32> {
+            unreachable!("the review route never runs interactively")
+        }
+    }
+
+    #[derive(Default)]
+    struct WriterInputBoundaryObservation {
+        prompt_named_input: bool,
+        profile_granted_read: bool,
+        profile_granted_write: bool,
+        profile_granted_sibling_read: bool,
+        sandbox_probe_succeeded: Option<bool>,
+    }
+
+    struct WriterInputBoundaryCoder {
+        profile_path: PathBuf,
+        input_path: PathBuf,
+        observation: Arc<Mutex<WriterInputBoundaryObservation>>,
+    }
+
+    impl crate::coder::Coder for WriterInputBoundaryCoder {
+        fn run(
+            &self,
+            _prompt: &str,
+            _system_prompt: &str,
+            _working_dir: &Path,
+            _extra_args: &[String],
+            _extra_env: &[(String, String)],
+            _transcript_file: Option<&Path>,
+        ) -> Result<i32> {
+            unreachable!("the Writer route launches through run_captured")
+        }
+
+        fn run_captured(
+            &self,
+            prompt: &str,
+            _system_prompt: &str,
+            _working_dir: &Path,
+            _extra_args: &[String],
+            _extra_env: &[(String, String)],
+            _capture: Option<&crate::coder::TranscriptCapture<'_>>,
+        ) -> Result<i32> {
+            let input_path = self.input_path.canonicalize().unwrap();
+            let sibling_path = input_path.parent().unwrap().join("sibling.txt");
+            let profile = fs::read_to_string(&self.profile_path).unwrap();
+            let read_rule = format!("(allow file-read*  (subpath \"{}\"))", input_path.display());
+            let write_rule = format!("(allow file-write* (subpath \"{}\"))", input_path.display());
+            let sibling_read_rule = format!(
+                "(allow file-read*  (subpath \"{}\"))",
+                sibling_path.display()
+            );
+            let sandbox_usable = std::process::Command::new("/usr/bin/sandbox-exec")
+                .args(["-p", "(version 1)(allow default)", "/usr/bin/true"])
+                .output()
+                .map(|output| output.status.success())
+                .unwrap_or(false);
+            let sandbox_probe_succeeded = sandbox_usable.then(|| {
+                std::process::Command::new("/usr/bin/sandbox-exec")
+                    .arg("-f")
+                    .arg(&self.profile_path)
+                    .args([
+                        "/bin/sh",
+                        "-c",
+                        "value=$(/bin/cat \"$1\") || exit 10; [ \"$value\" = authoritative ] || exit 11; if /bin/echo mutated > \"$1\"; then exit 12; fi; if /bin/cat \"$2\" >/dev/null 2>&1; then exit 13; fi",
+                        "writer-input-probe",
+                    ])
+                    .arg(&self.input_path)
+                    .arg(&sibling_path)
+                    .output()
+                    .map(|output| output.status.success())
+                    .unwrap_or(false)
+            });
+
+            *self.observation.lock().unwrap() = WriterInputBoundaryObservation {
+                prompt_named_input: prompt.contains("preserved Work Item input")
+                    && prompt.contains("0000-input.txt"),
+                profile_granted_read: profile.contains(&read_rule),
+                profile_granted_write: profile.contains(&write_rule),
+                profile_granted_sibling_read: profile.contains(&sibling_read_rule),
+                sandbox_probe_succeeded,
+            };
+            Ok(0)
+        }
+
+        fn run_interactive(
+            &self,
+            _system_prompt: &str,
+            _working_dir: &Path,
+            _extra_args: &[String],
+            _extra_env: &[(String, String)],
+        ) -> Result<i32> {
+            unreachable!("the Writer route never runs interactively")
+        }
+    }
+
+    #[test]
+    fn writer_launch_names_and_confines_preserved_work_item_input() {
+        let current_dir = std::env::current_dir().unwrap();
+        let tmp = tempfile::TempDir::new_in(current_dir).unwrap();
+        let project_root = tmp.path().join("project");
+        fs::create_dir_all(project_root.join(".fluent/expertise")).unwrap();
+        fs::write(
+            project_root.join(".fluent/expertise/INDEX.md"),
+            "# Project Expertise Index\n",
+        )
+        .unwrap();
+        fs::write(project_root.join("tracked.txt"), "baseline\n").unwrap();
+        for args in [
+            &["init", "-q", "-b", "main"] as &[&str],
+            &["config", "user.email", "test@test"],
+            &["config", "user.name", "test"],
+            &["add", "."],
+            &["commit", "-q", "-m", "Add fixture"],
+        ] {
+            crate::git::run(&project_root, args, "set up Writer input fixture").unwrap();
+        }
+
+        let input_path = project_root.join(".fluent/work/artifacts/work-1/inputs/0000-input.txt");
+        fs::create_dir_all(input_path.parent().unwrap()).unwrap();
+        fs::write(&input_path, "authoritative\n").unwrap();
+        fs::write(
+            input_path.parent().unwrap().join("sibling.txt"),
+            "private\n",
+        )
+        .unwrap();
+        let mut item = WorkItem {
+            id: "work-1".to_string(),
+            title: "Use authoritative input".to_string(),
+            input_artifacts: vec![crate::work_model::WorkItemInputArtifact {
+                source_path: ".fluent/work/artifacts/source/input.txt".to_string(),
+                snapshot_path: ".fluent/work/artifacts/work-1/inputs/0000-input.txt".to_string(),
+                digest: "sha256:approved".to_string(),
+            }],
+            ..Default::default()
+        };
+        item.add_initial_attempt("attempt-1").unwrap();
+        let task_id = item.attempts[0].tasks[0].id.clone();
+        let store = WorkModelStore::new(&project_root);
+        store.create_work_item(&item).unwrap();
+        let resolver = ContentResolver::new(Some(&project_root));
+        let observation = Arc::new(Mutex::new(WriterInputBoundaryObservation::default()));
+        let observed = Arc::clone(&observation);
+        let expected_input = input_path.clone();
+        let make_coder = move |sandbox| {
+            let CoderSandbox::SeatbeltProfile(profile_path) = sandbox else {
+                panic!("the Writer must launch with its production Seatbelt profile")
+            };
+            Box::new(WriterInputBoundaryCoder {
+                profile_path: PathBuf::from(profile_path),
+                input_path: expected_input.clone(),
+                observation: Arc::clone(&observed),
+            }) as Box<dyn crate::coder::Coder>
+        };
+
+        let _ = run_write_task_with_coder(
+            WorkTaskRunConfig {
+                project_root: &project_root,
+                store: &store,
+                work_item_id: "work-1",
+                attempt_id: "attempt-1",
+                task_id: &task_id,
+                resolver: &resolver,
+                extra_args: &[],
+                no_sandbox: false,
+                store_lock: None,
+            },
+            Some(&make_coder),
+        );
+
+        let observation = observation.lock().unwrap();
+        assert!(observation.prompt_named_input);
+        assert!(observation.profile_granted_read);
+        assert!(!observation.profile_granted_write);
+        assert!(!observation.profile_granted_sibling_read);
+        if let Some(succeeded) = observation.sandbox_probe_succeeded {
+            assert!(
+                succeeded,
+                "the sandboxed Writer must read but not modify the input"
+            );
+        }
+        assert_eq!(fs::read_to_string(input_path).unwrap(), "authoritative\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writer_cache_symlink_rejection_leaves_the_task_unstarted() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_root = tmp.path().join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        crate::git::run(&project_root, &["init", "-q", "-b", "main"], "init fixture").unwrap();
+        crate::git::run(
+            &project_root,
+            &["config", "user.email", "test@test"],
+            "configure fixture",
+        )
+        .unwrap();
+        crate::git::run(
+            &project_root,
+            &["config", "user.name", "test"],
+            "configure fixture",
+        )
+        .unwrap();
+        fs::write(project_root.join("tracked.txt"), "baseline\n").unwrap();
+        crate::git::run(&project_root, &["add", "."], "add fixture").unwrap();
+        crate::git::run(
+            &project_root,
+            &["commit", "-q", "-m", "Add fixture"],
+            "commit fixture",
+        )
+        .unwrap();
+
+        let mut item = WorkItem {
+            id: "work-1".to_string(),
+            title: "Reject escaped Writer cache".to_string(),
+            ..Default::default()
+        };
+        item.add_initial_attempt("attempt-1").unwrap();
+        let task_id = item.attempts[0].tasks[0].id.clone();
+        let workspace_path = resolve_managed_workspace_path(
+            &project_root,
+            &item.attempts[0].tasks[0].workspace_access.writes[0].path,
+            "work-1",
+            "attempt-1",
+        )
+        .unwrap();
+        let store = WorkModelStore::new(&project_root);
+        store.create_work_item(&item).unwrap();
+        let external = tmp.path().join("external");
+        fs::create_dir_all(&external).unwrap();
+        fs::create_dir_all(project_root.join(".fluent/work/cache/writers")).unwrap();
+        std::os::unix::fs::symlink(
+            &external,
+            project_root.join(".fluent/work/cache/writers/work-1"),
+        )
+        .unwrap();
+        let resolver = ContentResolver::new(Some(&project_root));
+        let make_coder = |_sandbox| -> Box<dyn crate::coder::Coder> {
+            panic!("cache preflight must reject before constructing a coder")
+        };
+
+        let error = run_write_task_with_coder(
+            WorkTaskRunConfig {
+                project_root: &project_root,
+                store: &store,
+                work_item_id: "work-1",
+                attempt_id: "attempt-1",
+                task_id: &task_id,
+                resolver: &resolver,
+                extra_args: &[],
+                no_sandbox: true,
+                store_lock: None,
+            },
+            Some(&make_coder),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("must not be a symlink"));
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(stored.attempts[0].status, AttemptStatus::Planned);
+        assert_eq!(stored.attempts[0].tasks[0].status, TaskStatus::Planned);
+        assert!(!workspace_path.exists());
+    }
+
+    #[test]
+    fn writer_provider_outage_pauses_exact_task_without_writer_charge() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_root = tmp.path().join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let project_root = project_root.as_path();
+        crate::git::run(project_root, &["init", "-q", "-b", "main"], "init fixture").unwrap();
+        crate::git::run(
+            project_root,
+            &["config", "user.email", "t@t.co"],
+            "configure fixture",
+        )
+        .unwrap();
+        crate::git::run(
+            project_root,
+            &["config", "user.name", "t"],
+            "configure fixture",
+        )
+        .unwrap();
+        fs::write(project_root.join("tracked.txt"), "baseline").unwrap();
+        crate::git::run(project_root, &["add", "."], "add fixture").unwrap();
+        crate::git::run(
+            project_root,
+            &["commit", "-q", "-m", "Add fixture"],
+            "commit fixture",
+        )
+        .unwrap();
+
+        let store = WorkModelStore::new(project_root);
+        let mut item = WorkItem {
+            id: "writer-provider-outage".to_string(),
+            title: "Writer provider outage".to_string(),
+            ..Default::default()
+        };
+        item.add_initial_attempt("writer-provider-attempt").unwrap();
+        item.attempts[0].coder_mapping.write.coder = CoderKind::Claude;
+        let task_id = item.attempts[0].tasks[0].id.clone();
+        store.create_work_item(&item).unwrap();
+        let resolver = ContentResolver::new(Some(project_root));
+        let launches = Arc::new(Mutex::new(0));
+        let launches_for_coder = Arc::clone(&launches);
+        let make_coder = move |_sandbox| {
+            Box::new(ProviderOutageCoder {
+                launches: Arc::clone(&launches_for_coder),
+            }) as Box<dyn crate::coder::Coder>
+        };
+
+        let _error = run_write_task_with_coder(
+            WorkTaskRunConfig {
+                project_root,
+                store: &store,
+                work_item_id: "writer-provider-outage",
+                attempt_id: "writer-provider-attempt",
+                task_id: &task_id,
+                resolver: &resolver,
+                extra_args: &[],
+                no_sandbox: true,
+                store_lock: None,
+            },
+            Some(&make_coder),
+        )
+        .expect_err("provider outage pauses the Writer task");
+
+        assert_eq!(
+            *launches.lock().unwrap(),
+            1,
+            "the typed pause must bypass Fluent's outer generic coder retries"
+        );
+        let attempt = &store
+            .read_work_item("writer-provider-outage")
+            .unwrap()
+            .attempts[0];
+        assert_eq!(attempt.tasks[0].id, task_id);
+        assert_eq!(attempt.tasks[0].status, TaskStatus::NeedsUser);
+        assert_eq!(
+            attempt.pause_kind,
+            Some(crate::work_model::PauseKind::ProviderUnavailable)
+        );
+        assert_eq!(
+            attempt
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            1,
+            "a provider pause must not consume or create another Writer round"
+        );
+    }
+
+    #[test]
+    fn provider_outage_pauses_reviewer_before_generic_retries() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_root = tmp.path();
+        crate::git::run(project_root, &["init", "-q", "-b", "main"], "init fixture").unwrap();
+        crate::git::run(
+            project_root,
+            &["config", "user.email", "t@t.co"],
+            "configure fixture",
+        )
+        .unwrap();
+        crate::git::run(
+            project_root,
+            &["config", "user.name", "t"],
+            "configure fixture",
+        )
+        .unwrap();
+        fs::write(project_root.join("tracked.txt"), "baseline").unwrap();
+        crate::git::run(project_root, &["add", "."], "add fixture").unwrap();
+        crate::git::run(
+            project_root,
+            &["commit", "-q", "-m", "Add fixture"],
+            "commit fixture",
+        )
+        .unwrap();
+        let head =
+            crate::git::run_stdout(project_root, &["rev-parse", "HEAD"], "resolve head").unwrap();
+        let store = WorkModelStore::new(project_root);
+        let mut item = WorkItem {
+            id: "provider-outage-work".to_string(),
+            title: "Provider outage".to_string(),
+            ..Default::default()
+        };
+        item.add_review_only_attempt(
+            "provider-outage-attempt",
+            &["architecture"],
+            "main",
+            head.trim(),
+            true,
+        )
+        .unwrap();
+        item.attempts[0].coder_mapping.review.coder = CoderKind::Claude;
+        let task_id = item.attempts[0].tasks[0].id.clone();
+        store.create_work_item(&item).unwrap();
+        let resolver = ContentResolver::new(Some(project_root));
+        let launches = Arc::new(Mutex::new(0));
+        let launches_for_coder = Arc::clone(&launches);
+        let make_coder = move |_sandbox| {
+            Box::new(ProviderOutageCoder {
+                launches: Arc::clone(&launches_for_coder),
+            }) as Box<dyn crate::coder::Coder>
+        };
+
+        run_review_task_with_coder(
+            WorkTaskRunConfig {
+                project_root,
+                store: &store,
+                work_item_id: "provider-outage-work",
+                attempt_id: "provider-outage-attempt",
+                task_id: &task_id,
+                resolver: &resolver,
+                extra_args: &[],
+                no_sandbox: true,
+                store_lock: None,
+            },
+            Some(&make_coder),
+            &FilesystemReviewerCacheAdmission,
+            &report_reviewer_cache,
+        )
+        .expect_err("provider outage pauses the review task");
+
+        assert_eq!(
+            *launches.lock().unwrap(),
+            1,
+            "typed provider evidence bypasses the generic retry budget"
+        );
+        let stored = store.read_work_item("provider-outage-work").unwrap();
+        assert_eq!(stored.attempts[0].tasks[0].status, TaskStatus::NeedsUser);
+        assert_eq!(
+            stored.attempts[0].pause_kind,
+            Some(crate::work_model::PauseKind::ProviderUnavailable)
+        );
+    }
+
     #[test]
     fn reviewer_route_composes_pump_and_confinement_restore_failure() {
         // B7: the FULL Reviewer route — real reservation, post-reservation setup, the
@@ -6065,7 +14921,20 @@ mod tests {
         git(&["config", "user.email", "t@t.co"]);
         git(&["config", "user.name", "t"]);
         fs::write(project_root.join("tracked.txt"), b"original").unwrap();
-        git(&["add", "tracked.txt"]);
+        fs::write(
+            project_root.join("Cargo.toml"),
+            "[package]\nname = \"terminal-cache\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        fs::create_dir_all(project_root.join("target")).unwrap();
+        fs::write(project_root.join("target/output"), "candidate cache").unwrap();
+        fs::create_dir_all(project_root.join(".fluent")).unwrap();
+        fs::write(
+            project_root.join(".fluent/config.yaml"),
+            "reviewer-cache:\n  max-project-gib: 1\n  min-free-gib: 0\n",
+        )
+        .unwrap();
+        git(&["add", "."]);
         git(&["commit", "-q", "-m", "baseline"]);
         let head = crate::git::run_stdout(project_root, &["rev-parse", "HEAD"], "head").unwrap();
 
@@ -6105,6 +14974,8 @@ mod tests {
                 store_lock: None,
             },
             Some(&make_coder),
+            &FilesystemReviewerCacheAdmission,
+            &report_reviewer_cache,
         )
         .expect_err("a composite coder+confinement-restore failure must return an error");
 
@@ -6147,6 +15018,25 @@ mod tests {
             TaskStatus::NeedsUser,
             "the Review Task is durably terminalized through the real route, never left Executing"
         );
+        let artifact_dir = project_root.join(crate::work_model::work_artifact_path(
+            "work-1",
+            "attempt-1",
+            &review_task_id,
+        ));
+        assert!(
+            !artifact_dir.join("target").exists(),
+            "NeedsUser Reviewer settlement must reclaim the admitted canonical cache"
+        );
+        assert!(
+            project_root
+                .join(crate::work_model::work_artifact_path(
+                    "work-1",
+                    "attempt-1",
+                    "needs-user-attempt-1-review-architecture.md",
+                ))
+                .is_file(),
+            "terminal cleanup must retain the NeedsUser handoff evidence"
+        );
         assert_eq!(
             after.attempts[0].status,
             AttemptStatus::NeedsUser,
@@ -6169,6 +15059,244 @@ mod tests {
             b"coder mutation",
             "the failed restore left the coder's tracked mutation, not the baseline"
         );
+    }
+
+    struct ReviewCompletionFixture {
+        _tmp: tempfile::TempDir,
+        project_root: PathBuf,
+        store: WorkModelStore,
+        candidate_commit: String,
+        artifact_dir: PathBuf,
+    }
+
+    impl ReviewCompletionFixture {
+        fn new() -> Self {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let project_root = tmp.path().join("project");
+            fs::create_dir_all(project_root.join("src")).unwrap();
+            git::run(
+                &project_root,
+                &["init", "-q", "-b", "main"],
+                "initialize fixture",
+            )
+            .unwrap();
+            fs::write(project_root.join("src/lib.rs"), "pub fn reviewed() {}\n").unwrap();
+            git::run(&project_root, &["add", "src/lib.rs"], "stage fixture").unwrap();
+            git::run(
+                &project_root,
+                &[
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "fixture",
+                ],
+                "commit fixture",
+            )
+            .unwrap();
+            let candidate_commit =
+                git::run_stdout(&project_root, &["rev-parse", "HEAD"], "read HEAD").unwrap();
+
+            let artifact_area =
+                work_artifact_path("work-1", "attempt-1", "attempt-1-review-architecture");
+            let artifact_dir = project_root.join(&artifact_area);
+            fs::create_dir_all(&artifact_dir).unwrap();
+            let mut item = WorkItem {
+                id: "work-1".to_string(),
+                title: "Review inspection fixture".to_string(),
+                ..Default::default()
+            };
+            item.add_initial_attempt("attempt-1").unwrap();
+            let task = &mut item.attempts[0].tasks[0];
+            task.id = "attempt-1-review-architecture".to_string();
+            task.kind = TaskKind::Review;
+            task.role = "architecture".to_string();
+            task.status = TaskStatus::Executing;
+            task.workspace_access.writes.clear();
+            task.workspace_access.reads = vec![WorkspaceRef {
+                id: "candidate".to_string(),
+                path: ".".to_string(),
+            }];
+            task.artifact_area = Some(crate::work_model::TaskArtifactArea {
+                path: artifact_area,
+            });
+            task.review_context = Some(crate::work_model::ReviewContext {
+                candidate_workspace_id: "candidate".to_string(),
+                candidate_workspace_path: ".".to_string(),
+                source_branch: "main".to_string(),
+                candidate_commit: candidate_commit.clone(),
+                base_commit: None,
+            });
+            task.output = None;
+            item.attempts[0].status = AttemptStatus::Reviewing;
+            let store = WorkModelStore::new(&project_root);
+            store.create_work_item(&item).unwrap();
+
+            Self {
+                _tmp: tmp,
+                project_root,
+                store,
+                candidate_commit,
+                artifact_dir,
+            }
+        }
+
+        fn config<'a>(&'a self, resolver: &'a ContentResolver) -> WorkTaskRunConfig<'a> {
+            WorkTaskRunConfig {
+                project_root: &self.project_root,
+                store: &self.store,
+                work_item_id: "work-1",
+                attempt_id: "attempt-1",
+                task_id: "attempt-1-review-architecture",
+                resolver,
+                extra_args: &[],
+                no_sandbox: true,
+                store_lock: None,
+            }
+        }
+
+        fn write_valid_passing_artifacts(&self) {
+            fs::write(
+                self.artifact_dir.join("review.md"),
+                "Verdict: pass\n\n## Findings\n",
+            )
+            .unwrap();
+            fs::write(
+                self.artifact_dir
+                    .join(crate::review_inspection::REVIEW_INSPECTION_FILE),
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "schema-version": 1,
+                    "candidate-commit": self.candidate_commit,
+                    "role": "architecture",
+                    "inspections": [{
+                        "path": "src/lib.rs",
+                        "summary": "Checked the public module boundary."
+                    }]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            fs::write(
+                self.artifact_dir.join("transcript.jsonl"),
+                format!(
+                    "{{\"type\":\"item.completed\",\"item\":{{\"type\":\"command_execution\",\"status\":\"completed\",\"exit_code\":0,\"command\":\"sed -n 1,40p {}\"}}}}\n",
+                    self.project_root.join("src/lib.rs").display()
+                ),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn passing_review_completes_with_candidate_bound_inspection_artifact() {
+        let fixture = ReviewCompletionFixture::new();
+        fixture.write_valid_passing_artifacts();
+        let review_path = fixture.artifact_dir.join("review.md");
+        let inspection_path = fixture
+            .artifact_dir
+            .join(crate::review_inspection::REVIEW_INSPECTION_FILE);
+
+        let resolver = ContentResolver::new(Some(&fixture.project_root));
+        finalize_review_outcome(
+            &fixture.config(&resolver),
+            Ok(()),
+            Ok(()),
+            &review_path,
+            &inspection_path,
+            &fixture.artifact_dir.join("transcript.jsonl"),
+            &fixture.project_root,
+            &fixture.candidate_commit,
+            "architecture",
+            &|_, _| {},
+        )
+        .unwrap();
+
+        let stored = fixture.store.read_work_item("work-1").unwrap();
+        assert_eq!(stored.attempts[0].tasks[0].status, TaskStatus::Complete);
+        let paths: Vec<_> = stored.attempts[0]
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.path.as_str())
+            .collect();
+        assert!(paths.iter().any(|path| path.ends_with("/review.md")));
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.ends_with("/review-inspection.json"))
+        );
+    }
+
+    #[test]
+    fn passing_review_without_successful_inspection_fails_closed() {
+        let fixture = ReviewCompletionFixture::new();
+        fixture.write_valid_passing_artifacts();
+        fs::write(
+            fixture.artifact_dir.join("transcript.jsonl"),
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\"}}\n",
+        )
+        .unwrap();
+        let review_path = fixture.artifact_dir.join("review.md");
+        let inspection_path = fixture
+            .artifact_dir
+            .join(crate::review_inspection::REVIEW_INSPECTION_FILE);
+
+        let resolver = ContentResolver::new(Some(&fixture.project_root));
+        let error = finalize_review_outcome(
+            &fixture.config(&resolver),
+            Ok(()),
+            Ok(()),
+            &review_path,
+            &inspection_path,
+            &fixture.artifact_dir.join("transcript.jsonl"),
+            &fixture.project_root,
+            &fixture.candidate_commit,
+            "architecture",
+            &|_, _| {},
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("no successful provider tool result")
+        );
+        let stored = fixture.store.read_work_item("work-1").unwrap();
+        assert_eq!(stored.attempts[0].tasks[0].status, TaskStatus::Failed);
+    }
+
+    #[test]
+    fn nonpassing_review_does_not_require_inspection_artifact() {
+        for verdict in ["fail", "uncertain"] {
+            let fixture = ReviewCompletionFixture::new();
+            let review_path = fixture.artifact_dir.join("review.md");
+            fs::write(&review_path, format!("Verdict: {verdict}\n\n## Findings\n")).unwrap();
+            let inspection_path = fixture
+                .artifact_dir
+                .join(crate::review_inspection::REVIEW_INSPECTION_FILE);
+
+            let resolver = ContentResolver::new(Some(&fixture.project_root));
+            finalize_review_outcome(
+                &fixture.config(&resolver),
+                Ok(()),
+                Ok(()),
+                &review_path,
+                &inspection_path,
+                &fixture.artifact_dir.join("transcript.jsonl"),
+                &fixture.project_root,
+                &fixture.candidate_commit,
+                "architecture",
+                &|_, _| {},
+            )
+            .unwrap();
+
+            let stored = fixture.store.read_work_item("work-1").unwrap();
+            assert_eq!(stored.attempts[0].tasks[0].status, TaskStatus::Complete);
+            assert_eq!(stored.attempts[0].artifacts.len(), 1);
+            assert!(stored.attempts[0].artifacts[0].path.ends_with("/review.md"));
+        }
     }
 
     #[test]
@@ -6206,6 +15334,9 @@ mod tests {
                 path: ".fluent/work/artifacts/work-1/attempt-1/attempt-1-write-1".to_string(),
             }),
             review_context: None,
+            writer_correction_assignment: None,
+            verification_context: None,
+            evidence_review_context: None,
             input_artifacts: Vec::new(),
             depends_on: None,
             output: None,
@@ -6221,15 +15352,529 @@ mod tests {
         let advanced = head_commit(&workspace).unwrap();
         assert_ne!(first, advanced, "HEAD must have advanced");
 
+        // Setup may stop after binding the host baseline but before creating
+        // the artifact sidecar. Restore from that binding, even if HEAD moved.
+        let sidecar = project_root
+            .join(task.artifact_area.as_ref().unwrap().path.as_str())
+            .join("write-baseline-commit");
+        fs::remove_file(&sidecar).unwrap();
+
         // Resume resolves the SAME persisted baseline, not the advanced HEAD.
         let resumed = resolve_or_persist_write_baseline(project_root, &task, &workspace).unwrap();
         assert_eq!(
             resumed, first,
             "resume must reuse the persisted pre-write baseline, not recompute from HEAD"
         );
+        assert_eq!(fs::read_to_string(&sidecar).unwrap(), first);
         assert!(
             commits_ahead(&workspace, &resumed).unwrap() >= 1,
             "the pre-failure commit must count as produced work on resume"
+        );
+
+        // An artifact alone cannot establish a trusted baseline on resume.
+        let store = WorkModelStore::new(project_root);
+        let host_path = host_write_baseline_path(
+            &store,
+            &task.work_item_id,
+            task.attempt_id.as_deref().unwrap(),
+            &task.id,
+        )
+        .unwrap();
+        fs::remove_file(host_path).unwrap();
+        resolve_or_persist_write_baseline(project_root, &task, &workspace)
+            .expect_err("an unbound artifact baseline must fail closed");
+    }
+
+    #[test]
+    fn tester_harness_repair_scope_accepts_only_config_and_extractor() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace = tmp.path();
+        let git = |args: &[&str]| {
+            crate::git::run(workspace, args, "prepare Tester repair scope fixture").unwrap();
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t.co"]);
+        git(&["config", "user.name", "t"]);
+        fs::create_dir_all(workspace.join(".fluent")).unwrap();
+        fs::write(workspace.join(".fluent/tester.yaml"), "commands: []\n").unwrap();
+        fs::write(
+            workspace.join(".fluent/extract-tester-results"),
+            "#!/bin/sh\necho '[]'\n",
+        )
+        .unwrap();
+        fs::write(workspace.join("product.txt"), "original\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "baseline"]);
+        let baseline = head_commit(workspace).unwrap();
+
+        let error = ensure_tester_harness_repair_scope(workspace, &baseline).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("did not change tracked Tester files")
+        );
+
+        fs::write(
+            workspace.join(".fluent/extract-tester-results"),
+            "#!/bin/sh\necho deduplicated\n",
+        )
+        .unwrap();
+        git(&["add", ".fluent/extract-tester-results"]);
+        git(&["commit", "-q", "-m", "repair extractor"]);
+        ensure_tester_harness_repair_scope(workspace, &baseline).unwrap();
+
+        fs::write(workspace.join("product.txt"), "changed\n").unwrap();
+        git(&["add", "product.txt"]);
+        git(&["commit", "-q", "-m", "change product"]);
+        let error = ensure_tester_harness_repair_scope(workspace, &baseline).unwrap_err();
+        assert!(error.to_string().contains("product.txt"));
+
+        git(&["reset", "--hard", &baseline]);
+        git(&["rm", "-q", ".fluent/extract-tester-results"]);
+        git(&["commit", "-q", "-m", "remove extractor"]);
+        let error = ensure_tester_harness_repair_scope(workspace, &baseline).unwrap_err();
+        assert!(error.to_string().contains(
+            "removed or replaced required regular Tester file .fluent/extract-tester-results"
+        ));
+    }
+
+    #[test]
+    fn tester_harness_repair_start_restores_rejected_descendant_for_retry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace = tmp.path();
+        let git = |args: &[&str]| {
+            crate::git::run(workspace, args, "prepare Tester repair start fixture").unwrap();
+        };
+        git(&["init", "-q"]);
+        fs::write(workspace.join(".git/info/exclude"), ".fluent/work/\n").unwrap();
+        git(&["config", "user.email", "t@t.co"]);
+        git(&["config", "user.name", "t"]);
+        fs::create_dir_all(workspace.join(".fluent")).unwrap();
+        fs::write(workspace.join(".fluent/tester.yaml"), "commands: []\n").unwrap();
+        fs::write(
+            workspace.join(".fluent/extract-tester-results"),
+            "#!/bin/sh\necho '[]'\n",
+        )
+        .unwrap();
+        fs::write(workspace.join("product.txt"), "original\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "baseline"]);
+        let baseline = head_commit(workspace).unwrap();
+        let artifact_area = ".fluent/work/artifacts/work-1/attempt-1/attempt-1-write-2";
+        let task = crate::work_model::Task {
+            id: "attempt-1-write-2".to_string(),
+            kind: crate::work_model::TaskKind::Write,
+            status: TaskStatus::Planned,
+            role: crate::work_model::TESTER_HARNESS_REPAIR_ROLE.to_string(),
+            instructions: Some("Repair the Tester harness.".to_string()),
+            work_item_id: "work-1".to_string(),
+            attempt_id: Some("attempt-1".to_string()),
+            workspace_access: crate::work_model::WorkspaceAccess {
+                reads: Vec::new(),
+                writes: vec![crate::work_model::WorkspaceRef {
+                    id: "candidate".to_string(),
+                    path: ".".to_string(),
+                }],
+            },
+            artifact_area: Some(crate::work_model::TaskArtifactArea {
+                path: artifact_area.to_string(),
+            }),
+            review_context: Some(crate::work_model::ReviewContext {
+                candidate_workspace_id: "candidate".to_string(),
+                candidate_workspace_path: ".".to_string(),
+                source_branch: "main".to_string(),
+                candidate_commit: baseline.clone(),
+                base_commit: None,
+            }),
+            writer_correction_assignment: None,
+            verification_context: None,
+            evidence_review_context: None,
+            input_artifacts: Vec::new(),
+            depends_on: None,
+            output: None,
+            created_at: None,
+            started_at: None,
+            completed_at: None,
+        };
+
+        assert_eq!(
+            inspect_tester_harness_repair_start(workspace, &task, workspace).unwrap(),
+            TesterHarnessRepairStart::ApprovedCandidate
+        );
+
+        fs::write(
+            workspace.join(".fluent/extract-tester-results"),
+            "#!/bin/sh\necho repaired\n",
+        )
+        .unwrap();
+        git(&["add", ".fluent/extract-tester-results"]);
+        git(&["commit", "-q", "-m", "repair extractor"]);
+        let repair_commit = head_commit(workspace).unwrap();
+        let error = inspect_tester_harness_repair_start(workspace, &task, workspace).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("must start at approved candidate")
+        );
+
+        let baseline_path = workspace.join(artifact_area).join("write-baseline-commit");
+        fs::create_dir_all(baseline_path.parent().unwrap()).unwrap();
+        fs::write(&baseline_path, &baseline).unwrap();
+        assert_eq!(
+            inspect_tester_harness_repair_start(workspace, &task, workspace).unwrap(),
+            TesterHarnessRepairStart::ScopedDescendant
+        );
+
+        fs::write(workspace.join("product.txt"), "changed\n").unwrap();
+        git(&["add", "product.txt"]);
+        git(&["commit", "-q", "-m", "change product"]);
+        let rejected = inspect_tester_harness_repair_start(workspace, &task, workspace).unwrap();
+        assert!(matches!(
+            &rejected,
+            TesterHarnessRepairStart::RejectedDescendant { reason, .. }
+                if reason.contains("product.txt")
+        ));
+        let rejected_commit = head_commit(workspace).unwrap();
+        prepare_tester_harness_repair_start(workspace, &task, workspace).unwrap();
+        assert_eq!(head_commit(workspace).unwrap(), baseline);
+        assert!(
+            workspace
+                .join(artifact_area)
+                .join(format!("rejected-repair-{}.json", &rejected_commit[..12]))
+                .is_file()
+        );
+
+        git(&["reset", "--hard", &repair_commit]);
+        fs::write(workspace.join("product.txt"), "dirty\n").unwrap();
+        let error = inspect_tester_harness_repair_start(workspace, &task, workspace).unwrap_err();
+        assert!(error.to_string().contains("uncommitted changes"));
+
+        git(&["reset", "--hard", &baseline]);
+        let tree = crate::git::run_stdout(
+            workspace,
+            &["rev-parse", &format!("{baseline}^{{tree}}")],
+            "resolve unrelated repair fixture tree",
+        )
+        .unwrap();
+        let unrelated = crate::git::run_stdout(
+            workspace,
+            &["commit-tree", &tree, "-m", "unrelated"],
+            "create unrelated repair fixture commit",
+        )
+        .unwrap();
+        git(&["reset", "--hard", &unrelated]);
+        let error = inspect_tester_harness_repair_start(workspace, &task, workspace).unwrap_err();
+        assert!(error.to_string().contains("is not descended from approved"));
+        assert_eq!(head_commit(workspace).unwrap(), unrelated);
+    }
+
+    struct TesterHarnessRepairCommitCoder {
+        runs: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl crate::coder::Coder for TesterHarnessRepairCommitCoder {
+        fn run(
+            &self,
+            _prompt: &str,
+            _system_prompt: &str,
+            _working_dir: &Path,
+            _extra_args: &[String],
+            _extra_env: &[(String, String)],
+            _transcript_file: Option<&Path>,
+        ) -> Result<i32> {
+            unreachable!("the Writer route launches through the session boundary")
+        }
+
+        fn run_captured_reported_session(
+            &self,
+            _prompt: &str,
+            _system_prompt: &str,
+            working_dir: &Path,
+            _extra_args: &[String],
+            _extra_env: &[(String, String)],
+            _capture: Option<&crate::coder::TranscriptCapture<'_>>,
+            _session: crate::coder::CoderSession<'_>,
+        ) -> crate::coder::CoderRunCompletion {
+            let terminal = (|| {
+                let run = self.runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if run == 0 {
+                    fs::write(working_dir.join("product.txt"), "unauthorized\n")?;
+                } else if fs::read_to_string(working_dir.join("product.txt"))? != "unchanged\n" {
+                    bail!("retry did not start from the restored approved candidate");
+                }
+                fs::write(
+                    working_dir.join(".fluent/extract-tester-results"),
+                    "#!/bin/sh\necho '[]' | awk '!seen[$0]++'\n",
+                )?;
+                let mut paths = vec![".fluent/extract-tester-results"];
+                if run == 0 {
+                    paths.push("product.txt");
+                }
+                let mut add = vec!["add"];
+                add.extend(paths);
+                crate::git::run(working_dir, &add, "stage Tester-harness repair")?;
+                crate::git::run(
+                    working_dir,
+                    &["commit", "-q", "-m", "Repair Tester extractor"],
+                    "commit Tester-harness repair",
+                )?;
+                Ok(0)
+            })();
+            crate::coder::CoderRunCompletion {
+                terminal,
+                report: Default::default(),
+            }
+        }
+
+        fn run_interactive(
+            &self,
+            _system_prompt: &str,
+            _working_dir: &Path,
+            _extra_args: &[String],
+            _extra_env: &[(String, String)],
+        ) -> Result<i32> {
+            unreachable!("the Writer route never runs interactively")
+        }
+    }
+
+    #[test]
+    fn tester_harness_repair_writer_restores_rejection_and_retries_through_real_executor() {
+        use crate::work_model::{
+            AttemptReviewState, ReviewContext, Task, TaskArtifactArea, WorkspaceAccess,
+            WorkspaceRef, work_artifact_path,
+        };
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project = tmp.path().join("main");
+        fs::create_dir_all(project.join(".fluent/expertise")).unwrap();
+        fs::write(
+            project.join(".fluent/expertise/INDEX.md"),
+            "# Project Expertise Index\n",
+        )
+        .unwrap();
+        fs::write(project.join(".fluent/tester.yaml"), "commands: []\n").unwrap();
+        fs::write(
+            project.join(".fluent/extract-tester-results"),
+            "#!/bin/sh\necho '[]'\n",
+        )
+        .unwrap();
+        fs::write(project.join("product.txt"), "unchanged\n").unwrap();
+        for args in [
+            &["init", "-q", "-b", "main"] as &[&str],
+            &["config", "user.name", "Mrinal Wadhwa"],
+            &["config", "user.email", "mrinal.wadhwa@gmail.com"],
+            &["add", "."],
+            &["commit", "-q", "-m", "Create repair fixture"],
+        ] {
+            crate::git::run(&project, args, "prepare Tester repair route fixture").unwrap();
+        }
+        let workspace_path =
+            crate::work_model::initial_candidate_workspace_path("work-1", "attempt-1");
+        let workspace = project
+            .parent()
+            .unwrap()
+            .join(Path::new(&workspace_path).file_name().unwrap());
+        crate::git::run(
+            &project,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "work/tester-repair",
+                workspace.to_str().unwrap(),
+            ],
+            "create Tester repair candidate",
+        )
+        .unwrap();
+        let candidate = head_commit(&workspace).unwrap();
+
+        let mut item = WorkItem::planned("work-1", "Repair Tester harness");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let attempt = &mut item.attempts[0];
+        attempt.coder_mapping.write.coder = CoderKind::Codex;
+        let writer = &mut attempt.tasks[0];
+        writer.status = TaskStatus::Complete;
+        writer.workspace_access = WorkspaceAccess {
+            reads: vec![WorkspaceRef {
+                id: "target".to_string(),
+                path: ".".to_string(),
+            }],
+            writes: vec![WorkspaceRef {
+                id: "candidate".to_string(),
+                path: workspace_path.clone(),
+            }],
+        };
+        writer.output = Some(TaskOutput {
+            workspace_id: "candidate".to_string(),
+            workspace_path: workspace_path.clone(),
+            source_branch: "main".to_string(),
+            base_commit: Some(candidate.clone()),
+            commit: candidate.clone(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        let tester_id = "attempt-1-tester";
+        let tester_area = work_artifact_path("work-1", "attempt-1", tester_id);
+        attempt.tasks.push(Task {
+            id: tester_id.to_string(),
+            kind: TaskKind::Tester,
+            status: TaskStatus::NeedsUser,
+            role: "tester".to_string(),
+            instructions: None,
+            work_item_id: "work-1".to_string(),
+            attempt_id: Some("attempt-1".to_string()),
+            workspace_access: WorkspaceAccess::read_only(vec![WorkspaceRef {
+                id: "candidate".to_string(),
+                path: workspace_path,
+            }]),
+            artifact_area: Some(TaskArtifactArea {
+                path: tester_area.clone(),
+            }),
+            review_context: Some(ReviewContext {
+                candidate_workspace_id: "candidate".to_string(),
+                candidate_workspace_path: crate::work_model::initial_candidate_workspace_path(
+                    "work-1",
+                    "attempt-1",
+                ),
+                source_branch: "main".to_string(),
+                candidate_commit: candidate.clone(),
+                base_commit: None,
+            }),
+            writer_correction_assignment: None,
+            verification_context: None,
+            evidence_review_context: None,
+            input_artifacts: Vec::new(),
+            depends_on: None,
+            output: None,
+            created_at: Some(crate::work_model::now_iso8601()),
+            started_at: Some(crate::work_model::now_iso8601()),
+            completed_at: Some(crate::work_model::now_iso8601()),
+        });
+        attempt.status = AttemptStatus::NeedsUser;
+        attempt.pause_kind = Some(crate::work_model::PauseKind::TesterHarness);
+        attempt.review_state = Some(AttemptReviewState::Passed);
+        attempt.completed_at = Some(crate::work_model::now_iso8601());
+        let store = WorkModelStore::new(&project);
+        store.create_work_item(&mut item).unwrap();
+        fs::create_dir_all(project.join(&tester_area)).unwrap();
+        fs::write(project.join(&tester_area).join("commands.json"), "[]\n").unwrap();
+        fs::write(
+            project.join(&tester_area).join("tester-results.json"),
+            r#"{"candidate_commit":null,"commands":[],"tests":[],"summary":{"total":0,"pass":0,"fail":0,"skipped":0},"error":{"kind":"duplicate_test_ids","message":"duplicate","details":""}}"#,
+        )
+        .unwrap();
+
+        let approved = crate::tester_harness_recovery::request(
+            &project,
+            &store,
+            "work-1",
+            "attempt-1",
+            "Deduplicate repeated nextest failures while preserving the authoritative failure.",
+        )
+        .unwrap();
+        store
+            .mutate_work_item("work-1", |item| {
+                crate::work_model::reopen_attempt(&mut item.attempts[0]);
+                Ok(())
+            })
+            .unwrap();
+        let resolver = ContentResolver::new(Some(&project));
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let make_coder = |_sandbox| {
+            Box::new(TesterHarnessRepairCommitCoder { runs: runs.clone() })
+                as Box<dyn crate::coder::Coder>
+        };
+        let first_error = run_write_task_with_coder(
+            WorkTaskRunConfig {
+                project_root: &project,
+                store: &store,
+                work_item_id: "work-1",
+                attempt_id: "attempt-1",
+                task_id: &approved.task_id,
+                resolver: &resolver,
+                extra_args: &[],
+                no_sandbox: true,
+                store_lock: None,
+            },
+            Some(&make_coder),
+        )
+        .unwrap_err();
+        assert!(first_error.to_string().contains("product.txt"));
+        assert_eq!(head_commit(&workspace).unwrap(), candidate);
+        assert!(
+            crate::git::run_stdout(
+                &workspace,
+                &["status", "--porcelain", "--untracked-files=all"],
+                "verify rejected repair restoration",
+            )
+            .unwrap()
+            .is_empty()
+        );
+        let repair_area = store.read_work_item("work-1").unwrap().attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.id == approved.task_id)
+            .unwrap()
+            .artifact_area
+            .as_ref()
+            .unwrap()
+            .path
+            .clone();
+        assert!(
+            fs::read_dir(project.join(repair_area))
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("rejected-repair-"))
+        );
+        store
+            .mutate_work_item("work-1", |item| {
+                crate::work_model::reopen_attempt(&mut item.attempts[0]);
+                Ok(())
+            })
+            .unwrap();
+        let result = run_write_task_with_coder(
+            WorkTaskRunConfig {
+                project_root: &project,
+                store: &store,
+                work_item_id: "work-1",
+                attempt_id: "attempt-1",
+                task_id: &approved.task_id,
+                resolver: &resolver,
+                extra_args: &[],
+                no_sandbox: true,
+                store_lock: None,
+            },
+            Some(&make_coder),
+        )
+        .unwrap();
+
+        assert_ne!(result.output, candidate);
+        let stored = store.read_work_item("work-1").unwrap();
+        let attempt = &stored.attempts[0];
+        assert_eq!(attempt.tasks[1].status, TaskStatus::Failed);
+        let repair = attempt
+            .tasks
+            .iter()
+            .find(|task| task.id == approved.task_id)
+            .unwrap();
+        assert_eq!(repair.status, TaskStatus::Complete);
+        assert_eq!(repair.output.as_ref().unwrap().commit, result.output);
+        assert_eq!(
+            repair.output.as_ref().unwrap().base_commit.as_deref(),
+            Some(candidate.as_str())
+        );
+        assert!(
+            crate::git::run_stdout(
+                &workspace,
+                &["status", "--porcelain", "--untracked-files=all"],
+                "verify repaired candidate cleanliness",
+            )
+            .unwrap()
+            .is_empty()
         );
     }
 
@@ -6267,6 +15912,9 @@ mod tests {
                 path: area.to_string(),
             }),
             review_context: None,
+            writer_correction_assignment: None,
+            verification_context: None,
+            evidence_review_context: None,
             input_artifacts: Vec::new(),
             depends_on: None,
             output: None,
@@ -6326,6 +15974,9 @@ mod tests {
                 path: area.to_string(),
             }),
             review_context: None,
+            writer_correction_assignment: None,
+            verification_context: None,
+            evidence_review_context: None,
             input_artifacts: Vec::new(),
             depends_on: None,
             output: None,
@@ -6351,6 +16002,276 @@ mod tests {
         review_item_with_role("tests")
     }
 
+    fn review_item_with_final_tester() -> WorkItem {
+        let mut item = review_item();
+        item.add_final_tester_task("attempt-1").unwrap();
+        for task in &mut item.attempts[0].tasks {
+            if let Some(output) = task.output.as_mut() {
+                output.workspace_path = "candidate".to_string();
+            }
+            if let Some(context) = task.review_context.as_mut() {
+                context.candidate_workspace_path = "candidate".to_string();
+            }
+            for workspace in task
+                .workspace_access
+                .reads
+                .iter_mut()
+                .chain(task.workspace_access.writes.iter_mut())
+            {
+                if workspace.id == "candidate" {
+                    workspace.path = "candidate".to_string();
+                }
+            }
+        }
+        item
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_command_recheck_executes_only_the_bound_subset() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_root = tmp.path().join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let store = WorkModelStore::new(&project_root);
+        let mut item = review_item_with_final_tester();
+        let source = item.attempts[0]
+            .tasks
+            .iter_mut()
+            .find(|task| task.kind == TaskKind::Tester)
+            .unwrap();
+        crate::work_model::set_task_terminal(source, TaskStatus::Complete);
+        let source_id = source.id.clone();
+        let source_results = ArtifactRef {
+            producer_id: source_id.clone(),
+            path: format!(
+                "{}/tester-results.json",
+                source.artifact_area.as_ref().unwrap().path
+            ),
+        };
+        let source_dir = project_root.join(&source.artifact_area.as_ref().unwrap().path);
+        fs::create_dir_all(&source_dir).unwrap();
+
+        let first = tmp.path().join("first-ran");
+        let second = tmp.path().join("second-ran");
+        let third = tmp.path().join("third-ran");
+        let commands = [
+            format!("printf first > {}", first.display()),
+            format!("printf second > {}; exit 7", second.display()),
+            format!("printf third > {}", third.display()),
+        ];
+        let mut source_json = serde_json::json!({
+            "candidate_commit": "abc123",
+            "commands": [
+                {"command": commands[0], "test_harness": "shell", "exit_code": 0, "duration_ms": 1, "stdout_log": "commands/0-stdout.log", "stderr_log": "commands/0-stderr.log"},
+                {"command": commands[1], "test_harness": "shell", "exit_code": 7, "duration_ms": 1, "stdout_log": "commands/1-stdout.log", "stderr_log": "commands/1-stderr.log"},
+                {"command": commands[2], "test_harness": "shell", "exit_code": 0, "duration_ms": 1, "stdout_log": "commands/2-stdout.log", "stderr_log": "commands/2-stderr.log"}
+            ],
+            "tests": [],
+            "summary": {"total": 0, "pass": 0, "fail": 0, "skipped": 0},
+            "error": null
+        });
+        fs::write(
+            source_dir.join("tester-results.json"),
+            serde_json::to_vec_pretty(&source_json).unwrap(),
+        )
+        .unwrap();
+        let recheck_id = item
+            .add_failed_command_recheck_task("attempt-1", source_results)
+            .unwrap();
+        let recheck = item.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.id == recheck_id)
+            .unwrap();
+        let candidate = resolve_workspace_path(
+            &project_root,
+            &recheck
+                .review_context
+                .as_ref()
+                .unwrap()
+                .candidate_workspace_path,
+        );
+        fs::create_dir_all(candidate.join(".fluent")).unwrap();
+        fs::write(
+            candidate.join(".fluent/tester.yaml"),
+            format!(
+                "commands:\n  - command: '{}'\n    test_harness: shell\n  - command: '{}'\n    test_harness: shell\n  - command: '{}'\n    test_harness: shell\n",
+                commands[0], commands[1], commands[2]
+            ),
+        )
+        .unwrap();
+        let extractor = candidate.join(".fluent/extract-tester-results");
+        fs::write(&extractor, "#!/bin/sh\necho '[]'\n").unwrap();
+        fs::set_permissions(&extractor, fs::Permissions::from_mode(0o755)).unwrap();
+        commit_tester_candidate_fixture(&project_root, &mut item);
+        let candidate_commit = head_commit(&candidate).unwrap();
+        source_json["candidate_commit"] = serde_json::json!(&candidate_commit);
+        fs::write(
+            source_dir.join("tester-results.json"),
+            serde_json::to_vec_pretty(&source_json).unwrap(),
+        )
+        .unwrap();
+        store.create_work_item(&item).unwrap();
+
+        let resolver = ContentResolver::new(Some(&project_root));
+        run_task(WorkTaskRunConfig {
+            project_root: &project_root,
+            store: &store,
+            work_item_id: "work-1",
+            attempt_id: "attempt-1",
+            task_id: &recheck_id,
+            resolver: &resolver,
+            extra_args: &[],
+            no_sandbox: true,
+            store_lock: None,
+        })
+        .unwrap();
+
+        assert!(!first.exists());
+        assert_eq!(fs::read_to_string(&second).unwrap(), "second");
+        assert!(!third.exists());
+        let artifact = project_root.join(work_artifact_path("work-1", "attempt-1", &recheck_id));
+        let results: crate::tester::TesterResults =
+            serde_json::from_slice(&fs::read(artifact.join("tester-results.json")).unwrap())
+                .unwrap();
+        assert_eq!(results.commands.len(), 1);
+        assert_eq!(results.commands[0].command, commands[1]);
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &fs::read(artifact.join("failed-command-recheck.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["failed_command_indexes"], serde_json::json!([1]));
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .find(|task| task.id == recheck_id)
+                .unwrap()
+                .status,
+            TaskStatus::Complete
+        );
+
+        // A failed-command recheck can itself be retried after a host-mode
+        // recovery.  Keep the first recheck as the immutable source rather
+        // than requiring every retry to point back to the original Tester.
+        let first_recheck = stored.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.id == recheck_id)
+            .unwrap()
+            .clone();
+        let chained_source = ArtifactRef {
+            producer_id: first_recheck.id.clone(),
+            path: format!(
+                "{}/tester-results.json",
+                first_recheck.artifact_area.as_ref().unwrap().path
+            ),
+        };
+        let mut chained_id = String::new();
+        store
+            .mutate_work_item("work-1", |item| {
+                chained_id = item.add_failed_command_recheck_task("attempt-1", chained_source)?;
+                Ok(())
+            })
+            .unwrap();
+        run_task(WorkTaskRunConfig {
+            project_root: &project_root,
+            store: &store,
+            work_item_id: "work-1",
+            attempt_id: "attempt-1",
+            task_id: &chained_id,
+            resolver: &resolver,
+            extra_args: &[],
+            no_sandbox: true,
+            store_lock: None,
+        })
+        .unwrap();
+        let chained = store.read_work_item("work-1").unwrap().attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.id == chained_id)
+            .unwrap()
+            .clone();
+        assert_eq!(chained.status, TaskStatus::Complete);
+        let chained_results = project_root
+            .join(chained.artifact_area.unwrap().path)
+            .join("tester-results.json");
+        let chained_results: crate::tester::TesterResults =
+            serde_json::from_slice(&fs::read(chained_results).unwrap()).unwrap();
+        assert_eq!(
+            chained_results.candidate_commit.as_deref(),
+            Some(candidate_commit.as_str())
+        );
+        assert_eq!(chained_results.commands.len(), 1);
+    }
+
+    #[test]
+    fn tester_task_uses_attempt_scoped_dependency_cache() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_root = tmp.path().join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let store = WorkModelStore::new(&project_root);
+        let mut item = review_item_with_final_tester();
+        let tester = item.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Tester)
+            .unwrap();
+        let tester_id = tester.id.clone();
+        let workspace = project_root.join(
+            &tester
+                .review_context
+                .as_ref()
+                .unwrap()
+                .candidate_workspace_path,
+        );
+        fs::create_dir_all(workspace.join(".fluent")).unwrap();
+        fs::write(
+            workspace.join(".fluent/tester.yaml"),
+            "commands:\n  - command: 'test -d \"$CARGO_HOME\" && touch \"$CARGO_HOME/task-marker\"'\n    test_harness: shell-harness\n",
+        )
+        .unwrap();
+        let extractor = workspace.join(".fluent/extract-tester-results");
+        fs::write(&extractor, "#!/bin/sh\necho '[]'\n").unwrap();
+        fs::set_permissions(&extractor, fs::Permissions::from_mode(0o755)).unwrap();
+        commit_tester_candidate_fixture(&project_root, &mut item);
+        store.create_work_item(&item).unwrap();
+
+        let resolver = ContentResolver::new(Some(&project_root));
+        run_task(WorkTaskRunConfig {
+            project_root: &project_root,
+            store: &store,
+            work_item_id: "work-1",
+            attempt_id: "attempt-1",
+            task_id: &tester_id,
+            resolver: &resolver,
+            extra_args: &[],
+            no_sandbox: true,
+            store_lock: None,
+        })
+        .unwrap();
+
+        let cache_home =
+            project_root.join(".fluent/work/cache/writers/work-1/attempt-1/cargo-home");
+        assert!(
+            cache_home.join("task-marker").is_file(),
+            "Tester commands must write through the Attempt-scoped Cargo home"
+        );
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .find(|task| task.id == tester_id)
+                .unwrap()
+                .status,
+            TaskStatus::Complete
+        );
+    }
+
     fn review_item_with_role(role: &str) -> WorkItem {
         let mut item = WorkItem {
             id: "work-1".to_string(),
@@ -6374,9 +16295,215 @@ mod tests {
             source_branch: "main".to_string(),
             base_commit: None,
             commit: "abc123".to_string(),
+            no_change: None,
+            learner_canonicalization: None,
         });
         item.add_review_tasks("attempt-1", &[role]).unwrap();
         item
+    }
+
+    fn commit_tester_candidate_fixture(project_root: &Path, item: &mut WorkItem) -> PathBuf {
+        let workspace_path = item.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Tester)
+            .and_then(|task| task.review_context.as_ref())
+            .map(|context| context.candidate_workspace_path.clone())
+            .unwrap();
+        let workspace = project_root.join(workspace_path);
+        crate::git::run(
+            &workspace,
+            &["init", "-q", "-b", "main"],
+            "init candidate fixture",
+        )
+        .unwrap();
+        crate::git::run(
+            &workspace,
+            &["config", "user.email", "test@example.invalid"],
+            "configure candidate fixture",
+        )
+        .unwrap();
+        crate::git::run(
+            &workspace,
+            &["config", "user.name", "Test"],
+            "configure candidate fixture",
+        )
+        .unwrap();
+        crate::git::run(&workspace, &["add", "."], "stage candidate fixture").unwrap();
+        crate::git::run(
+            &workspace,
+            &["commit", "-q", "-m", "Create candidate fixture"],
+            "commit candidate fixture",
+        )
+        .unwrap();
+        let commit = head_commit(&workspace).unwrap();
+        for task in &mut item.attempts[0].tasks {
+            if let Some(output) = task.output.as_mut() {
+                output.commit = commit.clone();
+            }
+            if let Some(context) = task.review_context.as_mut() {
+                context.candidate_commit = commit.clone();
+            }
+        }
+        workspace
+    }
+
+    fn failed_tester_inspection_fixture()
+    -> (tempfile::TempDir, Task, Vec<NoChangeInspectedArtifact>) {
+        let project = tempfile::TempDir::new().unwrap();
+        let relative_paths = [
+            ".fluent/work/artifacts/work-1/attempt-1/candidate-gates/attempt-1-write-1/candidate-gate.json",
+            ".fluent/work/artifacts/work-1/attempt-1/attempt-1-tester-1/tester-results.json",
+            ".fluent/work/artifacts/work-1/attempt-1/attempt-1-tester-1/commands/0-stdout.log",
+            ".fluent/work/artifacts/work-1/attempt-1/attempt-1-tester-1/commands/0-stderr.log",
+        ];
+        let mut refs = Vec::new();
+        let mut inspected = Vec::new();
+        for (index, relative) in relative_paths.iter().enumerate() {
+            let path = project.path().join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let bytes = format!("failed Tester evidence {index}\n").into_bytes();
+            fs::write(&path, &bytes).unwrap();
+            refs.push(ArtifactRef {
+                producer_id: if index == 0 {
+                    "candidate-gate".to_string()
+                } else {
+                    "attempt-1-tester-1".to_string()
+                },
+                path: relative.to_string(),
+            });
+            inspected.push(NoChangeInspectedArtifact {
+                path: relative.to_string(),
+                digest: crate::follow_up::content_digest(&bytes),
+            });
+        }
+        let mut item = review_item();
+        let task_id = item.add_next_write_round("attempt-1", refs).unwrap();
+        let task = item.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.id == task_id)
+            .unwrap()
+            .clone();
+        (project, task, inspected)
+    }
+
+    #[test]
+    fn failed_tester_no_change_requires_every_attached_artifact_digest() {
+        let (project, task, inspected) = failed_tester_inspection_fixture();
+        let declaration = project.path().join("no-change.json");
+
+        let error = validate_failed_tester_no_change_inspection(
+            project.path(),
+            &task,
+            &inspected[..inspected.len() - 1],
+            &declaration,
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("must declare the inspected SHA-256 digest")
+        );
+        assert!(error.to_string().contains("0-stderr.log"));
+    }
+
+    #[test]
+    fn failed_tester_no_change_rejects_stale_artifact_digest() {
+        let (project, task, mut inspected) = failed_tester_inspection_fixture();
+        inspected[2].digest = "sha256:stale".to_string();
+
+        let error = validate_failed_tester_no_change_inspection(
+            project.path(),
+            &task,
+            &inspected,
+            &project.path().join("no-change.json"),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("declares digest sha256:stale"));
+        assert!(error.to_string().contains("0-stdout.log"));
+    }
+
+    #[test]
+    fn failed_tester_no_change_accepts_exact_attached_artifact_digests() {
+        let (project, task, inspected) = failed_tester_inspection_fixture();
+
+        validate_failed_tester_no_change_inspection(
+            project.path(),
+            &task,
+            &inspected,
+            &project.path().join("no-change.json"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn failed_tester_no_change_rejects_duplicate_and_extra_artifact_paths() {
+        let (project, task, mut inspected) = failed_tester_inspection_fixture();
+        inspected.push(NoChangeInspectedArtifact {
+            path: inspected[0].path.clone(),
+            digest: inspected[0].digest.clone(),
+        });
+        let declaration = project.path().join("no-change.json");
+
+        let duplicate = validate_failed_tester_no_change_inspection(
+            project.path(),
+            &task,
+            &inspected,
+            &declaration,
+        )
+        .unwrap_err();
+        assert!(
+            duplicate
+                .to_string()
+                .contains("duplicate inspected_artifacts path")
+        );
+
+        inspected.pop();
+        inspected.push(NoChangeInspectedArtifact {
+            path: ".fluent/work/artifacts/work-1/attempt-1/private-note.txt".to_string(),
+            digest: "sha256:unused".to_string(),
+        });
+        let extra = validate_failed_tester_no_change_inspection(
+            project.path(),
+            &task,
+            &inspected,
+            &declaration,
+        )
+        .unwrap_err();
+        assert!(
+            extra
+                .to_string()
+                .contains("unexpected inspected_artifacts path")
+        );
+    }
+
+    #[test]
+    fn review_only_no_change_does_not_require_artifact_digests() {
+        let mut item = review_item();
+        let review = ArtifactRef {
+            producer_id: "attempt-1-review-tests".to_string(),
+            path: ".fluent/work/artifacts/work-1/attempt-1/attempt-1-review-tests/review.md"
+                .to_string(),
+        };
+        let task_id = item
+            .add_next_write_round("attempt-1", vec![review])
+            .unwrap();
+        let task = item.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.id == task_id)
+            .unwrap();
+
+        validate_failed_tester_no_change_inspection(
+            Path::new("unused"),
+            task,
+            &[],
+            Path::new("no-change.json"),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -6756,8 +16883,100 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "test-support")]
     #[test]
-    fn tester_start_rejected_by_peer_terminal_creates_no_artifacts() {
+    fn reviewer_read_path_preflight_failure_precedes_reservation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_root = tmp.path().join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let git = |args: &[&str]| {
+            crate::git::run(&project_root, args, "test git setup").unwrap();
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@t.co"]);
+        git(&["config", "user.name", "t"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "baseline"]);
+
+        let store = WorkModelStore::new(&project_root);
+        let item = review_item_with_role("architecture");
+        let review = item.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Review)
+            .unwrap();
+        let review_task_id = review.id.clone();
+        let candidate_path = resolve_managed_readable_workspace_path(
+            &project_root,
+            &review.workspace_access.reads[0].path,
+            "work-1",
+            "attempt-1",
+        )
+        .unwrap();
+        let artifact_dir = project_root.join(&review.artifact_area.as_ref().unwrap().path);
+        let input_artifacts = review.input_artifacts.clone();
+        store.create_work_item(&item).unwrap();
+
+        fs::create_dir_all(candidate_path.parent().unwrap()).unwrap();
+        git(&[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            candidate_path.to_str().unwrap(),
+        ]);
+        for input in input_artifacts {
+            let path = project_root.join(input.path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "{}\n").unwrap();
+        }
+
+        unsafe {
+            std::env::set_var("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "pass");
+            std::env::set_var("FLUENT_TEST_REVIEWER_READ_PREFLIGHT", "fail");
+        }
+        let resolver = ContentResolver::new(Some(&project_root));
+        let result = run_task(WorkTaskRunConfig {
+            project_root: &project_root,
+            store: &store,
+            work_item_id: "work-1",
+            attempt_id: "attempt-1",
+            task_id: &review_task_id,
+            resolver: &resolver,
+            extra_args: &[],
+            no_sandbox: false,
+            store_lock: None,
+        });
+        unsafe {
+            std::env::remove_var("FLUENT_TEST_REVIEWER_READ_PREFLIGHT");
+            std::env::remove_var("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT");
+        }
+
+        let error = result.expect_err("an unreadable advertised path must stop the reviewer");
+        assert!(
+            error
+                .to_string()
+                .contains("test reviewer read-path preflight failure"),
+            "{error:#}"
+        );
+        let stored = store.read_work_item("work-1").unwrap();
+        let review = stored.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.id == review_task_id)
+            .unwrap();
+        assert_eq!(review.status, TaskStatus::NeedsUser);
+        assert!(
+            review.started_at.is_none(),
+            "read-path preflight must fail before Task reservation"
+        );
+        assert!(
+            !artifact_dir.exists(),
+            "read-path preflight must not create reviewer artifacts"
+        );
+    }
+
+    #[test]
+    fn tester_start_rejected_by_peer_terminal_creates_no_settlement_artifacts() {
         // A Tester start that loses the race to a peer pause rejects at the atomic
         // boundary before creating its artifact directory or launching the tester.
         let tmp = tempfile::TempDir::new().unwrap();
@@ -6782,6 +17001,9 @@ mod tests {
             },
             artifact_area: Some(crate::work_model::TaskArtifactArea { path: area.clone() }),
             review_context: None,
+            writer_correction_assignment: None,
+            verification_context: None,
+            evidence_review_context: None,
             input_artifacts: Vec::new(),
             depends_on: None,
             output: None,
@@ -6823,6 +17045,13 @@ mod tests {
         assert!(
             !project_root.join(&area).exists(),
             "a rejected tester start must not create its artifact directory"
+        );
+        assert!(
+            !project_root
+                .join(&area)
+                .join("commands/settlement")
+                .exists(),
+            "a rejected tester start must not create a settlement directory"
         );
     }
 
@@ -6968,43 +17197,42 @@ mod tests {
     }
 
     #[test]
-    fn tester_setup_failure_after_reservation_leaves_task_recoverable() {
-        // The reservation succeeds, then create_dir_all fails because the artifact
-        // path is occupied by a file. The Tester must roll back to Planned.
+    fn tester_settlement_setup_failure_after_reservation_leaves_task_recoverable() {
+        // The reservation creates the first guarded settlement directory, then
+        // fails on the second. The receipt must roll the Task back to Planned and
+        // remove only the partial directory it created.
         let tmp = tempfile::TempDir::new().unwrap();
         let project_root = tmp.path();
         let store = WorkModelStore::new(project_root);
-
-        let mut item = review_item_with_role("tests");
-        let area = ".fluent/work/artifacts/work-1/attempt-1/attempt-1-tester".to_string();
-        item.attempts[0].tasks.push(crate::work_model::Task {
-            id: "attempt-1-tester".to_string(),
-            kind: TaskKind::Tester,
-            status: TaskStatus::Planned,
-            role: "tester".to_string(),
-            instructions: None,
-            work_item_id: "work-1".to_string(),
-            attempt_id: Some("attempt-1".to_string()),
-            workspace_access: crate::work_model::WorkspaceAccess {
-                reads: Vec::new(),
-                writes: Vec::new(),
-            },
-            artifact_area: Some(crate::work_model::TaskArtifactArea { path: area.clone() }),
-            review_context: None,
-            input_artifacts: Vec::new(),
-            depends_on: None,
-            output: None,
-            created_at: None,
-            started_at: None,
-            completed_at: None,
-        });
+        let mut item = review_item_with_final_tester();
+        let tester = item.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Tester)
+            .unwrap();
+        let tester_id = tester.id.clone();
+        let workspace = project_root.join(
+            &tester
+                .review_context
+                .as_ref()
+                .unwrap()
+                .candidate_workspace_path,
+        );
+        let artifact = project_root.join(&tester.artifact_area.as_ref().unwrap().path);
+        fs::create_dir_all(workspace.join(".fluent")).unwrap();
+        fs::write(
+            workspace.join(".fluent/tester.yaml"),
+            "commands:\n  - command: true\n    test_harness: shell-harness\n    reject_process_leaks: true\n  - command: true\n    test_harness: shell-harness\n    reject_process_leaks: true\n",
+        )
+        .unwrap();
+        commit_tester_candidate_fixture(project_root, &mut item);
         store.create_work_item(&item).unwrap();
 
-        // Occupy the artifact directory path with a file so create_dir_all fails
-        // after the reservation.
-        let artifact_path = project_root.join(&area);
-        fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
-        fs::write(&artifact_path, "not a directory").unwrap();
+        // Let preparation create settlement/0, but occupy settlement/1 so its
+        // creation fails after the reservation and partial setup has begun.
+        let blocked_directory = artifact.join("commands/settlement/1");
+        fs::create_dir_all(blocked_directory.parent().unwrap()).unwrap();
+        fs::write(&blocked_directory, "not a directory").unwrap();
 
         let resolver = ContentResolver::new(Some(project_root));
         let error = run_task(WorkTaskRunConfig {
@@ -7012,7 +17240,7 @@ mod tests {
             store: &store,
             work_item_id: "work-1",
             attempt_id: "attempt-1",
-            task_id: "attempt-1-tester",
+            task_id: &tester_id,
             resolver: &resolver,
             extra_args: &[],
             no_sandbox: true,
@@ -7022,6 +17250,14 @@ mod tests {
         assert!(
             !is_start_rejected(&error),
             "expected the setup error: {error}"
+        );
+        assert!(
+            !artifact.join("commands/settlement/0").exists(),
+            "receipt-scoped cleanup removes the guarded directory created before failure"
+        );
+        assert!(
+            blocked_directory.is_file(),
+            "cleanup preserves the pre-existing obstruction"
         );
 
         let stored = store.read_work_item("work-1").unwrap();
@@ -7035,6 +17271,385 @@ mod tests {
             tester.started_at.is_none(),
             "a rolled-back tester reservation clears the start timestamp"
         );
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn tester_post_reservation_settlement_failure_never_leaves_task_executing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_root = tmp.path();
+        let store = WorkModelStore::new(project_root);
+        let mut item = review_item_with_final_tester();
+        let tester = item.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Tester)
+            .unwrap();
+        let tester_id = tester.id.clone();
+        let workspace = project_root.join(
+            &tester
+                .review_context
+                .as_ref()
+                .unwrap()
+                .candidate_workspace_path,
+        );
+        fs::create_dir_all(workspace.join(".fluent")).unwrap();
+        fs::write(
+            workspace.join(".fluent/tester.yaml"),
+            "commands:\n  - command: true\n    test_harness: shell-harness\n    reject_process_leaks: true\n",
+        )
+        .unwrap();
+        commit_tester_candidate_fixture(project_root, &mut item);
+        store.create_work_item(&item).unwrap();
+
+        unsafe { std::env::set_var("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "fail") };
+        unsafe { std::env::set_var("FLUENT_TEST_TESTER_PAUSE_PERSISTENCE", "fail") };
+        let resolver = ContentResolver::new(Some(project_root));
+        let error = run_task(WorkTaskRunConfig {
+            project_root,
+            store: &store,
+            work_item_id: "work-1",
+            attempt_id: "attempt-1",
+            task_id: &tester_id,
+            resolver: &resolver,
+            extra_args: &[],
+            no_sandbox: false,
+            store_lock: None,
+        })
+        .expect_err("sandbox preflight failure must stop the Tester");
+        unsafe { std::env::remove_var("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT") };
+        unsafe { std::env::remove_var("FLUENT_TEST_TESTER_PAUSE_PERSISTENCE") };
+
+        assert!(
+            error.to_string().contains("pausing Tester Task"),
+            "the injected pause failure must reach the Tester finalizer: {error:#}"
+        );
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .find(|task| task.id == tester_id)
+                .unwrap()
+                .status,
+            TaskStatus::Failed,
+            "a failed pause persistence must durably settle the reserved Task"
+        );
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn tester_rollback_persistence_failure_never_leaves_task_executing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_root = tmp.path();
+        let store = WorkModelStore::new(project_root);
+        let mut item = review_item_with_final_tester();
+        let tester = item.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Tester)
+            .unwrap();
+        let tester_id = tester.id.clone();
+        let workspace = project_root.join(
+            &tester
+                .review_context
+                .as_ref()
+                .unwrap()
+                .candidate_workspace_path,
+        );
+        fs::create_dir_all(workspace.join(".fluent")).unwrap();
+        fs::write(
+            workspace.join(".fluent/tester.yaml"),
+            "commands:\n  - command: true\n    test_harness: shell-harness\n    reject_process_leaks: true\n  - command: true\n    test_harness: shell-harness\n    reject_process_leaks: true\n",
+        )
+        .unwrap();
+        commit_tester_candidate_fixture(project_root, &mut item);
+        store.create_work_item(&item).unwrap();
+
+        TEST_TESTER_ROLLBACK_PERSISTENCE_FAILURE.with(|value| value.set(true));
+        let resolver = ContentResolver::new(Some(project_root));
+        let error = run_tester_task_with_settlement_preparer(
+            WorkTaskRunConfig {
+                project_root,
+                store: &store,
+                work_item_id: "work-1",
+                attempt_id: "attempt-1",
+                task_id: &tester_id,
+                resolver: &resolver,
+                extra_args: &[],
+                no_sandbox: true,
+                store_lock: None,
+            },
+            |_, _| anyhow::bail!("test-injected Tester settlement preparation failure"),
+        )
+        .expect_err("a rollback persistence failure must stop the Tester");
+        TEST_TESTER_ROLLBACK_PERSISTENCE_FAILURE.with(|value| value.set(false));
+
+        assert!(
+            error.to_string().contains("normalize the reserved Task"),
+            "the setup error must preserve the failed rollback context: {error:#}"
+        );
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .find(|task| task.id == tester_id)
+                .unwrap()
+                .status,
+            TaskStatus::Failed,
+            "a rollback persistence failure must durably settle the reserved Task"
+        );
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn tester_sandbox_preflight_failure_after_reservation_pauses_attempt() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_root = tmp.path();
+        let store = WorkModelStore::new(project_root);
+        let mut item = review_item_with_final_tester();
+        let tester = item.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Tester)
+            .unwrap();
+        let tester_id = tester.id.clone();
+        let workspace = project_root.join(
+            &tester
+                .review_context
+                .as_ref()
+                .unwrap()
+                .candidate_workspace_path,
+        );
+        let launched = project_root.join("launched");
+        fs::create_dir_all(workspace.join(".fluent")).unwrap();
+        fs::write(
+            workspace.join(".fluent/tester.yaml"),
+            format!(
+                "commands:\n  - command: 'touch {}'\n    test_harness: shell-harness\n    reject_process_leaks: true\n",
+                launched.display()
+            ),
+        )
+        .unwrap();
+        commit_tester_candidate_fixture(project_root, &mut item);
+        store.create_work_item(&item).unwrap();
+
+        unsafe { std::env::set_var("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "fail") };
+        let resolver = ContentResolver::new(Some(project_root));
+        let error = run_task(WorkTaskRunConfig {
+            project_root,
+            store: &store,
+            work_item_id: "work-1",
+            attempt_id: "attempt-1",
+            task_id: &tester_id,
+            resolver: &resolver,
+            extra_args: &[],
+            no_sandbox: false,
+            store_lock: None,
+        })
+        .expect_err("sandbox preflight failure must stop the Tester");
+        unsafe { std::env::remove_var("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT") };
+
+        assert!(error.to_string().contains("host sandbox preflight failed"));
+        assert!(!launched.exists(), "the Tester command must not launch");
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(stored.attempts[0].status, AttemptStatus::NeedsUser);
+        assert_eq!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .find(|task| task.id == tester_id)
+                .unwrap()
+                .status,
+            TaskStatus::NeedsUser
+        );
+    }
+
+    #[test]
+    fn attempt_stop_blocks_reserved_peer_while_another_worker_settles() {
+        use crate::execution::{self, ExecutionRecord, ExecutionState};
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let store = WorkModelStore::new(root);
+        let mut item = review_item();
+        item.add_review_tasks("attempt-1", &["behaviors"]).unwrap();
+        store.create_work_item(&item).unwrap();
+        let reserve = |task: &str| {
+            reserve_task_start(
+                root,
+                &store,
+                "work-1",
+                "attempt-1",
+                task,
+                TaskKind::Review,
+                AttemptStatus::Reviewing,
+                CoderKind::Claude,
+            )
+            .unwrap()
+        };
+        let a = reserve("attempt-1-review-tests");
+        let b = reserve("attempt-1-review-behaviors");
+        let a_transcript = root
+            .join(&a.task.artifact_area.unwrap().path)
+            .join("transcript.jsonl");
+        let b_transcript = root
+            .join(&b.task.artifact_area.unwrap().path)
+            .join("transcript.jsonl");
+        let a_record = execution::record_path_for_transcript(&a_transcript);
+        let b_record = execution::record_path_for_transcript(&b_transcript);
+        let a_ready = root.join("a-ready");
+        let a_stopping = root.join("a-stopping");
+        let a_release = root.join("a-release");
+        let b_marker = root.join("b-started");
+        let wait_for = |path: &Path, timeout: Duration| {
+            let deadline = Instant::now() + timeout;
+            while !path.is_file() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(path.is_file(), "fixture barrier {}", path.display());
+        };
+        let a_lease =
+            crate::lease::acquire(&crate::lease::task_lock_path(root, "work-1", &a.task.id))
+                .unwrap();
+        let b_lease =
+            crate::lease::acquire(&crate::lease::task_lock_path(root, "work-1", &b.task.id))
+                .unwrap();
+        std::thread::scope(|scope| {
+            let a_worker = scope.spawn(|| {
+                let _lease = a_lease;
+                let mut command = std::process::Command::new("python3");
+                command
+                    .args([
+                        "-c",
+                        r#"
+import pathlib, signal, sys, time
+ready, stopping, release = map(pathlib.Path, sys.argv[1:])
+deadline = time.monotonic() + 10
+def stop(*_):
+    stopping.touch()
+    while not release.exists() and time.monotonic() < deadline:
+        time.sleep(.005)
+    sys.exit(0)
+signal.signal(signal.SIGTERM, stop)
+ready.touch()
+while time.monotonic() < deadline:
+    time.sleep(.005)
+"#,
+                    ])
+                    .arg(&a_ready)
+                    .arg(&a_stopping)
+                    .arg(&a_release);
+                execution::output(&mut command, &a_transcript)
+            });
+            let (release_b, wait_b) = mpsc::channel();
+            let b_worker = scope.spawn({
+                let b_marker = &b_marker;
+                let b_transcript = &b_transcript;
+                move || {
+                    let _lease = b_lease;
+                    wait_b.recv_timeout(Duration::from_secs(5)).unwrap();
+                    let mut command = std::process::Command::new("touch");
+                    command.arg(&b_marker);
+                    execution::output(&mut command, &b_transcript)
+                }
+            });
+            wait_for(&a_ready, Duration::from_secs(5));
+            let cancel = scope.spawn(|| {
+                crate::work_attempt_loop::cancel_local_attempt(root, &store, "work-1", "attempt-1")
+            });
+            wait_for(&a_stopping, Duration::from_secs(1));
+            let stopped = store.read_work_item("work-1").unwrap();
+            assert!(stopped.attempts[0].cancellation_requested());
+            assert!(
+                stopped.attempts[0]
+                    .cancellation
+                    .as_ref()
+                    .unwrap()
+                    .settled_at
+                    .is_none()
+            );
+            assert_eq!(
+                serde_json::from_slice::<ExecutionRecord>(&fs::read(&b_record).unwrap())
+                    .unwrap()
+                    .state,
+                ExecutionState::Launching,
+                "cancellation has not visited B yet"
+            );
+            release_b.send(()).unwrap();
+            let result = b_worker.join().unwrap();
+            assert!(
+                execution::execution_is_live(&a_record).unwrap(),
+                "A must still hold its execution identity at the termination barrier"
+            );
+            assert!(
+                result.is_err(),
+                "the shared stop must reject B before cancellation visits its record"
+            );
+            assert!(
+                !b_marker.exists(),
+                "B must never start after the Attempt stop commits"
+            );
+            fs::write(&a_release, b"release").unwrap();
+            a_worker.join().unwrap().unwrap();
+            cancel.join().unwrap().unwrap();
+        });
+        assert!(!execution::execution_is_live(&a_record).unwrap());
+        let stopped = store.read_work_item("work-1").unwrap();
+        assert!(
+            stopped.attempts[0]
+                .cancellation
+                .as_ref()
+                .unwrap()
+                .settled_at
+                .is_some()
+        );
+        assert_eq!(
+            stopped.attempts[0].pause_kind,
+            Some(crate::work_model::PauseKind::Interrupted)
+        );
+    }
+
+    #[test]
+    fn task_execution_identity_precedes_executing_state_and_honors_stop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let mut item = WorkItem::planned("work-1", "Guard child launch");
+        item.add_initial_attempt("attempt-1").unwrap();
+        store.create_work_item(&item).unwrap();
+        let reserved = reserve_task_start(
+            tmp.path(),
+            &store,
+            "work-1",
+            "attempt-1",
+            "attempt-1-write-1",
+            TaskKind::Write,
+            AttemptStatus::Executing,
+            CoderKind::Claude,
+        )
+        .unwrap();
+        let path = crate::execution::record_path_for_artifact(
+            tmp.path(),
+            &reserved.task.artifact_area.unwrap().path,
+        );
+        assert!(
+            path.is_file(),
+            "executing Task must already have a cancellable identity"
+        );
+        crate::work_attempt_loop::cancel_local_attempt(tmp.path(), &store, "work-1", "attempt-1")
+            .unwrap();
+        let marker = tmp.path().join("launched");
+        let mut command = std::process::Command::new("touch");
+        command.arg(&marker);
+        // All production launchers cross this same guarded boundary.
+        assert!(
+            crate::execution::spawn(&mut command, &path.with_file_name("transcript.jsonl"))
+                .is_err()
+        );
+        assert!(!marker.exists());
     }
 
     #[test]
@@ -7086,6 +17701,7 @@ mod tests {
             let starter = scope.spawn(move || {
                 starter_barrier.wait();
                 reserve_task_start(
+                    project_root,
                     store_ref,
                     "work-1",
                     "attempt-1",
@@ -7117,6 +17733,44 @@ mod tests {
                 }
             }
         });
+    }
+
+    #[test]
+    fn corrective_writer_does_not_recapture_attempt_baseline_without_tester() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let mut item = review_item();
+        item.attempts[0].status = AttemptStatus::Planned;
+        let task_id = item.add_next_write_round("attempt-1", Vec::new()).unwrap();
+        store.create_work_item(&item).unwrap();
+
+        let reservation = reserve_task_start(
+            tmp.path(),
+            &store,
+            "work-1",
+            "attempt-1",
+            &task_id,
+            TaskKind::Write,
+            AttemptStatus::Executing,
+            CoderKind::Claude,
+        )
+        .unwrap();
+
+        assert!(
+            !reservation.is_first_write,
+            "a corrective Writer must reuse the Attempt baseline even when no final Tester exists"
+        );
+        let transition = store
+            .read_work_item("work-1")
+            .unwrap()
+            .transitions
+            .last()
+            .cloned()
+            .unwrap();
+        assert_eq!(transition.object_kind, "task");
+        assert_eq!(transition.object_id, task_id);
+        assert_eq!(transition.origin, DurableTransitionOrigin::TaskExecutor);
+        assert_eq!(transition.reason, None);
     }
 
     fn corrective_review_item(role: &str) -> WorkItem {
@@ -7167,6 +17821,8 @@ mod tests {
             source_branch: "main".to_string(),
             base_commit: None,
             commit: "abc123".to_string(),
+            no_change: None,
+            learner_canonicalization: None,
         });
         item.add_review_tasks("attempt-1", &[role]).unwrap();
         item
@@ -7179,7 +17835,8 @@ mod tests {
         let workspace = tmp.path().join("work-6-work-1-attempt-1");
         fs::create_dir_all(&workspace).unwrap();
 
-        let item = corrective_review_item("tests");
+        let mut item = corrective_review_item("tests");
+        item.add_final_tester_task("attempt-1").unwrap();
         let context = item.write_task_instructions().unwrap();
 
         // The Writer receives the corrective execution context verbatim.
@@ -7245,6 +17902,383 @@ mod tests {
     }
 
     #[test]
+    fn reviewed_correction_references_derived_authority_without_reinjecting_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_root = tmp.path();
+        let workspace = tmp.path().join("candidate");
+        fs::create_dir_all(&workspace).unwrap();
+        crate::git::run(&workspace, &["init", "-q"], "initialize correction fixture").unwrap();
+        crate::git::run(
+            &workspace,
+            &["config", "user.name", "Fluent Test"],
+            "configure correction fixture",
+        )
+        .unwrap();
+        crate::git::run(
+            &workspace,
+            &["config", "user.email", "fluent@example.test"],
+            "configure correction fixture",
+        )
+        .unwrap();
+        crate::git::run(
+            &workspace,
+            &["commit", "-q", "--allow-empty", "-m", "Add candidate"],
+            "commit correction fixture",
+        )
+        .unwrap();
+        let mut item = corrective_review_item("tests");
+        let authority = item.write_task_instructions().unwrap();
+        let review_path = project_root
+            .join(".fluent/work/artifacts/work-1/attempt-1/attempt-1-review-tests/review.md");
+        fs::create_dir_all(review_path.parent().unwrap()).unwrap();
+        fs::write(
+            &review_path,
+            "Verdict: fail\n\n## Findings\n\n- [ ] Restore the guard assertion\n",
+        )
+        .unwrap();
+        let task_id = item
+            .add_next_write_round(
+                "attempt-1",
+                vec![crate::work_model::ArtifactRef {
+                    producer_id: "attempt-1-review-tests".to_string(),
+                    path: review_path
+                        .strip_prefix(project_root)
+                        .unwrap()
+                        .display()
+                        .to_string(),
+                }],
+            )
+            .unwrap();
+
+        let prompt = build_reviewed_correction_prompt(
+            &item,
+            "attempt-1",
+            &task_id,
+            std::slice::from_ref(&review_path),
+            &workspace,
+            project_root,
+        )
+        .unwrap();
+        let authority_path = project_root
+            .join(work_artifact_path("work-1", "attempt-1", &task_id))
+            .join("corrective-authority.md");
+
+        assert!(prompt.contains(&authority_path.display().to_string()));
+        assert!(!prompt.contains("Retries stop after the configured cap"));
+        assert_eq!(fs::read_to_string(authority_path).unwrap(), authority);
+        assert!(!prompt.contains("{{"));
+    }
+
+    #[test]
+    fn reviewed_correction_launch_route_hands_append_only_lineage_to_the_coder() {
+        let project = tempfile::tempdir().unwrap();
+        let project_root = project.path();
+        let workspace = project_root.join("candidate");
+        fs::create_dir_all(&workspace).unwrap();
+        crate::git::run(&workspace, &["init", "-q"], "initialize correction fixture").unwrap();
+        crate::git::run(
+            &workspace,
+            &["config", "user.name", "Fluent Test"],
+            "configure correction fixture",
+        )
+        .unwrap();
+        crate::git::run(
+            &workspace,
+            &["config", "user.email", "fluent@example.test"],
+            "configure correction fixture",
+        )
+        .unwrap();
+        fs::write(workspace.join("candidate.txt"), "candidate\n").unwrap();
+        crate::git::run(&workspace, &["add", "."], "stage correction fixture").unwrap();
+        crate::git::run(
+            &workspace,
+            &["commit", "-q", "-m", "Add candidate"],
+            "commit correction fixture",
+        )
+        .unwrap();
+        let prior_candidate = head_commit(&workspace).unwrap();
+
+        let review_path = project_root
+            .join(".fluent/work/artifacts/work-1/attempt-1/attempt-1-review-tests/review.md");
+        fs::create_dir_all(review_path.parent().unwrap()).unwrap();
+        fs::write(
+            &review_path,
+            "Verdict: fail\n\n## Findings\n\n- [ ] Remove the unwanted file\n",
+        )
+        .unwrap();
+        let mut item = review_item();
+        item.attempts[0]
+            .writer_runs
+            .push(crate::work_model::WriterRun {
+                task_id: "attempt-1-write-1".to_string(),
+                outcome: crate::work_model::WriterOutcome::Continue,
+                kind: crate::work_model::WriterRunKind::Initial,
+                provider: "codex".to_string(),
+                session_id: Some("writer-session-1".to_string()),
+                continuation: 0,
+                checked_required: 0,
+                completed_matrix: 0,
+                candidate_commit: prior_candidate.clone(),
+            });
+        let task_id = item
+            .add_next_write_round(
+                "attempt-1",
+                vec![ArtifactRef {
+                    producer_id: "attempt-1-review-tests".to_string(),
+                    path: review_path
+                        .strip_prefix(project_root)
+                        .unwrap()
+                        .display()
+                        .to_string(),
+                }],
+            )
+            .unwrap();
+        let recorded = Arc::new(Mutex::new(None));
+        let recorded_for_coder = Arc::clone(&recorded);
+        let resolver = ContentResolver::new(Some(project_root));
+        let pump_config = crate::transcript_pump::resolve_config(project_root);
+
+        run_task_coder_with_coder(
+            &item,
+            "attempt-1",
+            &task_id,
+            project_root,
+            &workspace,
+            std::slice::from_ref(&review_path),
+            &resolver,
+            &[],
+            CoderKind::Codex,
+            true,
+            None,
+            None,
+            &pump_config,
+            None,
+            None,
+            &test_writer_cache(project_root),
+            None,
+            move |_sandbox, _executable| {
+                Box::new(RecordingWriterPromptCoder {
+                    recorded: recorded_for_coder,
+                })
+            },
+        )
+        .unwrap();
+
+        let prompt = recorded
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the production Writer route launches the coder once");
+        assert!(prompt.contains("append-only"));
+        assert!(prompt.contains(&prior_candidate));
+        assert!(!prompt.contains("{{"));
+        let context_path = project_root
+            .join(work_artifact_path("work-1", "attempt-1", &task_id))
+            .join("execution-context.json");
+        let context: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(context_path).unwrap()).unwrap();
+        assert_eq!(context["correction-lineage"]["mode"], "append-only");
+        assert_eq!(
+            context["correction-lineage"]["prior-candidate-commit"],
+            prior_candidate
+        );
+    }
+
+    #[test]
+    fn evidence_targeted_review_prompt_names_immutable_inputs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_root = tmp.path();
+        let workspace = project_root.join("work-6-work-1-attempt-1");
+        fs::create_dir_all(&workspace).unwrap();
+        let mut item = corrective_review_item("tests");
+        let task = item.attempts[0]
+            .tasks
+            .iter_mut()
+            .find(|task| task.kind == TaskKind::Review)
+            .unwrap();
+        task.evidence_review_context = Some(crate::work_model::EvidenceReviewContext {
+            recovery_id: "host-evidence-1".to_string(),
+            candidate_commit: "abc123".to_string(),
+            attachment: crate::work_model::EvidenceAttachment {
+                snapshot_path: ".fluent/work/artifacts/work-1/attempt-1/host-evidence/proof.json"
+                    .to_string(),
+                digest: "sha256:proof".to_string(),
+            },
+            prior_review_artifact: ".fluent/work/artifacts/work-1/attempt-1/review-tests/review.md"
+                .to_string(),
+        });
+        let artifact_dir =
+            project_root.join(".fluent/work/artifacts/work-1/attempt-1/attempt-1-review-tests");
+        let prompts = build_work_review_prompts(WorkReviewPromptInput {
+            item: &item,
+            attempt_id: "attempt-1",
+            task_id: "attempt-1-review-tests",
+            project_root,
+            artifact_dir: &artifact_dir,
+            review_path: &artifact_dir.join("review.md"),
+            readable_workspaces: std::slice::from_ref(&workspace),
+            input_artifacts: &[],
+            review_only: false,
+        })
+        .unwrap();
+        assert!(prompts.review_prompt.contains("Evidence-targeted review"));
+        assert!(prompts.review_prompt.contains("host-evidence/proof.json"));
+        assert!(
+            prompts
+                .review_prompt
+                .contains("Disposition: evidence-needed")
+        );
+        assert!(
+            prompts
+                .review_prompt
+                .contains("On failure, emit exactly one")
+        );
+        assert!(prompts.review_prompt.contains("`Disposition:` line"));
+        assert!(
+            prompts
+                .review_prompt
+                .contains("exactly one\n`External-Condition:")
+        );
+        assert!(
+            prompts
+                .review_prompt
+                .contains("line plus exactly one\n`Additional-Proof:")
+        );
+        assert!(prompts.review_prompt.contains("Disposition: code-change"));
+    }
+
+    #[test]
+    fn reviewer_prompt_names_preserved_work_item_inputs_separately() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_root = tmp.path();
+        let workspace = tmp.path().join("candidate");
+        fs::create_dir_all(&workspace).unwrap();
+        let mut item = corrective_review_item("tests");
+        item.input_artifacts = vec![crate::work_model::WorkItemInputArtifact {
+            source_path: ".fluent/work/artifacts/source/evidence.jsonl".to_string(),
+            snapshot_path: ".fluent/work/artifacts/work-1/inputs/0000-evidence.jsonl".to_string(),
+            digest: "sha256:approved".to_string(),
+        }];
+        let input_path = project_root.join(&item.input_artifacts[0].snapshot_path);
+        let artifact_dir =
+            project_root.join(".fluent/work/artifacts/work-1/attempt-1/attempt-1-review-tests");
+        let prompts = build_work_review_prompts(WorkReviewPromptInput {
+            item: &item,
+            attempt_id: "attempt-1",
+            task_id: "attempt-1-review-tests",
+            project_root,
+            artifact_dir: &artifact_dir,
+            review_path: &artifact_dir.join("review.md"),
+            readable_workspaces: std::slice::from_ref(&workspace),
+            input_artifacts: std::slice::from_ref(&input_path),
+            review_only: false,
+        })
+        .unwrap();
+
+        assert!(prompts.review_prompt.contains("preserved Work Item input"));
+        assert!(prompts.review_prompt.contains("0000-evidence.jsonl"));
+        assert!(
+            !prompts
+                .review_prompt
+                .contains("Read each prior review file")
+        );
+    }
+
+    #[test]
+    fn reviewer_prompt_uses_generated_context_for_prior_findings() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_root = tmp.path();
+        let workspace = tmp.path().join("candidate");
+        fs::create_dir_all(&workspace).unwrap();
+        let mut item = corrective_review_item("tests");
+        item.input_artifacts = vec![crate::work_model::WorkItemInputArtifact {
+            source_path: ".fluent/work/artifacts/source/evidence.jsonl".to_string(),
+            snapshot_path: ".fluent/work/artifacts/work-1/inputs/0000-evidence.jsonl".to_string(),
+            digest: "sha256:approved".to_string(),
+        }];
+        let input_path = project_root.join(&item.input_artifacts[0].snapshot_path);
+        let prior_review = project_root
+            .join(".fluent/work/artifacts/work-1/attempt-0/attempt-0-review-tests/review.md");
+        fs::create_dir_all(prior_review.parent().unwrap()).unwrap();
+        fs::write(
+            &prior_review,
+            "Verdict: fail\n\n- [ ] Preserve the input evidence.\n",
+        )
+        .unwrap();
+        let artifact_dir =
+            project_root.join(".fluent/work/artifacts/work-1/attempt-1/attempt-1-review-tests");
+        let prompts = build_work_review_prompts(WorkReviewPromptInput {
+            item: &item,
+            attempt_id: "attempt-1",
+            task_id: "attempt-1-review-tests",
+            project_root,
+            artifact_dir: &artifact_dir,
+            review_path: &artifact_dir.join("review.md"),
+            readable_workspaces: std::slice::from_ref(&workspace),
+            input_artifacts: &[input_path, prior_review.clone()],
+            review_only: false,
+        })
+        .unwrap();
+
+        assert!(
+            prompts
+                .review_prompt
+                .contains("Treat the deduplicated current findings in the generated context")
+        );
+        assert!(
+            !prompts
+                .review_prompt
+                .contains(&prior_review.display().to_string())
+        );
+        assert!(
+            prompts
+                .review_prompt
+                .contains("- Read each preserved Work Item input")
+        );
+    }
+
+    #[test]
+    fn review_only_prompt_names_preserved_work_item_inputs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_root = tmp.path();
+        let mut item = WorkItem {
+            id: "work-1".to_string(),
+            title: "Review authoritative evidence".to_string(),
+            input_artifacts: vec![crate::work_model::WorkItemInputArtifact {
+                source_path: ".fluent/work/artifacts/source/evidence.jsonl".to_string(),
+                snapshot_path: ".fluent/work/artifacts/work-1/inputs/0000-evidence.jsonl"
+                    .to_string(),
+                digest: "sha256:approved".to_string(),
+            }],
+            ..Default::default()
+        };
+        item.add_review_only_attempt("attempt-1", &["tests"], "main", "abc123", true)
+            .unwrap();
+        let input_path = project_root.join(&item.input_artifacts[0].snapshot_path);
+        let artifact_dir =
+            project_root.join(".fluent/work/artifacts/work-1/attempt-1/attempt-1-review-tests");
+        let prompts = build_work_review_prompts(WorkReviewPromptInput {
+            item: &item,
+            attempt_id: "attempt-1",
+            task_id: "attempt-1-review-tests",
+            project_root,
+            artifact_dir: &artifact_dir,
+            review_path: &artifact_dir.join("review.md"),
+            readable_workspaces: std::slice::from_ref(&project_root.to_path_buf()),
+            input_artifacts: std::slice::from_ref(&input_path),
+            review_only: true,
+        })
+        .unwrap();
+
+        assert!(
+            prompts
+                .review_prompt
+                .contains("immutable files are authoritative review inputs")
+        );
+        assert!(prompts.review_prompt.contains("0000-evidence.jsonl"));
+    }
+
+    #[test]
     fn writer_and_every_reviewer_prompt_retain_audit_after_origin_cleanup() {
         let tmp = tempfile::TempDir::new().unwrap();
         let project_root = tmp.path().join("project");
@@ -7296,6 +18330,8 @@ mod tests {
             source_branch: "main".to_string(),
             base_commit: None,
             commit: merged_commit.clone(),
+            no_change: None,
+            learner_canonicalization: None,
         });
         attempt.status = crate::work_model::AttemptStatus::Complete;
         attempt.review_state = Some(crate::work_model::AttemptReviewState::Passed);
@@ -7380,6 +18416,8 @@ mod tests {
             source_branch: "main".to_string(),
             base_commit: None,
             commit: batch.origin.merged_commit.clone(),
+            no_change: None,
+            learner_canonicalization: None,
         });
         seeded
             .add_review_tasks(
@@ -7393,6 +18431,7 @@ mod tests {
                 ],
             )
             .unwrap();
+        seeded.add_final_tester_task("attempt-1").unwrap();
         store.write_work_item(&seeded).unwrap();
         crate::follow_up::authorize_derived_work_item(&project_root, &store, &seeded.id).unwrap();
         crate::follow_up::process_landed_batch(&project_root, &batch, None).unwrap();
@@ -7524,7 +18563,7 @@ mod tests {
             project_root.join(".fluent/work/artifacts/work-1/attempt-1/attempt-1-review-tests");
         let review_path = artifact_dir.join("review.md");
 
-        let item = review_item();
+        let item = review_item_with_final_tester();
         let prompts = build_work_review_prompts(WorkReviewPromptInput {
             item: &item,
             attempt_id: "attempt-1",
@@ -7543,25 +18582,594 @@ mod tests {
                 .review_prompt
                 .contains(&review_path.display().to_string())
         );
+        let shared_cache = candidate_reviewer_cache_dir(project_root, "abc123");
         assert!(prompts.review_prompt.contains("CARGO_TARGET_DIR"));
-        assert!(prompts.review_prompt.contains("cargo build"));
+        assert!(prompts.review_prompt.contains("CARGO_HOME"));
         assert!(
-            prompts.review_prompt.contains("may READ the candidate"),
-            "prompt should tell reviewer they can read candidate build outputs"
+            prompts
+                .review_prompt
+                .contains(&shared_cache.display().to_string())
+        );
+        assert!(prompts.review_prompt.contains("/cargo-home"));
+        assert!(
+            prompts
+                .review_prompt
+                .contains("CARGO_HOME=\"$FLUENT_EVIDENCE_SCRATCH/cargo-home\"")
+        );
+        assert!(
+            prompts
+                .review_prompt
+                .contains("CARGO_TARGET_DIR=\"$FLUENT_EVIDENCE_SCRATCH/target\"")
+        );
+        assert!(
+            !prompts
+                .review_prompt
+                .contains(&artifact_dir.join("target").display().to_string())
+        );
+        assert!(
+            prompts
+                .review_prompt
+                .contains("one named missing evidence check")
         );
         assert!(
             prompts.review_prompt.contains("Do not edit or commit"),
             "prompt should tell reviewer not to write to candidate"
         );
+        assert!(prompts.review_prompt.contains("exact candidate commit"));
+        assert!(prompts.review_prompt.contains(
+            "Open the supplied absolute paths directly; do not discover them by listing parent directories"
+        ));
+        let execution_context = artifact_dir.join("execution-context.json");
+        assert!(execution_context.is_file());
         assert!(
-            prompts.review_prompt.contains("pre-populated"),
-            "prompt should mention pre-populated warm cache"
+            prompts
+                .review_prompt
+                .contains(&execution_context.display().to_string())
         );
         assert!(!prompts.review_prompt.contains(".fluent/runs/"));
         // System prompt is now thin (identity + lifecycle); build cache + artifact details live in the user message.
         assert!(!prompts.system_prompt.contains("CARGO_TARGET_DIR"));
         assert!(!prompts.system_prompt.contains("pre-populated"));
         assert!(!prompts.system_prompt.contains(".fluent/runs/"));
+    }
+
+    #[test]
+    fn execution_context_deduplicates_findings_and_summarizes_evidence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let artifact = tmp.path().join("artifact");
+        let first_review = tmp.path().join("attempt-1-review-tests/review.md");
+        let second_review = tmp.path().join("attempt-2-review-tests/review.md");
+        let tester = tmp.path().join("tester-results.json");
+        let stale_tester = tmp.path().join("prior/tester-results.json");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(first_review.parent().unwrap()).unwrap();
+        fs::create_dir_all(second_review.parent().unwrap()).unwrap();
+        fs::write(
+            &first_review,
+            "Verdict: fail\n\n- [ ] Fix duplicate boundary (blocking)\n",
+        )
+        .unwrap();
+        fs::write(
+            &second_review,
+            "Verdict: fail\n\n- [ ] Fix duplicate boundary (blocking)\n",
+        )
+        .unwrap();
+        fs::write(
+            &tester,
+            r#"{
+  "candidate_commit": "abc123",
+  "commands": [{"command": "cargo nextest run", "exit_code": 0, "test_harness": "cargo-nextest", "duration_ms": 1, "stdout_log": "commands/0-stdout.log", "stderr_log": "commands/0-stderr.log"}],
+  "tests": [{"id": "boundary", "status": "pass", "test_harness": "cargo-nextest"}],
+  "summary": {"total": 1, "pass": 1, "fail": 0, "skipped": 0},
+  "error": null
+}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(stale_tester.parent().unwrap()).unwrap();
+        fs::write(
+            &stale_tester,
+            r#"{
+  "candidate_commit": "stale123",
+  "commands": [{"command": "cargo nextest run", "exit_code": 0, "test_harness": "cargo-nextest", "duration_ms": 1, "stdout_log": "commands/0-stdout.log", "stderr_log": "commands/0-stderr.log"}],
+  "tests": [{"id": "boundary", "status": "pass", "test_harness": "cargo-nextest"}],
+  "summary": {"total": 1, "pass": 1, "fail": 0, "skipped": 0},
+  "error": null
+}"#,
+        )
+        .unwrap();
+
+        let context_path = write_execution_context(
+            &artifact,
+            &workspace,
+            "abc123",
+            Some("base123"),
+            &["finish context schema".to_string()],
+            &[first_review, second_review, tester, stale_tester],
+            None,
+        )
+        .unwrap();
+        let context: ExecutionContextV1 =
+            serde_json::from_str(&fs::read_to_string(context_path).unwrap()).unwrap();
+
+        assert_eq!(context.current_findings.len(), 1);
+        assert_eq!(context.current_findings[0].role, "tests");
+        assert!(context.current_findings[0].identity.starts_with("sha256:"));
+        assert_eq!(context.passing_evidence.len(), 1);
+        assert_eq!(context.passing_evidence[0].summary, "1 passing tests");
+        assert_eq!(context.executed_commands, ["cargo nextest run"]);
+        assert_eq!(context.historical_artifacts.len(), 4);
+        assert_eq!(context.omitted.current_findings, 0);
+    }
+
+    #[test]
+    fn execution_context_waits_for_publication_without_recovering_it() {
+        for host_finishes in [false, true] {
+            let project = tempfile::tempdir().unwrap();
+            let store = WorkModelStore::new(project.path());
+            store.create_work_item(&review_item()).unwrap();
+            let mut update = store.read_work_item_snapshot("work-1").unwrap();
+            update.title = "Pending publication".into();
+            let fault = crate::work_model::persist_fault::arm_split_write("work-1");
+            assert!(store.write_work_item(&update).is_err());
+            drop(fault);
+            let journal = project.path().join(".fluent/work/transactions/work-1.json");
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&fs::read(&journal).unwrap()).unwrap();
+            value
+                .as_object_mut()
+                .unwrap()
+                .remove("base_children_digest");
+            let pending = serde_json::to_vec_pretty(&value).unwrap();
+            fs::write(&journal, &pending).unwrap();
+            assert!(store.read_work_item_snapshot("work-1").is_err());
+
+            let root = project.path().to_path_buf();
+            let host = host_finishes.then(|| {
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    WorkModelStore::new(&root)
+                        .mutate_work_item("work-1", |_| Ok(()))
+                        .unwrap();
+                })
+            });
+            let area = project
+                .path()
+                .join(".fluent/work/artifacts/work-1/attempt-1/attempt-1-review-tests");
+            let result = current_verification_for_context(&area, "abc123");
+            if let Some(host) = host {
+                host.join().unwrap();
+                assert_eq!(result.unwrap().unwrap().1.candidate_commit, "abc123");
+            } else {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("snapshot is unavailable")
+                );
+                assert_eq!(fs::read(&journal).unwrap(), pending);
+            }
+        }
+    }
+
+    #[test]
+    fn execution_context_ignores_enclosing_tester_artifacts() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fluent = tmp.path().join(".fluent");
+        let items = fluent.join("work/items");
+        fs::create_dir_all(&items).unwrap();
+        fs::write(
+            items.join("enclosing.json"),
+            "unrelated enclosing Work record",
+        )
+        .unwrap();
+        let artifact_dir = fluent.join(
+            "work/artifacts/enclosing/attempt-1/attempt-1-tester/commands/settlement/0/fixture/context",
+        );
+        fs::create_dir_all(&artifact_dir).unwrap();
+        let current = current_verification_for_context(&artifact_dir, "candidate");
+        assert!(matches!(current, Ok(None)), "{current:?}");
+    }
+
+    #[test]
+    fn execution_context_retains_unclassified_tester_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let artifact = tmp.path().join("writer-artifact");
+        let tester_dir = tmp.path().join("attempt-1-tester-8");
+        let tester_results = tester_dir.join("tester-results.json");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(tester_dir.join("commands")).unwrap();
+        fs::write(tester_dir.join("commands/1-stdout.log"), "first stdout").unwrap();
+        fs::write(tester_dir.join("commands/1-stderr.log"), "first stderr").unwrap();
+        fs::write(tester_dir.join("commands/2-stdout.log"), "second stdout").unwrap();
+        fs::write(tester_dir.join("commands/2-stderr.log"), "second stderr").unwrap();
+        fs::write(
+            &tester_results,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "candidate_commit": "abc123",
+                "commands": [
+                    {"command": "cargo fmt --check", "test_harness": "cargo", "exit_code": 0, "duration_ms": 1, "stdout_log": "commands/0-stdout.log", "stderr_log": "commands/0-stderr.log"},
+                    {"command": "cargo test --lib", "test_harness": "cargo", "exit_code": 101, "duration_ms": 2, "stdout_log": "commands/1-stdout.log", "stderr_log": "commands/1-stderr.log"},
+                    {"command": "make test", "test_harness": "shell", "exit_code": 2, "duration_ms": 3, "stdout_log": "commands/2-stdout.log", "stderr_log": "commands/2-stderr.log"}
+                ],
+                "tests": [],
+                "summary": {"total": 0, "pass": 0, "fail": 0, "skipped": 0},
+                "error": null
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let context_path = write_execution_context(
+            &artifact,
+            &workspace,
+            "abc123",
+            Some("base123"),
+            &[],
+            std::slice::from_ref(&tester_results),
+            None,
+        )
+        .unwrap();
+        let context: ExecutionContextV1 =
+            serde_json::from_str(&fs::read_to_string(context_path).unwrap()).unwrap();
+
+        assert_eq!(context.current_findings.len(), 1);
+        assert_eq!(context.current_findings[0].role, "verification");
+        assert!(
+            context.current_findings[0]
+                .title
+                .contains("needs diagnosis")
+        );
+        assert_eq!(
+            context.current_findings[0].artifact,
+            tester_results.display().to_string()
+        );
+        assert_eq!(context.executed_commands.len(), 3);
+    }
+
+    #[test]
+    fn tester_harness_repair_execution_context_keeps_artifact_without_tester_findings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let deep_root = tmp.path().join("landing-settlement/".repeat(16));
+        assert!(deep_root.to_str().unwrap().len() > 240);
+
+        for root in [tmp.path(), deep_root.as_path()] {
+            let workspace = root.join("workspace");
+            let artifact = root.join("repair-writer-artifact");
+            let tester_dir = root.join("attempt-1-tester-8");
+            let tester_results = tester_dir.join("tester-results.json");
+            fs::create_dir_all(&workspace).unwrap();
+            fs::create_dir_all(&tester_dir).unwrap();
+            fs::write(
+                &tester_results,
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "candidate_commit": "abc123",
+                    "commands": [
+                        {"command": "cargo test --lib", "test_harness": "cargo", "exit_code": 101, "duration_ms": 2, "stdout_log": "commands/0-stdout.log", "stderr_log": "commands/0-stderr.log"}
+                    ],
+                    "tests": [],
+                    "summary": {"total": 0, "pass": 0, "fail": 0, "skipped": 0},
+                    "error": {"kind": "duplicate_test_ids", "message": "duplicate", "details": ""}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            let context_path = write_execution_context_with_finding_policy(
+                &artifact,
+                &workspace,
+                "abc123",
+                Some("base123"),
+                &[],
+                std::slice::from_ref(&tester_results),
+                None,
+                false,
+            )
+            .unwrap();
+            let context: ExecutionContextV1 =
+                serde_json::from_str(&fs::read_to_string(context_path).unwrap()).unwrap();
+
+            assert!(context.current_findings.is_empty());
+            assert_eq!(context.executed_commands, ["cargo test --lib"]);
+            assert_eq!(
+                context.historical_artifacts,
+                [tester_results.display().to_string()]
+            );
+        }
+    }
+
+    #[test]
+    fn reviewed_repair_prompt_selects_scoped_execution_context_policy() {
+        let project = tempfile::tempdir_in("target").unwrap();
+        let workspace = tempfile::tempdir_in("target").unwrap();
+        for args in [
+            &["init", "-q"] as &[&str],
+            &["config", "user.name", "Fluent Test"],
+            &["config", "user.email", "fluent@example.test"],
+            &["commit", "-q", "--allow-empty", "-m", "candidate"],
+        ] {
+            crate::git::run(workspace.path(), args, "prepare scoped prompt fixture").unwrap();
+        }
+        let tester_path = project
+            .path()
+            .join(".fluent/work/artifacts/work-1/attempt-1/attempt-1-tester-2/tester-results.json");
+        fs::create_dir_all(tester_path.parent().unwrap()).unwrap();
+        fs::write(
+            &tester_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "candidate_commit": head_commit(workspace.path()).unwrap(),
+                "commands": [
+                    {"command": "cargo test --lib", "test_harness": "cargo", "exit_code": 101, "duration_ms": 2, "stdout_log": "commands/0-stdout.log", "stderr_log": "commands/0-stderr.log"}
+                ],
+                "tests": [],
+                "summary": {"total": 0, "pass": 0, "fail": 0, "skipped": 0},
+                "error": {"kind": "duplicate_test_ids", "message": "duplicate", "details": ""}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut item = review_item();
+        let task_id = item
+            .add_next_write_round(
+                "attempt-1",
+                vec![crate::work_model::ArtifactRef {
+                    producer_id: "attempt-1-tester-2".to_string(),
+                    path: tester_path
+                        .strip_prefix(project.path())
+                        .unwrap()
+                        .display()
+                        .to_string(),
+                }],
+            )
+            .unwrap();
+        let task = item.attempts[0]
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == task_id)
+            .unwrap();
+        task.role = crate::work_model::TESTER_HARNESS_REPAIR_ROLE.to_string();
+        task.instructions = Some(
+            "Operator decision: deduplicate normalized results. Change only the two Tester files."
+                .to_string(),
+        );
+
+        let prompt = build_reviewed_correction_prompt(
+            &item,
+            "attempt-1",
+            &task_id,
+            std::slice::from_ref(&tester_path),
+            workspace.path(),
+            project.path(),
+        )
+        .unwrap();
+        let context_path = project
+            .path()
+            .join(work_artifact_path("work-1", "attempt-1", &task_id))
+            .join("execution-context.json");
+        let context: ExecutionContextV1 =
+            serde_json::from_str(&fs::read_to_string(context_path).unwrap()).unwrap();
+
+        assert!(context.current_findings.is_empty());
+        assert!(prompt.contains("## Tester-harness repair authority"));
+        assert!(prompt.contains("deduplicate normalized results"));
+        assert!(prompt.contains("Failed Tester commands are diagnostic evidence"));
+        assert!(prompt.contains("repair product code or product tests"));
+        assert_eq!(
+            context.historical_artifacts,
+            [tester_path.display().to_string()]
+        );
+    }
+
+    #[test]
+    fn tests_reviewer_prompt_indexes_failed_tester_correction_evidence() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_root_storage = tmp.path().join("candidate-correction-evidence/".repeat(12));
+        fs::create_dir_all(&project_root_storage).unwrap();
+        let project_root = project_root_storage.as_path();
+        let workspace = project_root.join("candidate");
+        let tester_dir =
+            project_root.join(".fluent/work/artifacts/work-1/attempt-1/attempt-1-tester");
+        let tester_results = tester_dir.join("tester-results.json");
+        let artifact_dir =
+            project_root.join(".fluent/work/artifacts/work-1/attempt-1/attempt-1-review-tests");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(tester_dir.join("commands")).unwrap();
+        fs::write(tester_dir.join("commands/0-stdout.log"), "stdout").unwrap();
+        fs::write(tester_dir.join("commands/0-stderr.log"), "stderr").unwrap();
+        fs::write(
+            &tester_results,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "candidate_commit": "prior123",
+                "commands": [{"command": "make test", "test_harness": "shell", "exit_code": 2, "duration_ms": 1, "stdout_log": "commands/0-stdout.log", "stderr_log": "commands/0-stderr.log"}],
+                "tests": [],
+                "summary": {"total": 0, "pass": 0, "fail": 0, "skipped": 0},
+                "error": null
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let item = corrective_review_item("tests");
+        let inputs = vec![
+            tester_results.clone(),
+            tester_dir.join("commands/0-stdout.log"),
+            tester_dir.join("commands/0-stderr.log"),
+        ];
+
+        let prompts = build_work_review_prompts(WorkReviewPromptInput {
+            item: &item,
+            attempt_id: "attempt-1",
+            task_id: "attempt-1-review-tests",
+            project_root,
+            artifact_dir: &artifact_dir,
+            review_path: &artifact_dir.join("review.md"),
+            readable_workspaces: std::slice::from_ref(&workspace),
+            input_artifacts: &inputs,
+            review_only: false,
+        })
+        .unwrap();
+        let context: ExecutionContextV1 = serde_json::from_str(
+            &fs::read_to_string(artifact_dir.join("execution-context.json")).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(context.current_findings.len(), 1);
+        assert_eq!(
+            context.current_findings[0].artifact,
+            tester_results.display().to_string()
+        );
+        assert!(
+            prompts
+                .review_prompt
+                .contains("Read the latest Tester correction evidence")
+        );
+        assert!(
+            prompts
+                .review_prompt
+                .contains(&tester_results.display().to_string())
+        );
+        assert!(
+            prompts.review_prompt.contains(
+                &tester_dir
+                    .join("commands/0-stdout.log")
+                    .display()
+                    .to_string()
+            )
+        );
+        assert!(
+            prompts.review_prompt.contains(
+                &tester_dir
+                    .join("commands/0-stderr.log")
+                    .display()
+                    .to_string()
+            )
+        );
+        assert!(
+            prompts.review_prompt.contains(
+                &artifact_dir
+                    .join("execution-context.json")
+                    .display()
+                    .to_string()
+            )
+        );
+        assert!(!prompts.review_prompt.contains("{{"));
+    }
+
+    #[test]
+    fn execution_context_surfaces_candidate_gate_diagnostics_from_long_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let artifact = tmp.path().join("artifact");
+        let gate_path = tmp
+            .path()
+            .join("candidate-gate-artifacts".repeat(4))
+            .join("attempt-artifacts".repeat(4))
+            .join(crate::candidate_gate::CANDIDATE_GATE_FILE);
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(gate_path.parent().unwrap()).unwrap();
+        let gate = crate::candidate_gate::CandidateGateEvidence {
+            schema_version: crate::candidate_gate::CANDIDATE_GATE_SCHEMA_VERSION,
+            phase: crate::candidate_gate::CandidateGatePhase::Writer,
+            disposition: crate::candidate_gate::CandidateGateDisposition::Rejected,
+            base_commit: "base".to_string(),
+            candidate_commit: "candidate".to_string(),
+            tester_results_path: None,
+            metadata_rewrite: None,
+            checks: vec![crate::candidate_gate::CandidateCheckEvidence {
+                name: "behavior-references".to_string(),
+                status: crate::candidate_gate::CandidateCheckStatus::Failed,
+                diagnostics: vec![
+                    "behaviors.md#b1 references missing committed test path AppTests/RateLimitTests.swift"
+                        .to_string(),
+                ],
+                log_path: None,
+            }],
+        };
+        fs::write(&gate_path, serde_json::to_vec_pretty(&gate).unwrap()).unwrap();
+
+        let context_path = write_execution_context(
+            &artifact,
+            &workspace,
+            "candidate",
+            Some("base"),
+            &[],
+            std::slice::from_ref(&gate_path),
+            None,
+        )
+        .unwrap();
+        let context: ExecutionContextV1 =
+            serde_json::from_str(&fs::read_to_string(context_path).unwrap()).unwrap();
+
+        assert_eq!(context.current_findings.len(), 1);
+        assert_eq!(context.current_findings[0].role, "candidate-gate");
+        assert_eq!(
+            context.current_findings[0].title,
+            "behavior-references check remains unresolved: behaviors.md#b1 references missing committed test path AppTests/RateLimitTests.swift"
+        );
+        assert!(
+            gate_path.display().to_string().len() > 240,
+            "the regression fixture must exceed the historical path limit"
+        );
+    }
+
+    #[test]
+    fn execution_context_is_bounded_and_preserves_authoritative_core() {
+        let tmp = tempfile::tempdir_in("target").unwrap();
+        let workspace = tmp.path().join("workspace");
+        let artifact = tmp.path().join("artifact");
+        // Keep the real review path short when each finding repeats it.
+        let review = Path::new("target")
+            .join(tmp.path().file_name().unwrap())
+            .join("attempt-review-tests/review.md");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(review.parent().unwrap()).unwrap();
+        let findings = (0..100)
+            .map(|index| {
+                format!(
+                    "- [ ] Finding {index}: {} (blocking)",
+                    "context that must not be reinjected ".repeat(100)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&review, format!("Verdict: fail\n\n{findings}\n")).unwrap();
+        let mut inputs = vec![review];
+        // Synthetic identifiers must not inherit the checkout or TMPDIR prefix.
+        inputs.extend((0..75).map(|index| PathBuf::from(format!("history-{index}.json"))));
+        let unresolved = (0..100)
+            .map(|index| format!("step {index}: {}", "large unresolved detail ".repeat(100)))
+            .collect::<Vec<_>>();
+
+        let context_path = write_execution_context(
+            &artifact,
+            &workspace,
+            "abc123",
+            Some("base123"),
+            &unresolved,
+            &inputs,
+            None,
+        )
+        .unwrap();
+        let source = fs::read_to_string(&context_path).unwrap();
+        let context: ExecutionContextV1 = serde_json::from_str(&source).unwrap();
+
+        assert!(source.len() <= EXECUTION_CONTEXT_MAX_BYTES);
+        assert_eq!(context.unresolved_steps.len(), 100);
+        assert_eq!(context.current_findings.len(), 100);
+        assert_eq!(
+            context.historical_artifacts,
+            inputs
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(context.omitted.unresolved_steps, 0);
+        assert_eq!(context.omitted.current_findings, 0);
+        assert_eq!(context.omitted.historical_artifacts, 0);
+        assert!(
+            inputs[0].is_file(),
+            "historical review evidence remains intact"
+        );
     }
 
     #[test]
@@ -7573,6 +19181,19 @@ mod tests {
         let artifact_dir =
             project_root.join(".fluent/work/artifacts/work-1/attempt-1/attempt-1-review-behaviors");
         let review_path = artifact_dir.join("review.md");
+        let writer_transcript = project_root
+            .join(".fluent/work/artifacts/work-1/attempt-1/attempt-1-write-1/transcript.jsonl");
+        fs::create_dir_all(writer_transcript.parent().unwrap()).unwrap();
+        fs::write(
+            &writer_transcript,
+            r#"{"type":"agent_message","message":"Verification: cargo test focused — pass"}"#,
+        )
+        .unwrap();
+        let writer_matrix = writer_transcript
+            .parent()
+            .unwrap()
+            .join(WRITER_COMPLETION_MATRIX_FILE);
+        fs::write(&writer_matrix, "{\"schema-version\":1}").unwrap();
 
         let item = review_item_with_role("behaviors");
         let prompts = build_work_review_prompts(WorkReviewPromptInput {
@@ -7583,7 +19204,7 @@ mod tests {
             artifact_dir: &artifact_dir,
             review_path: &review_path,
             readable_workspaces: std::slice::from_ref(&workspace),
-            input_artifacts: &[],
+            input_artifacts: &[writer_transcript.clone(), writer_matrix.clone()],
             review_only: false,
         })
         .unwrap();
@@ -7598,8 +19219,30 @@ mod tests {
             "behaviors reviewer should see the Test: reference verification"
         );
         assert!(
-            prompts.review_prompt.contains("tester-results.json"),
-            "behaviors reviewer should see tester-results.json instructions"
+            prompts
+                .review_prompt
+                .contains(&writer_transcript.display().to_string())
+        );
+        assert!(
+            prompts.review_prompt.contains("advisory evidence"),
+            "pre-Tester reviewers should receive the Writer verification boundary"
+        );
+        assert!(
+            prompts
+                .review_prompt
+                .contains(&writer_matrix.display().to_string())
+        );
+        assert!(prompts.review_prompt.contains("advisory coverage map"));
+        assert!(
+            !prompts.review_prompt.contains("host-owned outcomes"),
+            "pre-Tester reviewers must not be told canonical evidence already exists"
+        );
+        assert!(!prompts.review_prompt.contains("CARGO_TARGET_DIR"));
+        assert!(!prompts.review_prompt.contains("cargo test"));
+        assert!(
+            prompts
+                .review_prompt
+                .contains("Do not rerun the full suite")
         );
 
         // Other role blocks are NOT rendered.
@@ -7668,6 +19311,26 @@ mod tests {
                 "main...abc123".to_string(),
             ],
         );
+        assert!(
+            prompts.review_prompt.contains(
+                &tmp.path()
+                    .join("review-inspection.json")
+                    .display()
+                    .to_string()
+            )
+        );
+        assert!(
+            prompts
+                .review_prompt
+                .contains("\"candidate-commit\": \"abc123\"")
+        );
+        assert!(prompts.review_prompt.contains("\"role\": \"tests\""));
+        assert!(
+            prompts
+                .review_prompt
+                .contains(&workspace.display().to_string())
+        );
+        assert!(!prompts.review_prompt.contains("{{"));
     }
 
     fn post_merge_review_item(base_commit: Option<String>) -> WorkItem {
@@ -7754,6 +19417,17 @@ mod tests {
                 .review_prompt
                 .contains("Run the review diff command"),
             "review-only without base_commit should skip the diff step"
+        );
+        assert!(
+            prompts
+                .review_prompt
+                .contains("one named missing evidence check")
+        );
+        assert!(!prompts.review_prompt.contains("CARGO_TARGET_DIR"));
+        assert!(
+            !prompts
+                .review_prompt
+                .contains(".fluent/work/cache/reviewers")
         );
     }
 
@@ -7849,7 +19523,7 @@ mod tests {
 
     #[test]
     fn tester_task_artifact_path_resolved_from_artifact_area() {
-        let item = review_item();
+        let item = review_item_with_final_tester();
         let attempt = &item.attempts[0];
         let tester_task = attempt
             .tasks
@@ -7877,21 +19551,8 @@ mod tests {
     }
 
     #[test]
-    fn tester_task_does_not_spawn_coder_process() {
-        let item = review_item();
-        let attempt = &item.attempts[0];
-        let tester_task = attempt
-            .tasks
-            .iter()
-            .find(|t| t.kind == TaskKind::Tester)
-            .expect("should have a Tester task");
-        assert_eq!(tester_task.kind, TaskKind::Tester);
-        assert_ne!(tester_task.kind, TaskKind::BehaviorTests);
-    }
-
-    #[test]
     fn tester_task_does_not_write_transcript() {
-        let item = review_item();
+        let item = review_item_with_final_tester();
         let attempt = &item.attempts[0];
         let tester_task = attempt
             .tasks
@@ -7915,7 +19576,7 @@ mod tests {
 
     #[test]
     fn tester_task_invokes_subcommand_not_coder() {
-        let item = review_item();
+        let item = review_item_with_final_tester();
         let attempt = &item.attempts[0];
         let tester_task = attempt
             .tasks
@@ -8089,11 +19750,1284 @@ mod tests {
     }
 
     #[test]
-    fn writer_prompts_preserve_required_progress_schema() {
-        // Review follow-up placement B1/B2: when a follow-up Writer receives a
-        // required-progress contract, the prompt keeps review work in a separate
-        // section and tells the Writer to migrate legacy rows with their nested
-        // notes. An Attempt without a contract omits the authoritative schema.
+    fn continuation_prompt_contains_only_current_execution_context() {
+        let mut item = review_item();
+        item.attempts[0]
+            .writer_runs
+            .push(crate::work_model::WriterRun {
+                task_id: "attempt-1-write-0".to_string(),
+                outcome: crate::work_model::WriterOutcome::Continue,
+                kind: crate::work_model::WriterRunKind::Initial,
+                provider: "codex".to_string(),
+                session_id: Some("writer-thread-1".to_string()),
+                continuation: 0,
+                checked_required: 1,
+                completed_matrix: 0,
+                candidate_commit: "commit-1".to_string(),
+            });
+        let project = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["init", "-q"],
+            "initializing test repository",
+        )
+        .unwrap();
+        crate::git::run(
+            workspace.path(),
+            &[
+                "-c",
+                "user.name=Fluent Test",
+                "-c",
+                "user.email=fluent@example.test",
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "Add baseline",
+            ],
+            "commit the recorded context base",
+        )
+        .unwrap();
+        item.attempts[0].tasks[0]
+            .output
+            .as_mut()
+            .unwrap()
+            .base_commit = Some(git_stdout(workspace.path(), &["rev-parse", "HEAD"]));
+        fs::write(
+            workspace.path().join("candidate.txt"),
+            "new candidate content\n",
+        )
+        .unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["add", "candidate.txt"],
+            "staging test candidate",
+        )
+        .unwrap();
+        crate::git::run(
+            workspace.path(),
+            &[
+                "-c",
+                "user.name=Fluent Test",
+                "-c",
+                "user.email=fluent@example.test",
+                "commit",
+                "-q",
+                "-m",
+                "Add candidate",
+            ],
+            "committing test candidate",
+        )
+        .unwrap();
+        let progress = progress_md_path_for(project.path(), "work-1", "attempt-1");
+        fs::create_dir_all(progress.parent().unwrap()).unwrap();
+        fs::write(
+            &progress,
+            "## Required completion\n\n- [x] step-1 — Done; Evidence: test\n- [ ] step-2 — Still open\n  - keep this constraint\n",
+        )
+        .unwrap();
+        let finding = project.path().join("review-tests.md");
+        fs::write(&finding, "- [ ] Fix the boundary\n").unwrap();
+
+        let prompt = build_writer_continuation_prompt(
+            &item,
+            "attempt-1",
+            "attempt-1-write-1",
+            std::slice::from_ref(&finding),
+            workspace.path(),
+            project.path(),
+        )
+        .unwrap();
+
+        assert!(prompt.contains("step-2 — Still open"));
+        assert!(prompt.contains("keep this constraint"));
+        assert!(!prompt.contains("step-1 — Done"));
+        assert!(prompt.contains(&progress.display().to_string()));
+        let context_path = project.path().join(
+            ".fluent/work/artifacts/work-1/attempt-1/attempt-1-write-1/execution-context.json",
+        );
+        assert!(prompt.contains(&context_path.display().to_string()));
+        assert!(!prompt.contains("new candidate content"));
+        assert!(!prompt.contains("Fix the boundary"));
+        assert!(!prompt.contains("Writer completion matrix:"));
+        assert!(!prompt.contains("{{"));
+        assert!(prompt.contains(&format!(
+            "Candidate checkout: {}",
+            workspace.path().display()
+        )));
+        assert!(prompt.contains(&format!("Source checkout: {}", project.path().display())));
+        assert!(prompt.contains("Commit product changes only in the candidate checkout"));
+
+        item.attempts[0].writer_completion_contract =
+            Some(crate::work_model::WriterCompletionContract {
+                version: crate::work_model::WRITER_COMPLETION_CONTRACT_VERSION,
+                requirements: vec![crate::work_model::WriterCompletionRequirement {
+                    responsibility: None,
+                    id: "plan:step-2".to_string(),
+                    kind: crate::work_model::WriterCompletionRequirementKind::Plan,
+                    source: "plan.md#step-2".to_string(),
+                    requirement: "Keep the controls session-owned.".to_string(),
+                    verification_refs: Vec::new(),
+                    command: None,
+                }],
+            });
+        let matrix_prompt = build_writer_continuation_prompt(
+            &item,
+            "attempt-1",
+            "attempt-1-write-1",
+            std::slice::from_ref(&finding),
+            workspace.path(),
+            project.path(),
+        )
+        .unwrap();
+        assert!(matrix_prompt.contains("Writer completion matrix:"));
+        assert!(matrix_prompt.contains("Preserve every host-owned row field"));
+        assert!(matrix_prompt.contains("as JSON arrays"));
+        assert!(matrix_prompt.contains("[\"none: <specific reason>\"]"));
+        assert!(matrix_prompt.contains("exact allowed IDs"));
+        assert!(matrix_prompt.contains("- `plan:step-2`"));
+        assert!(matrix_prompt.contains("writer-completion.json"));
+        assert!(matrix_prompt.contains("do not edit the host-owned"));
+        assert!(!matrix_prompt.contains("{{"));
+
+        let context: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(context_path).unwrap()).unwrap();
+        assert_eq!(context["schema-version"], 1);
+        assert_eq!(context["candidate-commit"].as_str().unwrap().len(), 40);
+        assert_eq!(
+            context["changed-files"],
+            serde_json::json!(["candidate.txt"])
+        );
+        assert_eq!(
+            context["unresolved-steps"],
+            serde_json::json!(["step-2 — Still open\n  - keep this constraint"])
+        );
+        assert_eq!(context["current-findings"][0]["title"], "Fix the boundary");
+        assert_eq!(
+            context["historical-artifacts"],
+            serde_json::json!([finding.display().to_string()])
+        );
+    }
+
+    #[test]
+    fn reviewed_correction_prompt_is_bounded_and_references_full_artifacts_by_path() {
+        let mut item = review_item();
+        let project = tempfile::tempdir_in("target").unwrap();
+        let workspace = tempfile::tempdir_in("target").unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["init", "-q"],
+            "initialize correction fixture",
+        )
+        .unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["config", "user.name", "Fluent Test"],
+            "configure correction fixture",
+        )
+        .unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["config", "user.email", "fluent@example.test"],
+            "configure correction fixture",
+        )
+        .unwrap();
+        fs::write(workspace.path().join("candidate.txt"), "base\n").unwrap();
+        crate::git::run(workspace.path(), &["add", "."], "stage correction base").unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["commit", "-q", "-m", "Add base"],
+            "commit correction base",
+        )
+        .unwrap();
+        fs::write(workspace.path().join("candidate.txt"), "corrected\n").unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["add", "."],
+            "stage correction candidate",
+        )
+        .unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["commit", "-q", "-m", "Change candidate"],
+            "commit correction candidate",
+        )
+        .unwrap();
+        let prior_candidate = head_commit(workspace.path()).unwrap();
+
+        let review_path = project
+            .path()
+            .join(".fluent/work/artifacts/work-1/attempt-1/attempt-1-review-tests/review.md");
+        fs::create_dir_all(review_path.parent().unwrap()).unwrap();
+        let large_output_marker = "FULL-REVIEW-BODY-MUST-STAY-OUT-OF-PROMPT";
+        fs::write(
+            &review_path,
+            format!(
+                "Verdict: fail\n\n## Findings\n\n- [ ] Preserve overflow selection\n\n{}\n",
+                large_output_marker.repeat(4_000)
+            ),
+        )
+        .unwrap();
+        let review_ref = crate::work_model::ArtifactRef {
+            producer_id: "attempt-1-review-tests".to_string(),
+            path: review_path
+                .strip_prefix(project.path())
+                .unwrap()
+                .display()
+                .to_string(),
+        };
+        let task_id = item
+            .add_next_write_round("attempt-1", vec![review_ref.clone()])
+            .unwrap();
+        let human_resolution =
+            "Use the checkout's filesystem identity and fail closed after replacement.";
+        item.attempts[0]
+            .round_cap_extensions
+            .push(crate::work_model::RoundCapExtension {
+                id: "round-cap-1-2".to_string(),
+                old_cap: 1,
+                new_cap: 2,
+                additional_write_rounds: 1,
+                evidence_write_rounds: 0,
+                authorized_base_cap: None,
+                pre_extension_write_rounds: None,
+                candidate_commit: prior_candidate.clone(),
+                failed_reviews: vec![crate::work_model::RoundCapReviewArtifact {
+                    artifact: review_ref,
+                    digest: "sha256:review".to_string(),
+                }],
+                human_resolution: human_resolution.to_string(),
+                human_resolution_digest: crate::work_model::round_cap_resolution_digest(
+                    human_resolution,
+                ),
+                approved_at: "2026-08-18T00:00:00Z".to_string(),
+            });
+        item.attempts[0].writer_completion_contract =
+            Some(crate::work_model::WriterCompletionContract {
+                version: crate::work_model::WRITER_COMPLETION_CONTRACT_VERSION,
+                requirements: vec![crate::work_model::WriterCompletionRequirement {
+                    responsibility: None,
+                    id: "plan:step-2".to_string(),
+                    kind: crate::work_model::WriterCompletionRequirementKind::Plan,
+                    source: "plan.md#step-2".to_string(),
+                    requirement: "Keep the controls session-owned.".to_string(),
+                    verification_refs: Vec::new(),
+                    command: None,
+                }],
+            });
+        let progress = progress_md_path_for(project.path(), "work-1", "attempt-1");
+        fs::create_dir_all(progress.parent().unwrap()).unwrap();
+        fs::write(
+            &progress,
+            "## Review follow-ups\n\n- [ ] Preserve overflow selection\n",
+        )
+        .unwrap();
+
+        let prompt = build_reviewed_correction_prompt(
+            &item,
+            "attempt-1",
+            &task_id,
+            std::slice::from_ref(&review_path),
+            workspace.path(),
+            project.path(),
+        )
+        .unwrap();
+
+        let artifact_dir = project
+            .path()
+            .join(work_artifact_path("work-1", "attempt-1", &task_id));
+        let context_path = artifact_dir.join("execution-context.json");
+        assert!(prompt.len() <= crate::writer_context::REVIEWED_CORRECTION_PROMPT_MAX_BYTES);
+        assert!(prompt.contains(&context_path.display().to_string()));
+        assert!(prompt.contains(&artifact_dir.display().to_string()));
+        assert!(prompt.contains(&progress.display().to_string()));
+        assert!(prompt.contains("as JSON arrays"));
+        assert!(prompt.contains("[\"none: <specific reason>\"]"));
+        assert!(prompt.contains("exact allowed IDs"));
+        assert!(prompt.contains("- `plan:step-2`"));
+        assert!(prompt.contains("host-owned `## Required completion` projection"));
+        assert!(prompt.contains("\"schema_version\": 1"));
+        assert!(prompt.contains(&prior_candidate));
+        assert!(prompt.contains("append-only"));
+        assert!(prompt.contains("## Human resolution"));
+        assert!(prompt.contains(human_resolution));
+        assert!(!prompt.contains(large_output_marker));
+        assert!(!prompt.contains("{{"));
+
+        let context: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(context_path).unwrap()).unwrap();
+        assert_eq!(
+            context["current-findings"][0]["title"],
+            "Preserve overflow selection"
+        );
+        assert_eq!(
+            context["historical-artifacts"],
+            serde_json::json!([review_path.display().to_string()])
+        );
+        assert_eq!(
+            context["correction-lineage"],
+            serde_json::json!({
+                "mode": "append-only",
+                "prior-candidate-commit": prior_candidate,
+            })
+        );
+    }
+
+    #[test]
+    fn metadata_only_gate_explicitly_authorizes_tree_identical_rewrite_guidance() {
+        let mut item = review_item();
+        let project = tempfile::tempdir_in("target").unwrap();
+        let workspace = tempfile::tempdir_in("target").unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["init", "-q"],
+            "initialize correction fixture",
+        )
+        .unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["config", "user.name", "Fluent Test"],
+            "configure correction fixture",
+        )
+        .unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["config", "user.email", "fluent@example.test"],
+            "configure correction fixture",
+        )
+        .unwrap();
+        fs::write(workspace.path().join("candidate.txt"), "candidate\n").unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["add", "."],
+            "stage correction candidate",
+        )
+        .unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["commit", "-q", "-m", "bad subject."],
+            "commit correction candidate",
+        )
+        .unwrap();
+        let prior_candidate = head_commit(workspace.path()).unwrap();
+
+        let gate_path = project.path().join(
+            ".fluent/work/artifacts/work-1/attempt-1/candidate-gates/attempt-1-write-1/candidate-gate.json",
+        );
+        fs::create_dir_all(gate_path.parent().unwrap()).unwrap();
+        let checks = [
+            (
+                "candidate-identity",
+                crate::candidate_gate::CandidateCheckStatus::Passed,
+            ),
+            (
+                "whitespace",
+                crate::candidate_gate::CandidateCheckStatus::Passed,
+            ),
+            (
+                "commit-metadata",
+                crate::candidate_gate::CandidateCheckStatus::Failed,
+            ),
+            (
+                "behavior-references",
+                crate::candidate_gate::CandidateCheckStatus::Passed,
+            ),
+            (
+                "tester-reference-evidence",
+                crate::candidate_gate::CandidateCheckStatus::Skipped,
+            ),
+            (
+                "project-check",
+                crate::candidate_gate::CandidateCheckStatus::Passed,
+            ),
+        ]
+        .into_iter()
+        .map(
+            |(name, status)| crate::candidate_gate::CandidateCheckEvidence {
+                name: name.to_string(),
+                status,
+                diagnostics: Vec::new(),
+                log_path: None,
+            },
+        )
+        .collect();
+        let mut gate = crate::candidate_gate::CandidateGateEvidence {
+            schema_version: crate::candidate_gate::CANDIDATE_GATE_SCHEMA_VERSION,
+            phase: crate::candidate_gate::CandidateGatePhase::Writer,
+            disposition: crate::candidate_gate::CandidateGateDisposition::Rejected,
+            base_commit: prior_candidate.clone(),
+            candidate_commit: prior_candidate.clone(),
+            tester_results_path: None,
+            metadata_rewrite: None,
+            checks,
+        };
+        fs::write(&gate_path, serde_json::to_vec_pretty(&gate).unwrap()).unwrap();
+        let task_id = item
+            .add_next_write_round(
+                "attempt-1",
+                vec![ArtifactRef {
+                    producer_id: "attempt-1-write-1".to_string(),
+                    path: gate_path
+                        .strip_prefix(project.path())
+                        .unwrap()
+                        .display()
+                        .to_string(),
+                }],
+            )
+            .unwrap();
+
+        let prompt = build_reviewed_correction_prompt(
+            &item,
+            "attempt-1",
+            &task_id,
+            std::slice::from_ref(&gate_path),
+            workspace.path(),
+            project.path(),
+        )
+        .unwrap();
+        let context_path = project
+            .path()
+            .join(work_artifact_path("work-1", "attempt-1", &task_id))
+            .join("execution-context.json");
+        let context: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(context_path).unwrap()).unwrap();
+
+        assert_eq!(
+            context["correction-lineage"],
+            serde_json::json!({
+                "mode": "tree-identical-metadata-rewrite",
+                "prior-candidate-commit": prior_candidate,
+                "protected-base-commit": gate.base_commit.clone(),
+            })
+        );
+        assert!(prompt.contains("tree-identical-metadata-rewrite"));
+        assert!(prompt.contains(&prior_candidate));
+        assert!(prompt.contains(&gate.base_commit));
+        assert!(!prompt.contains("{{"));
+
+        let whitespace = gate
+            .checks
+            .iter_mut()
+            .find(|check| check.name == "whitespace")
+            .unwrap();
+        whitespace.status = crate::candidate_gate::CandidateCheckStatus::Failed;
+        fs::write(&gate_path, serde_json::to_vec_pretty(&gate).unwrap()).unwrap();
+        let prompt = build_reviewed_correction_prompt(
+            &item,
+            "attempt-1",
+            &task_id,
+            std::slice::from_ref(&gate_path),
+            workspace.path(),
+            project.path(),
+        )
+        .unwrap();
+        let context: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(
+                project
+                    .path()
+                    .join(work_artifact_path("work-1", "attempt-1", &task_id))
+                    .join("execution-context.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(context["correction-lineage"]["mode"], "append-only");
+        assert!(prompt.contains("append-only"));
+        assert!(!prompt.contains("tree-identical-metadata-rewrite"));
+    }
+
+    #[test]
+    fn latest_metadata_gate_wins_when_older_gate_history_is_preserved() {
+        let project = tempfile::tempdir().unwrap();
+        let checks = |metadata_status| {
+            [
+                (
+                    "candidate-identity",
+                    crate::candidate_gate::CandidateCheckStatus::Passed,
+                ),
+                (
+                    "whitespace",
+                    crate::candidate_gate::CandidateCheckStatus::Passed,
+                ),
+                ("commit-metadata", metadata_status),
+                (
+                    "behavior-references",
+                    crate::candidate_gate::CandidateCheckStatus::Passed,
+                ),
+                (
+                    "tester-reference-evidence",
+                    crate::candidate_gate::CandidateCheckStatus::Skipped,
+                ),
+                (
+                    "project-check",
+                    crate::candidate_gate::CandidateCheckStatus::Skipped,
+                ),
+            ]
+            .into_iter()
+            .map(
+                |(name, status)| crate::candidate_gate::CandidateCheckEvidence {
+                    name: name.to_string(),
+                    status,
+                    diagnostics: Vec::new(),
+                    log_path: None,
+                },
+            )
+            .collect::<Vec<_>>()
+        };
+        let write_gate = |path: &Path, candidate: &str, base: &str| {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(
+                path,
+                serde_json::to_vec_pretty(&crate::candidate_gate::CandidateGateEvidence {
+                    schema_version: crate::candidate_gate::CANDIDATE_GATE_SCHEMA_VERSION,
+                    phase: crate::candidate_gate::CandidateGatePhase::Writer,
+                    disposition: crate::candidate_gate::CandidateGateDisposition::Rejected,
+                    base_commit: base.to_string(),
+                    candidate_commit: candidate.to_string(),
+                    tester_results_path: None,
+                    metadata_rewrite: None,
+                    checks: checks(crate::candidate_gate::CandidateCheckStatus::Failed),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        };
+        let older = project.path().join("older/candidate-gate.json");
+        let current = project.path().join("current/candidate-gate.json");
+        write_gate(&older, "older-candidate", "protected-base");
+        write_gate(&current, "current-candidate", "protected-base");
+
+        let lineage = correction_lineage(project.path(), "current-candidate", &[older, current]);
+        assert_eq!(
+            lineage.mode,
+            ExecutionContextCorrectionLineageMode::TreeIdenticalMetadataRewrite
+        );
+        assert_eq!(lineage.prior_candidate_commit, "current-candidate");
+        assert_eq!(
+            lineage.protected_base_commit.as_deref(),
+            Some("protected-base")
+        );
+    }
+
+    #[test]
+    fn derived_line_length_metadata_gate_preserves_tree_identical_correction_lineage() {
+        let project = tempfile::tempdir().unwrap();
+        for args in [
+            &["init", "-q"][..],
+            &["config", "user.name", "Fluent Test"][..],
+            &["config", "user.email", "fluent@example.test"][..],
+        ] {
+            crate::git::run(project.path(), args, "prepare lineage fixture").unwrap();
+        }
+        fs::write(project.path().join("base.txt"), "base\n").unwrap();
+        crate::git::run(project.path(), &["add", "base.txt"], "stage lineage base").unwrap();
+        crate::git::run(
+            project.path(),
+            &["commit", "-q", "-m", "Create protected base"],
+            "commit lineage base",
+        )
+        .unwrap();
+        let protected_base = head_commit(project.path()).unwrap();
+        fs::write(project.path().join("candidate.txt"), "candidate\n").unwrap();
+        crate::git::run(
+            project.path(),
+            &["add", "candidate.txt"],
+            "stage lineage candidate",
+        )
+        .unwrap();
+        let malformed_message = "Candidate\nThis malformed body contains literal \\n text and is deliberately longer than seventy-two characters.";
+        crate::git::run(
+            project.path(),
+            &["commit", "-q", "-m", malformed_message],
+            "commit lineage candidate",
+        )
+        .unwrap();
+        let candidate = head_commit(project.path()).unwrap();
+        assert_ne!(candidate, protected_base);
+        assert_eq!(candidate.len(), 40);
+        assert_eq!(protected_base.len(), 40);
+        let gate_path = project.path().join(
+            ".fluent/work/artifacts/work-1/attempt-1/candidate-gates/attempt-1-write-1/candidate-gate.json",
+        );
+        let hook_path = gate_path
+            .parent()
+            .unwrap()
+            .join("hooks/check-pre-merge.log");
+        fs::create_dir_all(hook_path.parent().unwrap()).unwrap();
+        fs::write(
+            &hook_path,
+            format!("commit {candidate} body line 2 exceeds 72 characters\n"),
+        )
+        .unwrap();
+        let metadata_diagnostic =
+            format!("commit {candidate} contains literal \\n text instead of line breaks");
+        let checks = vec![
+            crate::candidate_gate::CandidateCheckEvidence {
+                name: "candidate-identity".to_string(),
+                status: crate::candidate_gate::CandidateCheckStatus::Passed,
+                diagnostics: Vec::new(),
+                log_path: None,
+            },
+            crate::candidate_gate::CandidateCheckEvidence {
+                name: "whitespace".to_string(),
+                status: crate::candidate_gate::CandidateCheckStatus::Passed,
+                diagnostics: Vec::new(),
+                log_path: None,
+            },
+            crate::candidate_gate::CandidateCheckEvidence {
+                name: "commit-metadata".to_string(),
+                status: crate::candidate_gate::CandidateCheckStatus::Failed,
+                diagnostics: vec![metadata_diagnostic],
+                log_path: None,
+            },
+            crate::candidate_gate::CandidateCheckEvidence {
+                name: "behavior-references".to_string(),
+                status: crate::candidate_gate::CandidateCheckStatus::Passed,
+                diagnostics: Vec::new(),
+                log_path: None,
+            },
+            crate::candidate_gate::CandidateCheckEvidence {
+                name: "tester-reference-evidence".to_string(),
+                status: crate::candidate_gate::CandidateCheckStatus::Skipped,
+                diagnostics: Vec::new(),
+                log_path: None,
+            },
+            crate::candidate_gate::CandidateCheckEvidence {
+                name: "project-check".to_string(),
+                status: crate::candidate_gate::CandidateCheckStatus::Failed,
+                diagnostics: vec!["check-pre-merge exited 1".to_string()],
+                log_path: Some(
+                    hook_path
+                        .strip_prefix(project.path())
+                        .unwrap()
+                        .to_string_lossy()
+                        .to_string(),
+                ),
+            },
+        ];
+        fs::write(
+            &gate_path,
+            serde_json::to_vec_pretty(&crate::candidate_gate::CandidateGateEvidence {
+                schema_version: crate::candidate_gate::CANDIDATE_GATE_SCHEMA_VERSION,
+                phase: crate::candidate_gate::CandidateGatePhase::Writer,
+                disposition: crate::candidate_gate::CandidateGateDisposition::Rejected,
+                base_commit: protected_base.clone(),
+                candidate_commit: candidate.clone(),
+                tester_results_path: None,
+                metadata_rewrite: None,
+                checks,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let lineage = correction_lineage(project.path(), &candidate, &[gate_path]);
+
+        assert_eq!(
+            lineage.mode,
+            ExecutionContextCorrectionLineageMode::TreeIdenticalMetadataRewrite
+        );
+        assert_eq!(
+            lineage.protected_base_commit.as_deref(),
+            Some(protected_base.as_str())
+        );
+    }
+
+    #[test]
+    fn recovered_ancestry_prompts_protect_immutable_history() {
+        let project = tempfile::tempdir_in("target").unwrap();
+        let workspace = tempfile::tempdir_in("target").unwrap();
+        for args in [
+            &["init", "-q"] as &[&str],
+            &["config", "user.name", "Fluent Test"],
+            &["config", "user.email", "fluent@example.test"],
+            &["commit", "-q", "--allow-empty", "-m", "Improve candidate"],
+        ] {
+            crate::git::run(workspace.path(), args, "prepare recovered prompt fixture").unwrap();
+        }
+        let mut item = review_item_with_role("documentation");
+        let repair = item.attempts[0]
+            .tasks
+            .iter_mut()
+            .find(|task| task.kind == TaskKind::Write)
+            .unwrap();
+        repair.role = crate::work_model::CANDIDATE_ANCESTRY_REPAIR_ROLE.to_string();
+        repair.output.as_mut().unwrap().base_commit = Some("protected123".to_string());
+
+        let review_artifact = project.path().join("review-artifact");
+        let review_path = review_artifact.join("review.md");
+        let prompts = build_work_review_prompts(WorkReviewPromptInput {
+            item: &item,
+            attempt_id: "attempt-1",
+            task_id: "attempt-1-review-documentation",
+            project_root: project.path(),
+            artifact_dir: &review_artifact,
+            review_path: &review_path,
+            readable_workspaces: &[workspace.path().to_path_buf()],
+            input_artifacts: &[],
+            review_only: false,
+        })
+        .unwrap();
+        assert!(prompts.review_prompt.contains("protected123"));
+        assert!(
+            prompts.review_prompt.contains(
+                "do not fail\nthe candidate or ask the Writer to rewrite commit metadata"
+            )
+        );
+
+        let task_id = "attempt-1-write-2".to_string();
+        let mut correction_task = item.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Write)
+            .unwrap()
+            .clone();
+        correction_task.id = task_id.clone();
+        correction_task.role = "corrective-writer".to_string();
+        correction_task.status = TaskStatus::Planned;
+        correction_task.output = None;
+        correction_task.input_artifacts.clear();
+        correction_task.artifact_area = Some(crate::work_model::TaskArtifactArea {
+            path: work_artifact_path("work-1", "attempt-1", &task_id),
+        });
+        item.attempts[0].tasks.push(correction_task);
+        let correction = build_reviewed_correction_prompt(
+            &item,
+            "attempt-1",
+            &task_id,
+            &[],
+            workspace.path(),
+            project.path(),
+        )
+        .unwrap();
+        assert!(correction.contains("protected123"));
+        assert!(correction.contains(&format!(
+            "Candidate checkout: {}",
+            workspace.path().display()
+        )));
+        assert!(correction.contains(&format!("Source checkout: {}", project.path().display())));
+        assert!(correction.contains("Commit product changes only in the candidate checkout"));
+        assert!(
+            correction
+                .contains("Do not rewrite their metadata even if a review finding requests it")
+        );
+    }
+
+    #[test]
+    fn reviewed_correction_prompt_requires_an_exact_prior_candidate() {
+        let project = tempfile::tempdir().unwrap();
+        let workspace = project.path().join("not-a-repository");
+        fs::create_dir_all(&workspace).unwrap();
+        let review_path = project
+            .path()
+            .join(".fluent/work/artifacts/work-1/attempt-1/attempt-1-review-tests/review.md");
+        fs::create_dir_all(review_path.parent().unwrap()).unwrap();
+        fs::write(&review_path, "Verdict: fail\n\n- [ ] Fix the candidate\n").unwrap();
+        let mut item = review_item();
+        let task_id = item
+            .add_next_write_round(
+                "attempt-1",
+                vec![ArtifactRef {
+                    producer_id: "attempt-1-review-tests".to_string(),
+                    path: review_path
+                        .strip_prefix(project.path())
+                        .unwrap()
+                        .display()
+                        .to_string(),
+                }],
+            )
+            .unwrap();
+
+        let error = build_reviewed_correction_prompt(
+            &item,
+            "attempt-1",
+            &task_id,
+            std::slice::from_ref(&review_path),
+            &workspace,
+            project.path(),
+        )
+        .expect_err("a correction prompt cannot name an empty prior candidate");
+
+        assert!(format!("{error:#}").contains("resolve task workspace HEAD"));
+    }
+
+    #[test]
+    fn failed_tester_correction_prompt_requires_digest_bound_inspection() {
+        let project = tempfile::tempdir_in("target").unwrap();
+        let workspace = tempfile::tempdir_in("target").unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["init", "-q"],
+            "initialize failed Tester correction fixture",
+        )
+        .unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["config", "user.name", "Fluent Test"],
+            "configure failed Tester correction fixture",
+        )
+        .unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["config", "user.email", "fluent@example.test"],
+            "configure failed Tester correction fixture",
+        )
+        .unwrap();
+        fs::write(workspace.path().join("candidate.txt"), "candidate\n").unwrap();
+        crate::git::run(workspace.path(), &["add", "."], "stage correction fixture").unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["commit", "-q", "-m", "Add candidate"],
+            "commit correction fixture",
+        )
+        .unwrap();
+
+        let relative_paths = [
+            ".fluent/work/artifacts/work-1/attempt-1/candidate-gates/attempt-1-write-1/candidate-gate.json",
+            ".fluent/work/artifacts/work-1/attempt-1/attempt-1-tester-1/tester-results.json",
+            ".fluent/work/artifacts/work-1/attempt-1/attempt-1-tester-1/commands/0-stdout.log",
+            ".fluent/work/artifacts/work-1/attempt-1/attempt-1-tester-1/commands/0-stderr.log",
+        ];
+        let mut refs = Vec::new();
+        let mut resolved = Vec::new();
+        for relative in relative_paths {
+            let path = project.path().join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, "evidence\n").unwrap();
+            refs.push(ArtifactRef {
+                producer_id: "attempt-1-tester-1".to_string(),
+                path: relative.to_string(),
+            });
+            resolved.push(path);
+        }
+        let gate = crate::candidate_gate::CandidateGateEvidence {
+            schema_version: crate::candidate_gate::CANDIDATE_GATE_SCHEMA_VERSION,
+            phase: crate::candidate_gate::CandidateGatePhase::FinalTester,
+            disposition: crate::candidate_gate::CandidateGateDisposition::Rejected,
+            base_commit: "base".into(),
+            candidate_commit: "candidate".into(),
+            tester_results_path: Some(relative_paths[1].into()),
+            metadata_rewrite: None,
+            checks: vec![crate::candidate_gate::CandidateCheckEvidence {
+                name: "tester-reference-evidence".into(),
+                status: crate::candidate_gate::CandidateCheckStatus::Failed,
+                diagnostics: vec!["Required test has no passing evidence".into()],
+                log_path: None,
+            }],
+        };
+        fs::write(&resolved[0], serde_json::to_vec_pretty(&gate).unwrap()).unwrap();
+        fs::write(
+            &resolved[1],
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "candidate_commit": "candidate",
+                "commands": [],
+                "tests": [],
+                "summary": {"total": 0, "pass": 0, "fail": 0, "skipped": 0},
+                "error": null
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut item = review_item();
+        let task_id = item.add_next_write_round("attempt-1", refs).unwrap();
+
+        let prompt = build_reviewed_correction_prompt(
+            &item,
+            "attempt-1",
+            &task_id,
+            &resolved,
+            workspace.path(),
+            project.path(),
+        )
+        .unwrap();
+
+        for path in &resolved {
+            assert!(
+                prompt.contains(&path.display().to_string()),
+                "prompt must name the complete correction artifact path {}",
+                path.display()
+            );
+        }
+        for relative in relative_paths {
+            assert!(
+                prompt.contains(relative),
+                "prompt must name the exact declaration path {relative}"
+            );
+        }
+        assert!(prompt.contains("Read every artifact below"));
+        assert!(prompt.contains("candidate's `.fluent/tester.yaml`"));
+        assert!(prompt.contains("is candidate-owned"));
+        assert!(prompt.contains("\"inspected_artifacts\""));
+        assert!(prompt.contains("Compute each digest from the artifact itself"));
+        assert!(!prompt.contains("{{"));
+    }
+
+    #[test]
+    fn execution_context_never_silently_omits_current_findings() {
+        let project = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["init", "-q"],
+            "initialize findings fixture",
+        )
+        .unwrap();
+        let review_path = project.path().join("review-tests.md");
+        let findings = (0..40)
+            .map(|index| format!("- [ ] Finding {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&review_path, findings).unwrap();
+
+        let context_path = write_execution_context(
+            project.path(),
+            workspace.path(),
+            "candidate",
+            None,
+            &[],
+            std::slice::from_ref(&review_path),
+            None,
+        )
+        .unwrap();
+        let context: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(context_path).unwrap()).unwrap();
+
+        assert_eq!(context["current-findings"].as_array().unwrap().len(), 40);
+        assert_eq!(context["omitted"]["current-findings"], 0);
+    }
+
+    #[test]
+    fn saved_schema_two_execution_context_remains_readable() {
+        let artifact = tempfile::tempdir().unwrap();
+        let path = artifact.path().join("execution-context.json");
+        let saved = serde_json::json!({
+            "schema-version": 2,
+            "candidate-commit": "candidate",
+            "base-commit": null,
+            "changed-files": [],
+            "unresolved-steps": [],
+            "current-findings": [],
+            "passing-evidence": [],
+            "executed-commands": [],
+            "historical-artifacts": [],
+            "omitted": {"changed-files": 0, "unresolved-steps": 0, "current-findings": 0,
+                "passing-evidence": 0, "executed-commands": 0, "historical-artifacts": 0},
+            "verification": {
+                "candidate_commit": "candidate",
+                "references": [{
+                    "id": "failed-reference", "source": "behaviors.md#b1", "meaning": null,
+                    "check": null, "satisfied": false, "cause": "candidate-defect",
+                    "owner": "writer", "next_action": "repair candidate",
+                    "bindings": [{"path": "tester-results.json", "digest": "sha256:fixture"}],
+                    "diagnostics": ["assertion failed"]
+                }],
+                "commands": []
+            }
+        });
+        fs::write(&path, serde_json::to_vec_pretty(&saved).unwrap()).unwrap();
+
+        let mut context: ExecutionContextV1 =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        context.current_findings.push(ExecutionContextFinding {
+            role: "tests".into(),
+            identity: "failed-reference".into(),
+            title: "assertion failed".into(),
+            artifact: "tester-results.json".into(),
+        });
+        let resumed: serde_json::Value =
+            serde_json::from_str(&bounded_execution_context_json(&mut context).unwrap()).unwrap();
+
+        assert_eq!(resumed["schema-version"], 2);
+        assert_eq!(resumed["verification"], saved["verification"]);
+        assert_eq!(resumed["current-findings"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn corrective_context_compacts_passing_verification() {
+        let artifact = tempfile::tempdir().unwrap();
+        let row = |id: String, satisfied: bool| {
+            serde_json::from_value::<crate::verification_assessment::RequirementAssessment>(
+                serde_json::json!({
+                    "id": id, "source": "canonical Tester", "meaning": null,
+                    "check": null, "satisfied": satisfied,
+                    "cause": if satisfied { serde_json::Value::Null } else { serde_json::json!("candidate-defect") },
+                    "owner": "writer", "next_action": if satisfied { None } else { Some("repair candidate") },
+                    "bindings": [{"path": "tester-results.json", "digest": "sha256:fixture"}],
+                    "diagnostics": if satisfied { Vec::new() } else { vec!["assertion failed".to_string()] }
+                }),
+            )
+            .unwrap()
+        };
+        let mut assessment = crate::verification_assessment::VerificationAssessment {
+            candidate_commit: "candidate".into(),
+            references: (0..700)
+                .map(|i| row(format!("reference-{i}"), true))
+                .collect(),
+            commands: (0..700)
+                .map(|i| row(format!("command-{i}"), true))
+                .collect(),
+        };
+        assessment
+            .references
+            .push(row("failed-reference".into(), false));
+        assessment
+            .commands
+            .push(row("failed-command".into(), false));
+        let full = serde_json::to_value(&assessment).unwrap();
+        assert!(
+            serde_json::to_vec_pretty(&assessment).unwrap().len() > EXECUTION_CONTEXT_MAX_BYTES
+        );
+
+        let compact = compact_execution_verification(artifact.path(), assessment).unwrap();
+        let encoded = serde_json::to_vec_pretty(&compact).unwrap();
+        assert!(encoded.len() < EXECUTION_CONTEXT_MAX_BYTES);
+        assert_eq!(compact.satisfied_references, 700);
+        assert_eq!(compact.satisfied_commands, 700);
+        assert_eq!(compact.references.len(), 1);
+        assert_eq!(compact.commands.len(), 1);
+        assert_eq!(compact.references[0].id, "failed-reference");
+        assert_eq!(compact.commands[0].id, "failed-command");
+        assert_eq!(compact.commands[0].diagnostics, ["assertion failed"]);
+        let saved = fs::read(&compact.full_assessment.path).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&saved).unwrap(),
+            full
+        );
+        assert_eq!(
+            compact.full_assessment.digest,
+            format!("sha256:{:x}", Sha256::digest(&saved))
+        );
+        let mut context = ExecutionContextV1 {
+            verification: Some(ExecutionContextVerificationRecord::Compact(compact)),
+            schema_version: 3,
+            candidate_commit: "candidate".into(),
+            base_commit: None,
+            correction_lineage: None,
+            changed_files: Vec::new(),
+            unresolved_steps: Vec::new(),
+            pending_writer_rows: Vec::new(),
+            current_findings: vec![ExecutionContextFinding {
+                role: "tests".into(),
+                identity: "failed-command".into(),
+                title: "assertion failed".into(),
+                artifact: "tester-results.json".into(),
+            }],
+            passing_evidence: Vec::new(),
+            executed_commands: Vec::new(),
+            historical_artifacts: vec!["tester-results.json".into()],
+            omitted: ExecutionContextOmitted::default(),
+        };
+        let serialized = bounded_execution_context_json(&mut context).unwrap();
+        assert!(serialized.len() <= EXECUTION_CONTEXT_MAX_BYTES);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&serialized).unwrap()["schema-version"],
+            3
+        );
+        assert!(serialized.contains("failed-reference"));
+        assert!(serialized.contains("failed-command"));
+        assert!(serialized.contains("verification-assessment.json"));
+
+        let Some(ExecutionContextVerificationRecord::Compact(verification)) =
+            context.verification.as_mut()
+        else {
+            panic!("new context must use compact verification");
+        };
+        verification
+            .commands
+            .extend((0..700).map(|i| row(format!("additional-failure-{i}"), false)));
+        let error = bounded_execution_context_json(&mut context).unwrap_err();
+        assert!(error.to_string().contains("execution context core exceeds"));
+        assert!(error.to_string().contains("actual:"));
+    }
+
+    #[test]
+    fn execution_context_rejects_review_findings_that_cannot_fit() {
+        let project = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["init", "-q"],
+            "initialize oversized fixture",
+        )
+        .unwrap();
+        let review_path = project.path().join("review-tests.md");
+        let findings = (0..500)
+            .map(|index| {
+                format!(
+                    "- [ ] Finding {index}: {}",
+                    "authoritative detail ".repeat(30)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&review_path, findings).unwrap();
+
+        let error = write_execution_context(
+            project.path(),
+            workspace.path(),
+            "candidate",
+            None,
+            &[],
+            std::slice::from_ref(&review_path),
+            None,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("execution context core exceeds"));
+        assert!(!project.path().join("execution-context.json").exists());
+    }
+
+    #[test]
+    fn execution_context_rejects_authoritative_findings_that_cannot_fit() {
+        let project = tempfile::TempDir::new().unwrap();
+        let workspace = project.path().join("candidate");
+        fs::create_dir_all(&workspace).unwrap();
+        for args in [
+            &["init", "-q"] as &[&str],
+            &["config", "user.name", "Fluent Test"],
+            &["config", "user.email", "fluent@example.test"],
+            &["commit", "-q", "--allow-empty", "-m", "candidate"],
+        ] {
+            crate::git::run(&workspace, args, "prepare oversized candidate").unwrap();
+        }
+        let candidate = git_stdout(&workspace, &["rev-parse", "HEAD"]);
+        let mut item = review_item();
+        let output = item.attempts[0].tasks[0].output.as_mut().unwrap();
+        output.commit = candidate.clone();
+        output.workspace_path = "candidate".into();
+        let task_id = item.add_next_write_round("attempt-1", Vec::new()).unwrap();
+        item.attempts[0].writer_completion_contract =
+            Some(crate::work_model::WriterCompletionContract {
+                version: crate::work_model::WRITER_COMPLETION_CONTRACT_VERSION,
+                requirements: (0..500)
+                    .map(|index| crate::work_model::WriterCompletionRequirement {
+                        responsibility: None,
+                        id: format!("behavior:oversized:b{index}"),
+                        kind: crate::work_model::WriterCompletionRequirementKind::Behavior,
+                        source: format!("behaviors.md#oversized:b{index}"),
+                        requirement: "Verify the candidate behavior.".into(),
+                        verification_refs: if index == 0 {
+                            vec!["cargo test --lib work_task_executor::tests::missing_case".into()]
+                        } else {
+                            Vec::new()
+                        },
+                        command: None,
+                    })
+                    .collect(),
+            });
+        WorkModelStore::new(project.path())
+            .create_work_item(&item)
+            .unwrap();
+
+        let error = build_writer_continuation_prompt(
+            &item,
+            "attempt-1",
+            &task_id,
+            &[],
+            &workspace,
+            project.path(),
+        )
+        .unwrap_err();
+        let artifact_dir = project
+            .path()
+            .join(work_artifact_path("work-1", "attempt-1", &task_id));
+        let assessment: crate::verification_assessment::VerificationAssessment =
+            serde_json::from_slice(
+                &fs::read(artifact_dir.join("verification-assessment.json")).unwrap(),
+            )
+            .unwrap();
+
+        assert_eq!(assessment.candidate_commit, candidate);
+        assert_eq!(assessment.unresolved().count(), 500);
+        assert_eq!(assessment.candidate_defects().len(), 1);
+        assert!(
+            serde_json::to_vec_pretty(&assessment.references)
+                .unwrap()
+                .len()
+                > EXECUTION_CONTEXT_MAX_BYTES
+        );
+        assert!(error.to_string().contains("execution context core exceeds"));
+        assert!(error.to_string().contains("actual:"));
+        assert!(!artifact_dir.join("execution-context.json").exists());
+    }
+
+    #[test]
+    fn execution_context_preserves_long_historical_artifact_path() {
+        let project = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["init", "-q"],
+            "initialize long artifact fixture",
+        )
+        .unwrap();
+        let artifact = project
+            .path()
+            .join("historical-évidence/".repeat(16))
+            .join("input.json");
+        fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        fs::write(&artifact, "{}").unwrap();
+        let expected = artifact.display().to_string();
+        assert!(expected.len() > 240);
+
+        let context_path = write_execution_context(
+            project.path(),
+            workspace.path(),
+            "candidate",
+            None,
+            &[],
+            std::slice::from_ref(&artifact),
+            None,
+        )
+        .unwrap();
+        let serialized = fs::read_to_string(context_path).unwrap();
+        assert!(serialized.len() <= EXECUTION_CONTEXT_MAX_BYTES);
+        let context: ExecutionContextV1 = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(context.historical_artifacts, [expected]);
+        assert_eq!(context.omitted.historical_artifacts, 0);
+    }
+
+    #[test]
+    fn execution_context_rejects_artifact_paths_that_cannot_fit() {
+        let project = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["init", "-q"],
+            "initialize oversized artifact fixture",
+        )
+        .unwrap();
+        let artifacts = (0..600)
+            .map(|index| {
+                project.path().join(format!(
+                    "inputs/{index:04}-{}-review.md",
+                    "immutable-correction-input".repeat(8)
+                ))
+            })
+            .collect::<Vec<_>>();
+
+        let error = write_execution_context(
+            project.path(),
+            workspace.path(),
+            "candidate",
+            None,
+            &[],
+            &artifacts,
+            None,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("execution context core exceeds"));
+        assert!(!project.path().join("execution-context.json").exists());
+    }
+
+    #[test]
+    fn matrix_backed_writer_prompt_keeps_required_progress_host_owned() {
+        // A matrix-backed prompt keeps required progress read-only and puts review
+        // work in a separate mutable section. An Attempt without either contract
+        // omits the host-owned schema.
         let mut item = WorkItem {
             id: "work-1".to_string(),
             title: "Required progress".to_string(),
@@ -8142,12 +21076,12 @@ mod tests {
             "the prompt names the authoritative required-progress section; got:\n{prompt}"
         );
         assert!(
-            prompt.contains("preserve every stable id"),
-            "the prompt instructs preserving stable ids and requirements; got:\n{prompt}"
+            prompt.contains("read-only projection"),
+            "the prompt identifies the host-owned projection; got:\n{prompt}"
         );
         assert!(
-            prompt.contains("Evidence:"),
-            "the prompt instructs attaching concrete evidence; got:\n{prompt}"
+            prompt.contains("do not edit its checkboxes"),
+            "the prompt keeps required progress out of the Writer's edit surface; got:\n{prompt}"
         );
         assert!(
             prompt.contains("## Review follow-ups"),
@@ -8157,14 +21091,33 @@ mod tests {
             prompt.contains("outside `## Required completion`"),
             "the prompt keeps follow-ups outside the authoritative section; got:\n{prompt}"
         );
+        assert!(!prompt.contains("toggle `- [ ]` to `- [x]`"));
+        assert!(!prompt.contains("move each row"));
+        assert!(prompt.contains("writer-completion.json"));
+        assert!(prompt.contains("Writer completion matrix"));
         assert!(
-            prompt.contains("nested evidence and commit notes"),
-            "the prompt migrates legacy rows and their nested notes as a unit; got:\n{prompt}"
+            prompt.contains("\"implementation-evidence\": [\"src/module.rs: changed symbol\"]")
         );
-        assert!(
-            prompt.contains("without re-creating or rewording"),
-            "the prompt preserves the required manifest while migrating legacy rows; got:\n{prompt}"
+        assert!(prompt.contains("\"verification\": ["));
+        assert!(prompt.contains("\"applicable-constraints\": []"));
+        assert!(prompt.contains("exact allowed IDs"));
+        assert!(prompt.contains("- `plan:step-1`"));
+        assert!(prompt.contains("harness-native"));
+        assert!(prompt.contains("does not replace the project's test selectors"));
+
+        let mut legacy_progress_item = item.clone();
+        legacy_progress_item.attempts[0].writer_completion_contract = None;
+        let legacy_progress_prompt = build_write_task_prompt_with_workspace(
+            &legacy_progress_item,
+            "attempt-1",
+            "attempt-1-write-1",
+            std::slice::from_ref(&review_path),
+            None,
+            Some(tmp.path()),
         );
+        assert!(legacy_progress_prompt.contains("Preserve every stable id"));
+        assert!(legacy_progress_prompt.contains("appending concrete `Evidence:`"));
+        assert!(!legacy_progress_prompt.contains("read-only projection"));
 
         // An unmarked (legacy) follow-up still separates review findings, then
         // resumes its ordinary plan checklist without required-progress terms.
@@ -8201,6 +21154,864 @@ mod tests {
     }
 
     #[test]
+    fn writer_route_preserves_wrapped_execution_guidance_in_matrix() {
+        let project = tempfile::TempDir::new().unwrap();
+        let mut item = WorkItem::planned("work-1", "Wrapped guidance");
+        item.planning_context = Some(crate::work_model::PlanningContext {
+            approach: Some(
+                "# Approach\n\n\
+                 ## Execution guidance\n\n\
+                 - Preserve the approved requirement,\n\
+                   including this wrapped constraint.\n"
+                    .to_string(),
+            ),
+            ..Default::default()
+        });
+        item.add_initial_attempt("attempt-1").unwrap();
+
+        let matrix_path = materialize_writer_completion_before_writer(
+            project.path(),
+            &item,
+            "attempt-1",
+            "attempt-1-write-1",
+        )
+        .unwrap()
+        .unwrap();
+        let matrix: crate::work_model::WriterCompletionMatrix =
+            serde_json::from_str(&fs::read_to_string(&matrix_path).unwrap()).unwrap();
+        assert_eq!(
+            matrix.rows[0].requirement,
+            "Preserve the approved requirement, including this wrapped constraint."
+        );
+
+        let prompt = build_write_task_prompt_with_workspace(
+            &item,
+            "attempt-1",
+            "attempt-1-write-1",
+            &[],
+            None,
+            Some(project.path()),
+        );
+        assert!(prompt.contains(&matrix_path.display().to_string()));
+        assert!(prompt.contains("`approach:guidance:1`"));
+    }
+
+    #[test]
+    fn corrective_writer_matrix_carries_planning_rows_and_adds_open_findings() {
+        let project = tempfile::TempDir::new().unwrap();
+        let mut item = WorkItem::planned("work-1", "Dashboard correction");
+        item.planning_context = Some(crate::work_model::PlanningContext {
+            behaviors: Some(
+                "## Dashboard\n\n### B1\n\nWHEN refreshed, THE SYSTEM SHALL preserve selection.\nTest: tests/dashboard.rs (preserves_selection)\n"
+                    .to_string(),
+            ),
+            ..Default::default()
+        });
+        item.add_initial_attempt("attempt-1").unwrap();
+        materialize_writer_completion_before_writer(
+            project.path(),
+            &item,
+            "attempt-1",
+            "attempt-1-write-1",
+        )
+        .unwrap();
+        let first_path = project.path().join(
+            ".fluent/work/artifacts/work-1/attempt-1/attempt-1-write-1/writer-completion.json",
+        );
+        let mut first: crate::work_model::WriterCompletionMatrix =
+            serde_json::from_str(&fs::read_to_string(&first_path).unwrap()).unwrap();
+        first.rows[0].state = crate::work_model::WriterCompletionState::Complete;
+        first.rows[0].implementation_evidence = vec!["src/dashboard.rs".to_string()];
+        first.rows[0].verification = vec![crate::work_model::WriterVerificationClaim {
+            command: "cargo test preserves_selection".to_string(),
+            result: crate::work_model::WriterVerificationResult::Pass,
+        }];
+        fs::write(&first_path, serde_json::to_vec_pretty(&first).unwrap()).unwrap();
+        let first_task = &mut item.attempts[0].tasks[0];
+        first_task.status = TaskStatus::Complete;
+        first_task.output = Some(TaskOutput {
+            workspace_id: "candidate".to_string(),
+            workspace_path: "candidate".to_string(),
+            source_branch: "work/attempt-1".to_string(),
+            base_commit: None,
+            commit: "commit-1".to_string(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        let review_rel =
+            ".fluent/work/artifacts/work-1/attempt-1/attempt-1-review-1-tests/review.md";
+        let review_path = project.path().join(review_rel);
+        fs::create_dir_all(review_path.parent().unwrap()).unwrap();
+        fs::write(
+            &review_path,
+            "Verdict: fail\n\n## Findings\n\n- [ ] Assert overflow navigation directly (blocking)\n",
+        )
+        .unwrap();
+        let task_id = item
+            .add_next_write_round(
+                "attempt-1",
+                vec![crate::work_model::ArtifactRef {
+                    producer_id: "attempt-1-review-1-tests".to_string(),
+                    path: review_rel.to_string(),
+                }],
+            )
+            .unwrap();
+
+        let path = materialize_writer_completion_before_writer(
+            project.path(),
+            &item,
+            "attempt-1",
+            &task_id,
+        )
+        .unwrap()
+        .unwrap();
+        let matrix: crate::work_model::WriterCompletionMatrix =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(matrix.rows.len(), 2);
+        assert_eq!(
+            matrix.rows[0].state,
+            crate::work_model::WriterCompletionState::Complete
+        );
+        assert_eq!(
+            matrix.rows[1].kind,
+            crate::work_model::WriterCompletionRequirementKind::Finding
+        );
+        assert_eq!(
+            matrix.rows[1].state,
+            crate::work_model::WriterCompletionState::Pending
+        );
+        assert!(
+            matrix.rows[1]
+                .requirement
+                .contains("Assert overflow navigation directly")
+        );
+
+        let before = fs::read(&path).unwrap();
+        materialize_writer_completion_before_writer(project.path(), &item, "attempt-1", &task_id)
+            .unwrap();
+        assert_eq!(
+            fs::read(path).unwrap(),
+            before,
+            "retry must not overwrite claims"
+        );
+    }
+
+    #[test]
+    fn existing_writer_matrix_revalidates_assignment_before_retry() {
+        let project = tempfile::TempDir::new().unwrap();
+        let store = WorkModelStore::new(project.path());
+        let mut item = WorkItem::planned("work-1", "Revalidate assignment");
+        item.add_initial_attempt("attempt-1").unwrap();
+        item.attempts[0].writer_completion_contract =
+            Some(crate::work_model::WriterCompletionContract {
+                version: crate::work_model::WRITER_COMPLETION_CONTRACT_VERSION,
+                requirements: vec![crate::work_model::WriterCompletionRequirement {
+                    responsibility: Some(crate::work_model::CompletionResponsibility::Writer),
+                    id: "plan:step-1".to_string(),
+                    kind: crate::work_model::WriterCompletionRequirementKind::Plan,
+                    source: "plan.md#step-1".to_string(),
+                    requirement: "Preserve the assigned correction".to_string(),
+                    verification_refs: Vec::new(),
+                    command: None,
+                }],
+            });
+        let source = &mut item.attempts[0].tasks[0];
+        let workspace = source.workspace_access.writes[0].clone();
+        source.status = TaskStatus::Complete;
+        source.output = Some(TaskOutput {
+            workspace_id: workspace.id,
+            workspace_path: workspace.path,
+            source_branch: "main".to_string(),
+            base_commit: None,
+            commit: "commit-initial".to_string(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        item.attempts[0].status = AttemptStatus::Reviewing;
+        let source_matrix_path = materialize_writer_completion_before_writer(
+            project.path(),
+            &item,
+            "attempt-1",
+            "attempt-1-write-1",
+        )
+        .unwrap()
+        .unwrap();
+        let mut source_matrix: crate::work_model::WriterCompletionMatrix =
+            serde_json::from_slice(&fs::read(&source_matrix_path).unwrap()).unwrap();
+        for row in &mut source_matrix.rows {
+            row.state = crate::work_model::WriterCompletionState::Complete;
+            row.implementation_evidence = vec!["src/lib.rs".to_string()];
+            row.verification = vec![crate::work_model::WriterVerificationClaim {
+                command: "cargo test".to_string(),
+                result: crate::work_model::WriterVerificationResult::Pass,
+            }];
+        }
+        fs::write(
+            &source_matrix_path,
+            serde_json::to_vec_pretty(&source_matrix).unwrap(),
+        )
+        .unwrap();
+
+        let evidence_path = work_artifact_path("work-1", "attempt-1", "review-tests/review.md");
+        let evidence_file = project.path().join(&evidence_path);
+        fs::create_dir_all(evidence_file.parent().unwrap()).unwrap();
+        fs::write(&evidence_file, "assigned evidence\n").unwrap();
+        let evidence = ArtifactRef {
+            producer_id: "review-tests".to_string(),
+            path: evidence_path.clone(),
+        };
+        let writer_task_id = item
+            .add_next_write_round("attempt-1", vec![evidence.clone()])
+            .unwrap();
+        item.attempts[0].tasks[1].writer_correction_assignment = Some(WriterCorrectionAssignment {
+            schema_version: WRITER_CORRECTION_ASSIGNMENT_SCHEMA_VERSION,
+            work_item_id: "work-1".to_string(),
+            attempt_id: "attempt-1".to_string(),
+            writer_task_id: writer_task_id.clone(),
+            source_task_id: "attempt-1-write-1".to_string(),
+            source_candidate_commit: "commit-initial".to_string(),
+            source_task_inputs: Vec::new(),
+            evidence: vec![WriterCorrectionAssignmentInput {
+                artifact: evidence,
+                digest: crate::follow_up::content_digest(&fs::read(&evidence_file).unwrap()),
+            }],
+            findings: vec![WriterCompletionFinding {
+                id: "finding:tests:revalidate".to_string(),
+                role: "tests".to_string(),
+                source: evidence_path,
+                requirement: "Preserve the assigned correction".to_string(),
+            }],
+            origin: WriterCorrectionAssignmentOrigin::Captured,
+        });
+        item.validate().unwrap();
+        store.create_work_item(&item).unwrap();
+
+        let stored = store.read_work_item("work-1").unwrap();
+        let matrix_path = materialize_writer_completion_before_writer(
+            project.path(),
+            &stored,
+            "attempt-1",
+            &writer_task_id,
+        )
+        .unwrap()
+        .unwrap();
+        let matrix_before = fs::read(&matrix_path).unwrap();
+        fs::write(&evidence_file, "changed evidence\n").unwrap();
+
+        let error = materialize_writer_completion_before_writer(
+            project.path(),
+            &stored,
+            "attempt-1",
+            &writer_task_id,
+        )
+        .expect_err("an existing matrix retry must revalidate its assignment inputs");
+        assert!(
+            error
+                .to_string()
+                .contains("Writer assignment input changed")
+        );
+        assert_eq!(fs::read(matrix_path).unwrap(), matrix_before);
+    }
+
+    #[test]
+    fn corrective_writer_inherits_audited_reference_revision_matrix() {
+        let project = tempfile::TempDir::new().unwrap();
+        let mut item = WorkItem::planned("work-1", "Revised verification boundary");
+        item.planning_context = Some(crate::work_model::PlanningContext {
+            behaviors: Some(
+                "## Readiness\n\n### B1\n\nWHEN checked, THE SYSTEM SHALL use the public workflow.\nTest: python3 tests/readiness.py\n\n### B2\n\nWHEN rejected, THE SYSTEM SHALL report the current reason.\nTest: python3 tests/readiness.py\n"
+                    .to_string(),
+            ),
+            ..Default::default()
+        });
+        item.add_initial_attempt("attempt-1").unwrap();
+        let first_path = materialize_writer_completion_before_writer(
+            project.path(),
+            &item,
+            "attempt-1",
+            "attempt-1-write-1",
+        )
+        .unwrap()
+        .unwrap();
+        let mut revised: crate::work_model::WriterCompletionMatrix =
+            serde_json::from_slice(&fs::read(&first_path).unwrap()).unwrap();
+        for row in &mut revised.rows {
+            row.state = crate::work_model::WriterCompletionState::Complete;
+            row.implementation_evidence = vec!["tests/readiness.py".to_string()];
+            row.verification = vec![crate::work_model::WriterVerificationClaim {
+                command: "python3 tests/readiness.py".to_string(),
+                result: crate::work_model::WriterVerificationResult::Pass,
+            }];
+        }
+        let revised_rel = ".fluent/work/artifacts/work-1/attempt-1/planning-reference-revisions/revision-1/writer-completion.json";
+        let revised_path = project.path().join(revised_rel);
+        fs::create_dir_all(revised_path.parent().unwrap()).unwrap();
+        fs::write(&revised_path, serde_json::to_vec_pretty(&revised).unwrap()).unwrap();
+        item.attempts[0]
+            .artifacts
+            .push(crate::work_model::ArtifactRef {
+                producer_id: "planning-reference-recovery".to_string(),
+                path: revised_rel.to_string(),
+            });
+
+        let first = &mut item.attempts[0].tasks[0];
+        first.status = TaskStatus::Complete;
+        first.output = Some(TaskOutput {
+            workspace_id: "candidate".to_string(),
+            workspace_path: "candidate".to_string(),
+            source_branch: "work/attempt-1".to_string(),
+            base_commit: None,
+            commit: "commit-1".to_string(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        let review_rel =
+            ".fluent/work/artifacts/work-1/attempt-1/attempt-1-review-1-tests/review.md";
+        let review_path = project.path().join(review_rel);
+        fs::create_dir_all(review_path.parent().unwrap()).unwrap();
+        fs::write(
+            review_path,
+            "Verdict: fail\n\n## Findings\n\n- [ ] Report stale readiness data (blocking)\n",
+        )
+        .unwrap();
+        let task_id = item
+            .add_next_write_round(
+                "attempt-1",
+                vec![crate::work_model::ArtifactRef {
+                    producer_id: "attempt-1-review-1-tests".to_string(),
+                    path: review_rel.to_string(),
+                }],
+            )
+            .unwrap();
+        let second_path = materialize_writer_completion_before_writer(
+            project.path(),
+            &item,
+            "attempt-1",
+            &task_id,
+        )
+        .unwrap()
+        .unwrap();
+        let inherited: crate::work_model::WriterCompletionMatrix =
+            serde_json::from_slice(&fs::read(&second_path).unwrap()).unwrap();
+        assert_eq!(
+            inherited.rows[0].state,
+            crate::work_model::WriterCompletionState::Complete
+        );
+        assert_eq!(
+            inherited.rows[0].implementation_evidence,
+            ["tests/readiness.py"]
+        );
+        assert_eq!(
+            inherited.rows[1].state,
+            crate::work_model::WriterCompletionState::Complete
+        );
+        assert_eq!(
+            inherited.rows[2].kind,
+            crate::work_model::WriterCompletionRequirementKind::Finding
+        );
+        assert_eq!(
+            inherited.rows[2].state,
+            crate::work_model::WriterCompletionState::Pending
+        );
+
+        // A retry may encounter a stale matrix materialized by an older Fluent
+        // build. Reapply only the missing host-authorized planning claims.
+        let mut stale = inherited.clone();
+        stale.rows[0].state = crate::work_model::WriterCompletionState::Pending;
+        stale.rows[0].implementation_evidence.clear();
+        stale.rows[0].verification.clear();
+        stale.rows[1].implementation_evidence = vec!["current Writer claim".to_string()];
+        fs::write(&second_path, serde_json::to_vec_pretty(&stale).unwrap()).unwrap();
+        materialize_writer_completion_before_writer(project.path(), &item, "attempt-1", &task_id)
+            .unwrap();
+        let repaired: crate::work_model::WriterCompletionMatrix =
+            serde_json::from_slice(&fs::read(&second_path).unwrap()).unwrap();
+        assert_eq!(
+            repaired.rows[0].state,
+            crate::work_model::WriterCompletionState::Complete
+        );
+        assert_eq!(repaired.rows[0].verification.len(), 1);
+        assert_eq!(
+            repaired.rows[1].implementation_evidence,
+            ["current Writer claim"]
+        );
+        assert_eq!(
+            repaired.rows[2].state,
+            crate::work_model::WriterCompletionState::Pending
+        );
+
+        // Preserve recovery across a chain that an older Fluent build already
+        // materialized from the stale task artifact.
+        let mut damaged_prior = repaired;
+        for row in damaged_prior
+            .rows
+            .iter_mut()
+            .filter(|row| row.kind != crate::work_model::WriterCompletionRequirementKind::Finding)
+        {
+            row.state = crate::work_model::WriterCompletionState::Pending;
+            row.implementation_evidence.clear();
+            row.verification.clear();
+        }
+        fs::write(
+            &second_path,
+            serde_json::to_vec_pretty(&damaged_prior).unwrap(),
+        )
+        .unwrap();
+        let second = item.attempts[0]
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == task_id)
+            .unwrap();
+        second.status = TaskStatus::Complete;
+        second.output = Some(TaskOutput {
+            workspace_id: "candidate".to_string(),
+            workspace_path: "candidate".to_string(),
+            source_branch: "work/attempt-1".to_string(),
+            base_commit: Some("commit-1".to_string()),
+            commit: "commit-2".to_string(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        let third_id = item.add_next_write_round("attempt-1", Vec::new()).unwrap();
+        let third_path = materialize_writer_completion_before_writer(
+            project.path(),
+            &item,
+            "attempt-1",
+            &third_id,
+        )
+        .unwrap()
+        .unwrap();
+        let recovered_chain: crate::work_model::WriterCompletionMatrix =
+            serde_json::from_slice(&fs::read(third_path).unwrap()).unwrap();
+        assert!(recovered_chain.rows.iter().all(|row| {
+            row.kind == crate::work_model::WriterCompletionRequirementKind::Finding
+                || row.state == crate::work_model::WriterCompletionState::Complete
+        }));
+    }
+
+    #[test]
+    fn corrective_writer_inherits_approved_ownership_matrix() {
+        use crate::work_model::*;
+        let project = tempfile::TempDir::new().unwrap();
+        let root = project.path();
+        crate::git::run(root, &["init", "-q", "-b", "main"], "init fixture").unwrap();
+        fs::write(root.join(".gitignore"), ".fluent/\n").unwrap();
+        crate::git::run(root, &["add", ".gitignore"], "stage fixture").unwrap();
+        crate::git::run(
+            root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-qm",
+                "Add fixture",
+            ],
+            "commit fixture",
+        )
+        .unwrap();
+        let mut item = WorkItem::planned("owned-work", "Retain approved completion");
+        item.planning_context = Some(PlanningContext {
+            plan: Some("| # | State reached | Behaviors | Verification | Req? |\n| 1 | Fix source. | | `cargo test fix` | Yes |\n| 2 | Fix source. Check host. | | `bash tests/host.sh` | Yes |\n".into()),
+            ..Default::default()
+        });
+        item.add_initial_attempt("attempt-1").unwrap();
+        let source_path = materialize_writer_completion_before_writer(
+            root,
+            &item,
+            "attempt-1",
+            "attempt-1-write-1",
+        )
+        .unwrap()
+        .unwrap();
+        let mut source: WriterCompletionMatrix =
+            serde_json::from_slice(&fs::read(&source_path).unwrap()).unwrap();
+        source.rows[0].state = WriterCompletionState::Complete;
+        source.rows[0].implementation_evidence = vec!["src/fix.rs: preserve source fix".into()];
+        source.rows[0].verification = vec![WriterVerificationClaim {
+            command: "cargo test fix".into(),
+            result: WriterVerificationResult::Pass,
+        }];
+        let source_bytes = serde_json::to_vec_pretty(&source).unwrap();
+        fs::write(&source_path, &source_bytes).unwrap();
+        let attempt = &mut item.attempts[0];
+        attempt.status = AttemptStatus::NeedsUser;
+        attempt.pause_kind = Some(PauseKind::WriterCompletion);
+        let writer = &mut attempt.tasks[0];
+        set_task_terminal(writer, TaskStatus::Complete);
+        writer.output = Some(TaskOutput {
+            workspace_id: "candidate".into(),
+            workspace_path: root.display().to_string(),
+            source_branch: "main".into(),
+            base_commit: None,
+            commit: head_commit(root).unwrap(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        let store = WorkModelStore::new(root);
+        store.create_work_item(&item).unwrap();
+        let proposal: OwnershipProposal = serde_json::from_value(serde_json::json!({"splits": [{"row_id":"plan:step-2", "parts":[
+            {"requirement":"Fix source.", "responsibility":"writer", "completion_from":"plan:step-1"},
+            {"requirement":" Check host.", "responsibility":"host"}
+        ]}]})).unwrap();
+        let preview =
+            crate::ownership_recovery::preview(root, &store, "owned-work", "attempt-1", &proposal)
+                .unwrap();
+        crate::ownership_recovery::approve(
+            root,
+            &store,
+            "owned-work",
+            "attempt-1",
+            &preview,
+            "Approve the displayed split",
+        )
+        .unwrap();
+        let mut item = store.read_work_item("owned-work").unwrap();
+        let review = ArtifactRef {
+            producer_id: "attempt-1-review-tests".into(),
+            path: ".fluent/work/artifacts/owned-work/attempt-1/attempt-1-review-tests/review.md"
+                .into(),
+        };
+        fs::create_dir_all(root.join(&review.path).parent().unwrap()).unwrap();
+        fs::write(
+            root.join(&review.path),
+            "Verdict: fail\n\n## Findings\n\n- [ ] Cover another source case (blocking)\n",
+        )
+        .unwrap();
+        let next = item
+            .add_next_write_round("attempt-1", vec![review])
+            .unwrap();
+        let path = materialize_writer_completion_before_writer(root, &item, "attempt-1", &next)
+            .unwrap()
+            .unwrap();
+        let inherited: WriterCompletionMatrix =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let completed = inherited
+            .rows
+            .iter()
+            .find(|row| row.id == "plan:step-2:part-1")
+            .unwrap();
+        assert_eq!(completed.state, WriterCompletionState::Complete);
+        assert_eq!(
+            completed.implementation_evidence,
+            source.rows[0].implementation_evidence
+        );
+        assert_eq!(completed.verification, source.rows[0].verification);
+        assert!(
+            inherited
+                .rows
+                .iter()
+                .filter(|row| row.kind == WriterCompletionRequirementKind::Finding
+                    || row.responsibility == Some(CompletionResponsibility::Host))
+                .all(|row| row.state == WriterCompletionState::Pending)
+        );
+        assert_eq!(fs::read(&source_path).unwrap(), source_bytes);
+        // Preserve approval through an already-materialized stale continuation.
+        let mut stale = inherited.clone();
+        for row in &mut stale.rows {
+            if row.id == "plan:step-2:part-1" {
+                row.state = WriterCompletionState::Pending;
+                row.implementation_evidence.clear();
+                row.verification.clear();
+            }
+        }
+        fs::write(&path, serde_json::to_vec_pretty(&stale).unwrap()).unwrap();
+        materialize_writer_completion_before_writer(root, &item, "attempt-1", &next).unwrap();
+        let restored: WriterCompletionMatrix =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(restored, inherited);
+        let mut unaudited = item.clone();
+        unaudited.attempts[0]
+            .artifacts
+            .retain(|artifact| !artifact.path.ends_with("/approval.json"));
+        assert!(
+            materialize_writer_completion_before_writer(root, &unaudited, "attempt-1", &next)
+                .is_err()
+        );
+        // An existing next-Writer matrix must still recheck the approved source.
+        let mut changed = source_bytes;
+        changed.push(b'\n');
+        fs::write(source_path, changed).unwrap();
+        assert!(
+            materialize_writer_completion_before_writer(root, &item, "attempt-1", &next).is_err()
+        );
+    }
+
+    #[test]
+    fn metadata_repair_matrix_adds_host_owned_candidate_gate_finding() {
+        let project = tempfile::TempDir::new().unwrap();
+        let mut item = WorkItem::planned("work-1", "Repair candidate metadata");
+        item.planning_context = Some(crate::work_model::PlanningContext {
+            behaviors: Some(
+                "## Metadata\n\n### B1\n\nWHEN a candidate is committed, THE SYSTEM SHALL preserve valid metadata.\nTest: tests/metadata.rs (valid_metadata)\n"
+                    .to_string(),
+            ),
+            ..Default::default()
+        });
+        item.add_initial_attempt("attempt-1").unwrap();
+        materialize_writer_completion_before_writer(
+            project.path(),
+            &item,
+            "attempt-1",
+            "attempt-1-write-1",
+        )
+        .unwrap();
+        let first_path = project.path().join(
+            ".fluent/work/artifacts/work-1/attempt-1/attempt-1-write-1/writer-completion.json",
+        );
+        let mut first: crate::work_model::WriterCompletionMatrix =
+            serde_json::from_str(&fs::read_to_string(&first_path).unwrap()).unwrap();
+        first.rows[0].state = crate::work_model::WriterCompletionState::Complete;
+        first.rows[0].implementation_evidence = vec!["src/metadata.rs".to_string()];
+        first.rows[0].verification = vec![crate::work_model::WriterVerificationClaim {
+            command: "cargo test valid_metadata".to_string(),
+            result: crate::work_model::WriterVerificationResult::Pass,
+        }];
+        fs::write(&first_path, serde_json::to_vec_pretty(&first).unwrap()).unwrap();
+        let first_task = &mut item.attempts[0].tasks[0];
+        first_task.status = TaskStatus::Complete;
+        first_task.output = Some(TaskOutput {
+            workspace_id: "candidate".to_string(),
+            workspace_path: "candidate".to_string(),
+            source_branch: "work/attempt-1".to_string(),
+            base_commit: Some("base".to_string()),
+            commit: "rejected".to_string(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+
+        let gate_rel = ".fluent/work/artifacts/work-1/attempt-1/candidate-gates/attempt-1-write-1/candidate-gate.json";
+        let gate_path = project.path().join(gate_rel);
+        fs::create_dir_all(gate_path.parent().unwrap()).unwrap();
+        let diagnostic = "commit rejected body line exceeds 72 characters";
+        let gate = crate::candidate_gate::CandidateGateEvidence {
+            schema_version: crate::candidate_gate::CANDIDATE_GATE_SCHEMA_VERSION,
+            phase: crate::candidate_gate::CandidateGatePhase::Writer,
+            disposition: crate::candidate_gate::CandidateGateDisposition::Rejected,
+            base_commit: "base".to_string(),
+            candidate_commit: "rejected".to_string(),
+            tester_results_path: None,
+            metadata_rewrite: None,
+            checks: vec![crate::candidate_gate::CandidateCheckEvidence {
+                name: "commit-metadata".to_string(),
+                status: crate::candidate_gate::CandidateCheckStatus::Failed,
+                diagnostics: vec![diagnostic.to_string()],
+                log_path: None,
+            }],
+        };
+        fs::write(&gate_path, serde_json::to_vec_pretty(&gate).unwrap()).unwrap();
+        let task_id = item
+            .add_next_write_round(
+                "attempt-1",
+                vec![crate::work_model::ArtifactRef {
+                    producer_id: "attempt-1-write-1".to_string(),
+                    path: gate_rel.to_string(),
+                }],
+            )
+            .unwrap();
+
+        let path = materialize_writer_completion_before_writer(
+            project.path(),
+            &item,
+            "attempt-1",
+            &task_id,
+        )
+        .unwrap()
+        .unwrap();
+        let matrix: crate::work_model::WriterCompletionMatrix =
+            serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(matrix.rows.len(), 2);
+        assert_eq!(
+            matrix.rows[0].state,
+            crate::work_model::WriterCompletionState::Complete
+        );
+        assert_eq!(
+            matrix.rows[1].id,
+            format!(
+                "finding:candidate-gate:{}",
+                crate::review::finding_identity("candidate-gate", "rejected:commit-metadata")
+            )
+        );
+        assert_eq!(matrix.rows[1].source, gate_rel);
+        assert_eq!(
+            matrix.rows[1].requirement,
+            format!(
+                "Address candidate-gate review finding: commit-metadata check remains unresolved: {diagnostic}"
+            )
+        );
+        assert_eq!(
+            matrix.rows[1].state,
+            crate::work_model::WriterCompletionState::Pending
+        );
+    }
+
+    #[test]
+    fn corrective_writer_matrix_adds_failed_tester_commands() {
+        let project = tempfile::TempDir::new().unwrap();
+        let mut item = WorkItem::planned("work-1", "Tester correction");
+        item.planning_context = Some(crate::work_model::PlanningContext {
+            behaviors: Some(
+                "## Tester\n\n### B1\n\nWHEN verification fails, THE SYSTEM SHALL correct it.\nTest: tests/binary.rs (corrects_failure)\n"
+                    .to_string(),
+            ),
+            ..Default::default()
+        });
+        item.add_initial_attempt("attempt-1").unwrap();
+        let tester_rel =
+            ".fluent/work/artifacts/work-1/attempt-1/attempt-1-tester-2/tester-results.json";
+        let tester_path = project.path().join(tester_rel);
+        fs::create_dir_all(tester_path.parent().unwrap()).unwrap();
+        fs::write(
+            &tester_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "candidate_commit": "candidate",
+                "commands": [
+                    {"command": "cargo test", "test_harness": "cargo", "exit_code": 101, "duration_ms": 1, "stdout_log": "commands/0-stdout.log", "stderr_log": "commands/0-stderr.log"},
+                    {"command": "cargo fmt --check", "test_harness": "cargo", "exit_code": 0, "duration_ms": 1, "stdout_log": "commands/1-stdout.log", "stderr_log": "commands/1-stderr.log"}
+                ],
+                "tests": [],
+                "summary": {"total": 0, "pass": 0, "fail": 0, "skipped": 0},
+                "error": null
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let writer = &mut item.attempts[0].tasks[0];
+        writer.input_artifacts = vec![crate::work_model::ArtifactRef {
+            producer_id: "attempt-1-tester-2".to_string(),
+            path: tester_rel.to_string(),
+        }];
+
+        let path = materialize_writer_completion_before_writer(
+            project.path(),
+            &item,
+            "attempt-1",
+            "attempt-1-write-1",
+        )
+        .unwrap()
+        .unwrap();
+        let matrix: crate::work_model::WriterCompletionMatrix =
+            serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+
+        assert_eq!(matrix.rows.len(), 2);
+        assert_eq!(
+            matrix.rows[1].kind,
+            crate::work_model::WriterCompletionRequirementKind::Finding
+        );
+        assert!(
+            matrix.rows[1]
+                .id
+                .starts_with("finding:verification:sha256:")
+        );
+        assert_eq!(matrix.rows[1].source, tester_rel);
+        assert!(
+            matrix.rows[1]
+                .requirement
+                .contains("Historical Tester evidence needs diagnosis and candidate binding")
+        );
+        assert!(
+            !matrix
+                .rows
+                .iter()
+                .any(|row| row.requirement.contains("fmt"))
+        );
+    }
+
+    #[test]
+    fn tester_harness_repair_matrix_excludes_and_sanitizes_failed_tester_commands() {
+        let project = tempfile::TempDir::new().unwrap();
+        let mut item = WorkItem::planned("work-1", "Tester harness repair");
+        item.planning_context = Some(crate::work_model::PlanningContext {
+            behaviors: Some(
+                "## Tester\n\n### B1\n\nWHEN verification runs, THE SYSTEM SHALL report results.\nTest: tests/binary.rs (reports_results)\n"
+                    .to_string(),
+            ),
+            ..Default::default()
+        });
+        item.add_initial_attempt("attempt-1").unwrap();
+        let tester_rel =
+            ".fluent/work/artifacts/work-1/attempt-1/attempt-1-tester-2/tester-results.json";
+        let tester_path = project.path().join(tester_rel);
+        fs::create_dir_all(tester_path.parent().unwrap()).unwrap();
+        fs::write(
+            &tester_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "candidate_commit": "candidate",
+                "commands": [
+                    {"command": "cargo test", "test_harness": "cargo", "exit_code": 101, "duration_ms": 1, "stdout_log": "commands/0-stdout.log", "stderr_log": "commands/0-stderr.log"},
+                    {"command": "docker run smoke", "test_harness": "shell", "exit_code": 1, "duration_ms": 1, "stdout_log": "commands/1-stdout.log", "stderr_log": "commands/1-stderr.log"}
+                ],
+                "tests": [],
+                "summary": {"total": 0, "pass": 0, "fail": 0, "skipped": 0},
+                "error": null
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let writer = &mut item.attempts[0].tasks[0];
+        writer.role = crate::work_model::TESTER_HARNESS_REPAIR_ROLE.to_string();
+        writer.input_artifacts = vec![crate::work_model::ArtifactRef {
+            producer_id: "attempt-1-tester-2".to_string(),
+            path: tester_rel.to_string(),
+        }];
+
+        let path = materialize_writer_completion_before_writer(
+            project.path(),
+            &item,
+            "attempt-1",
+            "attempt-1-write-1",
+        )
+        .unwrap()
+        .unwrap();
+        let mut stale: crate::work_model::WriterCompletionMatrix =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(stale.rows.len(), 1);
+        stale.rows.push(crate::work_model::WriterCompletionRow {
+            responsibility: None,
+            id: "finding:tester:legacy".to_string(),
+            kind: crate::work_model::WriterCompletionRequirementKind::Finding,
+            source: tester_rel.to_string(),
+            requirement: "Address tester review finding: failed command".to_string(),
+            verification_refs: Vec::new(),
+            command: None,
+            state: crate::work_model::WriterCompletionState::Complete,
+            implementation_evidence: vec!["product.txt".to_string()],
+            verification: Vec::new(),
+            applicable_constraints: Vec::new(),
+        });
+        fs::write(&path, serde_json::to_vec_pretty(&stale).unwrap()).unwrap();
+
+        materialize_writer_completion_before_writer(
+            project.path(),
+            &item,
+            "attempt-1",
+            "attempt-1-write-1",
+        )
+        .unwrap();
+        let repaired: crate::work_model::WriterCompletionMatrix =
+            serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(repaired.rows.len(), 1);
+        assert!(repaired.rows.iter().all(|row| {
+            row.kind != crate::work_model::WriterCompletionRequirementKind::Finding
+        }));
+    }
+
+    #[test]
+    fn writer_completion_findings_reject_artifact_path_escape() {
+        let project = tempfile::TempDir::new().unwrap();
+        let mut item = review_item();
+        let writer = &mut item.attempts[0].tasks[0];
+        writer.input_artifacts = vec![crate::work_model::ArtifactRef {
+            producer_id: "attempt-1-review-tests".to_string(),
+            path: "../../review-tests/review.md".to_string(),
+        }];
+
+        let error = writer_completion_findings(project.path(), writer).unwrap_err();
+        assert!(error.to_string().contains("must stay under"));
+    }
+
+    #[test]
     fn write_task_prompt_omits_prior_reviews_section_on_first_round() {
         let prompt = build_write_task_prompt(&review_item(), "attempt-1", "attempt-1-write-1", &[]);
         assert!(
@@ -8211,6 +22022,393 @@ mod tests {
             !prompt.contains("Address review finding:"),
             "first-round prompt should NOT include the prior-finding-record instruction; got prompt:\n{prompt}"
         );
+    }
+
+    #[test]
+    fn initial_writer_prompt_names_preserved_work_item_inputs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut item = review_item();
+        item.input_artifacts = vec![crate::work_model::WorkItemInputArtifact {
+            source_path: ".fluent/work/artifacts/source/transcript.jsonl".to_string(),
+            snapshot_path: ".fluent/work/artifacts/work-1/inputs/0000-transcript.jsonl".to_string(),
+            digest: "sha256:approved".to_string(),
+        }];
+        item.attempts[0].tasks[0].input_artifacts = vec![crate::work_model::ArtifactRef {
+            producer_id: "work-item".to_string(),
+            path: item.input_artifacts[0].snapshot_path.clone(),
+        }];
+
+        let prompt = build_write_task_prompt_with_workspace(
+            &item,
+            "attempt-1",
+            "attempt-1-write-1",
+            &[tmp.path().join(&item.input_artifacts[0].snapshot_path)],
+            Some(tmp.path()),
+            Some(tmp.path()),
+        );
+
+        assert!(prompt.contains("preserved Work Item input"));
+        assert!(prompt.contains("0000-transcript.jsonl"));
+        assert!(!prompt.contains("Read each prior correction artifact"));
+    }
+
+    #[test]
+    fn writer_prompt_distinguishes_candidate_from_source_checkout() {
+        let root = tempfile::tempdir().unwrap();
+        let candidate = root.path().join("candidate");
+        let source = root.path().join("source");
+        let prompt = build_write_task_prompt_with_workspace(
+            &review_item(),
+            "attempt-1",
+            "attempt-1-write-1",
+            &[],
+            Some(&candidate),
+            Some(&source),
+        );
+        assert!(prompt.contains(&format!(
+            "writable candidate checkout is {}",
+            candidate.display()
+        )));
+        assert!(prompt.contains(&format!("source checkout is {}", source.display())));
+        assert!(prompt.contains("product changes and commits only in the candidate checkout"));
+        assert!(prompt.contains("declared Task artifacts under the source checkout's `.fluent/work` tree remain writable"));
+    }
+
+    #[test]
+    fn writer_source_checkout_drift_detects_changed_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        fs::create_dir_all(&source).unwrap();
+        crate::git::run(&source, &["init", "-q", "-b", "main"], "init source").unwrap();
+        crate::git::run(&source, &["config", "user.email", "test@test"], "set email").unwrap();
+        crate::git::run(&source, &["config", "user.name", "test"], "set name").unwrap();
+        fs::write(source.join("tracked.txt"), "before\n").unwrap();
+        crate::git::run(&source, &["add", "."], "add source").unwrap();
+        crate::git::run(
+            &source,
+            &["commit", "-q", "-m", "Add fixture"],
+            "commit source",
+        )
+        .unwrap();
+        let before = source_product_snapshot(&source).unwrap();
+        fs::write(source.join("tracked.txt"), "after\n").unwrap();
+        let error = ensure_source_product_unchanged(&source, &before).unwrap_err();
+        assert!(
+            error.to_string().contains("preserve it for inspection"),
+            "{error:#}"
+        );
+        assert_eq!(
+            fs::read_to_string(source.join("tracked.txt")).unwrap(),
+            "after\n"
+        );
+        let dirty_before = source_product_snapshot(&source).unwrap();
+        fs::write(source.join("tracked.txt"), "changed again\n").unwrap();
+        assert_eq!(
+            dirty_before.status,
+            source_product_snapshot(&source).unwrap().status
+        );
+        assert!(ensure_source_product_unchanged(&source, &dirty_before).is_err());
+        fs::write(source.join("new.txt"), "untracked before\n").unwrap();
+        let untracked_before = source_product_snapshot(&source).unwrap();
+        fs::write(source.join("new.txt"), "untracked after\n").unwrap();
+        assert_eq!(
+            untracked_before.status,
+            source_product_snapshot(&source).unwrap().status
+        );
+        assert!(ensure_source_product_unchanged(&source, &untracked_before).is_err());
+    }
+
+    struct HandoffCoder {
+        launches: Arc<Mutex<Vec<String>>>,
+        sessions: Arc<Mutex<Vec<String>>>,
+        first_no_output: bool,
+        second_commit: bool,
+        source_drift: Option<PathBuf>,
+    }
+
+    impl crate::coder::Coder for HandoffCoder {
+        fn run(
+            &self,
+            _: &str,
+            _: &str,
+            _: &Path,
+            _: &[String],
+            _: &[(String, String)],
+            _: Option<&Path>,
+        ) -> Result<i32> {
+            unreachable!("Writer uses the captured session route")
+        }
+        fn run_captured_reported_session(
+            &self,
+            prompt: &str,
+            _: &str,
+            working_dir: &Path,
+            _: &[String],
+            _: &[(String, String)],
+            capture: Option<&crate::coder::TranscriptCapture<'_>>,
+            session: crate::coder::CoderSession<'_>,
+        ) -> crate::coder::CoderRunCompletion {
+            self.sessions.lock().unwrap().push(match session {
+                crate::coder::CoderSession::Resume(id) => format!("resume:{id}"),
+                crate::coder::CoderSession::FreshPersistent => "fresh".into(),
+                crate::coder::CoderSession::Ephemeral => "ephemeral".into(),
+            });
+            let mut launches = self.launches.lock().unwrap();
+            launches.push(prompt.to_string());
+            let number = launches.len();
+            drop(launches);
+            if number == 1 {
+                if let Some(capture) = capture {
+                    fs::write(
+                        capture.path(),
+                        "{\"type\":\"thread.started\",\"thread_id\":\"handoff-thread\"}\n",
+                    )
+                    .unwrap();
+                }
+                if let Some(source) = &self.source_drift {
+                    fs::write(source.join("tracked.txt"), "source drift\n").unwrap();
+                }
+            }
+            if number == 1 && !self.first_no_output {
+                fs::write(working_dir.join("change.txt"), "uncommitted\n").unwrap();
+            }
+            if number == 2 && self.second_commit {
+                fs::write(working_dir.join("change.txt"), "committed\n").unwrap();
+                crate::git::run(working_dir, &["add", "."], "stage handoff").unwrap();
+                crate::git::run(
+                    working_dir,
+                    &["commit", "-q", "-m", "Add handoff"],
+                    "commit handoff",
+                )
+                .unwrap();
+            }
+            crate::coder::CoderRunCompletion {
+                terminal: Ok(0),
+                report: Default::default(),
+            }
+        }
+        fn run_interactive(
+            &self,
+            _: &str,
+            _: &Path,
+            _: &[String],
+            _: &[(String, String)],
+        ) -> Result<i32> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn writer_handoff_retries_once_for_dirty_or_missing_output() {
+        for (first_no_output, second_commit) in [(false, true), (true, false)] {
+            let root = tempfile::tempdir().unwrap();
+            let source = root.path().join("source");
+            fs::create_dir_all(source.join(".fluent/expertise")).unwrap();
+            fs::write(source.join(".fluent/expertise/INDEX.md"), "# Index\n").unwrap();
+            crate::git::run(&source, &["init", "-q", "-b", "main"], "init fixture").unwrap();
+            crate::git::run(&source, &["config", "user.email", "test@test"], "set email").unwrap();
+            crate::git::run(&source, &["config", "user.name", "test"], "set name").unwrap();
+            fs::write(source.join("tracked.txt"), "baseline\n").unwrap();
+            crate::git::run(&source, &["add", "."], "add fixture").unwrap();
+            crate::git::run(
+                &source,
+                &["commit", "-q", "-m", "Add fixture"],
+                "commit fixture",
+            )
+            .unwrap();
+            let mut item = WorkItem {
+                id: "work-1".into(),
+                title: "Handoff".into(),
+                ..Default::default()
+            };
+            item.add_initial_attempt("attempt-1").unwrap();
+            let store = WorkModelStore::new(&source);
+            store.create_work_item(&item).unwrap();
+            let resolver = ContentResolver::new(Some(&source));
+            let launches = Arc::new(Mutex::new(Vec::new()));
+            let sessions = Arc::new(Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&launches);
+            let recorded_sessions = Arc::clone(&sessions);
+            let make_coder = move |_sandbox| {
+                Box::new(HandoffCoder {
+                    launches: Arc::clone(&recorded),
+                    sessions: Arc::clone(&recorded_sessions),
+                    first_no_output,
+                    second_commit,
+                    source_drift: None,
+                }) as Box<dyn crate::coder::Coder>
+            };
+            let result = run_write_task_with_coder(
+                WorkTaskRunConfig {
+                    project_root: &source,
+                    store: &store,
+                    work_item_id: "work-1",
+                    attempt_id: "attempt-1",
+                    task_id: "attempt-1-write-1",
+                    resolver: &resolver,
+                    extra_args: &[],
+                    no_sandbox: true,
+                    store_lock: None,
+                },
+                Some(&make_coder),
+            );
+            let prompts = launches.lock().unwrap();
+            assert_eq!(prompts.len(), 2);
+            assert!(prompts[1].contains("Writer handoff correction"));
+            assert_eq!(
+                sessions.lock().unwrap().as_slice(),
+                ["fresh", "resume:handoff-thread"]
+            );
+            let stored = store.read_work_item("work-1").unwrap();
+            if second_commit {
+                assert!(result.is_ok(), "{result:?}");
+                assert_eq!(stored.attempts[0].tasks[0].status, TaskStatus::Complete);
+            } else {
+                assert!(result.is_err());
+                assert_eq!(stored.attempts[0].tasks[0].status, TaskStatus::NeedsUser);
+                assert_eq!(
+                    stored.attempts[0].pause_kind,
+                    Some(crate::work_model::PauseKind::WriterCompletion)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn writer_source_checkout_drift_needs_user() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        fs::create_dir_all(source.join(".fluent/expertise")).unwrap();
+        fs::write(source.join(".fluent/expertise/INDEX.md"), "# Index\n").unwrap();
+        crate::git::run(&source, &["init", "-q", "-b", "main"], "init fixture").unwrap();
+        crate::git::run(&source, &["config", "user.email", "test@test"], "set email").unwrap();
+        crate::git::run(&source, &["config", "user.name", "test"], "set name").unwrap();
+        fs::write(source.join("tracked.txt"), "baseline\n").unwrap();
+        crate::git::run(&source, &["add", "."], "add fixture").unwrap();
+        crate::git::run(
+            &source,
+            &["commit", "-q", "-m", "Add fixture"],
+            "commit fixture",
+        )
+        .unwrap();
+        let mut item = WorkItem {
+            id: "work-1".into(),
+            title: "Source drift".into(),
+            ..Default::default()
+        };
+        item.add_initial_attempt("attempt-1").unwrap();
+        let store = WorkModelStore::new(&source);
+        store.create_work_item(&item).unwrap();
+        let resolver = ContentResolver::new(Some(&source));
+        let launches = Arc::new(Mutex::new(Vec::new()));
+        let sessions = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&launches);
+        let recorded_sessions = Arc::clone(&sessions);
+        let drift_source = source.clone();
+        let make_coder = move |_sandbox| {
+            Box::new(HandoffCoder {
+                launches: Arc::clone(&recorded),
+                sessions: Arc::clone(&recorded_sessions),
+                first_no_output: true,
+                second_commit: false,
+                source_drift: Some(drift_source.clone()),
+            }) as Box<dyn crate::coder::Coder>
+        };
+        let error = run_write_task_with_coder(
+            WorkTaskRunConfig {
+                project_root: &source,
+                store: &store,
+                work_item_id: "work-1",
+                attempt_id: "attempt-1",
+                task_id: "attempt-1-write-1",
+                resolver: &resolver,
+                extra_args: &[],
+                no_sandbox: true,
+                store_lock: None,
+            },
+            Some(&make_coder),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("preserve it for inspection"),
+            "{error:#}"
+        );
+        assert_eq!(launches.lock().unwrap().len(), 1);
+        assert_eq!(
+            fs::read_to_string(source.join("tracked.txt")).unwrap(),
+            "source drift\n"
+        );
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(stored.attempts[0].tasks[0].status, TaskStatus::NeedsUser);
+        assert_eq!(
+            stored.attempts[0].pause_kind,
+            Some(crate::work_model::PauseKind::WriterCompletion)
+        );
+    }
+
+    #[test]
+    fn writer_prompt_uses_distinct_bullets_for_optional_inputs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let review_path = tmp.path().join("review.md");
+        fs::write(&review_path, "review body").unwrap();
+        let mut item = review_item();
+        item.input_artifacts = vec![crate::work_model::WorkItemInputArtifact {
+            source_path: ".fluent/work/artifacts/source/evidence.jsonl".to_string(),
+            snapshot_path: ".fluent/work/artifacts/work-1/inputs/0000-evidence.jsonl".to_string(),
+            digest: "sha256:approved".to_string(),
+        }];
+
+        let prompt = build_write_task_prompt_with_workspace(
+            &item,
+            "attempt-1",
+            "attempt-1-write-1",
+            std::slice::from_ref(&review_path),
+            Some(tmp.path()),
+            Some(tmp.path()),
+        );
+
+        assert!(prompt.contains("- Read each prior correction artifact"));
+        assert!(prompt.contains("- Read each preserved Work Item input"));
+    }
+
+    #[test]
+    fn reviewer_readable_inputs_include_every_advertised_exact_file() {
+        let workspace = tempfile::tempdir().unwrap();
+        let artifacts = [
+            "writer/transcript.jsonl",
+            "writer/writer-completion.json",
+            "candidate-gates/write-2/candidate-gate.json",
+            "review/review.md",
+            "tester/tester-results.json",
+            "tester/commands/0-stdout.log",
+            "tester/commands/0-stderr.log",
+            "tester/commands/commands.json",
+            "work-1/inputs/0000-user-evidence.jsonl",
+        ]
+        .into_iter()
+        .map(|relative| workspace.path().join(relative))
+        .collect::<Vec<_>>();
+        for artifact in &artifacts {
+            fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+            fs::write(artifact, "evidence\n").unwrap();
+        }
+
+        assert_eq!(
+            correction_artifacts_only(&artifacts),
+            vec![
+                artifacts[2].clone(),
+                artifacts[3].clone(),
+                artifacts[4].clone(),
+                artifacts[5].clone(),
+                artifacts[6].clone(),
+            ]
+        );
+        let roots = declared_file_readable_roots(&artifacts, workspace.path()).unwrap();
+        for artifact in &artifacts {
+            assert!(roots.contains(artifact));
+            assert!(roots.contains(&fs::canonicalize(artifact).unwrap()));
+            assert!(!roots.contains(&artifact.parent().unwrap().to_path_buf()));
+        }
     }
 
     #[test]
@@ -8225,8 +22423,8 @@ mod tests {
             std::slice::from_ref(&review_path),
         );
         assert!(
-            prompt.contains("Read each prior review file"),
-            "follow-up-round prompt should include the prior-reviews instruction; got prompt:\n{prompt}"
+            prompt.contains("Read each prior correction artifact"),
+            "follow-up-round prompt should include the prior-correction instruction; got prompt:\n{prompt}"
         );
         assert!(
             prompt.contains(&format!("   - {}", review_path.display())),
@@ -8239,6 +22437,39 @@ mod tests {
     }
 
     #[test]
+    fn write_task_prompt_lists_candidate_gate_for_correction() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let gate_path = tmp.path().join("candidate-gate.json");
+        let tester_results_path = tmp.path().join("tester-results.json");
+        let commands_dir = tmp.path().join("commands");
+        let stdout_path = commands_dir.join("0-stdout.log");
+        let stderr_path = commands_dir.join("0-stderr.log");
+        fs::create_dir_all(&commands_dir).unwrap();
+        fs::write(&gate_path, "{\"disposition\":\"rejected\"}\n").unwrap();
+        fs::write(&tester_results_path, "{}\n").unwrap();
+        fs::write(&stdout_path, "stdout\n").unwrap();
+        fs::write(&stderr_path, "stderr\n").unwrap();
+
+        let prompt = build_write_task_prompt(
+            &review_item(),
+            "attempt-1",
+            "attempt-1-write-1",
+            &[
+                gate_path.clone(),
+                tester_results_path.clone(),
+                stdout_path.clone(),
+                stderr_path.clone(),
+            ],
+        );
+
+        assert!(prompt.contains("Read each prior correction artifact"));
+        assert!(prompt.contains(&gate_path.display().to_string()));
+        assert!(prompt.contains(&tester_results_path.display().to_string()));
+        assert!(prompt.contains(&stdout_path.display().to_string()));
+        assert!(prompt.contains(&stderr_path.display().to_string()));
+    }
+
+    #[test]
     fn write_user_prompt_contains_phase_headings() {
         let prompt = build_write_task_prompt(&review_item(), "attempt-1", "attempt-1-write-1", &[]);
         assert!(
@@ -8248,6 +22479,23 @@ mod tests {
         assert!(
             prompt.contains("## Phase 2"),
             "user prompt should contain Phase 2 (Implement each planned step)"
+        );
+    }
+
+    #[test]
+    fn followup_writer_prompt_has_no_unconditional_commit_requirement() {
+        let mut item = review_item();
+        item.add_next_write_round("attempt-1", Vec::new()).unwrap();
+
+        let prompt = build_write_task_prompt(&item, "attempt-1", "attempt-1-write-2", &[]);
+
+        assert!(
+            prompt.contains("verified as no-change"),
+            "follow-up completion criteria should allow verified no-change steps; got:\n{prompt}"
+        );
+        assert!(
+            !prompt.contains("Every step is committed."),
+            "follow-up prompt must not retain the initial Writer's unconditional commit requirement; got:\n{prompt}"
         );
     }
 
@@ -8284,6 +22532,39 @@ mod tests {
             prompt.contains("`.fluent/tester.yaml` is missing"),
             "prompt should include tester.yaml bootstrap when missing"
         );
+    }
+
+    #[test]
+    fn writer_prompt_assigns_focused_checks_and_reports_them_for_review() {
+        let item = review_item();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace = tmp.path();
+        let fluent_dir = workspace.join(".fluent");
+        std::fs::create_dir_all(&fluent_dir).unwrap();
+        std::fs::write(fluent_dir.join("tester.yaml"), "commands: []").unwrap();
+        let extractor = fluent_dir.join("extract-tester-results");
+        std::fs::write(&extractor, "#!/bin/sh\necho '[]'\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&extractor).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&extractor, permissions).unwrap();
+        }
+
+        let prompt = build_write_task_prompt_with_workspace(
+            &item,
+            "attempt-1",
+            "attempt-1-write-1",
+            &[],
+            Some(workspace),
+            None,
+        );
+
+        assert!(prompt.contains("smallest harness-native test selections"));
+        assert!(prompt.contains("concise `Verification` section"));
+        assert!(prompt.contains("final Tester artifact is the authoritative"));
+        assert!(!prompt.contains("Run all the test commands in `.fluent/tester.yaml`"));
     }
 
     #[test]
@@ -8486,20 +22767,82 @@ mod tests {
     }
 
     #[test]
-    fn write_user_prompt_directs_commit_conventions() {
-        let prompt = build_write_task_prompt(&review_item(), "attempt-1", "attempt-1-write-1", &[]);
-        let d1_region = prompt
-            .find("### D. Commit and advance")
-            .expect("prompt should contain §D heading");
-        let d1_text = &prompt[d1_region..];
-        assert!(
-            d1_text.contains("commit conventions"),
-            "§D.1 should reference the project's commit conventions"
-        );
-        assert!(
-            d1_text.contains("AGENTS.md") || d1_text.contains("CLAUDE.md"),
-            "§D.1 should reference AGENTS.md or CLAUDE.md as the source of commit conventions"
-        );
+    fn write_user_prompt_directs_advisory_commit_presentation() {
+        fn assert_advisory_writer_prompt(prompt: &str) {
+            let d1_region = prompt
+                .find("### D. Commit and advance")
+                .expect("prompt should contain §D heading");
+            let d1_text = &prompt[d1_region..];
+            assert!(
+                d1_text.contains("commit conventions"),
+                "§D.1 should reference the project's commit conventions"
+            );
+            assert!(
+                d1_text.contains("AGENTS.md") || d1_text.contains("CLAUDE.md"),
+                "§D.1 should reference AGENTS.md or CLAUDE.md as the source of commit conventions"
+            );
+            assert!(
+                d1_text.contains("literal `\\n` text"),
+                "§D.1 should classify literal newline text as presentation advice"
+            );
+            assert!(
+                d1_text.contains("presentation advice"),
+                "§D.1 should classify commit-message presentation as advice"
+            );
+            assert!(
+                d1_text.contains("do not create corrective work or block completion solely"),
+                "§D.1 should keep presentation advice from controlling completion"
+            );
+            assert!(
+                d1_text.contains("Co-Authored-By"),
+                "§D.1 should retain the attribution prohibition"
+            );
+            for required_integrity in ["commit-history", "identity", "message-encoding"] {
+                assert!(
+                    d1_text.contains(required_integrity),
+                    "§D.1 should retain the {required_integrity} requirement"
+                );
+            }
+        }
+
+        let mut item = review_item();
+        let followup = item.add_next_write_round("attempt-1", Vec::new()).unwrap();
+        for task_id in ["attempt-1-write-1", followup.as_str()] {
+            let prompt = build_write_task_prompt(&item, "attempt-1", task_id, &[]);
+            assert_advisory_writer_prompt(&prompt);
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let skill_dir = materialize_skill("review-documentation", tmp.path()).unwrap();
+        let skill = std::fs::read_to_string(skill_dir.join("SKILL.md")).unwrap();
+        assert!(skill.contains("commit-message presentation as advice"));
+        assert!(skill.contains("literal `\\n` text"));
+        assert!(skill.contains("Do not emit a finding or failing verdict solely"));
+        assert!(skill.contains("Co-Authored-By"));
+        for required_integrity in ["invalid history", "identity", "encoding", "attribution"] {
+            assert!(
+                skill.contains(required_integrity),
+                "documentation review should retain the {required_integrity} requirement"
+            );
+        }
+    }
+
+    #[test]
+    fn documentation_review_treats_commit_presentation_as_advice() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let skill_dir = materialize_skill("review-documentation", tmp.path()).unwrap();
+        let skill = std::fs::read_to_string(skill_dir.join("SKILL.md")).unwrap();
+
+        assert!(skill.contains("commit-message presentation as advice"));
+        assert!(skill.contains("literal `\\n` text"));
+        assert!(skill.contains("Do not emit a finding or failing verdict solely"));
+        assert!(skill.contains("Co-Authored-By"));
+        for required_integrity in ["invalid history", "identity", "encoding", "attribution"] {
+            assert!(
+                skill.contains(required_integrity),
+                "documentation review should retain the {required_integrity} requirement"
+            );
+        }
     }
 
     #[test]
@@ -8534,6 +22877,40 @@ mod tests {
             "commands:\n  - command: \"echo ok\"\n    test_harness: shell-harness\n",
         )
         .unwrap();
+        let extractor = workspace.join(".fluent/extract-tester-results");
+        std::fs::write(&extractor, "#!/bin/sh\nprintf '[]\\n'\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&extractor).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&extractor, permissions).unwrap();
+        }
+        crate::git::run(
+            &workspace,
+            &["init", "-q", "-b", "main"],
+            "init baseline fixture",
+        )
+        .unwrap();
+        crate::git::run(
+            &workspace,
+            &["config", "user.email", "test@example.com"],
+            "configure baseline fixture email",
+        )
+        .unwrap();
+        crate::git::run(
+            &workspace,
+            &["config", "user.name", "Test User"],
+            "configure baseline fixture name",
+        )
+        .unwrap();
+        crate::git::run(&workspace, &["add", ".fluent"], "stage baseline fixture").unwrap();
+        crate::git::run(
+            &workspace,
+            &["commit", "-q", "-m", "baseline"],
+            "commit baseline fixture",
+        )
+        .unwrap();
 
         let resolver = ContentResolver::new(Some(project_root));
         capture_baseline_tester(
@@ -8551,142 +22928,6 @@ mod tests {
         assert!(
             results_path.exists(),
             "baseline tester should persist tester-results.json as artifact"
-        );
-    }
-
-    #[test]
-    fn seed_prompt_renders_with_output_paths() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let workspace = tmp.path();
-        let resolver = ContentResolver::new(None);
-        let template = resolver
-            .resolve_content("prompts/seed-user.md")
-            .expect("seed-user.md must resolve");
-
-        let index_path = workspace.join(".fluent/expertise/INDEX.md");
-        let overview_path = workspace.join(".fluent/expertise/overview.md");
-        let rendered = crate::content::render_template(
-            &template,
-            &[
-                ("index_path", &index_path.display().to_string()),
-                ("overview_path", &overview_path.display().to_string()),
-                ("workspace_path", &workspace.display().to_string()),
-            ],
-        )
-        .expect("seed template must render");
-
-        assert!(
-            rendered.contains(&index_path.display().to_string()),
-            "rendered seed prompt should contain the INDEX.md path"
-        );
-        assert!(
-            rendered.contains(&overview_path.display().to_string()),
-            "rendered seed prompt should contain the overview.md path"
-        );
-        assert!(
-            rendered.contains(&workspace.display().to_string()),
-            "rendered seed prompt should contain the workspace path"
-        );
-        assert!(
-            rendered.contains("Seed project expertise overview"),
-            "rendered seed prompt should include the commit message instruction"
-        );
-    }
-
-    #[test]
-    fn write_prompt_includes_project_index_after_seed() {
-        let item = review_item();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let workspace = tmp.path();
-
-        assert!(
-            should_seed_project_model(TaskKind::Write, workspace),
-            "seed should fire before INDEX.md exists"
-        );
-
-        let prompt_before = build_write_task_prompt_with_workspace(
-            &item,
-            "attempt-1",
-            "attempt-1-write-1",
-            &[],
-            Some(workspace),
-            None,
-        );
-        assert!(
-            !prompt_before.contains("learned model of THIS project"),
-            "prompt should not include project expertise before seed"
-        );
-
-        let expertise_dir = workspace.join(".fluent/expertise");
-        fs::create_dir_all(&expertise_dir).unwrap();
-        fs::write(expertise_dir.join("INDEX.md"), "# Project Index\n").unwrap();
-        fs::write(expertise_dir.join("overview.md"), "# Overview\n").unwrap();
-
-        assert!(
-            !should_seed_project_model(TaskKind::Write, workspace),
-            "seed should not fire after INDEX.md exists"
-        );
-
-        let prompt_after = build_write_task_prompt_with_workspace(
-            &item,
-            "attempt-1",
-            "attempt-1-write-1",
-            &[],
-            Some(workspace),
-            None,
-        );
-        assert!(
-            prompt_after.contains("learned model of THIS project"),
-            "prompt should include project expertise after seed produces INDEX.md"
-        );
-        assert!(
-            prompt_after.contains(&expertise_dir.join("INDEX.md").display().to_string()),
-            "prompt should reference the INDEX.md path"
-        );
-    }
-
-    #[test]
-    fn should_seed_project_model_true_when_write_role_and_index_absent() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let workspace = tmp.path();
-        assert!(should_seed_project_model(TaskKind::Write, workspace));
-    }
-
-    #[test]
-    fn should_seed_project_model_false_when_index_present() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let workspace = tmp.path();
-        let expertise_dir = workspace.join(".fluent/expertise");
-        fs::create_dir_all(&expertise_dir).unwrap();
-        fs::write(expertise_dir.join("INDEX.md"), "# Index\n").unwrap();
-        assert!(!should_seed_project_model(TaskKind::Write, workspace));
-    }
-
-    #[test]
-    fn should_seed_project_model_false_for_non_write_tasks() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let workspace = tmp.path();
-        assert!(!should_seed_project_model(TaskKind::Review, workspace));
-        assert!(!should_seed_project_model(TaskKind::Tester, workspace));
-    }
-
-    #[test]
-    fn seed_session_uses_non_writer_system_prompt() {
-        let resolver = ContentResolver::new(None);
-        let seed_prompt = resolver
-            .resolve_content("prompts/seed-system.md")
-            .expect("seed-system.md must resolve");
-        let write_prompt = resolver
-            .resolve_content("prompts/write-system.md")
-            .expect("write-system.md must resolve");
-
-        assert_ne!(
-            seed_prompt, write_prompt,
-            "seed session must not reuse the writer's system prompt"
-        );
-        assert!(
-            !seed_prompt.contains("Fluent Writer"),
-            "seed system prompt must not identify as a Fluent Writer"
         );
     }
 
@@ -8901,6 +23142,97 @@ mod tests {
     }
 
     #[test]
+    fn learner_profile_reads_host_evidence_without_granting_write_access() {
+        let _seatbelt = crate::os::BackendPin::seatbelt();
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let handoff_dir = tmp.path().join("learner/runs/run-1/staging");
+        let provider_artifact_dir = tmp.path().join("learner/runs/run-1");
+        let provider_stderr = provider_artifact_dir.join("provider-stderr.log");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&handoff_dir).unwrap();
+        std::fs::write(&provider_stderr, "diagnostic\n").unwrap();
+        crate::git::run(&workspace, &["init", "-q"], "init learner fixture").unwrap();
+
+        let resolver = ContentResolver::new(None);
+        let inputs = LearnerRunInputs {
+            workspace_path: &workspace,
+            resolver: &resolver,
+            extra_args: &[],
+            coder_kind: CoderKind::Claude,
+            no_sandbox: false,
+            model: None,
+            effort: None,
+            review_artifact_paths: &[],
+            tester_artifact_paths: &[],
+            diff_command: "git diff",
+            handoff_dir: &handoff_dir,
+            denied_write_roots: &[],
+            handoff_only: false,
+            repair: None,
+        };
+        let mut readable_roots = Vec::new();
+        let expertise_dir = workspace.join(".fluent/expertise");
+        let (_, profile) = plan_learner_sandbox(
+            &inputs,
+            LearnerExecutionMode::Capture,
+            true,
+            None,
+            &expertise_dir,
+            &mut readable_roots,
+            Some(&provider_artifact_dir),
+        )
+        .unwrap();
+        let profile = profile.unwrap();
+        let content = std::fs::read_to_string(&profile.path).unwrap();
+        let evidence = provider_artifact_dir.display();
+        let staging = handoff_dir.display();
+
+        assert!(content.contains(&format!("(allow file-read*  (subpath \"{evidence}\"))")));
+        assert!(!content.contains(&format!("(allow file-write* (subpath \"{evidence}\"))")));
+        assert!(content.contains(&format!("(allow file-write* (subpath \"{staging}\"))")));
+
+        #[cfg(target_os = "macos")]
+        {
+            let sandbox_usable = std::process::Command::new("/usr/bin/sandbox-exec")
+                .args(["-p", "(version 1)(allow default)", "/usr/bin/true"])
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false);
+            if sandbox_usable {
+                let inspected = std::process::Command::new("/usr/bin/sandbox-exec")
+                    .arg("-f")
+                    .arg(&profile.path)
+                    .arg("/usr/bin/stat")
+                    .arg(&provider_stderr)
+                    .status()
+                    .unwrap();
+                assert!(
+                    inspected.success(),
+                    "Claude/Bun must be able to inspect the host-owned stderr descriptor"
+                );
+
+                let mutated = std::process::Command::new("/usr/bin/sandbox-exec")
+                    .arg("-f")
+                    .arg(&profile.path)
+                    .args([
+                        "/bin/sh",
+                        "-c",
+                        "echo changed >> \"$1\"",
+                        "learner-evidence",
+                    ])
+                    .arg(&provider_stderr)
+                    .status()
+                    .unwrap();
+                assert!(
+                    !mutated.success(),
+                    "the Learner must not write host-owned run evidence"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn learner_prompts_fail_closed_on_unrenderable_or_placeholder_leaking_template() {
         // The production helper fails before any coder is constructed when a template
         // cannot render or renders with a surviving `{{`/`}}` token.
@@ -8958,7 +23290,7 @@ mod tests {
     /// pair through the real `run_captured` route and reports a clean success, so a
     /// launch-route test observes exactly what the production route hands the coder.
     struct PromptRecordingCoder {
-        launches: Arc<Mutex<Vec<(String, String)>>>,
+        launches: Arc<Mutex<Vec<(String, String, Vec<(String, String)>)>>>,
     }
 
     impl crate::coder::Coder for PromptRecordingCoder {
@@ -8980,13 +23312,14 @@ mod tests {
             system_prompt: &str,
             _working_dir: &Path,
             _extra_args: &[String],
-            _extra_env: &[(String, String)],
+            extra_env: &[(String, String)],
             _capture: Option<&crate::coder::TranscriptCapture<'_>>,
         ) -> Result<i32> {
-            self.launches
-                .lock()
-                .unwrap()
-                .push((system_prompt.to_string(), prompt.to_string()));
+            self.launches.lock().unwrap().push((
+                system_prompt.to_string(),
+                prompt.to_string(),
+                extra_env.to_vec(),
+            ));
             Ok(0)
         }
 
@@ -9082,7 +23415,7 @@ mod tests {
                     mode,
                     None,
                     HostPreparation::Injected(&mut recording_prepare),
-                    move |_sandbox| {
+                    move |_sandbox, _executable| {
                         factory_for_run.fetch_add(1, AtomicOrdering::SeqCst);
                         Box::new(PromptRecordingCoder {
                             launches: launches_for_run,
@@ -9115,7 +23448,7 @@ mod tests {
                     1,
                     "{mode_name}/{invocation}: the coder launches exactly once"
                 );
-                let (system, user) = &launches[0];
+                let (system, user, environment) = &launches[0];
                 assert!(
                     !system.is_empty() && !user.is_empty(),
                     "{mode_name}/{invocation}: both prompts are non-empty"
@@ -9123,6 +23456,35 @@ mod tests {
                 assert!(
                     !system.contains("{{") && !system.contains("}}") && !user.contains("{{"),
                     "{mode_name}/{invocation}: no template placeholder leaks to the coder"
+                );
+                let environment = environment
+                    .iter()
+                    .cloned()
+                    .collect::<std::collections::HashMap<_, _>>();
+                assert_eq!(
+                    environment.get("FLUENT_TASK_KIND").map(String::as_str),
+                    Some("learner")
+                );
+                assert_eq!(
+                    environment
+                        .get("FLUENT_LEARNER_DRAFT_PATH")
+                        .map(String::as_str),
+                    Some(
+                        handoff_dir
+                            .join(crate::learner::DRAFT_FILE_NAME)
+                            .to_string_lossy()
+                            .as_ref()
+                    ),
+                    "{mode_name}/{invocation}: the provider receives the managed draft destination"
+                );
+                assert_eq!(
+                    environment.get("FLUENT_LEARNER_MODE").map(String::as_str),
+                    Some(match mode {
+                        LearnerExecutionMode::Capture => "capture",
+                        LearnerExecutionMode::PreLandNoExpertise => "no-expertise",
+                        LearnerExecutionMode::PostLandHandoffOnly => "post-land-handoff-only",
+                    }),
+                    "{mode_name}/{invocation}: the provider receives the explicit Learner mode"
                 );
 
                 // The system prompt carries the mode-accurate directive for every
@@ -9204,7 +23566,7 @@ mod tests {
                 LearnerExecutionMode::Capture,
                 None,
                 HostPreparation::Production,
-                move |_sandbox| {
+                move |_sandbox, _executable| {
                     factory_for_run.fetch_add(1, AtomicOrdering::SeqCst);
                     Box::new(PromptRecordingCoder {
                         launches: launches_for_run,
@@ -9330,7 +23692,7 @@ mod tests {
             LearnerExecutionMode::PreLandNoExpertise,
             None,
             HostPreparation::Injected(&mut failing_prepare),
-            move |_sandbox| {
+            move |_sandbox, _executable| {
                 factory_for_run.fetch_add(1, AtomicOrdering::SeqCst);
                 Box::new(PromptRecordingCoder {
                     launches: launches_for_run,
@@ -9479,7 +23841,9 @@ mod tests {
             "work-1",
             "attempt-1",
             "attempt-1-write-1",
-            &TaskFailure::Auth("Auth token expired".to_string()),
+            &TaskFailure::Auth(
+                crate::claude_auth::AuthError::Expired { expires_at: 0 }.user_message(),
+            ),
             &notify,
         )
         .unwrap();
@@ -9857,6 +24221,9 @@ mod tests {
                 candidate_commit: "abc123".to_string(),
                 base_commit: None,
             }),
+            writer_correction_assignment: None,
+            verification_context: None,
+            evidence_review_context: None,
             input_artifacts: Vec::new(),
             depends_on: None,
             output: None,
@@ -9924,7 +24291,94 @@ mod tests {
     }
 
     #[test]
+    fn failed_reviewer_waits_for_parallel_peer_before_failing_attempt() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let mut item = WorkItem::planned("work-1", "Settle the whole review round");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let writer = &mut item.attempts[0].tasks[0];
+        crate::work_model::set_task_terminal(writer, TaskStatus::Complete);
+        writer.output = Some(TaskOutput {
+            workspace_id: "candidate".to_string(),
+            workspace_path: ".fluent/work/workspaces/work-1/attempt-1/candidate".to_string(),
+            source_branch: "main".to_string(),
+            base_commit: Some("base".to_string()),
+            commit: "candidate".to_string(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        item.add_next_review_tasks("attempt-1", &["behaviors", "tests"])
+            .unwrap();
+        for task in &mut item.attempts[0].tasks[1..] {
+            task.status = TaskStatus::Executing;
+            crate::work_model::mark_task_started(task);
+        }
+        store.create_work_item(&item).unwrap();
+
+        mark_task_failed(
+            &store,
+            "work-1",
+            "attempt-1",
+            "attempt-1-review-behaviors",
+            true,
+        )
+        .unwrap();
+
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(stored.attempts[0].tasks[1].status, TaskStatus::Failed);
+        assert_eq!(stored.attempts[0].tasks[2].status, TaskStatus::Executing);
+        assert_eq!(
+            stored.attempts[0].status,
+            AttemptStatus::Reviewing,
+            "one reviewer must not terminalize the Attempt while its peer is running"
+        );
+        assert!(stored.attempts[0].completed_at.is_none());
+    }
+
+    #[test]
+    fn failed_standalone_reviewer_terminalizes_attempt_immediately() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let mut item = WorkItem::planned("work-1", "Fail a standalone review");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let writer = &mut item.attempts[0].tasks[0];
+        crate::work_model::set_task_terminal(writer, TaskStatus::Complete);
+        writer.output = Some(TaskOutput {
+            workspace_id: "candidate".to_string(),
+            workspace_path: ".fluent/work/workspaces/work-1/attempt-1/candidate".to_string(),
+            source_branch: "main".to_string(),
+            base_commit: Some("base".to_string()),
+            commit: "candidate".to_string(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        item.add_next_review_tasks("attempt-1", &["behaviors", "tests"])
+            .unwrap();
+        for task in &mut item.attempts[0].tasks[1..] {
+            task.status = TaskStatus::Executing;
+            crate::work_model::mark_task_started(task);
+        }
+        store.create_work_item(&item).unwrap();
+
+        mark_task_failed(
+            &store,
+            "work-1",
+            "attempt-1",
+            "attempt-1-review-behaviors",
+            false,
+        )
+        .unwrap();
+
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(stored.attempts[0].tasks[1].status, TaskStatus::Failed);
+        assert_eq!(stored.attempts[0].tasks[2].status, TaskStatus::Executing);
+        assert_eq!(stored.attempts[0].status, AttemptStatus::Failed);
+        assert!(stored.attempts[0].completed_at.is_some());
+    }
+
+    #[test]
     fn learner_sandbox_confines_expertise_handoff_and_git_writes() {
+        let _seatbelt = crate::os::BackendPin::seatbelt();
         let tmp = tempfile::TempDir::new().unwrap();
         let workspace = tmp.path().join("workspace");
         let expertise_dir = workspace.join(".fluent/expertise");
@@ -9959,34 +24413,38 @@ mod tests {
         let profile = profile.expect("sandbox profile should be present");
         let content = fs::read_to_string(&profile.path).unwrap();
 
-        let writable = |p: &Path| os::profile_grants_write(&content, p);
+        let write_grant =
+            |p: &Path| format!("(allow file-write* (subpath \"{}\"))", p.to_string_lossy());
 
         assert!(
-            writable(&expertise_dir),
+            content.contains(&write_grant(&expertise_dir)),
             "the Learner may write .fluent/expertise; profile:\n{content}"
         );
         assert!(
-            writable(&handoff_dir),
+            content.contains(&write_grant(&handoff_dir)),
             "the Learner may write the managed handoff surface; profile:\n{content}"
         );
         assert!(
-            writable(&common_git_dir),
+            content.contains(&write_grant(&common_git_dir)),
             "the Learner may write Git metadata; profile:\n{content}"
         );
         assert!(
-            os::profile_grants_read(&content, &workspace),
+            content.contains(&format!(
+                "(allow file-read*  (subpath \"{}\"))",
+                workspace.to_string_lossy()
+            )),
             "the Learner may read the workspace; profile:\n{content}"
         );
         assert!(
-            !writable(&workspace),
+            !content.contains(&write_grant(&workspace)),
             "the Learner may not write the whole workspace; profile:\n{content}"
         );
         assert!(
-            !writable(&work_model_dir),
+            !content.contains(&write_grant(&work_model_dir)),
             "the Learner may not write the Work model; profile:\n{content}"
         );
         assert!(
-            !writable(&observations_dir),
+            !content.contains(&write_grant(&observations_dir)),
             "the Learner may not write the Observation backlog; profile:\n{content}"
         );
 
@@ -10006,20 +24464,54 @@ mod tests {
         )
         .unwrap();
         let handoff_content = fs::read_to_string(handoff_profile.path).unwrap();
-        let handoff_writable = |p: &Path| os::profile_grants_write(&handoff_content, p);
+        assert!(handoff_content.contains(&write_grant(&handoff_dir)));
+        assert!(!handoff_content.contains(&write_grant(&expertise_dir)));
+        assert!(!handoff_content.contains(&write_grant(&common_git_dir)));
+        assert!(handoff_content.contains(&format!(
+            "(allow file-read*  (subpath \"{}\"))",
+            common_git_dir.to_string_lossy()
+        )));
+        assert!(handoff_content.contains(&format!(
+            "(deny file-write* (subpath \"{}\"))",
+            workspace.to_string_lossy()
+        )));
+        assert!(
+            !handoff_content.contains("(allow file-write* (subpath \"/private/var/folders\"))")
+        );
+    }
 
-        assert!(handoff_writable(&handoff_dir));
-        assert!(!handoff_writable(&expertise_dir));
-        assert!(!handoff_writable(&common_git_dir));
-        assert!(os::profile_grants_read(&handoff_content, &common_git_dir));
-        assert!(!handoff_writable(&workspace));
-        for root in os::shared_temp_roots() {
-            assert!(!handoff_writable(&root), "{}", root.display());
-        }
+    #[test]
+    fn preserved_work_item_input_parent_is_read_only_in_sandbox() {
+        let _seatbelt = crate::os::BackendPin::seatbelt();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let input_parent = tmp.path().join(".fluent/work/artifacts/work-1/inputs");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&input_parent).unwrap();
+        let resolver = ContentResolver::new(None);
+
+        let (_, profile) = build_coder_sandbox_with_writable_and_read_only_roots(
+            CoderKind::Claude,
+            &resolver,
+            &workspace,
+            &[],
+            std::slice::from_ref(&input_parent),
+        )
+        .unwrap();
+        let profile = fs::read_to_string(profile.unwrap().path).unwrap();
+        assert!(profile.contains(&format!(
+            "(allow file-read*  (subpath \"{}\"))",
+            input_parent.display()
+        )));
+        assert!(!profile.contains(&format!(
+            "(allow file-write* (subpath \"{}\"))",
+            input_parent.display()
+        )));
     }
 
     #[test]
     fn pre_land_no_expertise_denies_expertise_candidate_and_live_git_writes() {
+        let _seatbelt = crate::os::BackendPin::seatbelt();
         // A pre-land no-expertise run reuses the confined denied-writes profile:
         // only the managed handoff staging surface is writable, while expertise,
         // the candidate workspace, and shared Git metadata stay readable but denied
@@ -10062,25 +24554,29 @@ mod tests {
         )
         .unwrap();
         let content = fs::read_to_string(profile.path).unwrap();
-        // Seatbelt spells the denial as a rule and Landlock as the absence of a
-        // grant, so each denied root is asserted the one way both backends
-        // share: it is not writable.
-        let writable = |p: &Path| os::profile_grants_write(&content, p);
+        let write_grant =
+            |p: &Path| format!("(allow file-write* (subpath \"{}\"))", p.to_string_lossy());
+        let deny_write =
+            |p: &Path| format!("(deny file-write* (subpath \"{}\"))", p.to_string_lossy());
 
         assert!(
-            writable(&staging),
+            content.contains(&write_grant(&staging)),
             "only the staging surface is writable; profile:\n{content}"
         );
         assert!(
-            !writable(&expertise_dir),
+            !content.contains(&write_grant(&expertise_dir)),
             "expertise is never writable; profile:\n{content}"
         );
         assert!(
-            !writable(&workspace),
+            !content.contains(&write_grant(&workspace)),
+            "the candidate workspace is never writable; profile:\n{content}"
+        );
+        assert!(
+            content.contains(&deny_write(&workspace)),
             "the candidate workspace is denied; profile:\n{content}"
         );
         assert!(
-            !writable(&common_git_dir),
+            content.contains(&deny_write(&common_git_dir)),
             "shared Git metadata is denied; profile:\n{content}"
         );
     }
@@ -10144,5 +24640,232 @@ mod tests {
             !capture.effectively_sandboxed(requested_no_sandbox),
             "capture honors --no-sandbox and runs unconfined"
         );
+    }
+
+    #[test]
+    fn invalid_reviewer_arguments_pause_through_execution_route() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_root = tmp.path();
+        crate::git::run(project_root, &["init", "-q", "-b", "main"], "init fixture").unwrap();
+        crate::git::run(
+            project_root,
+            &["config", "user.email", "t@t.co"],
+            "configure fixture",
+        )
+        .unwrap();
+        crate::git::run(
+            project_root,
+            &["config", "user.name", "t"],
+            "configure fixture",
+        )
+        .unwrap();
+        fs::write(project_root.join("tracked.txt"), "baseline").unwrap();
+        crate::git::run(project_root, &["add", "."], "add fixture").unwrap();
+        crate::git::run(
+            project_root,
+            &["commit", "-q", "-m", "Add fixture"],
+            "commit fixture",
+        )
+        .unwrap();
+        let head =
+            crate::git::run_stdout(project_root, &["rev-parse", "HEAD"], "resolve head").unwrap();
+        let store = WorkModelStore::new(project_root);
+        let mut item = WorkItem {
+            id: "invalid-arguments-work".to_string(),
+            title: "Pause invalid reviewer arguments".to_string(),
+            ..Default::default()
+        };
+        item.add_review_only_attempt(
+            "invalid-arguments-attempt",
+            &["architecture"],
+            "main",
+            head.trim(),
+            true,
+        )
+        .unwrap();
+        item.attempts[0].coder_mapping.review.coder = CoderKind::Claude;
+        let task_id = item.attempts[0].tasks[0].id.clone();
+        store.create_work_item(&item).unwrap();
+        let resolver = ContentResolver::new(Some(project_root));
+        let launches = Arc::new(Mutex::new(0));
+        let launches_for_coder = Arc::clone(&launches);
+        let make_coder = move |_sandbox| {
+            Box::new(InvalidReviewerArgumentsCoder {
+                launches: Arc::clone(&launches_for_coder),
+            }) as Box<dyn crate::coder::Coder>
+        };
+
+        run_review_task_with_coder(
+            WorkTaskRunConfig {
+                project_root,
+                store: &store,
+                work_item_id: "invalid-arguments-work",
+                attempt_id: "invalid-arguments-attempt",
+                task_id: &task_id,
+                resolver: &resolver,
+                extra_args: &["--replacement-approach".to_string()],
+                no_sandbox: true,
+                store_lock: None,
+            },
+            Some(&make_coder),
+            &FilesystemReviewerCacheAdmission,
+            &report_reviewer_cache,
+        )
+        .expect_err("invalid provider arguments pause the same Review Task");
+
+        assert_eq!(*launches.lock().unwrap(), 1);
+        let stored = store.read_work_item("invalid-arguments-work").unwrap();
+        let attempt = &stored.attempts[0];
+        assert_eq!(attempt.status, AttemptStatus::NeedsUser);
+        assert_eq!(attempt.pause_kind, Some(PauseKind::ProviderUnavailable));
+        assert_eq!(attempt.tasks[0].status, TaskStatus::NeedsUser);
+        let artifact_dir = project_root.join(
+            attempt.tasks[0]
+                .artifact_area
+                .as_ref()
+                .unwrap()
+                .path
+                .clone(),
+        );
+        assert!(!artifact_dir.join("review.md").exists());
+        let handoff = fs::read_to_string(project_root.join(work_artifact_path(
+            "invalid-arguments-work",
+            "invalid-arguments-attempt",
+            "needs-user.md",
+        )))
+        .unwrap();
+        assert!(handoff.contains("unknown argument --replacement-approach"));
+        assert!(handoff.contains("pass-through provider arguments"));
+    }
+
+    #[test]
+    fn reviewer_execution_propagates_typed_provider_argument_failure() {
+        assert!(
+            PROVIDER_ARGUMENT_TEST_SELECTORS[0]
+                .ends_with("reviewer_execution_propagates_typed_provider_argument_failure")
+        );
+        let tmp = tempfile::TempDir::new().unwrap();
+        let executable = tmp.path().join("codex-provider-double");
+        fs::write(
+            &executable,
+            "#!/bin/sh\necho \"error: unexpected argument '--replacement-approach' found\" >&2\necho \"Usage: codex exec [OPTIONS] [PROMPT]\" >&2\nexit 2\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let transcript = tmp.path().join("reviewer-transcript.jsonl");
+        let capture = crate::coder::TranscriptCapture::with_config(&transcript, Default::default());
+        let coder = crate::coder::CodexCode {
+            sandbox_profile: None,
+            trusted_sandbox: false,
+            model_override: None,
+            effort: None,
+            executable,
+        };
+        let error = crate::coder::Coder::run_captured(
+            &coder,
+            "review prompt",
+            "review system prompt",
+            tmp.path(),
+            &["--replacement-approach".to_string()],
+            &[],
+            Some(&capture),
+        )
+        .expect_err("Codex parser exit becomes a typed provider argument error");
+        assert!(error.is::<crate::coder::ProviderArgumentError>());
+        assert!(!should_retry_coder_error(&Err(
+            error.context("typed provider error")
+        )));
+        let error = crate::coder::Coder::run_captured(
+            &coder,
+            "review prompt",
+            "review system prompt",
+            tmp.path(),
+            &["--replacement-approach".to_string()],
+            &[],
+            Some(&capture),
+        )
+        .expect_err("Codex parser exit remains available to reviewer settlement");
+        let failure = classify_reviewer_launch_failure(&error, &tmp.path().join("review.md"));
+        match &failure {
+            TaskFailure::ProviderArguments(message) => {
+                assert!(message.contains("pass-through provider arguments"));
+                assert!(message.contains("fluent attempt run"));
+            }
+            _ => panic!("invalid reviewer arguments must use a recoverable provider pause"),
+        }
+
+        let store = WorkModelStore::new(tmp.path());
+        let mut item = WorkItem::planned("work-1", "Pause invalid reviewer arguments");
+        item.add_initial_attempt("attempt-1").unwrap();
+        item.attempts[0].tasks[0].status = TaskStatus::Complete;
+        item.attempts[0].tasks[0].output = Some(TaskOutput {
+            workspace_id: "candidate".to_string(),
+            workspace_path: "../candidate".to_string(),
+            source_branch: "work-1".to_string(),
+            base_commit: Some("base".to_string()),
+            commit: "candidate".to_string(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        item.add_review_tasks("attempt-1", &["architecture"])
+            .unwrap();
+        let task_id = item.attempts[0].tasks[1].id.clone();
+        store.create_work_item(&item).unwrap();
+
+        mark_task_failed_attempt_needs_user(
+            &store,
+            tmp.path(),
+            "work-1",
+            "attempt-1",
+            &task_id,
+            &failure,
+            &|_, _| {},
+        )
+        .unwrap();
+
+        let stored = store.read_work_item("work-1").unwrap();
+        let attempt = &stored.attempts[0];
+        assert_eq!(attempt.status, AttemptStatus::NeedsUser);
+        assert_eq!(attempt.pause_kind, Some(PauseKind::ProviderUnavailable));
+        assert_eq!(
+            attempt
+                .tasks
+                .iter()
+                .find(|task| task.id == task_id)
+                .unwrap()
+                .status,
+            TaskStatus::NeedsUser
+        );
+        let handoff = fs::read_to_string(tmp.path().join(work_artifact_path(
+            "work-1",
+            "attempt-1",
+            "needs-user.md",
+        )))
+        .unwrap();
+        assert!(handoff.starts_with("# Provider arguments need repair"));
+        assert!(handoff.contains("Remove or correct the pass-through provider arguments"));
+        assert!(handoff.contains("unexpected argument '--replacement-approach'"));
+    }
+
+    #[test]
+    fn argument_words_without_typed_failure_remain_generic() {
+        assert!(
+            PROVIDER_ARGUMENT_TEST_SELECTORS[1]
+                .ends_with("argument_words_without_typed_failure_remain_generic")
+        );
+        let tmp = tempfile::TempDir::new().unwrap();
+        let error = anyhow::anyhow!("unknown argument --replacement-approach");
+        assert!(matches!(
+            classify_task_failure(&error),
+            TaskFailure::Generic
+        ));
+
+        let review = tmp.path().join("review.md");
+        fs::write(&review, "Verdict: findings\n").unwrap();
+        assert!(matches!(
+            classify_reviewer_launch_failure(&error, &review),
+            TaskFailure::Generic
+        ));
     }
 }

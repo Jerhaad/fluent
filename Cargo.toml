@@ -1,8 +1,11 @@
 [package]
 name = "fluent"
-version = "0.1.4"
+version = "0.6.0"
 edition = "2024"
 description = "Run coding agents inside an OS sandbox with session continuity"
+
+[features]
+test-support = []
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -19,12 +22,17 @@ unicode-width = "0.2"
 ctrlc = { version = "3", features = ["termination"] }
 rustix = { version = "1", features = ["fs"] }
 libc = "0.2"
+ureq = { version = "2", features = ["json"] }
+tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 
 [dev-dependencies]
 tempfile = "3"
 assert_cmd = "2"
 predicates = "3"
 serial_test = "3"
+
+[build-dependencies]
+sha2 = "0.10"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"

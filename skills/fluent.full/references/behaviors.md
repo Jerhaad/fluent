@@ -61,6 +61,12 @@ Each behavior statement captures one behavior. If it has two triggers or two eff
 
 Each behavior statement should suggest how to verify the behavior. If you can't imagine a test — an input, a check, an assertion — it is too vague to guarantee. "The system responds quickly" isn't testable; "the system responds within 200ms for a request under 1 MB" is. Verifiability keeps behavior statements from becoming aspirational.
 
+Declare whether the evidence covers a whole script, one native test, or a complete
+configured command. Keep the coverage description separate from that identity.
+Use the explicit `Test:` forms in [Define behaviors](define-behaviors.md#rules)
+when a legacy reference would be ambiguous. A missing result requires diagnosis;
+it does not prove that the candidate implementation is defective.
+
 ### Has one interpretation
 
 Each behavior statement should have one interpretation. Vague terms — "quickly," "sensible," "large," "user-friendly" — invite disagreement about whether the behavior holds. Replace them with concrete thresholds, or add a concrete example alongside it to pin down what it means.

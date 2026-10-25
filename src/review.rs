@@ -13,6 +13,49 @@ pub const REVIEWERS: &[&str] = &[
     "tests",
 ];
 
+/// Return a stable identity for one open finding within a reviewer role.
+pub fn finding_identity(role: &str, title: &str) -> String {
+    let title_without_status = title
+        .rfind(" (")
+        .and_then(|start| {
+            let suffix = title[start..].to_ascii_lowercase();
+            (suffix.ends_with(')')
+                && ["blocking", "minor", "partial"]
+                    .iter()
+                    .any(|marker| suffix.contains(marker)))
+            .then_some(&title[..start])
+        })
+        .unwrap_or(title);
+    let normalized = title_without_status
+        .chars()
+        .map(|character| {
+            if character.is_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    crate::follow_up::content_digest(format!("{role}\n{normalized}").as_bytes())
+}
+
+/// Extract unchecked finding titles from a review report.
+pub fn open_finding_titles(source: &str) -> Vec<String> {
+    source
+        .lines()
+        .filter(|line| line.trim_start().starts_with("- [ ]"))
+        .map(|line| {
+            line.trim_start()
+                .trim_start_matches("- [ ]")
+                .trim()
+                .to_string()
+        })
+        .collect()
+}
+
 /// Verdict from a single reviewer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -247,6 +290,152 @@ pub fn extract_verdict(content: &str) -> Verdict {
     Verdict::Uncertain
 }
 
+/// The next action requested by a failed evidence-targeted review.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EvidenceDisposition {
+    EvidenceNeeded,
+    CodeChange,
+}
+
+/// The actionable host condition and proof a reviewer requests before waiting
+/// for another evidence attachment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvidenceNeededReason {
+    pub external_condition: String,
+    pub additional_proof: String,
+}
+
+fn labeled_values(content: &str, label: &str) -> Vec<String> {
+    content
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let line = line.strip_prefix("- ").unwrap_or(line);
+            let (actual, value) = line.split_once(':')?;
+            actual
+                .trim()
+                .eq_ignore_ascii_case(label)
+                .then(|| value.trim().to_string())
+        })
+        .collect()
+}
+
+fn extract_evidence_needed_reason(content: &str) -> Option<EvidenceNeededReason> {
+    let external_conditions = labeled_values(content, "External-Condition");
+    let additional_proof = labeled_values(content, "Additional-Proof");
+    let [external_condition] = external_conditions.as_slice() else {
+        return None;
+    };
+    let [additional_proof] = additional_proof.as_slice() else {
+        return None;
+    };
+    if external_condition.is_empty() || additional_proof.is_empty() {
+        return None;
+    }
+    Some(EvidenceNeededReason {
+        external_condition: external_condition.clone(),
+        additional_proof: additional_proof.clone(),
+    })
+}
+
+/// Return whether a failed review contains exactly one evidence-needed marker.
+/// Qualification fields are intentionally ignored: a single marker with
+/// missing or malformed qualification follows the ordinary code-change path,
+/// while duplicate, unknown, or missing disposition markers remain uncertain.
+pub fn has_single_evidence_needed_disposition(content: &str) -> bool {
+    if extract_verdict(content) != Verdict::Fail {
+        return false;
+    }
+    let dispositions = labeled_values(content, "Disposition");
+    dispositions.len() == 1 && dispositions[0].eq_ignore_ascii_case("evidence-needed")
+}
+
+/// Return whether a failed review contains the legacy, unqualified
+/// `Disposition: evidence-needed` marker. New reviews must include actionable
+/// reason fields; this narrow marker exists only to migrate an already-paused
+/// pre-contract recovery without treating malformed new output as authority.
+pub fn has_unqualified_evidence_needed_disposition(content: &str) -> bool {
+    if !has_single_evidence_needed_disposition(content) {
+        return false;
+    }
+    labeled_values(content, "External-Condition").is_empty()
+        && labeled_values(content, "Additional-Proof").is_empty()
+}
+
+/// Read the fail-only disposition from an evidence-targeted review. A pass must
+/// not carry a disposition. `evidence-needed` is valid only when the reviewer
+/// names both an external remediation and the proof that would resolve it;
+/// otherwise a complete candidate-bound failure requires a source correction.
+pub fn extract_evidence_disposition(content: &str) -> Option<EvidenceDisposition> {
+    if extract_verdict(content) != Verdict::Fail {
+        return None;
+    }
+    let dispositions = labeled_values(content, "Disposition");
+    let [value] = dispositions.as_slice() else {
+        return None;
+    };
+    match value.to_ascii_lowercase().as_str() {
+        "evidence-needed" if extract_evidence_needed_reason(content).is_some() => {
+            Some(EvidenceDisposition::EvidenceNeeded)
+        }
+        "evidence-needed" => Some(EvidenceDisposition::CodeChange),
+        "code-change" => Some(EvidenceDisposition::CodeChange),
+        _ => None,
+    }
+}
+
+/// One focused command requested by a failed Tests Reviewer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FocusedEvidenceRequest {
+    pub applicability: crate::work_model::CheckApplicability,
+    pub command: String,
+    pub working_directory: String,
+}
+
+/// Read the exact focused-check request from a failed review. Both fields must
+/// occur exactly once; malformed, duplicated, or multiline requests are not
+/// executable authority.
+pub fn extract_focused_evidence_request(content: &str) -> Option<FocusedEvidenceRequest> {
+    if extract_verdict(content) != Verdict::Fail {
+        return None;
+    }
+    let values = |label: &str| {
+        content
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                let line = line.strip_prefix("- ").unwrap_or(line);
+                let (actual, value) = line.split_once(':')?;
+                actual
+                    .trim()
+                    .eq_ignore_ascii_case(label)
+                    .then(|| value.trim())
+            })
+            .collect::<Vec<_>>()
+    };
+    let commands = values("Evidence-Command");
+    let working_directories = values("Evidence-Working-Directory");
+    if commands.len() != 1
+        || working_directories.len() != 1
+        || commands[0].is_empty()
+        || working_directories[0].is_empty()
+    {
+        return None;
+    }
+    let declarations = values("Evidence-Applicability");
+    let applicability = match declarations.as_slice() {
+        [] => crate::work_model::CheckApplicability::default(),
+        [value] => serde_json::from_str(value).ok()?,
+        _ => return None,
+    };
+    Some(FocusedEvidenceRequest {
+        applicability,
+        command: commands[0].to_string(),
+        working_directory: working_directories[0].to_string(),
+    })
+}
+
 /// Reviewer's self-reported judgment about whether the writer made
 /// progress on prior-round concerns. Emitted as a `Progress:` line in
 /// review.md. Round 1 has no prior review to compare against, so
@@ -297,6 +486,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn finding_identity_ignores_review_status_annotations() {
+        let blocking = finding_identity("tests", "Fix stable boundary (blocking)");
+        let partial = finding_identity(
+            "tests",
+            "Fix stable boundary (blocking, partial — assertion still missing)",
+        );
+        let minor = finding_identity("tests", "Fix stable boundary (minor)");
+
+        assert_eq!(blocking, partial);
+        assert_eq!(blocking, minor);
+        assert_ne!(
+            blocking,
+            finding_identity("architecture", "Fix stable boundary")
+        );
+    }
+
+    #[test]
     fn test_extract_verdict_pass() {
         assert_eq!(
             extract_verdict("Verdict: pass\n\nLooks good."),
@@ -332,6 +538,108 @@ mod tests {
             extract_verdict("No verdict here.\nJust some text."),
             Verdict::Uncertain
         );
+    }
+
+    #[test]
+    fn evidence_needed_requires_actionable_host_reason() {
+        assert_eq!(
+            extract_evidence_disposition(
+                "Verdict: fail\nDisposition: evidence-needed\nExternal-Condition: Restore the host launch network.\nAdditional-Proof: Attach a rerun after restoring it.\n"
+            ),
+            Some(EvidenceDisposition::EvidenceNeeded)
+        );
+        assert_eq!(
+            extract_evidence_disposition("Verdict: fail\nDisposition: evidence-needed\n"),
+            Some(EvidenceDisposition::CodeChange)
+        );
+        assert_eq!(
+            extract_evidence_disposition("Verdict: fail\nDisposition: code-change\n"),
+            Some(EvidenceDisposition::CodeChange)
+        );
+        assert_eq!(
+            extract_evidence_disposition("Verdict: pass\nDisposition: code-change\n"),
+            None
+        );
+        assert_eq!(
+            extract_evidence_disposition("Verdict: fail\nDisposition: later\n"),
+            None
+        );
+
+        for malformed in [
+            "Verdict: fail\nDisposition: evidence-needed\nExternal-Condition: \nAdditional-Proof: Attach proof.\n",
+            "Verdict: fail\nDisposition: evidence-needed\nExternal-Condition: Repair the host.\nAdditional-Proof: \n",
+            "Verdict: fail\nDisposition: evidence-needed\nExternal-Condition: Repair the host.\nExternal-Condition: Repair it again.\nAdditional-Proof: Attach proof.\n",
+            "Verdict: fail\nDisposition: evidence-needed\nExternal-Condition: Repair the host.\nAdditional-Proof: Attach proof.\nAdditional-Proof: Attach more proof.\n",
+            "Verdict: fail\nDisposition: evidence-needed\nExternal-Condition: Repair the host.\n",
+            "Verdict: fail\nDisposition: evidence-needed\nAdditional-Proof: Attach proof.\n",
+        ] {
+            assert_eq!(
+                extract_evidence_disposition(malformed),
+                Some(EvidenceDisposition::CodeChange),
+                "malformed actionable reason must not authorize evidence-needed"
+            );
+        }
+        assert_eq!(
+            extract_evidence_disposition(
+                "Verdict: fail\nDisposition: evidence-needed\nDisposition: code-change\nExternal-Condition: Restore the host.\nAdditional-Proof: Attach proof.\n"
+            ),
+            None,
+            "contradictory disposition lines must be rejected"
+        );
+        assert_eq!(
+            extract_evidence_disposition(
+                "Verdict: fail\nDisposition: code-change\nDisposition: code-change\n"
+            ),
+            None,
+            "duplicate disposition lines must be rejected"
+        );
+        assert_eq!(
+            extract_evidence_disposition(
+                "Verdict: fail\nDisposition: evidence-needed\nExternal-Condition: Restore the host.\nExternal-Condition: \nAdditional-Proof: Attach proof.\n"
+            ),
+            Some(EvidenceDisposition::CodeChange),
+            "an empty duplicate reason must not authorize evidence-needed"
+        );
+        assert!(has_single_evidence_needed_disposition(
+            "Verdict: fail\nDisposition: evidence-needed\nExternal-Condition: \nAdditional-Proof: Attach proof.\n"
+        ));
+        assert!(!has_single_evidence_needed_disposition(
+            "Verdict: fail\nDisposition: evidence-needed\nDisposition: code-change\n"
+        ));
+        assert!(!has_single_evidence_needed_disposition(
+            "Verdict: fail\nDisposition: unknown\n"
+        ));
+        assert!(!has_single_evidence_needed_disposition("Verdict: fail\n"));
+    }
+
+    #[test]
+    fn focused_evidence_request_is_failed_exact_and_complete() {
+        let request = extract_focused_evidence_request(
+            "Verdict: fail\nEvidence-Command: cargo test exact_case\nEvidence-Working-Directory: crate\n",
+        )
+        .unwrap();
+        assert_eq!(request.command, "cargo test exact_case");
+        assert_eq!(request.working_directory, "crate");
+        assert!(extract_focused_evidence_request(
+            "Verdict: pass\nEvidence-Command: cargo test exact_case\nEvidence-Working-Directory: crate\n"
+        )
+        .is_none());
+        assert!(extract_focused_evidence_request(
+            "Verdict: fail\nEvidence-Command: cargo test one\nEvidence-Command: cargo test two\nEvidence-Working-Directory: crate\n"
+        )
+        .is_none());
+        assert!(
+            extract_focused_evidence_request(
+                "Verdict: fail\nEvidence-Command: cargo test exact_case\n"
+            )
+            .is_none()
+        );
+        let bulleted = extract_focused_evidence_request(
+            "Verdict: fail\n- Evidence-Command: cargo test exact_case\n- Evidence-Working-Directory: crate\n",
+        )
+        .unwrap();
+        assert_eq!(bulleted.command, "cargo test exact_case");
+        assert_eq!(bulleted.working_directory, "crate");
     }
 
     #[test]

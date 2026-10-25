@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(
@@ -159,7 +160,29 @@ pub enum Commands {
     },
 
     /// Initialize .fluent/ directory
-    Init,
+    Init {
+        /// Coder profile: codex-balanced, codex-stronger, claude-balanced,
+        /// codex-write-claude-review, claude-write-codex-review, or custom
+        #[arg(long)]
+        coder_profile: Option<String>,
+
+        /// Follow-up mode for configured first-time setup: propose or execute
+        #[arg(long)]
+        follow_up_mode: Option<String>,
+
+        #[arg(long)]
+        write_coder: Option<String>,
+        #[arg(long)]
+        write_model: Option<String>,
+        #[arg(long)]
+        write_effort: Option<String>,
+        #[arg(long)]
+        review_coder: Option<String>,
+        #[arg(long)]
+        review_model: Option<String>,
+        #[arg(long)]
+        review_effort: Option<String>,
+    },
 
     /// Clean stale Work Item artifacts and registered worktrees
     Cleanup {
@@ -178,7 +201,7 @@ pub enum Commands {
         path: Option<String>,
     },
 
-    /// Install bundled skills into agent skill directories
+    /// Adopt, install, or refresh bundled agent skills
     Skills {
         #[command(subcommand)]
         command: Option<SkillsCommands>,
@@ -202,11 +225,61 @@ pub enum Commands {
         command: KeepAwakeCommands,
     },
 
+    /// Print local Slack Socket Mode setup material
+    Slack {
+        #[command(subcommand)]
+        command: SlackCommands,
+    },
+
     /// Manage Fargate infrastructure
     Fargate {
         #[command(subcommand)]
         command: FargateCommands,
     },
+}
+
+#[derive(Subcommand)]
+pub enum SlackCommands {
+    /// Print the Slack app manifest for a Socket Mode installation
+    Manifest,
+    /// Print the owner-facing local Slack runner setup instructions
+    Setup,
+    /// Print the machine-local identity for a checkout
+    CheckoutIdentity {
+        /// Checkout to identify
+        path: PathBuf,
+    },
+    /// Authenticate a provider in the private state used by one Slack thread
+    ProviderLogin {
+        /// Configured project label
+        #[arg(long)]
+        project: String,
+        /// Slack thread timestamp
+        #[arg(long)]
+        thread: String,
+        /// Enabled provider name (`codex` or `claude`)
+        #[arg(long)]
+        provider: String,
+    },
+    /// Reconfirm a restored checkout and resume its paused Slack thread
+    ReconfirmCheckout {
+        /// Configured project label
+        #[arg(long)]
+        project: String,
+        /// Slack thread timestamp
+        #[arg(long)]
+        thread: String,
+    },
+    /// Install and start the local Slack runner at login
+    Enable,
+    /// Start the configured local Slack runner
+    Run,
+    /// Restart the local Slack runner
+    Restart,
+    /// Stop the local Slack runner
+    Stop,
+    /// Show the local Slack runner's safe operational status
+    Status,
 }
 
 // ---------------------------------------------------------------------------
@@ -259,6 +332,23 @@ pub enum WorkItemCommands {
         /// Pre-land Learner policy: `capture` (default) or `no-expertise`
         #[arg(long, value_name = "MODE")]
         learner_mode: Option<crate::work_model::LearnerMode>,
+
+        /// Preserve an existing managed artifact as immutable execution input
+        #[arg(long, value_name = "PATH")]
+        input_artifact: Vec<String>,
+
+        /// Authorize creation when behavior or Plan breadth exceeds the scope limit
+        #[arg(long)]
+        authorize_large_scope: bool,
+
+        /// Treat this Work Item as a release exercise with a fixed acceptance
+        /// contract
+        #[arg(long)]
+        release: bool,
+
+        /// Accepted release criterion in `id=statement` form (repeatable)
+        #[arg(long, value_name = "ID=STATEMENT", requires = "release")]
+        release_criterion: Vec<String>,
     },
 
     /// List stored Work Items
@@ -268,6 +358,18 @@ pub enum WorkItemCommands {
     Show {
         /// Work Item ID
         id: String,
+    },
+
+    /// Upgrade one Work Item's legacy split records to the current model format
+    Upgrade {
+        /// Work Item ID; omit to upgrade every readable Work Item
+        id: Option<String>,
+    },
+
+    /// Rebuild persisted status metrics after upgrade or manual artifact changes
+    RebuildMetrics {
+        /// Rebuild only this Work Item; omit to rebuild all
+        id: Option<String>,
     },
 
     /// Mark a Work Item as intentionally abandoned
@@ -286,6 +388,25 @@ pub enum WorkItemCommands {
         /// Work Item ID
         id: String,
     },
+
+    /// Classify a release finding. Findings are proposed follow-ups unless
+    /// explicitly mapped to an accepted release criterion.
+    ClassifyFinding {
+        /// Release Work Item ID
+        id: String,
+
+        /// Stable finding identifier
+        #[arg(long)]
+        finding_id: String,
+
+        /// One-line finding summary
+        #[arg(long)]
+        summary: String,
+
+        /// Accepted release criterion that makes this finding a blocker
+        #[arg(long, value_name = "CRITERION_ID")]
+        blocker_for: Option<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -294,6 +415,16 @@ pub enum WorkItemCommands {
 
 #[derive(Subcommand)]
 pub enum AttemptCommands {
+    /// Preview or explicitly approve responsibility for saved Plan obligations
+    Ownership {
+        #[command(subcommand)]
+        command: OwnershipCommands,
+    },
+    /// Run, attach, or classify host-evidence recovery
+    Evidence {
+        #[command(subcommand)]
+        command: AttemptEvidenceCommands,
+    },
     /// Create a planned Attempt with an initial write Task
     Create {
         /// Work Item ID
@@ -337,18 +468,6 @@ pub enum AttemptCommands {
         /// Effort for review Tasks
         #[arg(long)]
         review_effort: Option<String>,
-
-        /// Coder for behavior-tests Tasks: claude, codex, or pi
-        #[arg(long)]
-        behavior_tests_coder: Option<String>,
-
-        /// Model for behavior-tests Tasks
-        #[arg(long)]
-        behavior_tests_model: Option<String>,
-
-        /// Effort for behavior-tests Tasks
-        #[arg(long)]
-        behavior_tests_effort: Option<String>,
     },
 
     /// List Attempts for a Work Item
@@ -366,6 +485,135 @@ pub enum AttemptCommands {
         attempt_id: String,
     },
 
+    /// Approve a bounded, audited extension for a paused write-round cap
+    Extend {
+        /// Work Item ID
+        work_item_id: String,
+        /// Attempt ID
+        attempt_id: String,
+        /// Writer rounds to authorize (1 through 3)
+        #[arg(long)]
+        additional_write_rounds: usize,
+        /// Human decision that directs the corrective Writer at this boundary
+        #[arg(long)]
+        resolution: String,
+    },
+
+    /// Approve one tracked project Tester repair through a corrective Writer
+    RepairTester {
+        /// Work Item ID
+        work_item_id: String,
+        /// Attempt ID
+        attempt_id: String,
+        /// Operator decision that scopes the Tester repair Writer
+        #[arg(long)]
+        resolution: String,
+    },
+
+    /// Repair candidate ancestry or restore a settled interrupted Writer
+    RepairCandidateAncestry {
+        /// Work Item ID
+        work_item_id: String,
+        /// Attempt ID
+        attempt_id: String,
+        /// Operator decision approving the exact ancestry repair
+        #[arg(long)]
+        resolution: String,
+        /// Restore a settled interrupted Writer to its exact saved candidate
+        #[arg(long)]
+        restore_interrupted: bool,
+        /// Exact rejected HEAD inspected by the operator (never a target commit)
+        #[arg(
+            long,
+            requires = "restore_interrupted",
+            required_if_eq("restore_interrupted", "true")
+        )]
+        rejected_candidate: Option<String>,
+    },
+
+    /// Authorize a tree-identical commit-metadata rewrite for a rejected candidate
+    RepairCandidateMetadata {
+        /// Work Item ID
+        work_item_id: String,
+        /// Attempt ID
+        attempt_id: String,
+        /// Operator decision approving the exact metadata-only rewrite
+        #[arg(long)]
+        resolution: String,
+    },
+
+    /// Approve one retry of a Writer interrupted by a proven provider usage limit
+    RecoverUsageLimit {
+        work_item_id: String,
+        attempt_id: String,
+        /// Operator decision authorizing this exact interrupted Writer
+        #[arg(long)]
+        resolution: String,
+    },
+
+    /// Recover one saved mutable context input from its proven original bytes
+    RecoverAssignmentContext {
+        work_item_id: String,
+        attempt_id: String,
+        #[arg(long)]
+        task: String,
+        #[arg(long)]
+        candidate: String,
+        #[arg(long)]
+        assignment_digest: String,
+        #[arg(long)]
+        input: String,
+        #[arg(long)]
+        original_file: std::path::PathBuf,
+        #[arg(long)]
+        resolution: String,
+    },
+
+    /// Retry a paused Writer that did not produce a valid completion result
+    RepairWriterCompletion {
+        /// Work Item ID
+        work_item_id: String,
+        /// Attempt ID
+        attempt_id: String,
+        /// Human decision authorizing the exact Writer retry
+        #[arg(long)]
+        resolution: String,
+    },
+
+    /// Revise selected behavior Test references on a paused Attempt
+    ReviseTestReferences {
+        /// Work Item ID
+        work_item_id: String,
+        /// Attempt ID
+        attempt_id: String,
+        /// Replacement in `behavior-requirement-id=Test reference` form
+        #[arg(long, value_name = "ID=REFERENCE", required = true)]
+        reference: Vec<String>,
+        /// Human decision authorizing the exact planning correction
+        #[arg(long)]
+        resolution: String,
+    },
+
+    /// Replace an approved Approach at an audited review frontier
+    ///
+    /// Supports uncertain Architecture review and failed-review round-cap
+    /// frontiers with their existing recovery safeguards.
+    /// For a failed-review round-cap frontier, the complete flow is:
+    /// `fluent attempt extend <work-item-id> <attempt-id> --additional-write-rounds N --resolution '<authorization>'`
+    /// `fluent attempt revise-approach <work-item-id> <attempt-id> --approach-file <path> --resolution '<authorization>'`
+    ReviseApproach {
+        /// Work Item ID
+        work_item_id: String,
+        /// Attempt ID
+        attempt_id: String,
+        /// Complete replacement Approach document
+        #[arg(long, value_name = "PATH")]
+        approach_file: std::path::PathBuf,
+        /// Human decision authorizing the exact Approach revision
+        #[arg(long)]
+        resolution: String,
+    },
+
     /// Advance an Attempt through the next safe transitions
     Run {
         /// Work Item ID
@@ -377,6 +625,14 @@ pub enum AttemptCommands {
         /// Disable sandbox
         #[arg(long)]
         no_sandbox: bool,
+
+        /// Retry only the paused Tester Task without Fluent's Tester sandbox
+        #[arg(long, hide = true)]
+        tester_no_sandbox: bool,
+
+        /// Scheduler dispatch that admitted this launch
+        #[arg(long, hide = true)]
+        dispatch_id: Option<String>,
 
         /// Coding agent to launch: claude, codex, or pi
         #[arg(long)]
@@ -414,18 +670,6 @@ pub enum AttemptCommands {
         #[arg(long)]
         review_effort: Option<String>,
 
-        /// Coder for behavior-tests Tasks: claude, codex, or pi
-        #[arg(long)]
-        behavior_tests_coder: Option<String>,
-
-        /// Model for behavior-tests Tasks
-        #[arg(long)]
-        behavior_tests_model: Option<String>,
-
-        /// Effort for behavior-tests Tasks
-        #[arg(long)]
-        behavior_tests_effort: Option<String>,
-
         /// Execution runtime: local (default) or fargate
         #[arg(long)]
         runtime: Option<String>,
@@ -452,6 +696,15 @@ pub enum AttemptCommands {
         attempt_id: String,
     },
 
+    /// Persist a stop, settle all owned local workers, and suspend for explicit resume.
+    /// Repeating cancellation after settlement leaves history unchanged.
+    Cancel {
+        /// Work Item ID
+        work_item_id: String,
+        /// Attempt ID
+        attempt_id: String,
+    },
+
     /// Watch a Fargate-executed Attempt's ECS task until it stops.
     Watch {
         /// Work Item ID
@@ -461,6 +714,97 @@ pub enum AttemptCommands {
         /// Poll interval in seconds (default 15)
         #[arg(long, default_value_t = 15)]
         interval: u64,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum OwnershipCommands {
+    /// Read a proposed split and print a candidate-bound preview without adoption
+    Preview {
+        work_item_id: String,
+        attempt_id: String,
+        #[arg(long)]
+        proposal_file: std::path::PathBuf,
+    },
+    /// Adopt the exact preview with a recorded operator decision
+    Approve {
+        work_item_id: String,
+        attempt_id: String,
+        #[arg(long)]
+        preview_file: std::path::PathBuf,
+        #[arg(long)]
+        resolution: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum AttemptEvidenceCommands {
+    /// Classify paused failed host evidence as an authorized source correction
+    Classify {
+        /// Work Item ID
+        work_item_id: String,
+        /// Attempt ID
+        attempt_id: String,
+        /// Exact candidate commit
+        #[arg(long)]
+        candidate: String,
+        /// Completed evidence-targeted review artifact
+        #[arg(long, value_name = "PATH")]
+        review_artifact: String,
+        /// Digest of the attached immutable host evidence
+        #[arg(long)]
+        evidence_digest: String,
+        /// Operator authorization for the source correction
+        #[arg(long)]
+        resolution: String,
+    },
+    /// Schedule one failed Tests Review's approved check as a verification Task.
+    /// Run the printed Task command, then resume the Attempt to validate its receipt.
+    Run {
+        /// Work Item ID
+        work_item_id: String,
+        /// Attempt ID
+        attempt_id: String,
+        /// Failed Tests Review artifact this check addresses
+        #[arg(long, value_name = "PATH")]
+        review_artifact: String,
+        /// Exact one-line command for a legacy review without Evidence-Command
+        #[arg(long)]
+        command: Option<String>,
+        /// Candidate-relative directory for a legacy review without Evidence-Working-Directory
+        #[arg(long, value_name = "PATH")]
+        working_directory: Option<String>,
+        /// Maximum command duration
+        #[arg(long, default_value_t = 600)]
+        timeout_seconds: u64,
+    },
+    /// Attach one versioned JSON evidence document to an unchanged candidate
+    Attach {
+        /// Work Item ID
+        work_item_id: String,
+        /// Attempt ID
+        attempt_id: String,
+        /// Exact candidate commit
+        #[arg(long)]
+        candidate: String,
+        /// Host-produced evidence document
+        #[arg(long, value_name = "PATH")]
+        evidence_file: String,
+        /// Failed review artifact this evidence addresses
+        #[arg(long, value_name = "PATH")]
+        review_artifact: Vec<String>,
+        /// Failed-command recheck manifest this evidence addresses
+        #[arg(long, value_name = "PATH")]
+        recheck_artifact: Option<String>,
+        /// Required Plan completion row completed by this authorized-host run
+        #[arg(long, value_name = "ROW", conflicts_with_all = ["review_artifact", "recheck_artifact"])]
+        plan_row: Option<String>,
+        /// Stable canonical check selector printed in evidence recovery guidance
+        #[arg(long, value_name = "ID", conflicts_with_all = ["review_artifact", "recheck_artifact", "plan_row"])]
+        required_check: Option<String>,
+        /// Pending Tests finding in the current Writer's immutable assignment
+        #[arg(long, value_name = "ID", conflicts_with_all = ["review_artifact", "recheck_artifact", "plan_row", "required_check"])]
+        finding: Option<String>,
     },
 }
 
@@ -585,6 +929,16 @@ pub enum TaskCommands {
         task_id: String,
     },
 
+    /// Check the active Writer's current candidate before ending its Task
+    CheckHandoff {
+        /// Work Item ID
+        work_item_id: String,
+        /// Attempt ID
+        attempt_id: String,
+        /// Task ID
+        task_id: String,
+    },
+
     /// Run an existing Task
     Run {
         /// Work Item ID
@@ -636,18 +990,6 @@ pub enum TaskCommands {
         #[arg(long)]
         review_effort: Option<String>,
 
-        /// Coder for behavior-tests Tasks: claude, codex, or pi
-        #[arg(long)]
-        behavior_tests_coder: Option<String>,
-
-        /// Model for behavior-tests Tasks
-        #[arg(long)]
-        behavior_tests_model: Option<String>,
-
-        /// Effort for behavior-tests Tasks
-        #[arg(long)]
-        behavior_tests_effort: Option<String>,
-
         /// Extra args passed through to the agent
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         extra_args: Vec<String>,
@@ -670,8 +1012,32 @@ pub enum QueueCommands {
         priority: Option<i64>,
     },
 
+    /// Explicitly queue recovery of one suspended Attempt
+    Resume {
+        /// Work Item ID
+        work_item_id: String,
+
+        /// Exact needs-user Attempt to resume
+        #[arg(long)]
+        attempt: String,
+
+        /// Numeric priority (higher = sooner; default 0)
+        #[arg(long)]
+        priority: Option<i64>,
+
+        /// Approve this tester-harness recovery without Fluent's Tester sandbox
+        #[arg(long)]
+        no_sandbox: bool,
+    },
+
     /// List queued Work Items
     List,
+
+    /// Show the latest dispatch for a Work Item as JSON
+    Show {
+        /// Work Item ID
+        work_item_id: String,
+    },
 
     /// Remove a Work Item from the queue
     Remove {
@@ -686,6 +1052,12 @@ pub enum QueueCommands {
 
 #[derive(Subcommand)]
 pub enum TesterCommands {
+    /// Validate Tester readiness and run declared test commands
+    Check {
+        /// Disable sandbox
+        #[arg(long)]
+        no_sandbox: bool,
+    },
     /// Run the Tester subcommand for a specific Task
     Run {
         /// Work Item ID
@@ -709,11 +1081,19 @@ pub enum TesterCommands {
 
 #[derive(Subcommand)]
 pub enum SchedulerCommands {
-    /// Poll the queue and run Work Items sequentially
+    /// Poll the queue and run Work Items up to configured capacity
     Run {
         /// Seconds between queue polls when idle (default 30)
         #[arg(long)]
         poll_seconds: Option<u64>,
+    },
+    /// Show the elected coordinator and its exact Fluent build
+    Status,
+    /// Stop new claims and drain running Work in this project (or all registered projects)
+    Stop {
+        /// Drain the shared scheduler service across all registered projects
+        #[arg(long)]
+        all: bool,
     },
 }
 
@@ -778,18 +1158,18 @@ pub enum ObservationCommands {
 
 #[derive(Subcommand)]
 pub enum SkillsCommands {
-    /// Install bundled skills into agent skill directories
+    /// Refresh existing skills, or install with --agent and --project/--global
     Add {
-        /// Install into global skill directories only
-        #[arg(short = 'g', long, conflicts_with_all = ["project", "agent"])]
+        /// Install into the selected agents' global skill directories
+        #[arg(short = 'g', long, conflicts_with = "project")]
         global: bool,
 
-        /// Install into the project skill directory
-        #[arg(long, conflicts_with_all = ["global", "agent"])]
+        /// Install into the selected agents' project skill directories
+        #[arg(long, conflicts_with = "global")]
         project: bool,
 
-        /// Install for specific agents (comma-separated, or * for all)
-        #[arg(long, conflicts_with_all = ["global", "project"])]
+        /// Select agents to install for: codex, claude, comma-separated, or *
+        #[arg(long)]
         agent: Option<String>,
     },
 
@@ -846,4 +1226,266 @@ pub enum FargateCommands {
         #[arg(long)]
         keep_s3: bool,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slack_reconfirm_checkout_route_parses_scoped_identity() {
+        let cli = Cli::try_parse_from([
+            "fluent",
+            "slack",
+            "reconfirm-checkout",
+            "--project",
+            "app",
+            "--thread",
+            "1712345678.123456",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Slack {
+                command: SlackCommands::ReconfirmCheckout { project, thread }
+            }) if project == "app" && thread == "1712345678.123456"
+        ));
+    }
+
+    fn parsed_tester_recovery(args: &[&str]) -> (bool, Vec<String>) {
+        let cli = Cli::try_parse_from(args).expect("Tester recovery command should parse");
+        match cli.command {
+            Some(Commands::Attempt {
+                command:
+                    AttemptCommands::Run {
+                        tester_no_sandbox,
+                        extra_args,
+                        ..
+                    },
+            }) => (tester_no_sandbox, extra_args),
+            _ => panic!("expected attempt run"),
+        }
+    }
+
+    #[test]
+    fn tester_recovery_capability_must_precede_trailing_attempt_arguments() {
+        let (approved, extra_args) = parsed_tester_recovery(&[
+            "fluent",
+            "attempt",
+            "run",
+            "--tester-no-sandbox",
+            "work-1",
+            "attempt-1",
+        ]);
+        assert!(approved);
+        assert!(extra_args.is_empty());
+    }
+
+    #[test]
+    fn evidence_attach_parses_failed_recheck_frontier() {
+        let cli = Cli::try_parse_from([
+            "fluent",
+            "attempt",
+            "evidence",
+            "attach",
+            "work-1",
+            "attempt-1",
+            "--candidate",
+            "abc123",
+            "--evidence-file",
+            "evidence.json",
+            "--recheck-artifact",
+            ".fluent/work/artifacts/work-1/attempt-1/recheck/failed-command-recheck.json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Attempt {
+                command: AttemptCommands::Evidence {
+                    command: AttemptEvidenceCommands::Attach {
+                        review_artifact,
+                        recheck_artifact: Some(recheck),
+                        ..
+                    }
+                }
+            }) if review_artifact.is_empty() && recheck.ends_with("failed-command-recheck.json")
+        ));
+    }
+
+    #[test]
+    fn evidence_attach_parses_authorized_host_plan_row() {
+        let cli = Cli::try_parse_from([
+            "fluent",
+            "attempt",
+            "evidence",
+            "attach",
+            "work-1",
+            "attempt-1",
+            "--candidate",
+            "abc123",
+            "--evidence-file",
+            "evidence.json",
+            "--plan-row",
+            "plan:step-6",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Attempt {
+                command: AttemptCommands::Evidence {
+                    command: AttemptEvidenceCommands::Attach {
+                        plan_row: Some(row),
+                        review_artifact,
+                        recheck_artifact: None,
+                        ..
+                    }
+                }
+            }) if row == "plan:step-6" && review_artifact.is_empty()
+        ));
+    }
+
+    #[test]
+    fn evidence_classify_parses_candidate_bound_inputs() {
+        let cli = Cli::try_parse_from([
+            "fluent",
+            "attempt",
+            "evidence",
+            "classify",
+            "work-1",
+            "attempt-1",
+            "--candidate",
+            "abc123",
+            "--review-artifact",
+            "review.md",
+            "--evidence-digest",
+            "sha256:evidence",
+            "--resolution",
+            "Correct the source.",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Attempt {
+                command: AttemptCommands::Evidence {
+                    command: AttemptEvidenceCommands::Classify { evidence_digest, .. }
+                }
+            }) if evidence_digest == "sha256:evidence"
+        ));
+    }
+
+    #[test]
+    fn candidate_ancestry_repair_parses_operator_resolution() {
+        let cli = Cli::try_parse_from([
+            "fluent",
+            "attempt",
+            "repair-candidate-ancestry",
+            "work-1",
+            "attempt-1",
+            "--resolution",
+            "Preserve the protected base.",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Attempt {
+                command: AttemptCommands::RepairCandidateAncestry {
+                    work_item_id,
+                    attempt_id,
+                    resolution,
+                    restore_interrupted: false,
+                    rejected_candidate: None,
+                }
+            }) if work_item_id == "work-1"
+                && attempt_id == "attempt-1"
+                && resolution == "Preserve the protected base."
+        ));
+    }
+
+    #[test]
+    fn candidate_metadata_repair_parses_operator_resolution() {
+        let cli = Cli::try_parse_from([
+            "fluent",
+            "attempt",
+            "repair-candidate-metadata",
+            "work-1",
+            "attempt-1",
+            "--resolution",
+            "Rewrite only malformed commit messages.",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Attempt {
+                command: AttemptCommands::RepairCandidateMetadata {
+                    work_item_id,
+                    attempt_id,
+                    resolution,
+                }
+            }) if work_item_id == "work-1"
+                && attempt_id == "attempt-1"
+                && resolution == "Rewrite only malformed commit messages."
+        ));
+    }
+
+    #[test]
+    fn test_reference_revision_parses_repeated_selected_requirements() {
+        let cli = Cli::try_parse_from([
+            "fluent",
+            "attempt",
+            "revise-test-references",
+            "work-1",
+            "attempt-1",
+            "--reference",
+            "behavior:readiness:b1=python3 tests/readiness.py",
+            "--reference",
+            "behavior:readiness:b2=python3 tests/readiness.py",
+            "--resolution",
+            "Use the owning public workflow.",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Attempt {
+                command: AttemptCommands::ReviseTestReferences {
+                    work_item_id,
+                    attempt_id,
+                    reference,
+                    resolution,
+                }
+            }) if work_item_id == "work-1"
+                && attempt_id == "attempt-1"
+                && reference.len() == 2
+                && resolution == "Use the owning public workflow."
+        ));
+    }
+
+    #[test]
+    fn approach_revision_parses_authorized_replacement() {
+        let cli = Cli::try_parse_from([
+            "fluent",
+            "attempt",
+            "revise-approach",
+            "work-1",
+            "attempt-1",
+            "--approach-file",
+            "replacement.md",
+            "--resolution",
+            "Adopt the reviewed design.",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Attempt {
+                command: AttemptCommands::ReviseApproach {
+                    work_item_id,
+                    attempt_id,
+                    approach_file,
+                    resolution,
+                }
+            }) if work_item_id == "work-1"
+                && attempt_id == "attempt-1"
+                && approach_file == std::path::PathBuf::from("replacement.md")
+                && resolution == "Adopt the reviewed design."
+        ));
+    }
 }

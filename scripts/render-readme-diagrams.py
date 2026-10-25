@@ -152,7 +152,7 @@ def validate_tracks(tracks: tuple[Track, ...]) -> None:
 
 def run(command: list[str]) -> None:
     try:
-        subprocess.run(command, check=True)
+        subprocess.run(command, check=True, stdin=subprocess.DEVNULL)
     except subprocess.CalledProcessError as error:
         rendered_command = " ".join(command)
         raise RuntimeError(

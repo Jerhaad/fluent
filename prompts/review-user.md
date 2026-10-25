@@ -13,28 +13,77 @@ The Writer's workspace and commits:
 - Workspace: {{candidate_workspace_path}}
 - Commits: {{source_branch}}..{{candidate_commit}}
 
+{{#if has_recovered_protected_base}}
+This candidate passed an audited host ancestry repair. Commit
+`{{recovered_protected_base}}` and all earlier history are immutable recovery
+history. Review their product content as part of the candidate, but do not fail
+the candidate or ask the Writer to rewrite commit metadata at or before that
+boundary. Apply commit-metadata review only to later commits; Fluent's
+deterministic gate remains authoritative for the protected history.
+{{/if}}
+
+Open the supplied absolute paths directly; do not discover them by listing parent directories.
+Fluent grants the exact candidate workspace and named evidence files, while their parent and
+sibling directories may remain intentionally unreadable.
+
+{{#if evidence_review_context}}
+## Evidence-targeted review
+
+This unchanged candidate is under host-evidence recovery. Assess only whether
+the immutable host evidence at {{evidence_snapshot_path}} resolves the decision
+recorded at {{evidence_prior_review_path}} for commit
+{{evidence_candidate_commit}}. On failure, emit exactly one
+`Disposition:` line. Use `Disposition: evidence-needed` only when a concrete
+external host remediation could resolve the failure, and emit exactly one
+`External-Condition: <host condition to correct>` line plus exactly one
+`Additional-Proof: <evidence to attach after correction>` line. When the exact
+command has already run against this exact candidate and no external
+remediation is named, emit exactly one `Disposition: code-change` line.
+
+{{carried_finding_context}}
+{{/if}}
+
+{{accepted_host_evidence}}
+
 ## Phase 1 — Understand the Work Item
 
 1. Read Brief at {{brief_path}} — what should have changed and why.
 2. Read Behaviors at {{behaviors_path}} — EARS statements describing observable changes in behavior.
 3. Read Approach at {{approach_path}} — technical direction the implementation should have followed.
 4. Read Plan at {{plan_path}} — incremental steps the implementation should have followed.
-5. Read the expertise indexes. Each index is a list of expertise files you can load as needed in Phase 3.
+5. Read the generated current context at {{execution_context_path}}. It contains
+   exact candidate/base commits, changed files, unresolved steps, deduplicated
+   current findings, passing evidence, executed commands, and historical artifact
+   paths. Open a historical artifact only when the current review needs its detail.
+6. Read the expertise indexes. Each index is a list of expertise files you can load as needed in Phase 3.
    - {{general_expertise_index}} — architecture, testing, documentation, tooling
 {{#if has_project_expertise_index}}
    - {{project_expertise_index}} — workspace-specific decisions, conventions, patterns
 {{/if}}
 {{#if decisions_path}}
-6. Read recorded decisions at {{decisions_path}} — project-accepted choices not to flag in findings.
+7. Read recorded decisions at {{decisions_path}} — project-accepted choices not to flag in findings.
 {{/if}}
 {{#if has_prior_reviews}}
-7. Read each prior review file. The list below is the complete set of {{role}} reviews from the most recent prior round: {{prior_reviews_list}}
+- Treat the deduplicated current findings in the generated context as the prior
+  findings for this role. The context names the source artifact for each finding;
+  open that file only when the summarized title is insufficient to decide it.
+{{/if}}
+{{#if has_work_item_inputs}}
+- Read each preserved Work Item input. These immutable files are authoritative review inputs: {{work_item_inputs_list}}
+{{/if}}
+{{#if has_tester_correction_evidence}}
+- Read the latest Tester correction evidence at these complete paths:
+{{tester_correction_evidence_list}}
 {{/if}}
 
 ## Phase 2 — Inspect the candidate
 
 1. Run the review diff command (`{{review_diff_command}}`) to see what the Writer changed in this round.
-2. Read tester-results.json at {{tester_results_path}} — outcomes of the declared test commands.
+{{#if has_final_tester_evidence}}
+2. Read tester-results.json at {{tester_results_path}} — host-owned outcomes of the declared test commands for exact candidate commit {{candidate_commit}}. Treat this as the default executable evidence. If the file records a different candidate commit, report one blocking evidence mismatch.
+{{else}}
+2. For exact candidate commit {{candidate_commit}}, read the Writer's final verification summary in {{writer_transcript_path}}. Treat its focused commands as advisory evidence: inspect the changed tests and code yourself, and do not claim that the final canonical suite has run. If one concrete missing result prevents a decision, the tests reviewer may run one named harness-native check; other roles should report the evidence gap.
+{{/if}}
 3. Read progress.md at {{progress_md_path}} — the Writer's per-step notes, including any recorded divergences from plan, approach, or behaviors, and any `Untestable:` justifications.
 
 ## Phase 3 — Review and write the review report
@@ -42,13 +91,28 @@ The Writer's workspace and commits:
 1. Read the review-{{role}} skill at {{skill_path}} and apply it to evaluate the candidate.
 2. Identify findings — concerns the Writer should address.
 {{#if is_review_tests}}
+   - Read current verification requirements in the generated context and inspect their bound
+     structured results and named logs. Only established unresolved candidate defects require
+     source correction. Missing evidence and unexplained command failures need diagnosis;
+     applicable accepted proof remains effective through unrelated failures. Historical results
+     retain their original candidate and do not establish a pass for a changed commit.
    - Verify `Untestable:` justifications from progress.md rather than accepting them at face value. Reasons like "trivial delegation" or "framework guarantee" are fair; "hard to set up" usually isn't.
    - Each behavior in behaviors.md should have at least one test that verifies it. Flag behaviors without a verifying test.
+   - Do not rerun the full suite. If the Tester evidence omits one result needed to decide a concrete finding, you may run one named missing evidence check. Use the shared candidate cache with `CARGO_HOME="{{reviewer_cache_dir}}/cargo-home" CARGO_TARGET_DIR="{{reviewer_cache_dir}}/target"` for Cargo. Record the exact command and result in review.md.
+   - If one focused check could resolve a finding but the reviewer sandbox cannot run it, fail the review and include exactly one `Evidence-Command: <command>` line plus one `Evidence-Working-Directory: <candidate-relative-directory>` line. The fields may be plain lines or Markdown list entries. Name one direct harness invocation without pipes, redirection, command chaining, or multiline shell. Put `CARGO_HOME="$FLUENT_EVIDENCE_SCRATCH/cargo-home"` and `CARGO_TARGET_DIR="$FLUENT_EVIDENCE_SCRATCH/target"` in the command with any other build or cache arguments; Fluent supplies that private writable path only after an operator explicitly approves the host evidence run.
 {{/if}}
 {{#if is_review_behaviors}}
    - Every new or changed EARS statement should have a `Test:` reference or `Untestable:` marker. Missing markers are gaps.
-   - For each `Test:` reference, verify the matching entry in the `tests` array of tester-results.json has `status: pass`. A failed test or a missing reference is a finding.
+{{/if}}
+{{#if is_review_behaviors_with_final_tester}}
+   - For each `Test:` reference, inspect the current shared assessment and its supporting evidence. Whole-script and named-test references need their exact passing native identity; a command reference needs its exact canonical occurrence or supported legacy reviewed host proof. Descriptions do not select tests. Report missing evidence as a verification gap and establish its cause before asking for source correction.
    - If tester-results.json has a non-null `error` field, produce a single finding naming the error `kind` and `message` — don't flag individual behaviors when the test infrastructure itself failed.
+{{/if}}
+{{#if is_review_behaviors_before_final_tester}}
+   - For each `Test:` reference, verify that the named test exists and directly exercises the behavior. Use the Writer's focused verification only as advisory evidence; the final Tester has not run yet.
+{{/if}}
+{{#if has_writer_completion_matrix}}
+   - Read the Writer completion matrix at {{writer_completion_matrix_path}}. Treat its implementation and focused-verification claims as an advisory coverage map, not authoritative test evidence. Check the candidate and cited sources directly; the final Tester has not run yet.
 {{/if}}
 {{#if is_review_architecture}}
    - Flag structural choices that diverge from what `approach.md` specifies. Do not re-litigate `approach.md` itself — that judgment lives with `define-approach`. If the approach is itself the problem, mark Verdict `uncertain` and record the concern as a finding.
@@ -58,7 +122,7 @@ The Writer's workspace and commits:
    - Verify that user-facing docs read like polished prose, not a restated version of behaviors.md's EARS statements.
 {{/if}}
    {{#if has_prior_reviews}}
-   - For each finding in the prior reviews you read in Phase 1, mark `- [x]` if the Writer addressed it; `- [ ]` if not. For partial credit, mark `- [ ]` and add "(partial — what's still incomplete)" to the title.
+   - For each current finding for this role in the generated context, mark `- [x]` if the Writer addressed it; `- [ ]` if not. For partial credit, mark `- [ ]` and add "(partial — what's still incomplete)" to the title.
    - Add any new finding you identified as `- [ ]`.
    {{else}}
    - List each finding as `- [ ]`.
@@ -96,7 +160,36 @@ The Writer's workspace and commits:
 
 If you found nothing, still write the file with `Verdict: pass` and an empty `## Findings` section.
 
-The Task completes when the review report exists at {{review_path}}.
+For a passing verdict, also write candidate-bound inspection evidence to
+{{review_inspection_path}}. Use this exact JSON shape:
+
+```json
+{
+  "schema-version": 1,
+  "candidate-commit": "{{candidate_commit}}",
+  "role": "{{role}}",
+  "inspections": [
+    {
+      "path": "path/to/tracked-candidate-file",
+      "summary": "What this role checked in that file"
+    }
+  ]
+}
+```
+
+Each path must be a canonical repository-relative file path tracked by candidate
+commit {{candidate_commit}}. Include at least one file. When no changed file is
+specific to your role, inspect a tracked candidate file that lets you establish
+that no role-specific change is required and explain that conclusion in
+`summary`. At least one successful provider tool call must identify the exact
+candidate and one declared file in the same call. It may use the file's joined
+absolute path, the candidate workspace plus its repository-relative path, or
+candidate commit {{candidate_commit}} plus its repository-relative path (for
+example, a Git `commit:path` read). A workspace, commit, or relative path alone
+is insufficient. Do not write this artifact for a fail or uncertain verdict.
+
+The Task completes when the review report exists at {{review_path}} and a
+passing report has valid inspection evidence at {{review_inspection_path}}.
 
 ## Rules during review
 
@@ -104,11 +197,15 @@ The Task completes when the review report exists at {{review_path}}.
 
 Do not edit or commit in {{candidate_workspace_path}}. Multiple reviewers run against it concurrently.
 
-### Build cache and writable outputs
+### Executable evidence
 
-- You may READ the candidate workspace's existing build outputs (binaries, compiled artifacts, installed dependencies) freely. The writer produced them as part of completing the write task.
-- Fluent has pre-populated your reviewer artifact directory at {{artifact_dir}} with copies of the writer's build outputs for warm-start incremental builds. When you need to build new outputs the writer didn't produce, redirect them there.
-- For Cargo: `CARGO_TARGET_DIR="{{artifact_dir}}/target" cargo build` (or cargo test). If the writer already built the binary you need, invoke it directly from the candidate workspace instead of recompiling.
+{{#if has_final_tester_evidence}}
+- Use tester-results.json as the default executable evidence for the exact candidate commit.
+{{else}}
+- The Writer's focused verification summary is advisory evidence. Do not describe it as host-owned or as proof that the complete canonical suite passed.
+{{/if}}
+- Do not rerun the full suite. Architecture, behavior, skills, and documentation review should inspect the candidate and existing evidence without producing build outputs.
+- Keep review.md, logs, transcripts, and small diagnostic text in {{artifact_dir}}. Do not create build caches there.
 
 {{#if decisions_path}}
 ### Do not flag against recorded decisions

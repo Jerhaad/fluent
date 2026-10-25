@@ -11,9 +11,9 @@ use fluent::cleanup::{
     self, CleanupOptions, WorkBranchCleanup, WorkCleanupResult, WorktreeCleanup,
 };
 use fluent::cli::{
-    AttemptCommands, Cli, Commands, FargateCommands, KeepAwakeCommands, MergeCandidateCommands,
-    ObservationCommands, QueueCommands, ReviewCommands, SchedulerCommands, SkillsCommands,
-    TaskCommands, TesterCommands, WorkItemCommands,
+    AttemptCommands, AttemptEvidenceCommands, Cli, Commands, FargateCommands, KeepAwakeCommands,
+    MergeCandidateCommands, ObservationCommands, QueueCommands, ReviewCommands, SchedulerCommands,
+    SkillsCommands, SlackCommands, TaskCommands, TesterCommands, WorkItemCommands,
 };
 use fluent::coder::CoderKind;
 use fluent::content::ContentResolver;
@@ -29,12 +29,15 @@ use fluent::observations;
 use fluent::os;
 use fluent::post_merge_review;
 use fluent::review;
+use fluent::skill_install::{self, InstallOutcome};
+use fluent::slack_collaboration::{self, LaunchAgentServiceManager, RunnerControl};
 use fluent::update;
 use fluent::version;
 use fluent::work_attempt_loop::{self, WorkAttemptRunConfig, WorkAttemptRunOutcome};
 use fluent::work_merge_executor::{self, WorkMergeConfig};
 use fluent::work_model::{
-    self, PlanningContext, WorkItem, WorkModelStorageError, WorkModelStore, to_json_pretty,
+    self, PlanningContext, ReleaseContract, ReleaseCriterion, WorkItem, WorkModelError,
+    WorkModelStorageError, WorkModelStore, to_json_pretty,
 };
 use fluent::work_status;
 use fluent::work_task_executor::{self, WorkTaskRunConfig};
@@ -183,8 +186,29 @@ fn main() -> Result<()> {
         }) => {
             cmd_cleanup(&cwd, apply, prune_all_review_worktrees)?;
         }
-        Some(Commands::Init) => {
-            cmd_init(&cwd)?;
+        Some(Commands::Init {
+            coder_profile,
+            follow_up_mode,
+            write_coder,
+            write_model,
+            write_effort,
+            review_coder,
+            review_model,
+            review_effort,
+        }) => {
+            cmd_init(
+                &cwd,
+                fluent::setup::InitSetupInputs {
+                    coder_profile,
+                    follow_up_mode,
+                    write_coder,
+                    write_model,
+                    write_effort,
+                    review_coder,
+                    review_model,
+                    review_effort,
+                },
+            )?;
         }
         Some(Commands::Dashboard { path }) => {
             let search_root = path.map(PathBuf::from).unwrap_or(cwd);
@@ -224,6 +248,7 @@ fn main() -> Result<()> {
         Some(Commands::KeepAwake { command }) => {
             cmd_keep_awake(command)?;
         }
+        Some(Commands::Slack { command }) => cmd_slack(command)?,
         None => {
             let coder_kind = CoderKind::resolve(cli.coder.as_deref())?;
             cmd_interactive(&sandbox_root, &resolver, &cli.extra_args, coder_kind)?;
@@ -234,6 +259,82 @@ fn main() -> Result<()> {
         update::maybe_nudge();
     }
 
+    Ok(())
+}
+
+fn slack_home() -> Result<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .context("Slack runner requires a home directory")
+}
+
+fn cmd_slack(command: SlackCommands) -> Result<()> {
+    match command {
+        SlackCommands::Manifest => print!("{}", slack_collaboration::SOCKET_MODE_MANIFEST),
+        SlackCommands::Setup => print!("{}", include_str!("../docs/slack-runner.md")),
+        SlackCommands::CheckoutIdentity { path } => {
+            println!("{}", slack_collaboration::checkout_identity(&path)?);
+        }
+        SlackCommands::ProviderLogin {
+            project,
+            thread,
+            provider,
+        } => {
+            slack_collaboration::authenticate_provider_for_thread(
+                &slack_home()?,
+                &project,
+                &thread,
+                &provider,
+            )?;
+            println!("queued provider-login recovery for Slack thread {thread}");
+        }
+        SlackCommands::ReconfirmCheckout { project, thread } => {
+            slack_collaboration::request_checkout_reconfirmation(
+                &slack_home()?,
+                &project,
+                &thread,
+            )?;
+            println!("queued checkout reconfirmation for Slack thread {thread}");
+        }
+        SlackCommands::Enable => {
+            let home = slack_home()?;
+            let executable = std::env::current_exe()?;
+            let mut manager = LaunchAgentServiceManager::new(&home);
+            slack_collaboration::enable_runner(&mut manager, &executable).map_err(|error| {
+                slack_collaboration::classify_host_boundary(error, "fluent slack enable")
+            })?;
+            println!("enabled Slack runner at {}", manager.plist.display());
+        }
+        SlackCommands::Restart => {
+            let mut manager = LaunchAgentServiceManager::new(&slack_home()?);
+            slack_collaboration::control_runner(&mut manager, RunnerControl::Restart)?;
+            println!("restarted Slack runner");
+        }
+        SlackCommands::Stop => {
+            let mut manager = LaunchAgentServiceManager::new(&slack_home()?);
+            slack_collaboration::control_runner(&mut manager, RunnerControl::Stop)?;
+            println!("stopped Slack runner");
+        }
+        SlackCommands::Status => {
+            let home = slack_home()?;
+            let config = slack_collaboration::read_config(&home)?;
+            let operational = slack_collaboration::read_runner_operational_state(&home)?;
+            println!(
+                "{}",
+                slack_collaboration::runner_status(
+                    &config,
+                    operational.connected,
+                    operational.last_successful_connection,
+                    operational.failure,
+                )
+            );
+        }
+        SlackCommands::Run => {
+            slack_collaboration::run_configured_runner(&slack_home()?).map_err(|error| {
+                slack_collaboration::classify_host_boundary(error, "fluent slack run")
+            })?
+        }
+    }
     Ok(())
 }
 
@@ -256,6 +357,10 @@ fn cmd_work_item(project_root: &Path, command: WorkItemCommands) -> Result<()> {
             approach_file,
             plan_file,
             learner_mode,
+            input_artifact,
+            authorize_large_scope,
+            release,
+            release_criterion,
         } => {
             let instructions = match (instructions, instructions_file) {
                 (Some(instructions), None) => Some(instructions),
@@ -271,14 +376,102 @@ fn cmd_work_item(project_root: &Path, command: WorkItemCommands) -> Result<()> {
                 approach_file,
                 plan_file,
             )?;
-            let item = WorkItem {
+            let has_scope_inputs = planning_context.as_ref().is_some_and(|context| {
+                context.behavior_count() > 0 || context.required_plan_steps() > 0
+            });
+            let planning_config = has_scope_inputs
+                .then(|| fluent::config::resolve_planning_config(project_root))
+                .transpose()?;
+            let planning_scope = planning_context.as_ref().and_then(|context| {
+                planning_config.as_ref().and_then(|config| {
+                    context.scope_assessment(config.scope_limit.value, authorize_large_scope)
+                })
+            });
+            let local_scope_evidence = planning_scope
+                .as_ref()
+                .map(|scope| {
+                    let mut unreadable_items = 0_usize;
+                    let items = store.list_work_item_results().map(|items| {
+                        items
+                            .into_iter()
+                            .filter_map(|result| match result {
+                                Ok(item) => Some(item),
+                                Err(_) => {
+                                    unreadable_items = unreadable_items.saturating_add(1);
+                                    None
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                    })?;
+                    Ok::<_, fluent::work_model::WorkModelStorageError>((
+                        fluent::scope_calibration::summarize_local_scope_evidence(
+                            &items,
+                            scope.scope_units(),
+                        ),
+                        unreadable_items,
+                    ))
+                })
+                .transpose()?;
+            if let (Some(scope), Some((evidence, unreadable_items)), Some(config)) =
+                (&planning_scope, &local_scope_evidence, &planning_config)
+            {
+                eprintln!(
+                    "Scope assessment: {} approved behaviors, {} required plan steps; configured reference {} ({})",
+                    scope.behavior_count,
+                    scope.required_steps,
+                    scope.limit,
+                    config.scope_limit.source
+                );
+                eprintln!(
+                    "{}",
+                    fluent::scope_calibration::format_local_scope_evidence(evidence)
+                );
+                if *unreadable_items > 0 {
+                    let record = if *unreadable_items == 1 {
+                        "record"
+                    } else {
+                        "records"
+                    };
+                    eprintln!(
+                        "Project-local evidence omitted {} unreadable Work Item {}.",
+                        unreadable_items, record
+                    );
+                }
+            }
+            if let Some(scope) = &planning_scope
+                && scope.is_large()
+                && !scope.large_scope_authorized
+            {
+                bail!(
+                    "scope breadth exceeds the configured reference {}; minimum {} groups under the configured reference; this is not an optimal Work Item count. Consider independently landable outcomes, or rerun with --authorize-large-scope after approving the combined scope",
+                    scope.limit,
+                    scope.recommended_slices
+                );
+            }
+            let release_contract = build_release_contract(release, release_criterion)?;
+            let mut item = WorkItem {
                 planning_context,
+                planning_scope,
+                release_contract,
                 instructions,
                 learner_mode: learner_mode.unwrap_or_default(),
                 ..WorkItem::planned(id, title)
             };
-            store.create_work_item(&item)?;
+            store.create_work_item_with_inputs(&mut item, &input_artifact)?;
             println!("Created Work Item {}", item.id);
+            if let Some(scope) = item
+                .planning_scope
+                .as_ref()
+                .filter(|scope| scope.is_large())
+            {
+                eprintln!(
+                    "Authorized large scope: {} behaviors, {} required steps, reference {}, minimum {} policy groups (not an optimal Work Item count)",
+                    scope.behavior_count,
+                    scope.required_steps,
+                    scope.limit,
+                    scope.recommended_slices
+                );
+            }
             if guidance::guidance_enabled() {
                 eprintln!("{}", guidance::after_work_item_create());
             }
@@ -294,20 +487,22 @@ fn cmd_work_item(project_root: &Path, command: WorkItemCommands) -> Result<()> {
                 println!("{:<24} TITLE", "ID");
                 for item in items {
                     println!("{:<24} {}", item.id, item.title);
+                    for warning in item.compatibility_warnings() {
+                        eprintln!("Warning: {warning}");
+                    }
                 }
                 if guidance::guidance_enabled() {
                     eprintln!("{}", guidance::after_work_item_list());
                 }
             }
         }
-        WorkItemCommands::Show { id } => match store.read_work_item(&id) {
+        WorkItemCommands::Show { id } => match store.read_work_item_snapshot(&id) {
             Ok(item) => {
-                print!("{}", to_json_pretty(&item)?);
+                let output = work_status::work_item_show_value(&item, project_root)?;
+                print!("{}", to_json_pretty(&output)?);
                 if guidance::guidance_enabled() {
                     let row = work_status::summarize_work_item(&item, Some(project_root));
-                    if let Some(hint) =
-                        guidance::next_action_for_action(&row.action, &row.id, &row.merge_candidate)
-                    {
+                    if let Some(hint) = guidance::next_action_for_status_row(&row) {
                         eprintln!("{hint}");
                     }
                 }
@@ -319,6 +514,34 @@ fn cmd_work_item(project_root: &Path, command: WorkItemCommands) -> Result<()> {
             }
             Err(error) => return Err(error.into()),
         },
+        WorkItemCommands::Upgrade { id } => {
+            let ids = match id {
+                Some(id) => vec![id],
+                None => store.list_work_item_ids()?,
+            };
+            for work_item_id in ids {
+                let report = store.upgrade_work_item(&work_item_id)?;
+                if report.already_current {
+                    println!("Work Item {work_item_id} already uses the current model format");
+                } else {
+                    println!(
+                        "Upgraded Work Item {work_item_id} to model record schema {} (audit {})",
+                        fluent::work_model::WORK_MODEL_RECORD_SCHEMA_VERSION,
+                        report.audit_path.as_deref().unwrap_or("<none>")
+                    );
+                }
+            }
+        }
+        WorkItemCommands::RebuildMetrics { id } => {
+            let items = match id {
+                Some(id) => vec![store.read_work_item(&id)?],
+                None => store.list_work_items()?,
+            };
+            for item in &items {
+                work_status::refresh_persisted_metrics(project_root, item)?;
+            }
+            println!("Rebuilt persisted metrics for {} Work Item(s)", items.len());
+        }
         WorkItemCommands::Abandon { id, reason } => {
             let mut item = match store.read_work_item(&id) {
                 Ok(item) => item,
@@ -335,6 +558,23 @@ fn cmd_work_item(project_root: &Path, command: WorkItemCommands) -> Result<()> {
         }
         WorkItemCommands::Authorize { id } => {
             cmd_work_item_authorize(project_root, &store, &id)?;
+        }
+        WorkItemCommands::ClassifyFinding {
+            id,
+            finding_id,
+            summary,
+            blocker_for,
+        } => {
+            let classification = store.mutate_work_item(&id, |item| {
+                let contract = item.release_contract.as_mut().ok_or_else(|| {
+                    WorkModelError::ReleaseContractRequired {
+                        work_item_id: item.id.clone(),
+                    }
+                })?;
+                let finding = contract.classify_finding(finding_id, summary, blocker_for)?;
+                Ok(finding.classification.as_str().to_string())
+            })?;
+            println!("Classified release finding for Work Item {id}: {classification}");
         }
     }
     Ok(())
@@ -388,6 +628,22 @@ fn resolve_run_coder_mapping(
     attempt.coder_mapping.overlay_run_inputs(cli_inputs)
 }
 
+fn reject_retired_behavior_test_args(extra_args: &[String]) -> Result<()> {
+    if extra_args.iter().any(|argument| {
+        argument == "--behavior-tests-coder"
+            || argument.starts_with("--behavior-tests-coder=")
+            || argument == "--behavior-tests-model"
+            || argument.starts_with("--behavior-tests-model=")
+            || argument == "--behavior-tests-effort"
+            || argument.starts_with("--behavior-tests-effort=")
+    }) {
+        bail!(
+            "the behavior-tests coder role is retired; configure writer and reviewer roles instead"
+        );
+    }
+    Ok(())
+}
+
 fn cmd_attempt(
     project_root: &Path,
     command: AttemptCommands,
@@ -397,6 +653,161 @@ fn cmd_attempt(
 ) -> Result<()> {
     let store = WorkModelStore::new(project_root);
     match command {
+        AttemptCommands::Evidence {
+            command:
+                AttemptEvidenceCommands::Classify {
+                    work_item_id,
+                    attempt_id,
+                    candidate,
+                    review_artifact,
+                    evidence_digest,
+                    resolution,
+                },
+        } => {
+            let classification = fluent::host_evidence::classify_for_code_change(
+                project_root,
+                &store,
+                &work_item_id,
+                &attempt_id,
+                &candidate,
+                &review_artifact,
+                &evidence_digest,
+                &resolution,
+            )?;
+            println!(
+                "Authorized host-evidence source correction Writer {} for Attempt {}",
+                classification.writer_task_id, attempt_id
+            );
+            println!("Audit: {}", classification.audit_artifact);
+            println!("Next: fluent queue resume {work_item_id} --attempt {attempt_id}");
+        }
+        AttemptCommands::Evidence {
+            command:
+                AttemptEvidenceCommands::Run {
+                    work_item_id,
+                    attempt_id,
+                    review_artifact,
+                    command,
+                    working_directory,
+                    timeout_seconds,
+                },
+        } => {
+            let run = fluent::host_evidence::run_focused(
+                project_root,
+                &store,
+                &work_item_id,
+                &attempt_id,
+                &review_artifact,
+                command.as_deref(),
+                working_directory.as_deref(),
+                timeout_seconds,
+                resolver,
+            )?;
+            println!(
+                "Scheduled verification Task {} for Attempt {attempt_id}",
+                run.task_id
+            );
+            println!(
+                "Next: fluent task run {work_item_id} {attempt_id} {}",
+                run.task_id
+            );
+            println!("Then: fluent attempt run {work_item_id} {attempt_id}");
+        }
+        AttemptCommands::Evidence {
+            command:
+                AttemptEvidenceCommands::Attach {
+                    work_item_id,
+                    attempt_id,
+                    candidate,
+                    evidence_file,
+                    review_artifact,
+                    recheck_artifact,
+                    plan_row,
+                    required_check,
+                    finding,
+                },
+        } => {
+            if let Some(finding) = finding {
+                let recovery = fluent::host_evidence::attach_finding(
+                    project_root,
+                    &store,
+                    &work_item_id,
+                    &attempt_id,
+                    &candidate,
+                    &finding,
+                    Path::new(&evidence_file),
+                )?;
+                println!(
+                    "Attached host evidence {} for finding {}; targeted review: tests",
+                    recovery.attachment.digest, finding
+                );
+                return Ok(());
+            }
+            if let Some(required_check) = required_check {
+                let recovery = fluent::host_evidence::attach_required_check(
+                    project_root,
+                    &store,
+                    &work_item_id,
+                    &attempt_id,
+                    &candidate,
+                    &required_check,
+                    Path::new(&evidence_file),
+                )?;
+                println!(
+                    "Attached host evidence {} for required check {}; targeted review: tests",
+                    recovery.attachment.digest, required_check
+                );
+                return Ok(());
+            }
+            if let Some(plan_row) = plan_row {
+                anyhow::ensure!(
+                    review_artifact.is_empty() && recheck_artifact.is_none(),
+                    "--plan-row cannot be combined with review or recheck artifacts"
+                );
+                let recovery = fluent::host_evidence::attach_plan_row(
+                    project_root,
+                    &store,
+                    &work_item_id,
+                    &attempt_id,
+                    &candidate,
+                    &plan_row,
+                    Path::new(&evidence_file),
+                )?;
+                println!(
+                    "Attached Plan-row host evidence {} for Attempt {}; targeted reviews: {}",
+                    recovery.attachment.digest,
+                    attempt_id,
+                    recovery
+                        .targets
+                        .iter()
+                        .map(|target| target.role.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                return Ok(());
+            }
+            let recovery = fluent::host_evidence::attach(
+                project_root,
+                &store,
+                &work_item_id,
+                &attempt_id,
+                &candidate,
+                Path::new(&evidence_file),
+                &review_artifact,
+                recheck_artifact.as_deref(),
+            )?;
+            println!(
+                "Attached host evidence {} for Attempt {}; targeted reviews: {}",
+                recovery.attachment.digest,
+                attempt_id,
+                recovery
+                    .targets
+                    .iter()
+                    .map(|target| target.role.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
         AttemptCommands::Create {
             work_item_id,
             attempt_id,
@@ -409,9 +820,6 @@ fn cmd_attempt(
             review_coder,
             review_model,
             review_effort,
-            behavior_tests_coder,
-            behavior_tests_model,
-            behavior_tests_effort,
         } => {
             let mut item = match store.read_work_item(&work_item_id) {
                 Ok(item) => item,
@@ -423,29 +831,20 @@ fn cmd_attempt(
                 Err(error) => return Err(error.into()),
             };
             let attempt_id = attempt_id.unwrap_or_else(|| item.next_attempt_id());
-            item.add_initial_attempt(attempt_id.clone())?;
-
             let coder_mapping = work_model::resolve_coder_mapping(
-                &fluent::config::from_config(project_root)
-                    .merge(work_model::CoderMappingInputs::from_env())
-                    .merge_cli(
-                        write_coder,
-                        write_model,
-                        review_coder,
-                        review_model,
-                        behavior_tests_coder,
-                        behavior_tests_model,
-                        coder.or_else(|| global_coder.map(str::to_string)),
-                        model,
-                        write_effort,
-                        review_effort,
-                        behavior_tests_effort,
-                        effort,
-                    ),
+                &fluent::config::attempt_creation_inputs(project_root)?.merge_cli(
+                    write_coder,
+                    write_model,
+                    review_coder,
+                    review_model,
+                    coder.or_else(|| global_coder.map(str::to_string)),
+                    model,
+                    write_effort,
+                    review_effort,
+                    effort,
+                ),
             )?;
-            if let Some(attempt) = item.attempts.iter_mut().find(|a| a.id == attempt_id) {
-                attempt.coder_mapping = coder_mapping;
-            }
+            item.add_initial_attempt_with_coder_mapping(attempt_id.clone(), coder_mapping)?;
 
             store.write_work_item(&item)?;
             println!("Created Attempt {attempt_id} for Work Item {work_item_id}");
@@ -476,7 +875,7 @@ fn cmd_attempt(
             work_item_id,
             attempt_id,
         } => {
-            let item = match store.read_work_item(&work_item_id) {
+            let item = match store.read_work_item_snapshot(&work_item_id) {
                 Ok(item) => item,
                 Err(WorkModelStorageError::ReadFile { source, .. })
                     if source.kind() == ErrorKind::NotFound =>
@@ -496,10 +895,343 @@ fn cmd_attempt(
                 })?;
             print!("{}", to_json_pretty(attempt)?);
         }
+        AttemptCommands::Extend {
+            work_item_id,
+            attempt_id,
+            additional_write_rounds,
+            resolution,
+        } => {
+            let extension = work_attempt_loop::extend_round_cap(
+                project_root,
+                &store,
+                &work_item_id,
+                &attempt_id,
+                additional_write_rounds,
+                &resolution,
+            )?;
+            println!(
+                "Approved {} additional Writer round(s) for Attempt {} (cap {} -> {})",
+                extension.additional_write_rounds, attempt_id, extension.old_cap, extension.new_cap
+            );
+            println!(
+                "Reviewed candidate remains {}. Next: fluent queue resume {work_item_id} --attempt {attempt_id}",
+                extension.candidate_commit
+            );
+        }
+        AttemptCommands::RepairTester {
+            work_item_id,
+            attempt_id,
+            resolution,
+        } => {
+            let repair = fluent::tester_harness_recovery::request(
+                project_root,
+                &store,
+                &work_item_id,
+                &attempt_id,
+                &resolution,
+            )?;
+            if repair.already_requested {
+                println!(
+                    "Tester repair Writer {} is already recorded for candidate {}",
+                    repair.task_id, repair.candidate_commit
+                );
+            } else {
+                println!(
+                    "Approved Tester repair Writer {} for candidate {}",
+                    repair.task_id, repair.candidate_commit
+                );
+            }
+            println!("Next: fluent queue resume {work_item_id} --attempt {attempt_id}");
+        }
+        AttemptCommands::RepairCandidateAncestry {
+            work_item_id,
+            attempt_id,
+            resolution,
+            restore_interrupted,
+            rejected_candidate,
+        } => {
+            if restore_interrupted {
+                let restored = fluent::candidate_ancestry_recovery::restore_interrupted(
+                    project_root,
+                    &store,
+                    &work_item_id,
+                    &attempt_id,
+                    rejected_candidate
+                        .as_deref()
+                        .context("--rejected-candidate is required")?,
+                    &resolution,
+                )?;
+                println!(
+                    "Restored interrupted Writer {}: {} -> {} (operation {})",
+                    restored.task_id,
+                    restored.rejected_candidate,
+                    restored.recorded_candidate,
+                    restored.operation_id
+                );
+                println!("Audit: {}", restored.audit_artifact);
+                println!(
+                    "Cancellation remains active. Resume separately: fluent attempt run {work_item_id} {attempt_id}"
+                );
+                return Ok(());
+            }
+            let repair = fluent::candidate_ancestry_recovery::repair(
+                project_root,
+                &store,
+                &work_item_id,
+                &attempt_id,
+                &resolution,
+            )?;
+            if repair.already_repaired {
+                println!(
+                    "Candidate ancestry repair {} is already recorded at {}",
+                    repair.task_id, repair.recovered_candidate_commit
+                );
+            } else {
+                println!(
+                    "Repaired candidate ancestry {} -> {} with protected base {}",
+                    repair.source_candidate_commit,
+                    repair.recovered_candidate_commit,
+                    repair.protected_base_commit
+                );
+            }
+            println!(
+                "Next: {}",
+                fluent::candidate_ancestry_recovery::scheduler_action(&work_item_id, &attempt_id)
+            );
+        }
+        AttemptCommands::RepairCandidateMetadata {
+            work_item_id,
+            attempt_id,
+            resolution,
+        } => {
+            let repair = fluent::candidate_metadata_recovery::repair(
+                project_root,
+                &store,
+                &work_item_id,
+                &attempt_id,
+                &resolution,
+            )?;
+            if repair.already_authorized {
+                println!(
+                    "Candidate metadata recovery Writer {} is already authorized for {}",
+                    repair.task_id, repair.candidate_commit
+                );
+            } else {
+                println!(
+                    "Authorized candidate metadata recovery Writer {} for {} (protected base {})",
+                    repair.task_id, repair.candidate_commit, repair.protected_base_commit
+                );
+            }
+            println!("Audit: {}", repair.audit_artifact);
+            println!("Next: fluent queue resume {work_item_id} --attempt {attempt_id}");
+        }
+        AttemptCommands::RecoverUsageLimit {
+            work_item_id,
+            attempt_id,
+            resolution,
+        } => {
+            let approval = fluent::usage_limit_recovery::approve(
+                project_root,
+                &store,
+                &work_item_id,
+                &attempt_id,
+                &resolution,
+            )?;
+            println!(
+                "Recorded usage-limit approval {} for Writer {} at partial candidate {}",
+                approval.operation_id, approval.task_id, approval.partial_commit
+            );
+            println!("Audit: {}", approval.audit_artifact);
+            println!("Next: fluent attempt run {work_item_id} {attempt_id}");
+        }
+        AttemptCommands::RecoverAssignmentContext {
+            work_item_id,
+            attempt_id,
+            task,
+            candidate,
+            assignment_digest,
+            input,
+            original_file,
+            resolution,
+        } => {
+            let operation = fluent::assignment_context_recovery::recover(
+                project_root,
+                &store,
+                &fluent::assignment_context_recovery::RecoveryRequest {
+                    work: &work_item_id,
+                    attempt: &attempt_id,
+                    task: &task,
+                    candidate: &candidate,
+                    assignment_digest: &assignment_digest,
+                    input: &input,
+                    original_file: &original_file,
+                    resolution: &resolution,
+                },
+            )?;
+            println!("Recorded assignment context recovery {operation}; no Tasks were launched");
+            let item = store.read_work_item_snapshot(&work_item_id)?;
+            let attempt = item.attempts.iter().find(|a| a.id == attempt_id);
+            if let Some(action) =
+                fluent::work_status::attempt_recovery_next_action(attempt, Some(project_root))
+            {
+                println!("Next: {action}");
+            }
+        }
+        AttemptCommands::RepairWriterCompletion {
+            work_item_id,
+            attempt_id,
+            resolution,
+        } => {
+            let repair = fluent::writer_completion_recovery::repair(
+                project_root,
+                &store,
+                &work_item_id,
+                &attempt_id,
+                &resolution,
+            )?;
+            if repair.already_applied {
+                println!(
+                    "Writer-completion recovery {} is already recorded for candidate {}",
+                    repair.task_id, repair.candidate_commit
+                );
+            } else {
+                println!(
+                    "Authorized Writer-completion recovery {} for candidate {}",
+                    repair.task_id, repair.candidate_commit
+                );
+            }
+            if repair.superseded_task_ids.is_empty() {
+                println!("No duplicate Writer tasks were superseded");
+            } else {
+                println!(
+                    "Superseded duplicate Writer task(s): {}",
+                    repair.superseded_task_ids.join(", ")
+                );
+            }
+            if !repair.reconciled_task_ids.is_empty() {
+                println!(
+                    "Reconciled stale Writer task(s): {}",
+                    repair.reconciled_task_ids.join(", ")
+                );
+            }
+            println!("Audit: {}", repair.audit_artifact);
+            if repair.reconciled_task_ids.is_empty() {
+                println!("Next: fluent queue resume {work_item_id} --attempt {attempt_id}");
+            } else {
+                println!("Next: fluent attempt run {work_item_id} {attempt_id}");
+            }
+        }
+        AttemptCommands::ReviseTestReferences {
+            work_item_id,
+            attempt_id,
+            reference,
+            resolution,
+        } => {
+            let updates = reference
+                .iter()
+                .map(|value| {
+                    let (id, reference) = value.split_once('=').ok_or_else(|| {
+                        anyhow::anyhow!("invalid --reference {value:?}; expected ID=REFERENCE")
+                    })?;
+                    Ok(fluent::planning_reference_recovery::TestReferenceUpdate {
+                        requirement_id: id.to_string(),
+                        reference: reference.to_string(),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let revision = fluent::planning_reference_recovery::revise(
+                project_root,
+                &store,
+                &work_item_id,
+                &attempt_id,
+                &updates,
+                &resolution,
+            )?;
+            if revision.already_applied {
+                println!(
+                    "Test-reference revision {} is already applied to Attempt {}",
+                    revision.revision_id, attempt_id
+                );
+            } else {
+                println!(
+                    "Revised {} behavior Test reference(s) on Attempt {}",
+                    revision.updated_requirements, attempt_id
+                );
+            }
+            println!("Audit: {}", revision.audit_artifact);
+            println!("Next: fluent queue resume {work_item_id} --attempt {attempt_id}");
+        }
+        AttemptCommands::Ownership { command } => match command {
+            fluent::cli::OwnershipCommands::Preview {
+                work_item_id,
+                attempt_id,
+                proposal_file,
+            } => {
+                let proposal = serde_json::from_slice(&fs::read(proposal_file)?)?;
+                let preview = fluent::ownership_recovery::preview(
+                    project_root,
+                    &store,
+                    &work_item_id,
+                    &attempt_id,
+                    &proposal,
+                )?;
+                println!("{}", serde_json::to_string_pretty(&preview)?);
+            }
+            fluent::cli::OwnershipCommands::Approve {
+                work_item_id,
+                attempt_id,
+                preview_file,
+                resolution,
+            } => {
+                let preview = serde_json::from_slice(&fs::read(preview_file)?)?;
+                let approval = fluent::ownership_recovery::approve(
+                    project_root,
+                    &store,
+                    &work_item_id,
+                    &attempt_id,
+                    &preview,
+                    &resolution,
+                )?;
+                println!("{}", serde_json::to_string_pretty(&approval)?);
+            }
+        },
+        AttemptCommands::ReviseApproach {
+            work_item_id,
+            attempt_id,
+            approach_file,
+            resolution,
+        } => {
+            let bytes = fs::read(&approach_file).with_context(|| {
+                format!("read replacement Approach {}", approach_file.display())
+            })?;
+            let revision = fluent::planning_approach_recovery::revise(
+                project_root,
+                &store,
+                &work_item_id,
+                &attempt_id,
+                &bytes,
+                &resolution,
+            )?;
+            if revision.already_applied {
+                println!(
+                    "Approach revision {} is already applied to Attempt {}",
+                    revision.revision_id, attempt_id
+                );
+            } else {
+                println!(
+                    "Approved corrective Writer {} for Approach revision {}",
+                    revision.writer_task_id, revision.revision_id
+                );
+            }
+            println!("Audit: {}", revision.audit_artifact);
+            println!("Next: fluent queue resume {work_item_id} --attempt {attempt_id}");
+        }
         AttemptCommands::Run {
             work_item_id,
             attempt_id,
             no_sandbox,
+            tester_no_sandbox,
+            dispatch_id,
             coder,
             model,
             effort,
@@ -509,55 +1241,61 @@ fn cmd_attempt(
             review_coder,
             review_model,
             review_effort,
-            behavior_tests_coder,
-            behavior_tests_model,
-            behavior_tests_effort,
             runtime,
             extra_args,
         } => {
+            reject_retired_behavior_test_args(&extra_args)?;
             // Reject execution while the Work Item is proposed, before resolving
             // an Attempt to run, so proposed Work reports that human
             // authorization is required rather than that it has no Attempts.
-            match store.read_work_item(&work_item_id) {
-                Ok(item) => item.ensure_execution_ready()?,
+            let initial_item = match store.read_work_item(&work_item_id) {
+                Ok(item) => {
+                    item.ensure_execution_ready()?;
+                    item
+                }
                 Err(WorkModelStorageError::ReadFile { source, .. })
                     if source.kind() == ErrorKind::NotFound =>
                 {
                     bail!("Work Item {work_item_id:?} not found");
                 }
                 Err(error) => return Err(error.into()),
-            }
+            };
             let attempt_id = match attempt_id {
                 Some(id) => id,
                 None => {
-                    let item = match store.read_work_item(&work_item_id) {
-                        Ok(item) => item,
-                        Err(WorkModelStorageError::ReadFile { source, .. })
-                            if source.kind() == ErrorKind::NotFound =>
-                        {
-                            bail!("Work Item {work_item_id:?} not found");
-                        }
-                        Err(error) => return Err(error.into()),
-                    };
-                    item.latest_attempt_id()
+                    initial_item.latest_attempt_id()
                         .ok_or_else(|| anyhow::anyhow!(
                             "Work Item {work_item_id:?} has no Attempts; create one first with: fluent attempt create {work_item_id}"
                         ))?
                         .to_string()
                 }
             };
+            // Capture direct recovery authority before initialization can race
+            // with cancellation. Scheduler children use their earlier admission.
+            let resume_cancellation_requested_at = match dispatch_id.as_deref() {
+                Some(dispatch_id) => fluent::queue::cancellation_resume_for_dispatch(
+                    project_root,
+                    &work_item_id,
+                    &attempt_id,
+                    dispatch_id,
+                )?,
+                None => initial_item
+                    .attempts
+                    .iter()
+                    .find(|attempt| attempt.id == attempt_id)
+                    .filter(|attempt| attempt.cancellation_requested())
+                    .and_then(|attempt| attempt.cancellation.as_ref())
+                    .map(|stop| stop.requested_at.clone()),
+            };
             let cli_inputs = work_model::CoderMappingInputs::default().merge_cli(
                 write_coder,
                 write_model,
                 review_coder,
                 review_model,
-                behavior_tests_coder,
-                behavior_tests_model,
                 coder.or_else(|| global_coder.map(str::to_string)),
                 model,
                 write_effort,
                 review_effort,
-                behavior_tests_effort,
                 effort,
             );
             let coder_mapping =
@@ -594,10 +1332,20 @@ fn cmd_attempt(
                 other => bail!("Unknown runtime '{other}'. Available: local, fargate."),
             }
 
+            // Establish the enclosing host boundary before provider readiness,
+            // worktree creation, Task reservation, or any other durable Attempt
+            // transition. An explicit no-sandbox run keeps its existing route.
+            if !(no_sandbox || global_no_sandbox) {
+                os::preflight_host_execution(project_root, resolver)?;
+            }
+
             if guidance::guidance_enabled() {
                 eprintln!("{}", guidance::format_coder_plan(&coder_mapping));
             }
 
+            if tester_no_sandbox {
+                eprintln!("  Tester recovery   validating exact paused Tester capability");
+            }
             let result = work_attempt_loop::run_attempt(WorkAttemptRunConfig {
                 project_root,
                 store: &store,
@@ -606,12 +1354,19 @@ fn cmd_attempt(
                 resolver,
                 extra_args: &extra_args,
                 no_sandbox: no_sandbox || global_no_sandbox,
+                tester_no_sandbox,
+                resume_cancellation_requested_at: resume_cancellation_requested_at.as_deref(),
                 coder_mapping_inputs: cli_inputs.has_run_overrides().then_some(&cli_inputs),
             })?;
+            // A foreground Attempt does not claim a scheduler dispatch. If it
+            // advances an Attempt that was previously paused by the scheduler,
+            // reconcile that exact queue entry before printing status hints so
+            // direct and queued recovery expose the same durable outcome.
+            fluent::scheduler::reconcile_direct_attempt(project_root, &work_item_id, &attempt_id)?;
             // Resolve the runtime context the guidance hints need — why the
             // Attempt paused, which coder to re-authenticate, and where its latest
             // review verdicts live — from the persisted Attempt.
-            let (pause_kind, auth_coder, review_artifact) = {
+            let (pause_kind, auth_coder, review_artifact, evidence_action) = {
                 let item = store.read_work_item(&work_item_id).ok();
                 let attempt = item
                     .as_ref()
@@ -624,12 +1379,19 @@ fn cmd_attempt(
                             .into_iter()
                             .next()
                     }),
+                    attempt.and_then(|attempt| {
+                        fluent::work_status::attempt_recovery_next_action(
+                            Some(attempt),
+                            Some(project_root),
+                        )
+                    }),
                 )
             };
             let hint_ctx = guidance::AttemptRunContext {
                 pause_kind: pause_kind.as_ref(),
                 coder: auth_coder.as_deref(),
                 review_artifact: review_artifact.as_deref(),
+                evidence_action: evidence_action.as_deref(),
             };
             let mut pending_recovery = None;
             for outcome in &result.outcomes {
@@ -645,6 +1407,16 @@ fn cmd_attempt(
                         for task_id in task_ids {
                             println!("{task_id}");
                         }
+                    }
+                    WorkAttemptRunOutcome::PlannedFinalTester { task_id } => {
+                        println!(
+                            "Planned final canonical Tester Task {task_id} for Attempt {attempt_id}"
+                        );
+                    }
+                    WorkAttemptRunOutcome::PlannedFailedCommandRecheck { task_id } => {
+                        println!(
+                            "Planned failed-command Tester recheck {task_id} for Attempt {attempt_id}"
+                        );
                     }
                     WorkAttemptRunOutcome::MergeCandidateReady { candidate_id } => {
                         println!(
@@ -724,6 +1496,24 @@ fn cmd_attempt(
             println!(
                 "Stop requested for Attempt {attempt_id} of Work Item {work_item_id} (Fargate)"
             );
+        }
+        AttemptCommands::Cancel {
+            work_item_id,
+            attempt_id,
+        } => {
+            let canceled = work_attempt_loop::cancel_local_attempt(
+                project_root,
+                &store,
+                &work_item_id,
+                &attempt_id,
+            )?;
+            if canceled == 0 {
+                println!("Attempt {attempt_id} is already suspended after local cancellation");
+            } else {
+                println!(
+                    "Canceled {canceled} local Task(s) for Attempt {attempt_id}; run `fluent attempt run {work_item_id}` to resume or abandon the Work Item"
+                );
+            }
         }
         AttemptCommands::Watch {
             work_item_id,
@@ -973,7 +1763,7 @@ fn cmd_task(
             attempt_id,
             task_id,
         } => {
-            let item = match store.read_work_item(&work_item_id) {
+            let item = match store.read_work_item_snapshot(&work_item_id) {
                 Ok(item) => item,
                 Err(WorkModelStorageError::ReadFile { source, .. })
                     if source.kind() == ErrorKind::NotFound =>
@@ -1000,6 +1790,19 @@ fn cmd_task(
                 })?;
             print!("{}", to_json_pretty(task)?);
         }
+        TaskCommands::CheckHandoff {
+            work_item_id,
+            attempt_id,
+            task_id,
+        } => {
+            let report = work_attempt_loop::check_writer_handoff(
+                project_root,
+                &work_item_id,
+                &attempt_id,
+                &task_id,
+            )?;
+            print!("{}", to_json_pretty(&report)?);
+        }
         TaskCommands::Run {
             work_item_id,
             attempt_id,
@@ -1014,23 +1817,18 @@ fn cmd_task(
             review_coder,
             review_model,
             review_effort,
-            behavior_tests_coder,
-            behavior_tests_model,
-            behavior_tests_effort,
             extra_args,
         } => {
+            reject_retired_behavior_test_args(&extra_args)?;
             let cli_inputs = work_model::CoderMappingInputs::default().merge_cli(
                 write_coder,
                 write_model,
                 review_coder,
                 review_model,
-                behavior_tests_coder,
-                behavior_tests_model,
                 coder.or_else(|| global_coder.map(str::to_string)),
                 model,
                 write_effort,
                 review_effort,
-                behavior_tests_effort,
                 effort,
             );
             work_model::overlay_attempt_coder_mapping(
@@ -1070,6 +1868,28 @@ fn cmd_queue(project_root: &Path, command: QueueCommands) -> Result<()> {
             fluent::queue::add(project_root, &work_item_id, priority)?;
             println!("Queued Work Item {work_item_id}");
         }
+        QueueCommands::Resume {
+            work_item_id,
+            attempt,
+            priority,
+            no_sandbox,
+        } => {
+            let outcome = fluent::queue::resume_with_tester_no_sandbox(
+                project_root,
+                &work_item_id,
+                &attempt,
+                priority,
+                no_sandbox,
+            )?;
+            match outcome {
+                fluent::queue::ResumeDispatchOutcome::Created => {
+                    println!("Queued resume of Attempt {attempt} for Work Item {work_item_id}")
+                }
+                fluent::queue::ResumeDispatchOutcome::ExistingMatching => println!(
+                    "Resume of Attempt {attempt} for Work Item {work_item_id} is already queued"
+                ),
+            }
+        }
         QueueCommands::List => {
             let entries = fluent::queue::list(project_root)?;
             if entries.is_empty() {
@@ -1082,6 +1902,10 @@ fn cmd_queue(project_root: &Path, command: QueueCommands) -> Result<()> {
                     );
                 }
             }
+        }
+        QueueCommands::Show { work_item_id } => {
+            let dispatch = fluent::queue::show(project_root, &work_item_id)?;
+            println!("{}", serde_json::to_string_pretty(&dispatch)?);
         }
         QueueCommands::Remove { work_item_id } => {
             fluent::queue::remove(project_root, &work_item_id)?;
@@ -1099,6 +1923,17 @@ fn cmd_tester(project_root: &Path, command: TesterCommands, global_no_sandbox: b
     let store = WorkModelStore::new(project_root);
     let resolver = ContentResolver::new(Some(project_root));
     match command {
+        TesterCommands::Check { no_sandbox } => {
+            match fluent::tester::check(project_root, no_sandbox || global_no_sandbox, &resolver)? {
+                fluent::tester::TesterOutcome::Passed => println!("Tester passed"),
+                fluent::tester::TesterOutcome::TestFailures => {
+                    bail!("Tester completed with test-suite failures")
+                }
+                fluent::tester::TesterOutcome::HarnessError => {
+                    bail!("Tester harness could not produce trustworthy evidence")
+                }
+            }
+        }
         TesterCommands::Run {
             work_item_id,
             attempt_id,
@@ -1133,8 +1968,51 @@ fn cmd_scheduler(project_root: &Path, command: SchedulerCommands) -> Result<()> 
     match command {
         SchedulerCommands::Run { poll_seconds } => {
             let poll = poll_seconds.unwrap_or(30);
-            let runner = fluent::scheduler::CliAttemptRunner;
-            fluent::scheduler::run(project_root, poll, &runner)?;
+            fluent::scheduler_service::prepare_run_signal_handler();
+            let home = fluent::scheduler_service::runtime_home(project_root)?;
+            let identity = fluent::scheduler_service::assign_checkout_identity(project_root)?;
+            fluent::scheduler_service::register_checkout(&home, project_root, &identity)?;
+            let build = fluent::scheduler_service::executable_build_identity(
+                &std::env::current_exe().context("resolve scheduler executable")?,
+            )?;
+            fluent::scheduler_service::run_service(&home, build, poll)?;
+        }
+        SchedulerCommands::Status => match fluent::scheduler::status(project_root)? {
+            fluent::scheduler::SchedulerStatus::Stopped => {
+                println!("Scheduler: stopped");
+            }
+            fluent::scheduler::SchedulerStatus::Running(metadata) => {
+                println!(
+                    "Scheduler: {}",
+                    match metadata.state {
+                        fluent::scheduler::CoordinatorState::Running => "running",
+                        fluent::scheduler::CoordinatorState::Draining => "draining",
+                    }
+                );
+                println!("Instance:  {}", metadata.instance_id);
+                println!(
+                    "Build:     {} ({})",
+                    metadata.build.version, metadata.build.hash
+                );
+                println!("Started:   {}", metadata.started_at);
+                println!("PID:       {} (display only)", metadata.pid);
+            }
+        },
+        SchedulerCommands::Stop { all } => {
+            if all {
+                let home = fluent::scheduler_service::runtime_home(project_root)?;
+                let stopped = fluent::scheduler_service::stop_service(&home)?;
+                println!(
+                    "Stopped shared scheduler {} running {} ({})",
+                    stopped.instance_id, stopped.build.version, stopped.build.hash
+                );
+            } else {
+                let stopped = fluent::scheduler::stop(project_root)?;
+                println!(
+                    "Stopped scheduler {} running {} ({})",
+                    stopped.instance_id, stopped.build.version, stopped.build.hash
+                );
+            }
         }
     }
     Ok(())
@@ -1168,6 +2046,9 @@ fn cmd_review(
             };
             let source_ref = current_ref(project_root)?;
             let source_commit = head_commit(project_root)?;
+            let resolver = ContentResolver::new(Some(project_root));
+            fluent::tester::check_structural(project_root, false, &resolver)
+                .context("Tester is not ready; review state was not created")?;
             let task_ids = item.add_review_only_attempt(
                 attempt_id.clone(),
                 review::REVIEWERS,
@@ -1203,6 +2084,12 @@ fn cmd_review(
                 Err(error) => return Err(error.into()),
             };
             let task_ids = item.add_review_tasks(&attempt_id, review::REVIEWERS)?;
+            work_task_executor::prepare_ordinary_review_evidence(
+                &project_root,
+                &mut item,
+                &attempt_id,
+                &task_ids,
+            )?;
             store.write_work_item(&item)?;
             println!(
                 "Planned {} review Tasks for Attempt {attempt_id}",
@@ -1541,7 +2428,8 @@ fn cmd_status(search_root: &Path) -> Result<()> {
 
     // Surface stalled execution: queued Work with no live coordinator to claim
     // it stays queued until the scheduler is started or recovered.
-    if fluent::scheduler::execution_is_stopped(search_root)? {
+    let execution_is_stopped = fluent::scheduler::execution_is_stopped(search_root)?;
+    if execution_is_stopped {
         println!(
             "\nExecution is stopped: queued Work is waiting but no scheduler is running.\n\
              Start or recover it with: fluent scheduler run"
@@ -1551,6 +2439,8 @@ fn cmd_status(search_root: &Path) -> Result<()> {
     if guidance::guidance_enabled() {
         if is_empty {
             eprintln!("{}", guidance::empty_status_primer());
+        } else if execution_is_stopped {
+            eprintln!("\n→ Next: fluent scheduler run");
         } else if let Some(hint) = guidance::status_next_action(&work_status) {
             eprintln!("{hint}");
         }
@@ -1558,7 +2448,16 @@ fn cmd_status(search_root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn cmd_init(cwd: &Path) -> Result<()> {
+fn cmd_init(cwd: &Path, inputs: fluent::setup::InitSetupInputs) -> Result<()> {
+    let configured_setup = fluent::setup::ConfiguredSetup::from_inputs(inputs)?;
+    if let Some(setup) = configured_setup.as_ref() {
+        require_git_repository_root(cwd)?;
+        fluent::setup::preflight_durable_paths(cwd)?;
+        fluent::config::preflight_project_coder_config(cwd)?;
+        let resolver = ContentResolver::new(Some(cwd));
+        os::preflight_host_execution(cwd, &resolver)?;
+        fluent::setup::preflight_providers(&setup.mapping)?;
+    }
     let fluent_dir = cwd.join(".fluent");
     if fluent_dir.exists() {
         write_gitignore_if_absent(&fluent_dir)?;
@@ -1572,12 +2471,30 @@ fn cmd_init(cwd: &Path) -> Result<()> {
         eprintln!("  Initialized .fluent/ in {}", cwd.display());
     }
 
-    if let Err(e) = cmd_skills_add(cwd, false, false, None) {
-        eprintln!("  warning: could not install skills: {e}");
-    }
-
     if let Err(e) = seed_agent_instructions(cwd) {
         eprintln!("  warning: could not seed agent instructions: {e}");
+    }
+    if let Some(setup) = configured_setup {
+        let saved =
+            fluent::config::apply_project_coder_profile(cwd, &setup.mapping, setup.follow_up_mode)
+                .context("first-time setup is incomplete")?;
+        eprintln!("  Saved coder profile:");
+        for (role, pair) in [("writer", &saved.write), ("reviewer", &saved.review)] {
+            let model = if pair.model.is_empty() {
+                "provider default"
+            } else {
+                pair.model.as_str()
+            };
+            eprintln!(
+                "    {role}: {} {} {}",
+                pair.coder.as_str(),
+                model,
+                pair.effort.as_deref().unwrap_or("default")
+            );
+        }
+        eprintln!(
+            "  Each new Attempt stores this effective mapping unless you supply Attempt overrides."
+        );
     }
     match instruction_files_requiring_git_resolution(cwd) {
         Ok(paths) if !paths.is_empty() => {
@@ -1598,6 +2515,31 @@ fn cmd_init(cwd: &Path) -> Result<()> {
         eprintln!("  parent directory.");
     }
 
+    Ok(())
+}
+
+/// Require configured setup to run from the root of a Git worktree.
+///
+/// Keep legacy bare `fluent init` available outside repositories for existing
+/// automation, while preventing configured setup from probing providers or
+/// creating project state in an arbitrary nested directory.
+fn require_git_repository_root(cwd: &Path) -> Result<()> {
+    let root = git::run_stdout(
+        cwd,
+        &["rev-parse", "--show-toplevel"],
+        "resolve the repository root for configured init",
+    )
+    .context("configured init requires a Git repository root")?;
+    let canonical_cwd = fs::canonicalize(cwd)
+        .with_context(|| format!("canonicalize configured init directory {}", cwd.display()))?;
+    let canonical_root =
+        fs::canonicalize(&root).with_context(|| format!("canonicalize repository root {root}"))?;
+    if canonical_cwd != canonical_root {
+        bail!(
+            "configured init requires the repository root; run it from {}",
+            canonical_root.display()
+        );
+    }
     Ok(())
 }
 
@@ -1632,8 +2574,10 @@ This section is the always-loaded summary and is enough to drive fluent on its o
 - **Observations:** capture durable lessons and future work with `fluent observation
   create`; list them with `fluent observation list`.
 - **Pause for the user:** when a decision genuinely needs a human, fluent sets
-  `needs-user` and pauses; read the named handoff file, then resume with `fluent attempt
-  run` once resolved.
+  `needs-user` and pauses. Read the named handoff file, resolve it, then use the exact
+  `fluent queue resume <work-item-id> --attempt <attempt-id>` action from `fluent status`
+  to return scheduler-owned work to the queue. `fluent attempt run` remains the direct,
+  foreground recovery path.
 - **Committed scaffolding:** fluent commits its `.fluent/` notes and test config alongside
   your code changes, so its learned project state persists across runs.
 - **Local Preview:** Attempts run locally in the foreground. Corrective follow-ups become
@@ -1644,13 +2588,10 @@ This section is the always-loaded summary and is enough to drive fluent on its o
   Post-merge review is off by default; opt in per land with
   `fluent merge-candidate land --post-merge-review`. `fluent auto-merge`, automatic
   scheduler lifecycle, automatic landing, and Fargate are outside this path. For an
-  uninitialized project, use the full fluent skill to choose follow-up mode before running
-  `fluent init`. If the user chooses execute, write this after init:
-
-  ```yaml
-  follow-up:
-    mode: execute
-  ```
+  uninitialized project, use the full fluent skill to choose a follow-up mode and explicit
+  coder profile before running configured `fluent init`. Bare `fluent init` remains available
+  for compatible automation; the full skill passes the profile and follow-up flags, preflights
+  providers, and saves the writer/reviewer mapping atomically.
 
 ### Ask the user easy-to-answer questions
 
@@ -1783,6 +2724,9 @@ fn cmd_skills_add(
     let home = std::env::var("HOME")
         .map_err(|_| anyhow::anyhow!("HOME not set; cannot locate agent skills directory"))?;
 
+    let install_dirs = resolve_install_dirs(cwd, &home, force_global, force_project, &agent)?;
+    preflight_external_shim_handoffs(cwd, &home, &install_dirs)?;
+
     let names = fluent::content::bundled_skill_names();
 
     // Always write the full skill to the fixed data directory so the shim
@@ -1792,26 +2736,197 @@ fn cmd_skills_add(
         work_task_executor::materialize_skill(name, &data_dir)?;
     }
 
-    let install_dirs = resolve_install_dirs(cwd, &home, force_global, force_project, &agent)?;
-
     for dir in &install_dirs {
-        for name in &names {
-            work_task_executor::materialize_skill(name, dir)?;
+        let (agent_name, scope) = install_identity(cwd, dir);
+        let lock_path = external_skill_lock_path(cwd, &home, dir);
+        let fluent_outcome = install_skill_with_external_handoff(
+            "fluent",
+            dir,
+            agent_name,
+            scope,
+            Some(&lock_path),
+        )?;
+        let mut outcomes = vec![fluent_outcome];
+        if fluent_outcome != InstallOutcome::Conflict {
+            outcomes.extend(
+                names
+                    .iter()
+                    .filter(|name| **name != "fluent")
+                    .map(|name| install_skill(name, dir, agent_name, scope))
+                    .collect::<Result<Vec<_>>>()?,
+            );
         }
-        eprintln!("Installed {} skills to {}", names.len(), dir.display());
+        if fluent_outcome == InstallOutcome::Conflict {
+            eprintln!("No bundled skills installed to {}", dir.display());
+        } else if outcomes
+            .iter()
+            .all(|outcome| *outcome == InstallOutcome::Current)
+        {
+            eprintln!("Skills are current in {}", dir.display());
+        } else if outcomes
+            .iter()
+            .any(|outcome| *outcome == InstallOutcome::ReplacedShim)
+        {
+            eprintln!(
+                "Installed {} skills to {} (replaced Fluent shim)",
+                names.len(),
+                dir.display()
+            );
+        } else {
+            eprintln!("Installed {} skills to {}", names.len(), dir.display());
+        }
     }
 
-    // Scan for shim-marked fluent installations in candidate directories
-    // beyond what we just installed to and replace them.
-    let scan_dirs = shim_scan_candidate_dirs(&home);
-    for dir in &scan_dirs {
-        if install_dirs.iter().any(|d| d == dir) {
-            continue;
+    if install_dirs.is_empty() {
+        eprintln!(
+            "Wrote bundled skills to {}. No Fluent bootstrap or managed installation was found; use --agent with --project or --global to create one.",
+            data_dir.display()
+        );
+    }
+
+    let mut reported_dirs = install_dirs.clone();
+    for dir in fluent_installation_dirs(cwd, &home)? {
+        if !reported_dirs.contains(&dir) {
+            reported_dirs.push(dir);
         }
-        replace_shim_if_present(dir)?;
+    }
+    let scopes = reported_dirs
+        .iter()
+        .map(|dir| install_identity(cwd, dir).1)
+        .collect::<Vec<_>>();
+    if scopes.contains(&"global") && scopes.contains(&"project") {
+        let installations = reported_dirs
+            .iter()
+            .map(|dir| {
+                let (_, scope) = install_identity(cwd, dir);
+                format!("{scope} {}", dir.join("fluent").display())
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        eprintln!(
+            "Managed Fluent installations: {installations}. The agent may display both entries."
+        );
     }
 
     Ok(())
+}
+
+fn fluent_installation_dirs(cwd: &Path, home: &str) -> Result<Vec<PathBuf>> {
+    shim_candidate_roots(cwd, home)
+        .into_iter()
+        .filter(|dir| dir.join("fluent").is_dir())
+        .filter_map(|dir| {
+            let (agent, scope) = install_identity(cwd, &dir);
+            match skill_install::is_managed_bundled_skill("fluent", &dir, agent, scope) {
+                Ok(true) => Some(Ok(dir)),
+                Ok(false) => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .collect()
+}
+
+fn install_skill(skill: &str, dir: &Path, agent: &str, scope: &str) -> Result<InstallOutcome> {
+    let outcome = skill_install::install_bundled_skill(skill, dir, agent, scope)?;
+    if outcome == InstallOutcome::Conflict {
+        eprintln!(
+            "Skipped unmarked skill at {}; remove it manually before Fluent can install there",
+            dir.join(skill).display()
+        );
+    }
+    Ok(outcome)
+}
+
+fn install_skill_with_external_handoff(
+    skill: &str,
+    dir: &Path,
+    agent: &str,
+    scope: &str,
+    lock_path: Option<&Path>,
+) -> Result<InstallOutcome> {
+    let should_handoff = skill == "fluent" && is_sidecar_free_fluent_shim(dir)?;
+    let handoff = if should_handoff {
+        lock_path
+            .map(skill_install::prepare_external_skill_lock_handoff)
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
+    complete_external_skill_handoff(handoff, &dir.join(skill), || {
+        install_skill(skill, dir, agent, scope)
+    })
+}
+
+fn is_sidecar_free_fluent_shim(skills_dir: &Path) -> Result<bool> {
+    if !is_fluent_shim(skills_dir) {
+        return Ok(false);
+    }
+    let sidecar = skills_dir.join("fluent/.fluent-managed.json");
+    match fs::symlink_metadata(&sidecar) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(true),
+        Err(error) => {
+            Err(error).with_context(|| format!("Failed to inspect {}", sidecar.display()))
+        }
+    }
+}
+
+fn complete_external_skill_handoff<F>(
+    handoff: Option<skill_install::ExternalSkillLockHandoff>,
+    managed_path: &Path,
+    install: F,
+) -> Result<InstallOutcome>
+where
+    F: FnOnce() -> Result<InstallOutcome>,
+{
+    if let Some(handoff) = handoff.as_ref() {
+        handoff.apply()?;
+    }
+
+    let result = install();
+    match result {
+        Ok(InstallOutcome::ReplacedShim) => {
+            if let Some(handoff) = handoff {
+                eprintln!(
+                    "Removed Fluent's bootstrap entry from {}; Fluent now manages {}",
+                    handoff.path().display(),
+                    managed_path.display()
+                );
+            }
+            Ok(InstallOutcome::ReplacedShim)
+        }
+        Ok(outcome) => {
+            if let Some(handoff) = handoff {
+                handoff.restore()?;
+            }
+            Ok(outcome)
+        }
+        Err(error) => {
+            if let Some(handoff) = handoff
+                && let Err(restore_error) = handoff.restore()
+            {
+                bail!("{error:#}; also failed to restore external skill lock: {restore_error:#}");
+            }
+            Err(error)
+        }
+    }
+}
+
+fn install_identity(cwd: &Path, dir: &Path) -> (&'static str, &'static str) {
+    if dir == cwd.join(".claude/skills") {
+        ("claude", "project")
+    } else if dir == cwd.join(".codex/skills") {
+        ("codex", "project")
+    } else if dir == cwd.join(".agents/skills") {
+        ("universal", "project")
+    } else if dir.ends_with(".codex/skills") {
+        ("codex", "global")
+    } else if dir.ends_with(".agents/skills") || dir.ends_with(".config/agents/skills") {
+        ("universal", "global")
+    } else {
+        ("claude", "global")
+    }
 }
 
 fn resolve_install_dirs(
@@ -1821,9 +2936,11 @@ fn resolve_install_dirs(
     force_project: bool,
     agent: &Option<String>,
 ) -> Result<Vec<PathBuf>> {
-    if force_project {
-        let project_dir = cwd.join(".claude/skills");
-        return Ok(vec![project_dir]);
+    let explicit_scope = force_global || force_project;
+    match (explicit_scope, agent.as_ref()) {
+        (true, None) => bail!("--project and --global require --agent <codex|claude|*>"),
+        (false, Some(_)) => bail!("--agent requires either --project or --global"),
+        _ => {}
     }
 
     if let Some(agents) = agent {
@@ -1831,84 +2948,86 @@ fn resolve_install_dirs(
         let mut dirs = Vec::new();
         for a in agents.split(',') {
             let a = a.trim();
-            if a == "*" {
-                dirs.extend(all_agent_skill_dirs(&home));
-            } else {
-                dirs.push(home.join(format!(".{a}/skills")));
+            let selected = match a {
+                "*" => vec!["claude", "codex"],
+                "claude" => vec!["claude"],
+                "codex" => vec!["codex"],
+                "" => bail!("--agent must name codex, claude, or *"),
+                other => bail!("Unsupported agent {other:?}; expected codex, claude, or *"),
+            };
+            for selected_agent in selected {
+                let dir = if force_project {
+                    cwd.join(format!(".{selected_agent}/skills"))
+                } else {
+                    home.join(format!(".{selected_agent}/skills"))
+                };
+                if !dirs.contains(&dir) {
+                    dirs.push(dir);
+                }
             }
         }
         if dirs.is_empty() {
-            bail!("No agent skill directories found");
+            bail!("--agent must name codex, claude, or *");
         }
         return Ok(dirs);
     }
 
-    // Default or --global: install to global roots.
-    let mut dirs = global_skill_roots(home);
-
-    // If not explicitly --global, also update a project-level fluent skill
-    // if one already exists (B5).
-    if !force_global {
-        let project_dir = cwd.join(".claude/skills");
-        let project_fluent = project_dir.join("fluent/SKILL.md");
-        if project_fluent.exists() {
-            dirs.push(project_dir);
-        }
-    }
-
-    Ok(dirs)
+    Ok(shim_candidate_roots(cwd, home)
+        .into_iter()
+        .filter(|dir| dir.join("fluent").exists())
+        .collect())
 }
-
-fn all_agent_skill_dirs(home: &Path) -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    for agent in &["claude", "codex"] {
-        let dir = home.join(format!(".{agent}/skills"));
-        dirs.push(dir);
-    }
-    dirs
-}
-
-const SHIM_MARKER: &str = "fluent-shim: true";
 
 fn is_fluent_shim(skills_dir: &Path) -> bool {
-    let skill_md = skills_dir.join("fluent/SKILL.md");
-    match fs::read_to_string(&skill_md) {
-        Ok(content) => content.contains(SHIM_MARKER),
-        Err(_) => false,
-    }
+    skill_install::is_fluent_shim(&skills_dir.join("fluent"))
 }
 
-fn replace_shim_if_present(skills_dir: &Path) -> Result<()> {
-    if !is_fluent_shim(skills_dir) {
-        return Ok(());
+/// Candidate directories where the external `skills` CLI may install a shim.
+fn shim_candidate_roots(cwd: &Path, home: &str) -> Vec<PathBuf> {
+    let mut roots = project_shim_candidate_roots(cwd);
+    roots.extend(global_shim_candidate_roots(home));
+    roots
+}
+
+fn project_shim_candidate_roots(cwd: &Path) -> Vec<PathBuf> {
+    vec![
+        cwd.join(".agents/skills"),
+        cwd.join(".claude/skills"),
+        cwd.join(".codex/skills"),
+    ]
+}
+
+fn global_shim_candidate_roots(home: &str) -> Vec<PathBuf> {
+    let home = PathBuf::from(home);
+    vec![
+        home.join(".agents/skills"),
+        home.join(".config/agents/skills"),
+        home.join(".claude/skills"),
+        home.join(".codex/skills"),
+    ]
+}
+
+fn preflight_external_shim_handoffs(
+    cwd: &Path,
+    home: &str,
+    install_dirs: &[PathBuf],
+) -> Result<()> {
+    for dir in install_dirs {
+        if is_sidecar_free_fluent_shim(&dir)? {
+            let lock_path = external_skill_lock_path(cwd, home, &dir);
+            skill_install::prepare_external_skill_lock_handoff(&lock_path)?;
+        }
     }
-    work_task_executor::materialize_skill("fluent", skills_dir)?;
-    eprintln!("Replaced fluent shim in {}", skills_dir.display());
     Ok(())
 }
 
-/// Candidate directories where a fluent shim might have been installed by
-/// the `skills` CLI. These are the known per-agent skill directories.
-fn shim_scan_candidate_dirs(home: &str) -> Vec<PathBuf> {
-    let home = PathBuf::from(home);
-    let mut dirs = Vec::new();
-
-    // Claude Code per-agent directories
-    for agent in &["claude", "codex"] {
-        let dir = home.join(format!(".{agent}/skills"));
-        if dir.is_dir() {
-            dirs.push(dir);
-        }
+fn external_skill_lock_path(cwd: &Path, home: &str, skills_dir: &Path) -> PathBuf {
+    let (_, scope) = install_identity(cwd, skills_dir);
+    if scope == "project" {
+        cwd.join("skills-lock.json")
+    } else {
+        PathBuf::from(home).join(".agents/.skill-lock.json")
     }
-
-    // The main ~/.claude/skills is a global root, included for completeness
-    // but will be skipped if already in global_dirs.
-    let claude_skills = home.join(".claude/skills");
-    if claude_skills.is_dir() && !dirs.contains(&claude_skills) {
-        dirs.push(claude_skills);
-    }
-
-    dirs
 }
 
 fn cmd_skills_show(path_only: bool, name: &str) -> Result<()> {
@@ -1939,18 +3058,6 @@ fn skills_data_dir(home: &str) -> PathBuf {
         .join("skills")
 }
 
-/// Candidate global skill roots where agents may read skills from.
-fn global_skill_roots(home: &str) -> Vec<PathBuf> {
-    let home = PathBuf::from(home);
-    let mut roots = Vec::new();
-
-    // Claude Code global skills directory
-    let claude_skills = home.join(".claude").join("skills");
-    roots.push(claude_skills);
-
-    roots
-}
-
 // -------------------------------------------------------------------------
 // Helpers
 // -------------------------------------------------------------------------
@@ -1974,6 +3081,7 @@ fn read_planning_context(
             (None, None) => None,
             (Some(_), Some(_)) => unreachable!("clap rejects conflicting planning context inputs"),
         },
+        approved_revisions: Default::default(),
     };
 
     Ok((!context.is_empty()).then_some(context))
@@ -1981,6 +3089,28 @@ fn read_planning_context(
 
 fn read_optional_file(path: Option<String>) -> Result<Option<String>> {
     path.map(fs::read_to_string).transpose().map_err(Into::into)
+}
+
+fn build_release_contract(release: bool, criteria: Vec<String>) -> Result<Option<ReleaseContract>> {
+    if !release {
+        return Ok(None);
+    }
+    if criteria.is_empty() {
+        bail!("release work requires at least one --release-criterion ID=STATEMENT");
+    }
+    let criteria = criteria
+        .into_iter()
+        .map(|value| {
+            let (id, statement) = value.split_once('=').ok_or_else(|| {
+                anyhow::anyhow!("invalid --release-criterion {value:?}; expected ID=STATEMENT")
+            })?;
+            Ok(ReleaseCriterion {
+                id: id.trim().to_string(),
+                statement: statement.trim().to_string(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Some(ReleaseContract::new(criteria)?))
 }
 
 fn head_commit(project_root: &Path) -> Result<String> {
@@ -2004,22 +3134,10 @@ fn current_ref(project_root: &Path) -> Result<String> {
     }
 }
 
-const FLUENT_GITIGNORE: &str = "\
-# Fluent working state: everything here is ignored by default.
-# Durable content is re-included below.
-/*
-!/.gitignore
-!/expertise/
-!/hooks/
-!/Dockerfile
-!/tester.yaml
-!/extract-tester-results
-";
-
 fn write_gitignore_if_absent(fluent_dir: &Path) -> Result<()> {
     let gitignore = fluent_dir.join(".gitignore");
     if !gitignore.exists() {
-        fs::write(&gitignore, FLUENT_GITIGNORE)?;
+        fs::write(&gitignore, fluent::setup::FLUENT_GITIGNORE)?;
     }
     Ok(())
 }
@@ -2087,7 +3205,6 @@ mod tests {
             coder_mapping: CoderMapping {
                 write: pair(CoderKind::Pi),
                 review: pair(CoderKind::Claude),
-                behavior_tests: pair(CoderKind::Codex),
             },
             tasks: vec![Task {
                 id: "a1-task-1".to_string(),
@@ -2103,6 +3220,9 @@ mod tests {
                 },
                 artifact_area: None,
                 review_context: None,
+                writer_correction_assignment: None,
+                verification_context: None,
+                evidence_review_context: None,
                 input_artifacts: Vec::new(),
                 depends_on: None,
                 output: None,
@@ -2121,15 +3241,11 @@ mod tests {
 
     #[test]
     fn resolve_paused_coder_routes_through_canonical_mapping() {
-        // A paused Tester task resolves to the write coder — the canonical
-        // `for_task_kind` mapping, not the behavior-tests slot.
+        // A paused Tester task resolves to the write coder through the
+        // canonical `for_task_kind` mapping.
         assert_eq!(
             resolve_paused_coder(&attempt_with_paused_task(TaskKind::Tester)).as_deref(),
             Some("pi")
-        );
-        assert_eq!(
-            resolve_paused_coder(&attempt_with_paused_task(TaskKind::BehaviorTests)).as_deref(),
-            Some("codex")
         );
         assert_eq!(
             resolve_paused_coder(&attempt_with_paused_task(TaskKind::Review)).as_deref(),
@@ -2142,5 +3258,37 @@ mod tests {
         let mut attempt = attempt_with_paused_task(TaskKind::Write);
         attempt.tasks[0].status = TaskStatus::Complete;
         assert_eq!(resolve_paused_coder(&attempt), None);
+    }
+
+    #[test]
+    fn failed_shim_replacement_restores_external_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lock_path = tmp.path().join("skills-lock.json");
+        let original = serde_json::json!({
+            "version": 1,
+            "skills": {
+                "fluent": {
+                    "source": "mrinalwadhwa/fluent",
+                    "sourceType": "github",
+                    "skillPath": "skills/fluent/SKILL.md",
+                    "computedHash": "shim-hash"
+                }
+            }
+        });
+        fs::write(&lock_path, serde_json::to_vec_pretty(&original).unwrap()).unwrap();
+        let handoff = skill_install::prepare_external_skill_lock_handoff(&lock_path)
+            .unwrap()
+            .unwrap();
+
+        let result = complete_external_skill_handoff(
+            Some(handoff),
+            &tmp.path().join(".agents/skills/fluent"),
+            || bail!("injected install failure"),
+        );
+
+        assert!(result.is_err());
+        let restored: serde_json::Value =
+            serde_json::from_slice(&fs::read(lock_path).unwrap()).unwrap();
+        assert_eq!(restored, original);
     }
 }

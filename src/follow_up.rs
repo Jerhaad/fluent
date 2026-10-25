@@ -16,9 +16,25 @@ use crate::config::{self, CorrectionSource, FrozenFollowUpPolicy};
 use crate::observations::{self, LEARNER_FOLLOW_UP_KIND, ObservationFrontmatter};
 use crate::work_model::{
     CorrectiveAuditContext, CorrectiveAuthorityReference, CorrectiveContext,
-    CorrectiveEvidenceReference, DerivedProvenance, ExecutionAuthority, WorkItem, WorkLineage,
-    WorkModelStorageError, WorkModelStore,
+    CorrectiveEvidenceReference, DerivedProvenance, DurableTransitionMetadata,
+    DurableTransitionOrigin, ExecutionAuthority, WorkItem, WorkLineage, WorkModelStorageError,
+    WorkModelStore,
 };
+
+fn post_land_transition() -> DurableTransitionMetadata {
+    DurableTransitionMetadata {
+        origin: DurableTransitionOrigin::PostLand,
+        reason: None,
+        evidence_ref: None,
+    }
+}
+
+fn write_post_land_work_item(
+    store: &WorkModelStore,
+    item: &WorkItem,
+) -> Result<(), WorkModelStorageError> {
+    store.write_work_item_with_transition(item, &post_land_transition())
+}
 
 /// Content-addressed pointer to a file within a learner handoff. The path is
 /// always relative to the handoff root; the digest lets a consumer verify the
@@ -651,6 +667,21 @@ pub struct ReplayOutcome {
     /// Derived Work Items newly enqueued by this replay (0 on an idempotent
     /// re-run).
     pub work_items_queued: usize,
+}
+
+/// One completed post-land effect that a conversation projection can report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostLandProjectionEffect {
+    /// Stable operation-and-follow-up identity for idempotent delivery.
+    pub identity: String,
+    pub kind: PostLandProjectionKind,
+}
+
+/// The durable effect produced by one completed post-land follow-up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PostLandProjectionKind {
+    Observation { observation_id: String },
+    CorrectiveWork { work_item_id: String },
 }
 
 /// The canonical byte encoding of a serializable value: sorted-key JSON, so an
@@ -1336,6 +1367,64 @@ pub fn post_land_operation_complete(
     Ok(true)
 }
 
+/// Project completed post-land effects whose origin belongs to any supplied
+/// Work Item. Keep journal interpretation here so conversation consumers do
+/// not become additional owners of the durable follow-up schema.
+pub fn completed_projection_effects(
+    project_root: &Path,
+    origin_work_item_ids: &[String],
+) -> Result<Vec<PostLandProjectionEffect>> {
+    let root = follow_ups_root(project_root);
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).with_context(|| format!("read {}", root.display())),
+    };
+    let origins = origin_work_item_ids
+        .iter()
+        .collect::<std::collections::HashSet<_>>();
+    let mut effects = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() || entry.file_name() == ".locks" {
+            continue;
+        }
+        let operation_path = entry.path().join("operation.json");
+        if !operation_path.is_file() {
+            continue;
+        }
+        let operation: PendingPostLandOperationV1 =
+            serde_json::from_slice(&fs::read(&operation_path)?).with_context(|| {
+                format!("parse post-land operation {}", operation_path.display())
+            })?;
+        if !origins.contains(&operation.origin.work_item_id) {
+            continue;
+        }
+        if !post_land_operation_complete(project_root, &operation.origin)? {
+            continue;
+        }
+        let journal_path = entry.path().join("journal.json");
+        let journal = read_journal(&journal_path, &operation.operation_id)?;
+        for receipt in journal.follow_ups {
+            let identity = format!("{}:{}", operation.operation_id, receipt.follow_up_id);
+            let kind = if receipt.corrective == Some(true) {
+                PostLandProjectionKind::CorrectiveWork {
+                    work_item_id: receipt
+                        .derived_work_item_id
+                        .context("completed corrective follow-up has no Work Item")?,
+                }
+            } else {
+                PostLandProjectionKind::Observation {
+                    observation_id: receipt.observation_id,
+                }
+            };
+            effects.push(PostLandProjectionEffect { identity, kind });
+        }
+    }
+    effects.sort_by(|left, right| left.identity.cmp(&right.identity));
+    Ok(effects)
+}
+
 /// Record and immediately replay a landed follow-up batch. This is the single
 /// entry point the local land hook calls once a Merge Candidate is durably
 /// merged.
@@ -1620,7 +1709,7 @@ fn ensure_derived_work(
         Err(error) => return Err(error.into()),
     }
 
-    store.create_work_item(&item)?;
+    store.create_work_item_with_transition(&item, &post_land_transition())?;
     Ok(true)
 }
 
@@ -1650,9 +1739,14 @@ fn reconcile_reusable_derived_work(
     if existing.corrective_audit.is_none() {
         let mut reconciled = existing.clone();
         reconciled.corrective_audit = expected.corrective_audit.clone();
-        store.write_work_item(&reconciled)?;
+        write_post_land_work_item(store, &reconciled)?;
     }
     Ok(())
+}
+
+/// Share the cleanup dependency lock with human authorization.
+pub(crate) fn cleanup_dependency_lock_path(project_root: &Path) -> PathBuf {
+    project_root.join(".fluent/work/locks/follow-up-cleanup.lock")
 }
 
 /// Authorize one proposed derived Work Item under human authority and reconcile
@@ -1673,6 +1767,9 @@ pub fn authorize_derived_work_item(
         Err(error) => return Err(error.into()),
     };
     let root_id = initial.lineage.root_id(&initial.id).to_string();
+    // Cleanup holds this lock from its final follow-up check through removal.
+    // A descendant's authorization does not change the origin's revision.
+    let dependency_lock = crate::land_lock::acquire(&cleanup_dependency_lock_path(project_root))?;
     let lineage_lock = crate::lineage_lock::acquire_human(project_root, &root_id)
         .with_context(|| format!("acquire lineage lock for {root_id:?}"))?;
     let work_lock_path = project_root
@@ -1705,9 +1802,12 @@ pub fn authorize_derived_work_item(
         .pending_enqueue
         .clone()
         .expect("enqueue intent was just ensured");
+    // A later human authorization is a generic host mutation, not the landed
+    // operation that originally derived this Work Item.
     store.write_work_item(&item)?;
     drop(work_lock);
     drop(lineage_lock);
+    drop(dependency_lock);
 
     crate::queue::ensure_dispatch(
         project_root,
@@ -3668,6 +3768,12 @@ mod tests {
             1,
             "exactly one queue entry survives replay"
         );
+        let derived = WorkModelStore::new(tmp.path())
+            .read_work_item(DERIVED_ID)
+            .unwrap();
+        assert!(derived.transitions.iter().all(|transition| {
+            transition.origin == DurableTransitionOrigin::PostLand && transition.reason.is_none()
+        }));
     }
 
     #[test]

@@ -70,27 +70,113 @@ pub fn cleanup_work_items(
     options: &CleanupOptions,
 ) -> Result<Vec<WorkCleanupResult>> {
     let source_root = cleanup_source_root(search_root)?;
-    let _land_lock = crate::land_lock::acquire(&crate::land_lock::lock_path(&source_root))?;
     let store = WorkModelStore::new(&source_root);
-    let work_items = store.list_work_items()?;
-    let stored_work_item_ids = work_items
-        .iter()
-        .map(|work_item| work_item.id.clone())
-        .collect::<HashSet<_>>();
+    let work_items = {
+        let _land_lock = crate::land_lock::acquire(&crate::land_lock::lock_path(&source_root))?;
+        store.list_work_items()?
+    };
     let candidates = cleanup_work_item_candidates(&source_root, work_items);
-    let registered = registered_worktrees(&source_root)?;
+    #[cfg(feature = "test-support")]
+    if let (Ok(reached), Ok(release)) = (
+        std::env::var("FLUENT_TEST_CLEANUP_SELECTED"),
+        std::env::var("FLUENT_TEST_CLEANUP_RELEASE"),
+    ) {
+        fs::write(&reached, b"selected")?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !Path::new(&release).exists() {
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "cleanup selection barrier timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
     let mut results = Vec::new();
 
     for work_item in candidates {
-        let work_item = match store.read_work_item(&work_item.id) {
+        // Verify post-land effects before holding the origin model lock.
+        // That verification takes the operation lock and reads Work Items;
+        // holding the model lock here would invert its lock order.
+        let checked = match store.read_work_item(&work_item.id) {
+            Ok(current)
+                if work_item_is_cleanable(&current)
+                    && !retains_for_follow_up_recovery(&source_root, &current) =>
+            {
+                current
+            }
+            _ => continue,
+        };
+        #[cfg(feature = "test-support")]
+        if options.apply
+            && std::env::var("FLUENT_TEST_CLEANUP_PRELOCK_ITEM")
+                .ok()
+                .as_deref()
+                == Some(work_item.id.as_str())
+        {
+            if let (Ok(reached), Ok(release)) = (
+                std::env::var("FLUENT_TEST_CLEANUP_PRELOCK_REACHED"),
+                std::env::var("FLUENT_TEST_CLEANUP_PRELOCK_RELEASE"),
+            ) {
+                fs::write(&reached, b"checked")?;
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while !Path::new(&release).exists() {
+                    anyhow::ensure!(
+                        std::time::Instant::now() < deadline,
+                        "cleanup prelock barrier timed out"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
+        // Human authorization can change a descendant without changing this
+        // origin. Recheck under the shared dependency lock and hold it through
+        // removal. Verify before taking the land or origin model locks to keep
+        // the operation lock order intact.
+        let _dependency_lock = crate::land_lock::acquire(
+            &crate::follow_up::cleanup_dependency_lock_path(&source_root),
+        )?;
+        if retains_for_follow_up_recovery(&source_root, &checked) {
+            continue;
+        }
+        // Landing takes the land lock before mutating the Work Item. Keep that
+        // order and hold both locks through every destructive action. Reject a
+        // changed snapshot rather than using an eligibility result from before
+        // the model lock was acquired.
+        let _land_lock = crate::land_lock::acquire(&crate::land_lock::lock_path(&source_root))?;
+        let _model_lock = store.lock_work_item_model(&work_item.id)?;
+        let work_item = match store.read_work_item_under_model_lock(&work_item.id) {
             Ok(work_item)
-                if work_item_is_cleanable(&work_item)
-                    && !retains_for_follow_up_recovery(&source_root, &work_item) =>
+                if work_item == checked
+                    && work_item.storage_revision.get() == checked.storage_revision.get()
+                    && work_item_is_cleanable(&work_item) =>
             {
                 work_item
             }
             _ => continue,
         };
+        let registered = registered_worktrees(&source_root)?;
+        #[cfg(feature = "test-support")]
+        if options.apply
+            && std::env::var("FLUENT_TEST_CLEANUP_LOCKED_ITEM")
+                .ok()
+                .as_deref()
+                == Some(work_item.id.as_str())
+        {
+            if let (Ok(reached), Ok(release)) = (
+                std::env::var("FLUENT_TEST_CLEANUP_LOCKED_REACHED"),
+                std::env::var("FLUENT_TEST_CLEANUP_LOCKED_RELEASE"),
+            ) {
+                fs::write(&reached, b"locked")?;
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while !Path::new(&release).exists() {
+                    anyhow::ensure!(
+                        std::time::Instant::now() < deadline,
+                        "cleanup locked barrier timed out"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
         let plan = work_cleanup_plan(&source_root, &store, &work_item, &registered, options.apply)?;
         if options.apply {
             apply_work_item_cleanup(&plan)?;
@@ -98,9 +184,24 @@ pub fn cleanup_work_items(
         results.push(WorkCleanupResult::WorkItem(plan));
     }
 
+    let _land_lock = crate::land_lock::acquire(&crate::land_lock::lock_path(&source_root))?;
+    let stored_work_item_ids = store
+        .list_work_item_ids()?
+        .into_iter()
+        .collect::<HashSet<_>>();
     for plan in
         orphan_work_artifact_cleanup_plans(&source_root, &stored_work_item_ids, options.apply)?
     {
+        // Creation takes the same model lock. Keep it through removal so a
+        // newly published Work Item cannot lose its artifact root.
+        let model_lock = if crate::work_model::validate_work_item_id(&plan.work_item_id).is_ok() {
+            Some(store.lock_work_item_model(&plan.work_item_id)?)
+        } else {
+            None
+        };
+        if model_lock.is_some() && store.work_item_path(&plan.work_item_id)?.exists() {
+            continue;
+        }
         if options.apply {
             apply_orphan_work_artifact_cleanup(&plan)?;
         }
@@ -186,9 +287,12 @@ fn has_executing_merge_candidate(store: &WorkModelStore, work_item_id: &str) -> 
     let Ok(item) = store.read_work_item(work_item_id) else {
         return false;
     };
-    item.merge_candidates
-        .iter()
-        .any(|candidate| candidate.merge_state.status == MergeCandidateMergeStatus::Executing)
+    item.merge_candidates.iter().any(|candidate| {
+        matches!(
+            candidate.merge_state.status,
+            MergeCandidateMergeStatus::Executing | MergeCandidateMergeStatus::LandingPending
+        )
+    })
 }
 
 fn cleanup_source_root(search_root: &Path) -> Result<PathBuf> {
@@ -241,7 +345,10 @@ fn retains_for_follow_up_recovery(project_root: &Path, work_item: &WorkItem) -> 
     })
 }
 
-fn work_item_is_cleanable(work_item: &WorkItem) -> bool {
+pub(crate) fn work_item_is_cleanable(work_item: &WorkItem) -> bool {
+    if !work_item.compatibility_warnings().is_empty() {
+        return false;
+    }
     if work_item.abandonment.is_some() {
         return work_item_has_no_active_execution(work_item);
     }
@@ -265,7 +372,10 @@ fn work_item_has_no_active_execution(work_item: &WorkItem) -> bool {
             .all(|task| task.status != TaskStatus::Executing)
     }) && work_item.merge_candidates.iter().all(|candidate| {
         candidate.merge_review_state != MergeReviewState::Reviewing
-            && candidate.merge_state.status != MergeCandidateMergeStatus::Executing
+            && !matches!(
+                candidate.merge_state.status,
+                MergeCandidateMergeStatus::Executing | MergeCandidateMergeStatus::LandingPending
+            )
     })
 }
 
@@ -278,7 +388,10 @@ fn attempt_is_terminal(attempt: &Attempt) -> bool {
 }
 
 fn task_is_terminal(task: &Task) -> bool {
-    matches!(task.status, TaskStatus::Complete | TaskStatus::Failed)
+    matches!(
+        task.status,
+        TaskStatus::Complete | TaskStatus::Failed | TaskStatus::Superseded
+    )
 }
 
 fn merge_candidate_is_terminal(candidate: &MergeCandidate) -> bool {
@@ -730,6 +843,21 @@ mod tests {
     }
 
     #[test]
+    fn unknown_pause_work_item_is_not_a_cleanup_candidate() {
+        let mut item = WorkItem::planned("future-work", "Future work");
+        item.add_initial_attempt("attempt-1").unwrap();
+        item.abandonment = Some(crate::work_model::WorkItemAbandonment {
+            reason: Some("superseded".to_string()),
+        });
+        item.attempts[0].status = AttemptStatus::NeedsUser;
+        item.attempts[0].pause_kind = Some(crate::work_model::PauseKind::Unknown(
+            "future-pause".to_string(),
+        ));
+
+        assert!(!work_item_is_cleanable(&item));
+    }
+
+    #[test]
     fn abandoned_work_item_with_executing_task_is_not_cleanup_candidate() {
         let mut item = WorkItem {
             id: "work-active".to_string(),
@@ -798,6 +926,7 @@ mod tests {
             merge_review_state: MergeReviewState::Reviewing,
             merge_state: crate::work_model::MergeCandidateMergeState::default(),
             created_at: None,
+            ready_at: None,
             started_at: None,
             completed_at: None,
         };
@@ -864,6 +993,7 @@ mod tests {
                 merge_review_state: MergeReviewState::Passed,
                 merge_state: crate::work_model::MergeCandidateMergeState::default(),
                 created_at: None,
+                ready_at: None,
                 started_at: None,
                 completed_at: None,
             };
@@ -1232,6 +1362,8 @@ mod tests {
             source_branch: "main".to_string(),
             base_commit: None,
             commit: "abc123".to_string(),
+            no_change: None,
+            learner_canonicalization: None,
         });
         let candidate_id = item.create_or_get_merge_candidate("attempt-1").unwrap();
         store.create_work_item(&item).unwrap();

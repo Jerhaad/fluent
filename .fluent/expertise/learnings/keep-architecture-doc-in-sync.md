@@ -1,6 +1,6 @@
 ---
 name: keep-architecture-doc-in-sync
-description: documentation/architecture.md is a living present-tense doc; subsystem changes must update its file-map lines and subsystem sections in the same change
+description: Keep the architecture file map, subsystem prose, and shell documentation checks aligned with the implementation
 metadata:
   type: convention
 ---
@@ -15,6 +15,14 @@ When a Work Item replaces or reshapes a subsystem, both must be updated so the d
 Verify generated paths and identifiers against the implementation helper instead of inferring their shape from domain ids. Follow-up operation directories, for example, use `.fluent/work/follow-ups/land-<digest>/`; documenting a raw `<work-item-id>-<candidate-id>` form contradicts the collision-safe identity scheme and sends operators to a path that does not exist. Search for and update every copy of a concrete path, including related learning files, in the same change.
 
 Responsibility changes also require updating the affected Rust module's `//!` header. Reviewers compare that header with the module's actual imports and effects, so a stale responsibility claim remains misleading even when the external architecture document is accurate.
+
+Shell scripts under `tests/behaviors/operations/` also assert literal text in
+architecture sections. When correcting documented vocabularies or wording to
+match the implementation, search those scripts for the old text and update the
+affected expectations in the same change, preserving the remaining assertions.
+Run each affected script with `bash`; the Rust test suite does not exercise
+these documentation checks. See [[shell-tests-invisible-to-compiler]] for the
+related risk when changing serialized fields.
 
 Rewrites should read as connected prose grouping related behaviors, not as a restated list of EARS statements from `behaviors.md`, and must avoid AI writing tells.
 

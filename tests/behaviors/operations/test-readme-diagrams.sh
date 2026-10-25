@@ -105,6 +105,28 @@ renderer.validate_tracks((renderer.Track(points, cycles=2),))
 PY
 }
 
+test_runs_renderer_commands_without_terminal_input() {
+  python3 - "$RENDERER" <<'PY'
+import importlib.util
+import subprocess
+import sys
+from unittest import mock
+
+renderer_path = sys.argv[1]
+spec = importlib.util.spec_from_file_location("readme_diagram_renderer", renderer_path)
+renderer = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = renderer
+spec.loader.exec_module(renderer)
+
+with mock.patch.object(renderer.subprocess, "run") as run:
+    renderer.run(["renderer-command"])
+
+run.assert_called_once_with(
+    ["renderer-command"], check=True, stdin=subprocess.DEVNULL
+)
+PY
+}
+
 test_generated_assets_match_sources() {
   local missing_tools=""
   local tool
@@ -128,6 +150,7 @@ printf 'test-readme-diagrams\n\n'
 run_test "tracks each light and dark source" test_tracks_each_light_and_dark_source
 run_test "tracks each output and README reference" test_tracks_each_output_and_readme_reference
 run_test "rejects animation tracks that break the loop" test_rejects_animation_tracks_that_break_the_loop
+run_test "runs renderer commands without terminal input" test_runs_renderer_commands_without_terminal_input
 run_test "generated assets match their sources" test_generated_assets_match_sources
 
 summarize_and_exit

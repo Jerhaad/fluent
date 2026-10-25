@@ -234,6 +234,15 @@ pub fn spawn_detached_runner(
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(log_clone));
+    // Keep the intentionally detached runner outside the merge command's
+    // process group so callers can clean up their own fixture descendants
+    // without terminating this durable follow-up.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+
+        cmd.process_group(0);
+    }
     let child = cmd
         .spawn()
         .with_context(|| format!("spawn detached {fluent_bin:?} for post-merge review"))?;
@@ -461,6 +470,7 @@ fn review_one(project_root: &Path, entry: &QueueEntry, fix_depth: u64) -> Result
             approach: None,
             plan: None,
             combined: None,
+            approved_revisions: Default::default(),
         }),
         instructions: None,
         abandonment: None,
@@ -496,6 +506,8 @@ fn review_one(project_root: &Path, entry: &QueueEntry, fix_depth: u64) -> Result
         resolver: &resolver,
         extra_args: &[],
         no_sandbox: true,
+        tester_no_sandbox: false,
+        resume_cancellation_requested_at: None,
         coder_mapping_inputs: None,
         #[cfg(test)]
         learner_run_coder: None,
@@ -615,6 +627,8 @@ fn auto_run_post_merge_review_fix(
         resolver: &resolver,
         extra_args: &[],
         no_sandbox: false,
+        tester_no_sandbox: false,
+        resume_cancellation_requested_at: None,
         coder_mapping_inputs: None,
         #[cfg(test)]
         learner_run_coder: None,
@@ -699,6 +713,7 @@ pub fn create_post_merge_review_fix_work_item(
         approach: None,
         plan: None,
         combined: None,
+        approved_revisions: Default::default(),
     };
     let mut item = WorkItem {
         id: id.clone(),

@@ -44,6 +44,8 @@ The script must:
 [{"id": "test_name", "test_harness": "cargo-nextest", "status": "pass", "duration_ms": 42, "failure_excerpt": null}]
 ```
 - Every `id` must be globally unique across all commands and harnesses. When a test name recurs across binaries, files, or sections, prefix with the binary, file, or section to disambiguate.
+- Preserve native qualification: Rust binary and module, Python module and class, and exact script path. A whole-script result uses `tests/check.sh`; a named shell result uses `tests/check.sh::test_name`. Coverage descriptions and harness display labels do not identify tests.
+- Existing native IDs are normalized by Fluent. A producer may also supply `identity`, for example `{"kind":"named-test","path":"tests/check.sh","name":"test_name"}`. Preserve the raw `id` and `status`; a supplied identity must agree with any native qualifiers in the raw ID. The producer cannot supply canonical command occurrence or host acceptance authority.
 - `status` must be one of: `pass`, `fail`, `skipped`, `not_run`.
 - `failure_excerpt` is a string (at most 500 chars) or null.
 - Be executable (`chmod +x`).
@@ -66,10 +68,14 @@ First, understand what this Work Item asks for:
      this is fluent's own accumulated understanding of the project — prefer it over re-deriving.
 {{/if}}
 {{#if has_prior_reviews}}
-6. Read each prior review file. The list below is the complete set from the most recent prior round: {{prior_reviews_list}}
+- Read each prior correction artifact, including review reports, Tester evidence, or `candidate-gate.json`. The list below is the complete set for this continuation: {{prior_reviews_list}}
+{{/if}}
+{{#if has_work_item_inputs}}
+- Read each preserved Work Item input. These immutable files are authoritative execution inputs: {{work_item_inputs_list}}
 {{/if}}
 
 Before implementing, orient to the codebase so your work fits how this project already does things:
+- Your writable candidate checkout is {{candidate_checkout_path}}. The source checkout is {{source_checkout_path}}. Make product changes and commits only in the candidate checkout. Keep source product files read-only; declared Task artifacts under the source checkout's `.fluent/work` tree remain writable.
 - Skim the existing code around what the plan touches. Match its structure, naming, error
   handling, and idioms.
 - Follow the project's stated conventions in its `AGENTS.md` / `CLAUDE.md` (your coding agent
@@ -77,6 +83,29 @@ Before implementing, orient to the codebase so your work fits how this project a
 Your changes should read as though the project's regular maintainers wrote them.
 
 The Brief, Behaviors, Approach, and Plan files are read-only.
+
+{{#if has_writer_completion_matrix}}
+Rows assigned to `host`, `review`, `tester`, or `learner` are read-only context: leave their state pending and their evidence arrays empty. Complete only `writer` rows (or legacy rows with no responsibility) and applicable findings. Fluent verifies host evidence and later stages separately; assignment never authorizes host execution.
+
+## Writer completion matrix
+
+Read {{writer_completion_matrix_path}}. Fluent generated its rows from the approved behaviors and their existing `Test:` or `Untestable:` references, required Plan rows and their existing Verification cells, applicable Approach decisions, structural boundaries, execution guidance, and this round's open review findings.
+
+The row identity, kind, source, requirement, responsibility, and verification references are immutable. Do not add, remove, reorder, or rewrite rows. For each Writer-owned row or applicable finding you satisfy, set `state` to `complete`, list concrete files, symbols, commits, or a verified no-change reason in `implementation-evidence`, and add at least one focused harness-native command with `result: pass` under `verification`. Keep each editable collection as a JSON array, even when it contains one value:
+
+    "state": "complete",
+    "implementation-evidence": ["src/module.rs: changed symbol"],
+    "verification": [
+      {"command": "cargo test focused_case", "result": "pass"}
+    ],
+    "applicable-constraints": []
+
+For each review-finding row, list applicable Behavior, Approach, or required Plan row IDs in `applicable-constraints`; when none applies, use `["none: <specific reason>"]`. These are the exact allowed IDs for this Attempt:
+
+{{writer_completion_allowed_constraints}}
+
+Fluent validates this matrix before starting ordinary reviewers. Incomplete Writer-owned rows or applicable findings return to Writer work when the no-output, regression, stagnation, and structural pause rules permit continuation. Once Writer work finishes, a pending required host check pauses with the exact candidate, action, and evidence handoff instead of another Writer. Host checks require passing evidence and targeted Tests Review; review, final Tester, and Learner rows remain pending context governed by their separate stage gates. Structural edits or contradictory claims pause for repair. The matrix is advisory evidence for reviewers; it does not replace the project's test selectors or Fluent's final Tester.
+{{/if}}
 
 ## Phase 2 — Set up progress
 
@@ -88,9 +117,13 @@ progress.md is a `- [ ]` to-do list that persists across rounds. Each item can h
     - [ ] Implement chunk dispatch
     - [ ] Write integration test
 
-{{#if has_required_progress}}
-progress.md contains an authoritative `## Required completion` section the Fluent materialized from the Plan's required rows. Each top-level entry is exactly `- [ ] <stable-id> — <requirement>` or, once satisfied, `- [x] <stable-id> — <requirement>; Evidence: <source/test>`. You MUST preserve every stable id and its requirement text exactly — never add, remove, reorder, or reword an entry. Mark an entry `- [x]` only by appending `; Evidence: <the source file or test that proves it>` once it is genuinely complete. Keep this section limited to the materialized stable manifest; record review work under a separate `## Review follow-ups` section outside `## Required completion`. The required section is the advancement gate's authority: a candidate cannot advance while any required entry is unchecked, and a review disagreement is resolved by a follow-up Writer checking the current item with concrete evidence, never by editing the schema.
+{{#if has_matrix_backed_required_progress}}
+Fluent owns the `## Required completion` section in progress.md. It is a read-only projection of the Plan's required rows: use its order to choose work, but do not edit its checkboxes, requirement text, evidence, or nested content. Report completion only in `writer-completion.json`; after validating the matrix, Fluent replaces this section from the immutable Plan contract and points each completed row to its matrix evidence. Record review work under a separate `## Review follow-ups` section outside `## Required completion`.
 
+Each incomplete Writer run must create a candidate commit and must not reduce the number of completed matrix rows. Fluent resumes the same provider session when possible and gives that continuation the unresolved progress, latest candidate change, and current findings. An incomplete no-change run, regressed matrix, or two consecutive Writer continuations against the same obligations, including after review, with no newly completed row pauses for user inspection.
+{{/if}}
+{{#if has_legacy_required_progress}}
+progress.md contains an authoritative `## Required completion` section Fluent materialized from the Plan's required rows. Preserve every stable id and its requirement text exactly. Mark an entry complete only by changing its checkbox and appending concrete `Evidence:`. Keep review work under a separate `## Review follow-ups` section.
 {{/if}}
 {{#if has_progress_md}}
 1. Read progress.md at {{progress_md_path}}.
@@ -99,9 +132,8 @@ progress.md contains an authoritative `## Required completion` section the Fluen
 {{/if}}
 {{#if has_prior_reviews_with_required_progress}}
 2. Ensure progress.md has a separate `## Review follow-ups` section outside `## Required completion`.
-3. If `## Required completion` contains legacy top-level `Address review finding:` rows, move each row and all of its nested evidence and commit notes as a unit to `## Review follow-ups`, without re-creating or rewording any required manifest row. Preserve checked findings as historical records and keep unchecked findings unresolved.
-4. Collect every `- [ ]` finding from the prior review files. Under `## Review follow-ups`, add any missing finding as `- [ ] Address review finding: <title> (from <review-md-path>)`. Do not delete unresolved follow-ups. Address these before remaining required steps.
-5. Find the first unchecked review follow-up, or otherwise the first `- [ ]` required item — that is your next step.
+3. Collect every `- [ ]` finding from the prior review files. Under `## Review follow-ups`, add any missing finding as `- [ ] Address review finding: <title> (from <review-md-path>)`. Do not delete unresolved follow-ups. Address these before remaining required steps.
+4. Find the first unchecked review follow-up, or otherwise the first `- [ ]` required item — that is your next step.
 {{/if}}
 {{#if has_prior_reviews_without_required_progress}}
 2. Ensure progress.md has a `## Review follow-ups` section.
@@ -121,7 +153,7 @@ Work through every `- [ ]` item in progress.md, one at a time. For each item:
 1. Refer to sections related to this step in plan.md and behaviors.md.
 2. Find approach.md sections related to this step. Note any recommended names, file paths, structural ideas, and constraints.
 3. Consult the indexes and read expertise files relevant to this step (architecture, testing, docs, etc.), including any patterns they reference.
-4. Identify any tests the plan names for this step. Check the codebase for their presence; record missing tests in progress.md before making code changes.
+4. Identify any tests the plan names for this step. Check the codebase for their presence; record missing tests in the matrix evidence or a mutable progress section before making code changes.
 
 ### B. Implement test-first
 
@@ -139,26 +171,70 @@ Skip TDD only when the step has no new behavior to test. Skip-eligible examples:
 1. Review your diff: each change should be intentional and match plan, approach, and behaviors. Remove debug prints, unrelated edits, dead code, or commented-out blocks.
 2. Confirm the step's behaviors (from behaviors.md) are now observable.
 3. Confirm every approach.md constraint you noted is satisfied (grep, find, or project introspection).
-4. If your implementation diverged from plan, approach, or behaviors, record the divergence as a nested bullet under the current step in progress.md — never silently diverge.
+4. If your implementation diverged from plan, approach, or behaviors, record the divergence in the matrix evidence or a mutable progress section — never silently diverge or edit the host-owned required section.
 5. Update all documentation the step's change affects — READMEs, CHANGELOGs, API references, inline comments, user guides, etc.
 
 ### D. Commit and advance
 
+{{#if is_followup_writer}}
+1. When the step requires a correction, make one commit per step. Include everything the step touched — code, tests, `tester.yaml` updates, pattern files, docs — in that commit. Write a message that describes what changed and follows the project's stated commit conventions (`AGENTS.md` / `CLAUDE.md`) — subject length, mood, prohibited trailers, and the like.
+   Treat subject length or style, body presence, body-line length or wrapping,
+   body formatting, and literal `\n` text as presentation advice: follow it
+   when practical, but
+   do not create corrective work or block completion solely to satisfy it.
+   Continue to obey commit-history, identity, message-encoding, and
+   `Co-Authored-By` requirements.
+2. If verification proves the previous Writer commit already satisfies the requested correction, preserve the clean candidate without creating a commit. Write {{no_change_declaration_path}} with this exact JSON shape:
+
+   ```json
+   {
+     "schema_version": 1,
+     "reason": "Why no correction was necessary",
+     "verification": [
+       {"command": "the command you ran", "result": "pass"}
+     ]
+   }
+   ```
+
+   `reason` and every `command` must be non-empty, and `verification` must contain at least one passing entry. Fluent deletes this file before every coder launch, so only evidence produced by this run can authorize no-change completion. Do not use this path when you changed the candidate, when verification did not pass, or when the workspace is dirty.
+3. Record completion in the interface described in Phase 2: update the matrix when present and leave its host-owned progress projection unchanged; otherwise mark the progress item with commit or verified no-change evidence.
+{{else}}
 1. Make one commit per step. Include everything the step touched — code, tests, `tester.yaml` updates, pattern files, docs — in that commit. Write a message that describes what changed and follows the project's stated commit conventions (`AGENTS.md` / `CLAUDE.md`) — subject length, mood, prohibited trailers, and the like.
-2. In progress.md: toggle `- [ ]` to `- [x]` and add a nested bullet below it with the commit hash and anything the next round should know.
-3. Move to the next `- [ ]` item.
+   Treat subject length or style, body presence, body-line length or wrapping,
+   body formatting, and literal `\n` text as presentation advice: follow it
+   when practical, but
+   do not create corrective work or block completion solely to satisfy it.
+   Continue to obey commit-history, identity, message-encoding, and
+   `Co-Authored-By` requirements.
+2. Record completion in the interface described in Phase 2: update the matrix when present and leave its host-owned progress projection unchanged; otherwise mark the progress item with commit evidence.
+{{/if}}
+Then move to the next `- [ ]` item.
 
-## Phase 4 — Final verification
+## Phase 4 — Focused verification
 
-Run all the test commands in `.fluent/tester.yaml`. Fix and re-run until everything passes.
+After committing, run `fluent task check-handoff <work-item-id> <attempt-id> <task-id>` from the assigned candidate workspace. It reports each handoff check against the candidate at that moment. A passing preflight does not end the Task or replace Fluent's final post-Writer rerun.
+
+Run the smallest harness-native test selections that give useful feedback for the files and behaviors you changed. Do not run the complete configured suite merely to duplicate Fluent's final Tester gate; Fluent runs that canonical suite once after reviewers pass. Expand your focused selection when failures or the change's risk justify it.
+
+Fluent has assigned this Attempt a private dependency cache through `CARGO_HOME`. Reuse it for focused Cargo commands. Do not override that variable or read from or write to the operator's global Cargo home. When confirming that admitted dependencies are sufficient, prefer Cargo's `--offline` option.
 
 ### Task is done when
 
+{{#if is_followup_writer}}
+- Every step is committed or explicitly verified as no-change.
+{{else}}
 - Every step is committed.
-- All test commands in `.fluent/tester.yaml` succeed.
+{{/if}}
+- Your focused verification succeeds. The final canonical Tester remains Fluent's responsibility after review.
 - The workspace has no unstaged, staged, or untracked changes — commit meaningful files; add generated ones to `.gitignore`.
 
-A Write Task with no new commits fails automatically.
+{{#if is_followup_writer}}
+A follow-up Write Task with no new commit succeeds only through the verified no-change declaration above. Initial Writers and every Writer without valid fresh evidence must produce a commit.
+{{else}}
+An initial Write Task with no new commits fails automatically.
+{{/if}}
+
+In your final response, include a concise `Verification` section. For every command you ran, report the exact command, pass/fail result, and the behavior or risk it covered. Also state which canonical commands you intentionally left to Fluent's final Tester. This summary is advisory review input; Fluent's final Tester artifact is the authoritative full-suite evidence.
 
 ## Rules during step execution
 

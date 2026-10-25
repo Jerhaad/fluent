@@ -1,9 +1,11 @@
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use crate::work_model::CoderMappingInputs;
+use crate::atomic_write::atomic_write;
+use crate::work_model::{CoderMapping, CoderMappingInputs, CoderModelPair};
 
 // -------------------------------------------------------------------------
 // Layered follow-up and scheduler policy
@@ -27,6 +29,26 @@ pub const DEFAULT_LEARNER_SCHEMA_REPAIR_BUDGET: u32 = 2;
 pub const DEFAULT_TRANSCRIPT_CONSOLE_PREVIEW_LIMIT: u32 = 8 * 1024;
 /// Built-in interval, in milliseconds, between transcript-pump status flushes.
 pub const DEFAULT_TRANSCRIPT_STATUS_FLUSH_INTERVAL_MS: u32 = 1000;
+/// Built-in time an autonomous Claude launch may remain before model progress.
+pub const DEFAULT_CLAUDE_NO_PROGRESS_TIMEOUT_SECONDS: u32 = 60;
+/// Built-in number of automatic same-Task relaunches after a safe no-progress timeout.
+pub const DEFAULT_CLAUDE_NO_PROGRESS_RETRIES: u32 = 2;
+/// Built-in first delay before a safe Claude no-progress relaunch. Later delays double.
+pub const DEFAULT_CLAUDE_NO_PROGRESS_BACKOFF_SECONDS: u32 = 5;
+/// Codex response silence allowed while no tool is active.
+pub const DEFAULT_CODEX_RESPONSE_TIMEOUT_SECONDS: u32 = 10 * 60;
+/// Same-session Codex continuations allowed within one Fluent Task.
+pub const DEFAULT_CODEX_RESPONSE_CONTINUATIONS: u32 = 2;
+/// Built-in maximum managed reviewer cache footprint for one project.
+pub const DEFAULT_REVIEWER_CACHE_MAX_PROJECT_GIB: u64 = 50;
+/// Built-in filesystem space reserved after a reviewer cache admission.
+pub const DEFAULT_REVIEWER_CACHE_MIN_FREE_GIB: u64 = 50;
+/// Built-in maximum concurrent logical runs for one provider across projects.
+pub const DEFAULT_PROVIDER_CONCURRENCY: u32 = 5;
+/// Built-in maximum approved behaviors or required Plan rows before Work
+/// creation needs an explicit large-scope authorization.
+pub const DEFAULT_PLANNING_SCOPE_LIMIT: u32 = 12;
+const GIB_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Which configuration layer supplied a resolved leaf.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +102,62 @@ impl fmt::Display for FollowUpMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
+}
+
+/// Atomically merge a configured setup profile into project configuration.
+pub fn apply_project_coder_profile(
+    root: &Path,
+    mapping: &CoderMapping,
+    mode: FollowUpMode,
+) -> Result<CoderMapping> {
+    preflight_project_coder_config(root)?;
+    let path = root.join(".fluent/config.yaml");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+    };
+    let mut document = if text.trim().is_empty() {
+        serde_yaml::Value::Mapping(Default::default())
+    } else {
+        serde_yaml::from_str(&text).context("parse existing project configuration")?
+    };
+    let root_map = document
+        .as_mapping_mut()
+        .ok_or_else(|| anyhow::anyhow!("project configuration must be a YAML mapping"))?;
+    let coders = mapping_at_mut(root_map, "coders")?;
+    write_role(coders, "writer", &mapping.write)?;
+    write_role(coders, "reviewer", &mapping.review)?;
+    if mode == FollowUpMode::Execute {
+        mapping_at_mut(root_map, "follow-up")?.insert("mode".into(), "execute".into());
+    }
+    let rendered = serde_yaml::to_string(&document).context("serialize project configuration")?;
+    atomic_write(&path, rendered.as_bytes())
+        .with_context(|| format!("write {}", path.display()))?;
+    Ok(mapping.clone())
+}
+
+fn mapping_at_mut<'a>(
+    map: &'a mut serde_yaml::Mapping,
+    key: &str,
+) -> Result<&'a mut serde_yaml::Mapping> {
+    let value = map
+        .entry(key.into())
+        .or_insert_with(|| serde_yaml::Value::Mapping(Default::default()));
+    value
+        .as_mapping_mut()
+        .ok_or_else(|| anyhow::anyhow!("configuration key {key:?} must be a mapping"))
+}
+
+fn write_role(coders: &mut serde_yaml::Mapping, name: &str, pair: &CoderModelPair) -> Result<()> {
+    let role = mapping_at_mut(coders, name)?;
+    role.insert("coder".into(), pair.coder.as_str().into());
+    role.insert("model".into(), pair.model.clone().into());
+    role.insert(
+        "effort".into(),
+        pair.effort.clone().unwrap_or_default().into(),
+    );
+    Ok(())
 }
 
 /// A resolved configuration value paired with the layer that supplied it.
@@ -161,13 +239,45 @@ pub struct ResolvedSchedulerConfig {
     pub max_local_concurrency: ResolvedLeaf<u32>,
 }
 
-/// Operator-facing transcript-pump thresholds resolved from project, then user,
-/// then built-in defaults. The pump uses these to bound console previews and to
-/// pace status flushes; they never affect canonical byte capture.
+/// Transcript-enabled launch settings resolved from project, then user, then
+/// built-in defaults. Capture thresholds never affect canonical bytes; the
+/// Claude recovery leaves are correctness-sensitive and may disable relaunch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedTranscriptPumpConfig {
     pub console_preview_limit: ResolvedLeaf<u32>,
     pub status_flush_interval_ms: ResolvedLeaf<u32>,
+    pub claude_no_progress_timeout_seconds: ResolvedLeaf<u32>,
+    pub claude_no_progress_retries: ResolvedLeaf<u32>,
+    pub claude_no_progress_backoff_seconds: ResolvedLeaf<u32>,
+    pub codex_response_timeout_seconds: ResolvedLeaf<u32>,
+    pub codex_response_continuations: ResolvedLeaf<u32>,
+}
+
+/// Reviewer cache limits resolved from project, then user, then built-in defaults.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedReviewerCacheConfig {
+    pub max_project_bytes: ResolvedLeaf<u64>,
+    pub min_free_bytes: ResolvedLeaf<u64>,
+}
+
+/// Shared and project-local provider admission limits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedProviderAdmissionConfig {
+    pub shared_concurrency: ResolvedLeaf<u32>,
+    pub project_concurrency: ResolvedLeaf<u32>,
+}
+
+/// Planning intake limits resolved from project, then user, then built-in
+/// defaults.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedPlanningConfig {
+    pub scope_limit: ResolvedLeaf<u32>,
+}
+
+/// Skill roots copied into an autonomous Codex worker's private home.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedCodexWorkerConfig {
+    pub skill_roots: Vec<PathBuf>,
 }
 
 /// A configured follow-up or scheduler value that could not be parsed or
@@ -196,10 +306,101 @@ impl std::error::Error for FollowUpConfigError {}
 
 /// One configuration layer: its precedence source, on-disk path, and parsed
 /// document (absent when the file does not exist).
+#[derive(Clone)]
 struct ConfigLayer {
     source: ConfigSource,
     path: PathBuf,
     doc: Option<serde_yaml::Value>,
+}
+
+/// Resolve provider capacity. Only user configuration can raise or lower the
+/// shared ceiling; a project may reduce its own use but cannot enlarge the pool.
+pub fn resolve_provider_admission_config(
+    project_root: &Path,
+    provider: &str,
+) -> Result<ResolvedProviderAdmissionConfig, FollowUpConfigError> {
+    resolve_provider_admission_config_from(
+        &project_config_path(project_root),
+        user_config_path().as_deref(),
+        provider,
+    )
+}
+
+fn resolve_provider_admission_config_from(
+    project_path: &Path,
+    user_path: Option<&Path>,
+    provider: &str,
+) -> Result<ResolvedProviderAdmissionConfig, FollowUpConfigError> {
+    let layers = load_policy_layers(project_path, user_path)?;
+    let user_layers = layers
+        .iter()
+        .filter(|layer| layer.source == ConfigSource::User)
+        .cloned()
+        .collect::<Vec<_>>();
+    let project_layers = layers
+        .iter()
+        .filter(|layer| layer.source == ConfigSource::Project)
+        .cloned()
+        .collect::<Vec<_>>();
+    let shared_concurrency = resolve_provider_count(
+        &user_layers,
+        "concurrency",
+        provider,
+        DEFAULT_PROVIDER_CONCURRENCY,
+    )?;
+    let project_limit = resolve_provider_count(
+        &project_layers,
+        "project-concurrency",
+        provider,
+        shared_concurrency.value,
+    )?;
+    let user_limit = resolve_provider_count(
+        &user_layers,
+        "project-concurrency",
+        provider,
+        shared_concurrency.value,
+    )?;
+    let configured_project = if project_limit.source == ConfigSource::Project {
+        project_limit
+    } else if user_limit.source == ConfigSource::User {
+        user_limit
+    } else {
+        ResolvedLeaf {
+            value: shared_concurrency.value,
+            source: shared_concurrency.source,
+        }
+    };
+    Ok(ResolvedProviderAdmissionConfig {
+        shared_concurrency,
+        project_concurrency: ResolvedLeaf {
+            value: configured_project.value.min(shared_concurrency.value),
+            source: configured_project.source,
+        },
+    })
+}
+
+fn resolve_provider_count(
+    layers: &[ConfigLayer],
+    section: &str,
+    provider: &str,
+    fallback: u32,
+) -> Result<ResolvedLeaf<u32>, FollowUpConfigError> {
+    let default = resolve_leaf(
+        layers,
+        &["providers", section, "default"],
+        fallback,
+        convert_positive_count,
+    )?;
+    let mut resolved = resolve_leaf(
+        layers,
+        &["providers", section, provider],
+        default.value,
+        convert_positive_count,
+    )?;
+    if resolved.source == ConfigSource::Default {
+        resolved.source = default.source;
+    }
+    Ok(resolved)
 }
 
 fn load_layer(source: ConfigSource, path: PathBuf) -> Result<ConfigLayer, FollowUpConfigError> {
@@ -222,6 +423,117 @@ fn load_layer(source: ConfigSource, path: PathBuf) -> Result<ConfigLayer, Follow
             }
         };
     Ok(ConfigLayer { source, path, doc })
+}
+
+/// Resolve the explicitly configured skill roots available to autonomous Codex
+/// workers. Project configuration may name only paths contained by the project;
+/// user configuration may additionally name absolute external paths.
+pub fn resolve_codex_worker_config(
+    project_root: &Path,
+) -> Result<ResolvedCodexWorkerConfig, FollowUpConfigError> {
+    resolve_codex_worker_config_from(
+        project_root,
+        &project_config_path(project_root),
+        user_config_path().as_deref(),
+    )
+}
+
+fn resolve_codex_worker_config_from(
+    project_root: &Path,
+    project_path: &Path,
+    user_path: Option<&Path>,
+) -> Result<ResolvedCodexWorkerConfig, FollowUpConfigError> {
+    let project_root =
+        std::fs::canonicalize(project_root).map_err(|error| FollowUpConfigError {
+            path: project_path.to_path_buf(),
+            key: "codex.skill-roots".to_string(),
+            detail: format!("could not resolve project root: {error}"),
+        })?;
+    let layers = load_policy_layers(project_path, user_path)?;
+    let mut skill_roots = Vec::new();
+    for layer in layers.iter().rev() {
+        let Some(doc) = layer.doc.as_ref() else {
+            continue;
+        };
+        let Some(raw) = lookup(doc, &["codex", "skill-roots"]) else {
+            continue;
+        };
+        let roots = raw.as_sequence().ok_or_else(|| FollowUpConfigError {
+            path: layer.path.clone(),
+            key: "codex.skill-roots".to_string(),
+            detail: "expected a sequence of paths".to_string(),
+        })?;
+        for (index, raw_root) in roots.iter().enumerate() {
+            let key = format!("codex.skill-roots[{index}]");
+            let text = raw_root.as_str().ok_or_else(|| FollowUpConfigError {
+                path: layer.path.clone(),
+                key: key.clone(),
+                detail: "expected a path string".to_string(),
+            })?;
+            if text.trim().is_empty() {
+                return Err(FollowUpConfigError {
+                    path: layer.path.clone(),
+                    key,
+                    detail: "expected a non-empty path".to_string(),
+                });
+            }
+            let configured = PathBuf::from(text);
+            let candidate = match layer.source {
+                ConfigSource::Project if configured.is_relative() => project_root.join(configured),
+                ConfigSource::Project => configured,
+                ConfigSource::User if configured.is_absolute() => configured,
+                ConfigSource::User => {
+                    return Err(FollowUpConfigError {
+                        path: layer.path.clone(),
+                        key,
+                        detail: "user skill roots must be absolute paths".to_string(),
+                    });
+                }
+                ConfigSource::Default => unreachable!("configuration layers are never defaults"),
+            };
+            let candidate_metadata =
+                std::fs::symlink_metadata(&candidate).map_err(|error| FollowUpConfigError {
+                    path: layer.path.clone(),
+                    key: key.clone(),
+                    detail: format!("could not inspect {}: {error}", candidate.display()),
+                })?;
+            if candidate_metadata.file_type().is_symlink() {
+                return Err(FollowUpConfigError {
+                    path: layer.path.clone(),
+                    key,
+                    detail: format!("skill root {} may not be a symlink", candidate.display()),
+                });
+            }
+            let canonical =
+                std::fs::canonicalize(&candidate).map_err(|error| FollowUpConfigError {
+                    path: layer.path.clone(),
+                    key: key.clone(),
+                    detail: format!("could not resolve {}: {error}", candidate.display()),
+                })?;
+            if !canonical.is_dir() {
+                return Err(FollowUpConfigError {
+                    path: layer.path.clone(),
+                    key,
+                    detail: format!("{} is not a directory", canonical.display()),
+                });
+            }
+            if layer.source == ConfigSource::Project && !canonical.starts_with(&project_root) {
+                return Err(FollowUpConfigError {
+                    path: layer.path.clone(),
+                    key,
+                    detail: format!(
+                        "project skill root {} escapes project {}",
+                        canonical.display(),
+                        project_root.display()
+                    ),
+                });
+            }
+            if !skill_roots.contains(&canonical) {
+                skill_roots.push(canonical);
+            }
+        }
+    }
+    Ok(ResolvedCodexWorkerConfig { skill_roots })
 }
 
 /// Look up a nested key path in a document. A key present but null is treated as
@@ -301,6 +613,21 @@ fn convert_priority(raw: &serde_yaml::Value) -> Result<i64, String> {
         .ok_or_else(|| "expected an integer".to_string())
 }
 
+fn convert_gib(raw: &serde_yaml::Value) -> Result<u64, String> {
+    let value = raw
+        .as_i64()
+        .ok_or_else(|| "expected a non-negative integer GiB value".to_string())?;
+    if value < 0 {
+        return Err(format!(
+            "expected a non-negative integer GiB value, found {value}"
+        ));
+    }
+    u64::try_from(value)
+        .map_err(|_| format!("value {value} is out of range"))?
+        .checked_mul(GIB_BYTES)
+        .ok_or_else(|| format!("value {value} GiB overflows bytes"))
+}
+
 fn digest_hex(canonical: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(canonical.as_bytes());
@@ -316,6 +643,68 @@ pub fn resolve_follow_up_policy(
         &project_config_path(project_root),
         user_config_path().as_deref(),
     )
+}
+
+/// Resolve reviewer cache safety limits. A malformed configured leaf fails
+/// closed so callers can run the reviewer cold while naming its source.
+pub fn resolve_reviewer_cache_config(
+    project_root: &Path,
+) -> Result<ResolvedReviewerCacheConfig, FollowUpConfigError> {
+    resolve_reviewer_cache_config_from(
+        &project_config_path(project_root),
+        user_config_path().as_deref(),
+    )
+}
+
+/// Resolve the deterministic Work-intake scope limit. A malformed configured
+/// value fails closed before a Work Item is created.
+pub fn resolve_planning_config(
+    project_root: &Path,
+) -> Result<ResolvedPlanningConfig, FollowUpConfigError> {
+    resolve_planning_config_from(
+        &project_config_path(project_root),
+        user_config_path().as_deref(),
+    )
+}
+
+fn resolve_planning_config_from(
+    project_path: &Path,
+    user_path: Option<&Path>,
+) -> Result<ResolvedPlanningConfig, FollowUpConfigError> {
+    let layers = load_policy_layers(project_path, user_path)?;
+    Ok(ResolvedPlanningConfig {
+        scope_limit: resolve_leaf(
+            &layers,
+            &["planning", "scope-limit"],
+            DEFAULT_PLANNING_SCOPE_LIMIT,
+            convert_positive_count,
+        )?,
+    })
+}
+
+pub(crate) fn resolve_reviewer_cache_config_from(
+    project_path: &Path,
+    user_path: Option<&Path>,
+) -> Result<ResolvedReviewerCacheConfig, FollowUpConfigError> {
+    let layers = load_policy_layers(project_path, user_path)?;
+    Ok(ResolvedReviewerCacheConfig {
+        max_project_bytes: resolve_leaf(
+            &layers,
+            &["reviewer-cache", "max-project-gib"],
+            DEFAULT_REVIEWER_CACHE_MAX_PROJECT_GIB
+                .checked_mul(GIB_BYTES)
+                .expect("built-in reviewer cache budget fits u64"),
+            convert_gib,
+        )?,
+        min_free_bytes: resolve_leaf(
+            &layers,
+            &["reviewer-cache", "min-free-gib"],
+            DEFAULT_REVIEWER_CACHE_MIN_FREE_GIB
+                .checked_mul(GIB_BYTES)
+                .expect("built-in reviewer free-space floor fits u64"),
+            convert_gib,
+        )?,
+    })
 }
 
 fn resolve_follow_up_policy_from(
@@ -445,9 +834,44 @@ pub(crate) fn resolve_transcript_pump_config_from(
         DEFAULT_TRANSCRIPT_STATUS_FLUSH_INTERVAL_MS,
         convert_positive_count,
     )?;
+    let claude_no_progress_timeout_seconds = resolve_leaf(
+        &layers,
+        &["provider-recovery", "claude", "no-progress-timeout-seconds"],
+        DEFAULT_CLAUDE_NO_PROGRESS_TIMEOUT_SECONDS,
+        convert_positive_count,
+    )?;
+    let claude_no_progress_retries = resolve_leaf(
+        &layers,
+        &["provider-recovery", "claude", "automatic-retries"],
+        DEFAULT_CLAUDE_NO_PROGRESS_RETRIES,
+        convert_count,
+    )?;
+    let claude_no_progress_backoff_seconds = resolve_leaf(
+        &layers,
+        &["provider-recovery", "claude", "retry-backoff-seconds"],
+        DEFAULT_CLAUDE_NO_PROGRESS_BACKOFF_SECONDS,
+        convert_count,
+    )?;
+    let codex_response_timeout_seconds = resolve_leaf(
+        &layers,
+        &["provider-recovery", "codex", "response-timeout-seconds"],
+        DEFAULT_CODEX_RESPONSE_TIMEOUT_SECONDS,
+        convert_positive_count,
+    )?;
+    let codex_response_continuations = resolve_leaf(
+        &layers,
+        &["provider-recovery", "codex", "automatic-continuations"],
+        DEFAULT_CODEX_RESPONSE_CONTINUATIONS,
+        convert_count,
+    )?;
     Ok(ResolvedTranscriptPumpConfig {
         console_preview_limit,
         status_flush_interval_ms,
+        claude_no_progress_timeout_seconds,
+        claude_no_progress_retries,
+        claude_no_progress_backoff_seconds,
+        codex_response_timeout_seconds,
+        codex_response_continuations,
     })
 }
 
@@ -472,14 +896,12 @@ struct Config {
 }
 
 #[derive(Debug, Deserialize, Default)]
-#[serde(rename_all = "kebab-case")]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
 struct CoderConfig {
     #[serde(default)]
     writer: RoleConfig,
     #[serde(default)]
     reviewer: RoleConfig,
-    #[serde(default)]
-    behavior_tests: RoleConfig,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -501,9 +923,23 @@ fn project_config_path(project_root: &Path) -> std::path::PathBuf {
     project_root.join(".fluent/config.yaml")
 }
 
-fn read_config(path: &Path) -> Option<Config> {
-    let contents = std::fs::read_to_string(path).ok()?;
-    serde_yaml::from_str(&contents).ok()
+/// Reject an unreadable or invalid project coder mapping before setup mutates
+/// the project or checks external providers.
+pub fn preflight_project_coder_config(project_root: &Path) -> Result<()> {
+    read_config(&project_config_path(project_root)).map(|_| ())
+}
+
+fn read_config(path: &Path) -> Result<Option<Config>> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("read coder config {}", path.display()));
+        }
+    };
+    serde_yaml::from_str(&contents)
+        .with_context(|| format!("parse coder config {}", path.display()))
+        .map(Some)
 }
 
 fn config_to_inputs(config: &Config) -> CoderMappingInputs {
@@ -512,35 +948,67 @@ fn config_to_inputs(config: &Config) -> CoderMappingInputs {
         write_model: config.coders.writer.model.clone(),
         review_coder: config.coders.reviewer.coder.clone(),
         review_model: config.coders.reviewer.model.clone(),
-        behavior_tests_coder: config.coders.behavior_tests.coder.clone(),
-        behavior_tests_model: config.coders.behavior_tests.model.clone(),
         global_coder: None,
         write_effort: config.coders.writer.effort.clone(),
         review_effort: config.coders.reviewer.effort.clone(),
-        behavior_tests_effort: config.coders.behavior_tests.effort.clone(),
     }
 }
 
 /// Read user (`~/.config/fluent/config.yaml`) then project
 /// (`.fluent/config.yaml`) config, layering project over user.
-pub fn from_config(project_root: &Path) -> CoderMappingInputs {
-    let user = user_config_path().and_then(|p| read_config(&p));
-    let project = read_config(&project_config_path(project_root));
+pub fn from_config(project_root: &Path) -> Result<CoderMappingInputs> {
+    let user = user_config_path()
+        .map(|path| read_config(&path))
+        .transpose()?
+        .flatten();
+    let project = read_config(&project_config_path(project_root))?;
 
     let base = user.as_ref().map(config_to_inputs).unwrap_or_default();
 
-    match project {
+    Ok(match project {
         Some(ref proj) => {
             let proj_inputs = config_to_inputs(proj);
             base.merge(proj_inputs)
         }
         None => base,
-    }
+    })
+}
+
+/// Resolve the configuration and environment layers used when a new Attempt
+/// snapshots its coder mapping. Existing Attempts must keep their persisted
+/// mapping and must not call this again when they resume.
+pub fn attempt_creation_inputs(project_root: &Path) -> Result<CoderMappingInputs> {
+    attempt_creation_inputs_with_environment(project_root, CoderMappingInputs::from_env())
+}
+
+/// Resolve creation inputs with an explicit environment layer. Production
+/// passes the supported `FLUENT_*` variables; tests pass a deterministic layer
+/// without mutating process-global environment state.
+fn attempt_creation_inputs_with_environment(
+    project_root: &Path,
+    environment: CoderMappingInputs,
+) -> Result<CoderMappingInputs> {
+    Ok(from_config(project_root)?.merge(environment))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn planning_scope_limit_resolves_from_project_and_rejects_zero() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project = tmp.path().join("project.yaml");
+        std::fs::write(&project, "planning:\n  scope-limit: 7\n").unwrap();
+        let resolved = resolve_planning_config_from(&project, None).unwrap();
+        assert_eq!(resolved.scope_limit.value, 7);
+        assert_eq!(resolved.scope_limit.source, ConfigSource::Project);
+
+        std::fs::write(&project, "planning:\n  scope-limit: 0\n").unwrap();
+        let error = resolve_planning_config_from(&project, None).unwrap_err();
+        assert_eq!(error.key, "planning.scope-limit");
+        assert!(error.detail.contains("positive integer"));
+    }
 
     #[test]
     fn parses_full_config() {
@@ -553,8 +1021,6 @@ coders:
   reviewer:
     coder: codex
     model: o3
-  behavior-tests:
-    coder: claude
 "#;
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.coders.writer.coder.as_deref(), Some("claude"));
@@ -565,11 +1031,6 @@ coders:
         assert_eq!(config.coders.writer.effort.as_deref(), Some("high"));
         assert_eq!(config.coders.reviewer.coder.as_deref(), Some("codex"));
         assert_eq!(config.coders.reviewer.model.as_deref(), Some("o3"));
-        assert_eq!(
-            config.coders.behavior_tests.coder.as_deref(),
-            Some("claude")
-        );
-        assert!(config.coders.behavior_tests.model.is_none());
     }
 
     #[test]
@@ -586,6 +1047,32 @@ coders:
             Some("claude-sonnet-4-6")
         );
         assert!(config.coders.reviewer.coder.is_none());
+    }
+
+    #[test]
+    fn rejects_retired_behavior_test_coder_config() {
+        let yaml = "coders:\n  behavior-tests:\n    coder: claude\n";
+        let error = serde_yaml::from_str::<Config>(yaml).unwrap_err();
+        assert!(format!("{error:#}").contains("behavior-tests"));
+    }
+
+    #[test]
+    fn configured_profile_rejects_retired_role_without_changing_config() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join(".fluent")).unwrap();
+        let path = directory.path().join(".fluent/config.yaml");
+        let original = "coders:\n  behavior-tests:\n    coder: claude\n";
+        std::fs::write(&path, original).unwrap();
+
+        let error = apply_project_coder_profile(
+            directory.path(),
+            &CoderMapping::default(),
+            FollowUpMode::Propose,
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("behavior-tests"));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
     }
 
     #[test]
@@ -607,10 +1094,6 @@ coders:
   reviewer:
     coder: codex
     model: o3
-  behavior-tests:
-    coder: claude
-    model: claude-opus-4-6
-    effort: low
 "#;
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         let inputs = config_to_inputs(&config);
@@ -619,12 +1102,6 @@ coders:
         assert_eq!(inputs.write_effort.as_deref(), Some("high"));
         assert_eq!(inputs.review_coder.as_deref(), Some("codex"));
         assert_eq!(inputs.review_model.as_deref(), Some("o3"));
-        assert_eq!(inputs.behavior_tests_coder.as_deref(), Some("claude"));
-        assert_eq!(
-            inputs.behavior_tests_model.as_deref(),
-            Some("claude-opus-4-6")
-        );
-        assert_eq!(inputs.behavior_tests_effort.as_deref(), Some("low"));
     }
 
     #[test]
@@ -638,16 +1115,43 @@ coders:
         )
         .unwrap();
 
-        let inputs = from_config(dir.path());
+        let inputs = from_config(dir.path()).unwrap();
         assert_eq!(inputs.write_model.as_deref(), Some("custom-model"));
     }
 
     #[test]
     fn from_config_returns_empty_when_no_config() {
         let dir = tempfile::tempdir().unwrap();
-        let inputs = from_config(dir.path());
+        let inputs = from_config(dir.path()).unwrap();
         assert!(inputs.write_coder.is_none());
         assert!(inputs.write_model.is_none());
+    }
+
+    #[test]
+    fn attempt_creation_inputs_layer_environment_over_project_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join(".fluent");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("config.yaml"),
+            "coders:\n  writer:\n    coder: codex\n    model: project-write\n  reviewer:\n    coder: claude\n    model: project-review\n",
+        )
+        .unwrap();
+
+        let inputs = attempt_creation_inputs_with_environment(
+            dir.path(),
+            CoderMappingInputs {
+                review_coder: Some("codex".to_string()),
+                review_model: Some("environment-review".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(inputs.write_coder.as_deref(), Some("codex"));
+        assert_eq!(inputs.write_model.as_deref(), Some("project-write"));
+        assert_eq!(inputs.review_coder.as_deref(), Some("codex"));
+        assert_eq!(inputs.review_model.as_deref(), Some("environment-review"));
     }
 
     #[test]
@@ -661,7 +1165,7 @@ coders:
         )
         .unwrap();
 
-        let inputs = from_config(dir.path());
+        let inputs = from_config(dir.path()).unwrap();
         assert_eq!(inputs.write_model.as_deref(), Some("project-model"));
     }
 
@@ -669,6 +1173,82 @@ coders:
         let path = dir.join(name);
         std::fs::write(&path, contents).unwrap();
         path
+    }
+
+    #[test]
+    fn provider_capacity_is_shared_by_user_and_lowered_by_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = write_yaml(
+            dir.path(),
+            "project.yaml",
+            "providers:\n  concurrency:\n    claude: 99\n  project-concurrency:\n    default: 4\n    codex: 2\n",
+        );
+        let user = write_yaml(
+            dir.path(),
+            "user.yaml",
+            "providers:\n  concurrency:\n    default: 5\n    codex: 3\n",
+        );
+
+        let claude =
+            resolve_provider_admission_config_from(&project, Some(&user), "claude").unwrap();
+        assert_eq!(claude.shared_concurrency.value, 5);
+        assert_eq!(claude.shared_concurrency.source, ConfigSource::User);
+        assert_eq!(claude.project_concurrency.value, 4);
+
+        let codex = resolve_provider_admission_config_from(&project, Some(&user), "codex").unwrap();
+        assert_eq!(codex.shared_concurrency.value, 3);
+        assert_eq!(codex.project_concurrency.value, 2);
+    }
+
+    #[test]
+    fn project_provider_capacity_cannot_raise_shared_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = write_yaml(
+            dir.path(),
+            "project.yaml",
+            "providers:\n  project-concurrency:\n    default: 20\n",
+        );
+        let user = write_yaml(
+            dir.path(),
+            "user.yaml",
+            "providers:\n  concurrency:\n    default: 2\n",
+        );
+        let resolved = resolve_provider_admission_config_from(&project, Some(&user), "pi").unwrap();
+        assert_eq!(resolved.shared_concurrency.value, 2);
+        assert_eq!(resolved.project_concurrency.value, 2);
+    }
+
+    #[test]
+    fn project_default_lowers_user_provider_specific_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = write_yaml(
+            dir.path(),
+            "project.yaml",
+            "providers:\n  project-concurrency:\n    default: 2\n",
+        );
+        let user = write_yaml(
+            dir.path(),
+            "user.yaml",
+            "providers:\n  concurrency:\n    default: 5\n  project-concurrency:\n    claude: 4\n",
+        );
+        let resolved =
+            resolve_provider_admission_config_from(&project, Some(&user), "claude").unwrap();
+        assert_eq!(resolved.shared_concurrency.value, 5);
+        assert_eq!(resolved.project_concurrency.value, 2);
+        assert_eq!(resolved.project_concurrency.source, ConfigSource::Project);
+    }
+
+    #[test]
+    fn invalid_provider_capacity_fails_closed_at_owning_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = write_yaml(
+            dir.path(),
+            "project.yaml",
+            "providers:\n  project-concurrency:\n    codex: 0\n",
+        );
+        let error = resolve_provider_admission_config_from(&project, None, "codex").unwrap_err();
+        assert_eq!(error.path, project);
+        assert_eq!(error.key, "providers.project-concurrency.codex");
     }
 
     #[test]
@@ -793,6 +1373,106 @@ coders:
             resolved.status_flush_interval_ms.value,
             DEFAULT_TRANSCRIPT_STATUS_FLUSH_INTERVAL_MS
         );
+        assert_eq!(
+            resolved.claude_no_progress_timeout_seconds.value,
+            DEFAULT_CLAUDE_NO_PROGRESS_TIMEOUT_SECONDS
+        );
+        assert_eq!(
+            resolved.claude_no_progress_retries.value,
+            DEFAULT_CLAUDE_NO_PROGRESS_RETRIES
+        );
+        assert_eq!(
+            resolved.claude_no_progress_backoff_seconds.value,
+            DEFAULT_CLAUDE_NO_PROGRESS_BACKOFF_SECONDS
+        );
+        assert_eq!(
+            resolved.codex_response_timeout_seconds.value,
+            DEFAULT_CODEX_RESPONSE_TIMEOUT_SECONDS
+        );
+        assert_eq!(
+            resolved.codex_response_continuations.value,
+            DEFAULT_CODEX_RESPONSE_CONTINUATIONS
+        );
+    }
+
+    #[test]
+    fn claude_no_progress_recovery_layers_each_leaf() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = write_yaml(
+            dir.path(),
+            "project.yaml",
+            "provider-recovery:\n  claude:\n    no-progress-timeout-seconds: 12\n    automatic-retries: 0\n",
+        );
+        let user = write_yaml(
+            dir.path(),
+            "user.yaml",
+            "provider-recovery:\n  claude:\n    no-progress-timeout-seconds: 90\n    automatic-retries: 4\n    retry-backoff-seconds: 3\n",
+        );
+
+        let resolved = resolve_transcript_pump_config_from(&project, Some(&user)).unwrap();
+
+        assert_eq!(resolved.claude_no_progress_timeout_seconds.value, 12);
+        assert_eq!(
+            resolved.claude_no_progress_timeout_seconds.source,
+            ConfigSource::Project
+        );
+        assert_eq!(resolved.claude_no_progress_retries.value, 0);
+        assert_eq!(resolved.claude_no_progress_backoff_seconds.value, 3);
+        assert_eq!(
+            resolved.claude_no_progress_backoff_seconds.source,
+            ConfigSource::User
+        );
+    }
+
+    #[test]
+    fn invalid_claude_no_progress_timeout_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = write_yaml(
+            dir.path(),
+            "project.yaml",
+            "provider-recovery:\n  claude:\n    no-progress-timeout-seconds: 0\n",
+        );
+
+        let error = resolve_transcript_pump_config_from(&project, None).unwrap_err();
+
+        assert_eq!(error.path, project);
+        assert_eq!(
+            error.key,
+            "provider-recovery.claude.no-progress-timeout-seconds"
+        );
+    }
+
+    #[test]
+    fn reviewer_cache_limits_layer_and_convert_gib_to_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = write_yaml(
+            dir.path(),
+            "project.yaml",
+            "reviewer-cache:\n  max-project-gib: 3\n",
+        );
+        let user = write_yaml(
+            dir.path(),
+            "user.yaml",
+            "reviewer-cache:\n  max-project-gib: 2\n  min-free-gib: 4\n",
+        );
+        let resolved = resolve_reviewer_cache_config_from(&project, Some(&user)).unwrap();
+        assert_eq!(resolved.max_project_bytes.value, 3 * GIB_BYTES);
+        assert_eq!(resolved.max_project_bytes.source, ConfigSource::Project);
+        assert_eq!(resolved.min_free_bytes.value, 4 * GIB_BYTES);
+        assert_eq!(resolved.min_free_bytes.source, ConfigSource::User);
+    }
+
+    #[test]
+    fn invalid_reviewer_cache_limit_names_owning_file_and_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = write_yaml(
+            dir.path(),
+            "project.yaml",
+            "reviewer-cache:\n  min-free-gib: no\n",
+        );
+        let error = resolve_reviewer_cache_config_from(&project, None).unwrap_err();
+        assert_eq!(error.path, project);
+        assert_eq!(error.key, "reviewer-cache.min-free-gib");
     }
 
     #[test]
@@ -938,6 +1618,129 @@ coders:
         assert_eq!(inputs.write_model.as_deref(), Some("o4-mini"));
         assert_eq!(inputs.review_coder.as_deref(), Some("claude"));
         assert!(inputs.review_model.is_none());
-        assert!(inputs.behavior_tests_coder.is_none());
+    }
+
+    #[test]
+    fn codex_skill_roots_combine_user_external_and_project_local_paths() {
+        let project_root = tempfile::tempdir().unwrap();
+        let project_skills = project_root.path().join("project-skills");
+        std::fs::create_dir(&project_skills).unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let project = write_yaml(
+            project_root.path(),
+            "project.yaml",
+            "codex:\n  skill-roots:\n    - project-skills\n",
+        );
+        let user = write_yaml(
+            project_root.path(),
+            "user.yaml",
+            &format!(
+                "codex:\n  skill-roots:\n    - {}\n",
+                external.path().display()
+            ),
+        );
+
+        let resolved =
+            resolve_codex_worker_config_from(project_root.path(), &project, Some(&user)).unwrap();
+
+        assert_eq!(
+            resolved.skill_roots,
+            vec![
+                std::fs::canonicalize(external.path()).unwrap(),
+                std::fs::canonicalize(project_skills).unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn project_codex_skill_root_cannot_escape_the_project() {
+        let project_root = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let project = write_yaml(
+            project_root.path(),
+            "project.yaml",
+            &format!(
+                "codex:\n  skill-roots:\n    - {}\n",
+                external.path().display()
+            ),
+        );
+
+        let error =
+            resolve_codex_worker_config_from(project_root.path(), &project, None).unwrap_err();
+
+        assert_eq!(error.key, "codex.skill-roots[0]");
+        assert!(error.detail.contains("escapes project"), "{error}");
+    }
+
+    #[test]
+    fn user_codex_skill_root_must_be_absolute() {
+        let project_root = tempfile::tempdir().unwrap();
+        let project = project_root.path().join("missing-project.yaml");
+        let user = write_yaml(
+            project_root.path(),
+            "user.yaml",
+            "codex:\n  skill-roots:\n    - relative-skills\n",
+        );
+
+        let error = resolve_codex_worker_config_from(project_root.path(), &project, Some(&user))
+            .unwrap_err();
+
+        assert_eq!(error.key, "codex.skill-roots[0]");
+        assert!(error.detail.contains("must be absolute"), "{error}");
+    }
+
+    #[test]
+    fn configured_codex_skill_root_must_exist() {
+        let project_root = tempfile::tempdir().unwrap();
+        let project = write_yaml(
+            project_root.path(),
+            "project.yaml",
+            "codex:\n  skill-roots:\n    - missing-skills\n",
+        );
+
+        let error =
+            resolve_codex_worker_config_from(project_root.path(), &project, None).unwrap_err();
+
+        assert_eq!(error.key, "codex.skill-roots[0]");
+        assert!(error.detail.contains("could not inspect"), "{error}");
+    }
+
+    #[test]
+    fn configured_codex_skill_root_must_be_a_directory() {
+        let project_root = tempfile::tempdir().unwrap();
+        std::fs::write(project_root.path().join("skills.txt"), "not a root").unwrap();
+        let project = write_yaml(
+            project_root.path(),
+            "project.yaml",
+            "codex:\n  skill-roots:\n    - skills.txt\n",
+        );
+
+        let error =
+            resolve_codex_worker_config_from(project_root.path(), &project, None).unwrap_err();
+
+        assert_eq!(error.key, "codex.skill-roots[0]");
+        assert!(error.detail.contains("is not a directory"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_codex_skill_root_may_not_be_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let project_root = tempfile::tempdir().unwrap();
+        let real_root = project_root.path().join("real-skills");
+        std::fs::create_dir(&real_root).unwrap();
+        symlink(&real_root, project_root.path().join("skill-alias")).unwrap();
+        let project = write_yaml(
+            project_root.path(),
+            "project.yaml",
+            "codex:\n  skill-roots:\n    - skill-alias\n",
+        );
+
+        let error =
+            resolve_codex_worker_config_from(project_root.path(), &project, None).unwrap_err();
+
+        assert_eq!(error.key, "codex.skill-roots[0]");
+        assert!(error.detail.contains("may not be a symlink"), "{error}");
     }
 }

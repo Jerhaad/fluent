@@ -10,16 +10,31 @@ This is derived corrective Work with no brief, behaviors, approach, or plan. The
 {{/if}}
 Review the codebase at {{candidate_workspace_path}}.
 
+Open the supplied absolute paths directly; do not discover them by listing parent directories.
+Fluent grants the exact review workspace and named evidence files, while their parent and sibling
+directories may remain intentionally unreadable.
+
 ## Phase 1 — Understand the Work Item
 
 1. Read Brief at {{brief_path}} — what to review and why.
-2. Read the expertise indexes. Each index is a list of expertise files you can load as needed in Phase 3.
+2. Read the generated current context at {{execution_context_path}}. It contains
+   exact candidate/base commits, changed files, unresolved steps, deduplicated
+   current findings, passing evidence, executed commands, and historical artifact
+   paths. Open a historical artifact only when the current review needs its detail.
+3. Read the expertise indexes. Each index is a list of expertise files you can load as needed in Phase 3.
    - {{general_expertise_index}} — architecture, testing, documentation, tooling
 {{#if has_project_expertise_index}}
    - {{project_expertise_index}} — workspace-specific decisions, conventions, patterns
 {{/if}}
 {{#if decisions_path}}
-3. Read recorded decisions at {{decisions_path}} — project-accepted choices not to flag in findings.
+4. Read recorded decisions at {{decisions_path}} — project-accepted choices not to flag in findings.
+{{/if}}
+{{#if has_work_item_inputs}}
+
+### Authoritative Work Item inputs
+
+Read each preserved Work Item input. These immutable files are authoritative review inputs:
+{{work_item_inputs_list}}
 {{/if}}
 
 ## Phase 2 — Inspect the codebase
@@ -57,7 +72,37 @@ Review the codebase at {{candidate_workspace_path}}.
 
 If you found nothing, still write the file with `Verdict: pass` and an empty `## Findings` section.
 
-The Task completes when the review report exists at {{review_path}}.
+For a passing verdict, also write candidate-bound inspection evidence to
+{{review_inspection_path}}. Use this exact JSON shape:
+
+```json
+{
+  "schema-version": 1,
+  "candidate-commit": "{{candidate_commit}}",
+  "role": "{{role}}",
+  "inspections": [
+    {
+      "path": "path/to/tracked-candidate-file",
+      "summary": "What this role checked in that file"
+    }
+  ]
+}
+```
+
+Each path must be a canonical repository-relative file path tracked by candidate
+commit {{candidate_commit}}. Include at least one file. When no file is specific
+to your role, inspect a tracked candidate file that lets you establish that no
+role-specific concern applies and explain that conclusion in `summary`. Do not
+write this artifact for a fail or uncertain verdict. At least one successful
+provider tool call must identify the exact candidate and one declared file in
+the same call. It may use the file's joined absolute path, the candidate
+workspace plus its repository-relative path, or candidate commit
+{{candidate_commit}} plus its repository-relative path (for example, a Git
+`commit:path` read). A workspace, commit, or relative path alone is
+insufficient.
+
+The Task completes when the review report exists at {{review_path}} and a
+passing report has valid inspection evidence at {{review_inspection_path}}.
 
 ## Rules during review
 
@@ -65,11 +110,14 @@ The Task completes when the review report exists at {{review_path}}.
 
 Do not edit or commit in {{candidate_workspace_path}}. Multiple reviewers run against it concurrently.
 
-### Build cache and writable outputs
+### Executable evidence
 
-- You may READ the workspace's existing build outputs (binaries, compiled artifacts, installed dependencies) freely.
-- Fluent has pre-populated your reviewer artifact directory at {{artifact_dir}} with copies of those build outputs for warm-start incremental builds. When you need to build new outputs (for example, ephemeral tests to verify a finding), redirect them there.
-- For Cargo: `CARGO_TARGET_DIR="{{artifact_dir}}/target" cargo build` (or cargo test). If a binary you need already exists in the workspace, invoke it directly from the workspace instead of recompiling.
+- Use existing exact-commit evidence before running another command.
+- Do not rerun a full suite.
+{{#if is_review_tests}}
+- For a concrete finding that lacks one result, you may run one named missing evidence check. Review-only work does not provision a shared build cache; keep build outputs outside {{artifact_dir}}.
+{{/if}}
+- Keep review.md, logs, transcripts, and small diagnostic text in {{artifact_dir}}. Do not create build caches there.
 
 {{#if decisions_path}}
 ### Do not flag against recorded decisions

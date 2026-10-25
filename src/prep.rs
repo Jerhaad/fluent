@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub struct Toolchain {
@@ -44,7 +44,20 @@ pub fn populate_reviewer_cache(
 ) -> Result<()> {
     for dir_name in toolchain.dirs {
         let src = candidate.join(dir_name);
-        if !src.is_dir() {
+        let metadata = match std::fs::symlink_metadata(&src) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to inspect {}", src.display()));
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            anyhow::bail!(
+                "canonical build directory {} must not be a symlink",
+                src.display()
+            );
+        }
+        if !metadata.is_dir() {
             continue;
         }
         let dst = artifact_dir.join(dir_name);
@@ -58,6 +71,175 @@ pub fn populate_reviewer_cache(
         })?;
     }
     Ok(())
+}
+
+/// Copy every canonical managed cache directory found directly below `source`
+/// into `destination`. This is used to relocate custom reviewer-hook caches out
+/// of durable artifact areas without copying unrelated hook evidence.
+pub fn populate_managed_cache(source: &Path, destination: &Path) -> Result<()> {
+    std::fs::create_dir_all(destination).with_context(|| {
+        format!(
+            "failed to create managed cache destination {}",
+            destination.display()
+        )
+    })?;
+    for src in managed_cache_dirs(source)? {
+        let name = src
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("managed cache has no directory name"))?;
+        let dst = destination.join(name);
+        copy_dir_with_fallback(&src, &dst).with_context(|| {
+            format!(
+                "failed to relocate managed reviewer cache {} to {}",
+                src.display(),
+                dst.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// Return the canonical build-cache directories present directly under `root`.
+fn managed_cache_dirs(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut dirs = Vec::new();
+    for name in TOOLCHAINS.iter().flat_map(|toolchain| toolchain.dirs) {
+        let path = root.join(name);
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            anyhow::bail!(
+                "canonical managed cache {} must not be a symlink",
+                path.display()
+            );
+        }
+        if metadata.is_dir() && !dirs.contains(&path) {
+            dirs.push(path);
+        }
+    }
+    Ok(dirs)
+}
+
+/// Sum regular-file lengths below canonical cache directories without following
+/// symlinks. Metadata failures and arithmetic overflow fail closed.
+pub fn managed_cache_bytes(root: &Path) -> Result<u64> {
+    let mut total = 0_u64;
+    for path in managed_cache_dirs(root)? {
+        total = total
+            .checked_add(directory_logical_bytes(&path)?)
+            .ok_or_else(|| {
+                anyhow::anyhow!("managed cache size overflow below {}", root.display())
+            })?;
+    }
+    Ok(total)
+}
+
+pub fn toolchain_cache_bytes(root: &Path, toolchain: &Toolchain) -> Result<u64> {
+    let mut total = 0_u64;
+    for name in toolchain.dirs {
+        let path = root.join(name);
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            anyhow::bail!(
+                "canonical build directory {} must not be a symlink",
+                path.display()
+            );
+        }
+        if metadata.is_dir() {
+            total = total
+                .checked_add(directory_logical_bytes(&path)?)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("build cache size overflow below {}", root.display())
+                })?;
+        }
+    }
+    Ok(total)
+}
+
+/// Sum regular-file lengths below `root` without following symlinks.
+pub fn logical_bytes(root: &Path) -> Result<u64> {
+    directory_logical_bytes(root)
+}
+
+fn directory_logical_bytes(path: &Path) -> Result<u64> {
+    let mut total = 0_u64;
+    for entry in std::fs::read_dir(path)
+        .with_context(|| format!("failed to read managed cache directory {}", path.display()))?
+    {
+        let entry = entry?;
+        let metadata = std::fs::symlink_metadata(entry.path())?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
+            total = total
+                .checked_add(directory_logical_bytes(&entry.path())?)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("managed cache size overflow below {}", path.display())
+                })?;
+        } else if metadata.is_file() {
+            total = total.checked_add(metadata.len()).ok_or_else(|| {
+                anyhow::anyhow!("managed cache size overflow below {}", path.display())
+            })?;
+        }
+    }
+    Ok(total)
+}
+
+/// Return free bytes on the filesystem that contains `path`.
+pub fn filesystem_free_bytes(path: &Path) -> Result<u64> {
+    let stat = rustix::fs::statvfs(path).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to inspect free space at {}: {error}",
+            path.display()
+        )
+    })?;
+    u64::try_from(stat.f_bavail)
+        .ok()
+        .and_then(|blocks| blocks.checked_mul(u64::from(stat.f_frsize)))
+        .ok_or_else(|| anyhow::anyhow!("free-space calculation overflow at {}", path.display()))
+}
+
+/// Remove only canonical managed cache directories, preserving every other
+/// reviewer artifact.
+pub fn remove_managed_cache_dirs(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut dirs = Vec::new();
+    for name in TOOLCHAINS.iter().flat_map(|toolchain| toolchain.dirs) {
+        let path = root.join(name);
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_dir() || metadata.file_type().is_symlink() => {
+                if !dirs.contains(&path) {
+                    dirs.push(path);
+                }
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
+            }
+        }
+    }
+    for path in &dirs {
+        let result = if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+            std::fs::remove_file(path)
+        } else {
+            std::fs::remove_dir_all(path)
+        };
+        result.with_context(|| {
+            format!("failed to remove managed reviewer cache {}", path.display())
+        })?;
+    }
+    Ok(dirs)
 }
 
 fn copy_dir_with_fallback(src: &Path, dst: &Path) -> Result<()> {
@@ -78,6 +260,27 @@ fn copy_dir_with_fallback(src: &Path, dst: &Path) -> Result<()> {
     }
     anyhow::bail!(
         "All copy strategies failed for {} -> {}",
+        src.display(),
+        dst.display()
+    )
+}
+
+/// Copy a writable private cache without ever hard-linking it to the source.
+/// Clone/reflink copies are safe because writes use copy-on-write; the final
+/// fallback is an ordinary recursive copy.
+pub(crate) fn copy_private_cache_dir(src: &Path, dst: &Path) -> Result<()> {
+    if cfg!(target_os = "macos") {
+        if try_cp(src, dst, &["-cR"]) {
+            return Ok(());
+        }
+    } else if try_cp(src, dst, &["-R", "--reflink=auto"]) {
+        return Ok(());
+    }
+    if try_cp(src, dst, &["-R"]) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "All private copy strategies failed for {} -> {}",
         src.display(),
         dst.display()
     )
@@ -212,5 +415,42 @@ mod tests {
         let tc = &TOOLCHAINS[0]; // rust — no target/ dir
         populate_reviewer_cache(&candidate, &artifact, tc).unwrap();
         assert!(!artifact.join("target").exists());
+    }
+
+    #[test]
+    fn managed_cache_bytes_counts_regular_files_without_following_links() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("target/nested")).unwrap();
+        std::fs::write(tmp.path().join("target/nested/output"), b"1234").unwrap();
+        std::fs::write(tmp.path().join("notes"), b"preserved").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(tmp.path().join("notes"), tmp.path().join("target/link"))
+            .unwrap();
+        assert_eq!(managed_cache_bytes(tmp.path()).unwrap(), 4);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_a_canonical_cache_symlink() {
+        let tmp = TempDir::new().unwrap();
+        let external = tmp.path().join("external");
+        std::fs::create_dir_all(&external).unwrap();
+        std::os::unix::fs::symlink(&external, tmp.path().join("target")).unwrap();
+
+        let error = managed_cache_bytes(tmp.path()).unwrap_err();
+        assert!(error.to_string().contains("must not be a symlink"));
+    }
+
+    #[test]
+    fn removes_only_canonical_managed_cache_dirs() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("target")).unwrap();
+        std::fs::write(tmp.path().join("review.md"), "evidence").unwrap();
+        remove_managed_cache_dirs(tmp.path()).unwrap();
+        assert!(!tmp.path().join("target").exists());
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("review.md")).unwrap(),
+            "evidence"
+        );
     }
 }

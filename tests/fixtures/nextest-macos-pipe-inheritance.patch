@@ -1,0 +1,16 @@
+--- a/nextest-runner/src/test_command/imp.rs
++++ b/nextest-runner/src/test_command/imp.rs
+@@ -42,6 +42,13 @@
+     strategy: CaptureStrategy,
+     stdin_passthrough: bool,
+ ) -> std::io::Result<Child> {
++    // macOS creates pipes and marks them close-on-exec in separate calls.
++    // Exclude sibling launches from that interval without waiting for test completion.
++    #[cfg(target_os = "macos")]
++    static SPAWN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
++    #[cfg(target_os = "macos")]
++    let _spawn_guard = SPAWN_LOCK.lock().unwrap_or_else(|error| error.into_inner());
++
+     if stdin_passthrough {
+         cmd.stdin(Stdio::inherit());
+     } else {

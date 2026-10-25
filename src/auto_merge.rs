@@ -224,7 +224,14 @@ fn mark_auto_merge_skipped(store: &WorkModelStore, work_item_id: &str, candidate
         {
             candidate.merge_state.auto_merge_skipped = Some(true);
         }
-        store.write_work_item(&item)?;
+        store.write_work_item_with_transition(
+            &item,
+            &crate::work_model::DurableTransitionMetadata {
+                origin: crate::work_model::DurableTransitionOrigin::Landing,
+                reason: Some("skip automatic landing".to_string()),
+                evidence_ref: None,
+            },
+        )?;
         Ok(())
     })();
     if let Err(err) = result {
@@ -314,6 +321,9 @@ mod tests {
                     },
                     artifact_area: None,
                     review_context: None,
+                    writer_correction_assignment: None,
+                    verification_context: None,
+                    evidence_review_context: None,
                     input_artifacts: vec![],
                     depends_on: None,
                     output: Some(TaskOutput {
@@ -322,6 +332,8 @@ mod tests {
                         source_branch: "main".to_string(),
                         base_commit: None,
                         commit: "abc123".to_string(),
+                        no_change: None,
+                        learner_canonicalization: None,
                     }),
                     created_at: None,
                     started_at: None,
@@ -364,8 +376,10 @@ mod tests {
                 review_artifacts: vec![],
                 auto_merge_skipped,
                 follow_up_failure: None,
+                landing_intent: None,
             },
             created_at: None,
+            ready_at: None,
             started_at: None,
             completed_at: None,
         });

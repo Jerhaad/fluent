@@ -1,17 +1,23 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::process::Command;
 
 use serde::Deserialize;
 
-const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 const EXPIRY_MARGIN_MS: i64 = 5 * 60 * 1000;
 
 #[derive(Debug, Clone)]
 pub enum AuthError {
-    Expired { expires_at: i64 },
-    Rejected { request_id: Option<String> },
+    Expired {
+        expires_at: i64,
+    },
+    Rejected {
+        request_id: Option<String>,
+    },
+    NotLoggedIn,
+    RefreshFailed {
+        failure: crate::claude_diagnostics::ClaudeProbeFailure,
+    },
 }
 
 impl std::fmt::Display for AuthError {
@@ -27,8 +33,26 @@ impl AuthError {
         let prefix = match self {
             AuthError::Expired { .. } => "Claude auth token expired.",
             AuthError::Rejected { .. } => "Claude auth token rejected (HTTP 401).",
+            AuthError::NotLoggedIn => "Claude is not logged in.",
+            AuthError::RefreshFailed { failure } => {
+                return failure.task_user_message("credential refresh");
+            }
         };
         format!("{prefix} Run 'claude /login' to re-authenticate, then 'fluent attempt run'.")
+    }
+
+    pub fn is_authentication_error(&self) -> bool {
+        match self {
+            Self::RefreshFailed { failure } => failure.is_authentication(),
+            Self::Expired { .. } | Self::Rejected { .. } | Self::NotLoggedIn => true,
+        }
+    }
+
+    pub fn probe_failure(&self) -> Option<&crate::claude_diagnostics::ClaudeProbeFailure> {
+        match self {
+            Self::RefreshFailed { failure } => Some(failure),
+            _ => None,
+        }
     }
 }
 
@@ -49,10 +73,7 @@ struct ClaudeAiOauth {
 }
 
 fn read_keychain() -> Option<ClaudeAiOauth> {
-    let output = Command::new("security")
-        .args(["find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"])
-        .output()
-        .ok()?;
+    let output = crate::credential::claude_keychain_command().output().ok()?;
 
     if !output.status.success() {
         return None;
@@ -93,9 +114,11 @@ pub fn ensure_not_expired() -> Result<(), AuthError> {
     )
 }
 
-/// Walk a transcript JSONL file and return `AuthError::Rejected` if
-/// the most recent `result` event has `api_error_status == 401`.
-pub fn classify_transcript_401(transcript_path: &Path) -> Option<AuthError> {
+/// Walk a transcript JSONL file and classify the most recent structured Claude
+/// authentication outcome. Besides HTTP 401 results, Claude can emit an
+/// assistant event with `error: "authentication_failed"` when its launch home
+/// has no usable credential. A later successful result clears earlier evidence.
+pub fn classify_transcript_auth_failure(transcript_path: &Path) -> Option<AuthError> {
     let file = File::open(transcript_path).ok()?;
     let reader = BufReader::new(file);
 
@@ -104,21 +127,37 @@ pub fn classify_transcript_401(transcript_path: &Path) -> Option<AuthError> {
         let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
-        if val.get("type").and_then(|v| v.as_str()) != Some("result") {
-            continue;
-        }
-        let status = val.get("api_error_status").and_then(|v| v.as_i64());
-        if status == Some(401) {
-            let request_id = val
-                .get("request_id")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            last = Some(AuthError::Rejected { request_id });
-        } else {
-            last = None;
+        match val.get("type").and_then(|value| value.as_str()) {
+            Some("assistant")
+                if val.get("error").and_then(|value| value.as_str())
+                    == Some("authentication_failed") =>
+            {
+                last = Some(AuthError::NotLoggedIn);
+            }
+            Some("result") => {
+                if val.get("api_error_status").and_then(|value| value.as_i64()) == Some(401) {
+                    let request_id = val
+                        .get("request_id")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string);
+                    last = Some(AuthError::Rejected { request_id });
+                } else if !matches!(last, Some(AuthError::NotLoggedIn))
+                    || val.get("is_error").and_then(|value| value.as_bool()) != Some(true)
+                {
+                    last = None;
+                }
+            }
+            _ => {}
         }
     }
     last
+}
+
+/// Walk a transcript JSONL file and return `AuthError::Rejected` if
+/// the most recent `result` event has `api_error_status == 401`.
+pub fn classify_transcript_401(transcript_path: &Path) -> Option<AuthError> {
+    classify_transcript_auth_failure(transcript_path)
+        .filter(|error| matches!(error, AuthError::Rejected { .. }))
 }
 
 #[cfg(test)]
@@ -168,6 +207,7 @@ mod tests {
             AuthError::Rejected {
                 request_id: Some("req-test".into()),
             },
+            AuthError::NotLoggedIn,
         ] {
             let msg = err.user_message();
             assert!(
@@ -179,6 +219,20 @@ mod tests {
                 "should name resume command: {msg}"
             );
         }
+    }
+
+    #[test]
+    fn non_auth_refresh_failure_does_not_name_login() {
+        let err = AuthError::RefreshFailed {
+            failure: crate::claude_diagnostics::ClaudeProbeFailure::new(
+                crate::claude_diagnostics::ClaudeProbeFailureKind::Network,
+                "connection refused",
+            ),
+        };
+        let message = err.user_message();
+        assert!(!err.is_authentication_error());
+        assert!(!message.contains("/login"));
+        assert!(message.contains("Restore network access"));
     }
 
     // -- KeychainEnvelope deserialization tests --
@@ -374,6 +428,48 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nonexistent.jsonl");
         assert!(classify_transcript_401(&path).is_none());
+    }
+
+    #[test]
+    fn classify_transcript_auth_failure_recognizes_not_logged_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        let mut f = File::create(&path).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"system","subtype":"init","apiKeySource":"none"}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"assistant","error":"authentication_failed","message":{{"content":[{{"type":"text","text":"Not logged in"}}]}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"result","is_error":true,"api_error_status":null}}"#
+        )
+        .unwrap();
+
+        assert!(matches!(
+            classify_transcript_auth_failure(&path),
+            Some(AuthError::NotLoggedIn)
+        ));
+    }
+
+    #[test]
+    fn classify_transcript_auth_failure_clears_not_logged_in_after_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        let mut f = File::create(&path).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"assistant","error":"authentication_failed"}}"#
+        )
+        .unwrap();
+        writeln!(f, r#"{{"type":"result","is_error":false}}"#).unwrap();
+
+        assert!(classify_transcript_auth_failure(&path).is_none());
     }
 
     #[test]

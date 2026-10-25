@@ -4,12 +4,170 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_PI_MODEL: &str = "qwen3.6-35b-a3b";
+pub(crate) const PROVIDER_STDERR_FILENAME: &str = "provider-stderr.log";
+pub(crate) const PROVIDER_TIMING_FILENAME: &str = "provider-timing.json";
+const PROVIDER_ARGUMENT_DIAGNOSTIC_LIMIT: usize = 512;
 
-fn trusted_sandbox_executable() -> std::ffi::OsString {
-    crate::os::sandbox_launcher(true)
+/// A provider process rejected Fluent's configured command-line arguments
+/// before it could produce role output. This preserves process-level origin so
+/// task settlement never infers recoverability from arbitrary error text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderArgumentError {
+    pub provider: CoderKind,
+    pub exit_status: i32,
+    pub diagnostic: String,
+    pub invocation: String,
+}
+
+impl std::fmt::Display for ProviderArgumentError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} rejected provider arguments (exit {}): {}",
+            self.provider.as_str(),
+            self.exit_status,
+            self.diagnostic
+        )
+    }
+}
+
+impl std::error::Error for ProviderArgumentError {}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ProviderRetryTiming {
+    pub schema_version: u32,
+    #[serde(default)]
+    pub retry_count: u64,
+    #[serde(default)]
+    pub wait_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_since_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub absorbed_through_phase: Option<u32>,
+}
+
+/// Keep provider diagnostics inside the same task-owned artifact boundary as
+/// the canonical transcript. Besides preserving evidence, this prevents a
+/// sandboxed provider from inheriting a scheduler log descriptor that its own
+/// runtime cannot inspect.
+pub(crate) fn provider_stderr_path(transcript_path: &Path) -> PathBuf {
+    transcript_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(PROVIDER_STDERR_FILENAME)
+}
+
+pub(crate) fn provider_timing_path(transcript_path: &Path) -> PathBuf {
+    transcript_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(PROVIDER_TIMING_FILENAME)
+}
+
+pub(crate) fn read_provider_retry_timing(path: &Path) -> Option<ProviderRetryTiming> {
+    let mut timing: ProviderRetryTiming =
+        serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    if timing.schema_version != 1 {
+        return None;
+    }
+    timing.settle(provider_timing_now_ms(), false);
+    Some(timing)
+}
+
+impl ProviderRetryTiming {
+    fn settle(&mut self, now: u64, clear: bool) {
+        if let (Some(started), Some(resume)) = (self.waiting_since_ms, self.resume_at_ms) {
+            self.wait_ms = self
+                .wait_ms
+                .saturating_add(now.min(resume).saturating_sub(started));
+            self.waiting_since_ms = Some(now.min(resume));
+        }
+        if clear || self.resume_at_ms.is_some_and(|resume| resume <= now) {
+            self.waiting_since_ms = None;
+            self.resume_at_ms = None;
+        }
+    }
+}
+
+fn provider_timing_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn write_provider_retry_wait(transcript_path: &Path, wait: Duration) -> Result<()> {
+    let path = provider_timing_path(transcript_path);
+    let now = provider_timing_now_ms();
+    let mut timing = read_provider_retry_timing(&path).unwrap_or(ProviderRetryTiming {
+        schema_version: 1,
+        ..ProviderRetryTiming::default()
+    });
+    timing.retry_count = timing.retry_count.saturating_add(1);
+    timing.waiting_since_ms = Some(now);
+    timing.resume_at_ms = Some(now.saturating_add(wait.as_millis() as u64));
+    crate::atomic_write::atomic_write(&path, &serde_json::to_vec_pretty(&timing)?)?;
+    Ok(())
+}
+
+fn finish_provider_retry_wait(transcript_path: &Path) -> Result<()> {
+    let path = provider_timing_path(transcript_path);
+    let Some(mut timing) = read_provider_retry_timing(&path) else {
+        return Ok(());
+    };
+    timing.settle(provider_timing_now_ms(), true);
+    crate::atomic_write::atomic_write(&path, &serde_json::to_vec_pretty(&timing)?)?;
+    Ok(())
+}
+
+fn absorb_pump_provider_timing(transcript_path: &Path, phase: u32) -> Result<()> {
+    let status_path = crate::transcript_pump::status_path_for(transcript_path);
+    let Some(status) = std::fs::read(&status_path).ok().and_then(|bytes| {
+        serde_json::from_slice::<crate::transcript_pump::PumpStatus>(&bytes).ok()
+    }) else {
+        return Ok(());
+    };
+    let path = provider_timing_path(transcript_path);
+    let mut timing = read_provider_retry_timing(&path).unwrap_or(ProviderRetryTiming {
+        schema_version: 1,
+        ..ProviderRetryTiming::default()
+    });
+    if timing
+        .absorbed_through_phase
+        .is_some_and(|absorbed| absorbed >= phase)
+    {
+        return Ok(());
+    }
+    timing.retry_count = timing
+        .retry_count
+        .saturating_add(status.provider_timing.retry_count);
+    timing.wait_ms = timing
+        .wait_ms
+        .saturating_add(status.provider_timing.wait_ms);
+    timing.absorbed_through_phase = Some(phase);
+    crate::atomic_write::atomic_write(&path, &serde_json::to_vec_pretty(&timing)?)?;
+    Ok(())
+}
+
+fn prepare_transcript_retry_phase(
+    transcript_file: Option<&Path>,
+    phase: &mut u32,
+) -> std::result::Result<(), crate::transcript_pump::TranscriptPumpError> {
+    if let Some(path) = transcript_file
+        && let Err(error) = absorb_pump_provider_timing(path, *phase)
+    {
+        eprintln!("warning: could not preserve provider retry timing: {error:#}");
+    }
+    preserve_transcript_phase(transcript_file, phase)
+}
+
+fn trusted_sandbox_executable() -> &'static str {
+    "/usr/bin/sandbox-exec"
 }
 
 fn claude_model() -> Option<String> {
@@ -150,6 +308,16 @@ impl CoderKind {
         model: Option<&str>,
         effort: Option<&str>,
     ) -> Box<dyn Coder> {
+        self.boxed_with_model_and_executable(sandbox, model, effort, None)
+    }
+
+    pub(crate) fn boxed_with_model_and_executable(
+        &self,
+        sandbox: CoderSandbox,
+        model: Option<&str>,
+        effort: Option<&str>,
+        executable: Option<&Path>,
+    ) -> Box<dyn Coder> {
         match self {
             Self::Claude => match sandbox {
                 CoderSandbox::SeatbeltProfile(profile) => Box::new(SandboxedClaudeCode {
@@ -178,6 +346,9 @@ impl CoderKind {
                 trusted_sandbox: matches!(sandbox, CoderSandbox::TrustedSeatbeltProfile(_)),
                 model_override: model.map(str::to_string),
                 effort: effort.map(str::to_string),
+                executable: executable
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| PathBuf::from("codex")),
             }),
             Self::Pi => Box::new(PiCode {
                 sandbox_profile: match &sandbox {
@@ -194,11 +365,11 @@ impl CoderKind {
 
 /// Trait abstracting the coding agent.
 /// A resolved, immutable per-launch transcript capture: where to persist the
-/// canonical byte stream and the pump thresholds to use for it.
+/// canonical byte stream and the immutable launch settings to use for it.
 ///
 /// The config travels WITH the launch rather than through mutable process-global
 /// state, so a concurrent launch (for example a parallel reviewer) can never
-/// overwrite another capture's resolved thresholds between resolution and pump
+/// overwrite another capture's resolved settings between resolution and pump
 /// spawn. The one value is retained across a launch's auth/rate-limit phases.
 pub struct TranscriptCapture<'a> {
     pub(crate) path: &'a Path,
@@ -304,6 +475,28 @@ pub trait Coder: Send + Sync {
         ))
     }
 
+    /// Launch a Writer with explicit provider-session semantics. External coders
+    /// that do not support session continuation safely fall back to a fresh launch.
+    fn run_captured_reported_session(
+        &self,
+        prompt: &str,
+        system_prompt: &str,
+        working_dir: &Path,
+        extra_args: &[String],
+        extra_env: &[(String, String)],
+        capture: Option<&TranscriptCapture<'_>>,
+        _session: CoderSession<'_>,
+    ) -> CoderRunCompletion {
+        self.run_captured_reported(
+            prompt,
+            system_prompt,
+            working_dir,
+            extra_args,
+            extra_env,
+            capture,
+        )
+    }
+
     /// Launch an interactive session (no -p flag).
     fn run_interactive(
         &self,
@@ -312,6 +505,17 @@ pub trait Coder: Send + Sync {
         extra_args: &[String],
         extra_env: &[(String, String)],
     ) -> Result<i32>;
+}
+
+/// Select how an autonomous provider launch treats its conversation state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoderSession<'a> {
+    /// Preserve the pre-existing stateless behavior for non-Writer roles.
+    Ephemeral,
+    /// Start a Writer session that the provider can continue later.
+    FreshPersistent,
+    /// Continue the exact provider session recorded by an earlier Writer.
+    Resume(&'a str),
 }
 
 /// Claude Code invoked via sandbox-exec.
@@ -373,28 +577,61 @@ impl Coder for SandboxedClaudeCode {
         extra_env: &[(String, String)],
         capture: Option<&TranscriptCapture<'_>>,
     ) -> CoderRunCompletion {
+        self.run_captured_reported_session(
+            prompt,
+            system_prompt,
+            working_dir,
+            extra_args,
+            extra_env,
+            capture,
+            CoderSession::Ephemeral,
+        )
+    }
+
+    fn run_captured_reported_session(
+        &self,
+        prompt: &str,
+        system_prompt: &str,
+        working_dir: &Path,
+        extra_args: &[String],
+        extra_env: &[(String, String)],
+        capture: Option<&TranscriptCapture<'_>>,
+        session: CoderSession<'_>,
+    ) -> CoderRunCompletion {
         if let Err(err) = ensure_not_expired_with_refresh() {
             return CoderRunCompletion::terminal_only(Err(err.into()));
         }
         let want_transcript = capture.is_some();
         let transcript_file = capture.map(|c| c.path);
         let config = capture.map(|c| c.config.clone()).unwrap_or_default();
-        run_with_transcript_retrying_reported(
-            || {
-                let mut cmd = self.build_command(working_dir);
-                apply_coder_env(&mut cmd, extra_env);
-                if want_transcript {
-                    cmd.args(["--verbose", "--output-format", "stream-json"]);
-                }
-                cmd.args(["--append-system-prompt", system_prompt]);
-                cmd.args(["-p", prompt]);
-                cmd.args(extra_args);
-                cmd
-            },
-            transcript_file,
-            &config,
-            &crate::notify::notify,
-            &real_credential_refresh,
+        classify_claude_provider_argument_failure(
+            run_with_transcript_retrying_reported(
+                || {
+                    let mut cmd = self.build_writer_command(working_dir, session);
+                    apply_coder_env(&mut cmd, extra_env);
+                    if want_transcript {
+                        cmd.args(["--verbose", "--output-format", "stream-json"]);
+                    } else {
+                        // Optional autonomous probes (for example project-model
+                        // seeding) have no artifact boundary. Give Claude stable
+                        // device streams instead of inheriting scheduler logs that
+                        // may live outside the Seatbelt profile.
+                        cmd.stdout(Stdio::null()).stderr(Stdio::null());
+                    }
+                    cmd.args(["--append-system-prompt", system_prompt]);
+                    cmd.args(["-p", prompt]);
+                    cmd.args(extra_args);
+                    cmd
+                },
+                transcript_file,
+                &config,
+                &crate::notify::notify,
+                &real_credential_refresh,
+                true,
+                None,
+            ),
+            capture,
+            extra_args,
         )
     }
 
@@ -405,7 +642,7 @@ impl Coder for SandboxedClaudeCode {
         extra_args: &[String],
         extra_env: &[(String, String)],
     ) -> Result<i32> {
-        let mut cmd = self.build_command(working_dir);
+        let mut cmd = self.build_command(working_dir, false);
         apply_coder_env(&mut cmd, extra_env);
         cmd.args(["--append-system-prompt", system_prompt]);
         cmd.args(extra_args);
@@ -420,16 +657,23 @@ impl SandboxedClaudeCode {
         self.model_override.clone().or_else(claude_model)
     }
 
-    fn build_command(&self, working_dir: &Path) -> Command {
+    fn build_command(&self, working_dir: &Path, autonomous: bool) -> Command {
         let model = self.effective_model();
         if let Some(ref profile) = self.sandbox_profile {
-            let mut cmd = Command::new(crate::os::sandbox_launcher(self.trusted_sandbox));
+            let mut cmd = Command::new(if self.trusted_sandbox {
+                trusted_sandbox_executable()
+            } else {
+                "sandbox-exec"
+            });
             if self.trusted_sandbox {
                 restrict_trusted_coder_env(&mut cmd);
             }
-            cmd.args(crate::os::sandbox_launcher_args(profile));
+            cmd.args(["-f", profile]);
             cmd.arg("claude");
             cmd.arg("--dangerously-skip-permissions");
+            if autonomous {
+                cmd.arg("--safe-mode");
+            }
             if let Some(ref m) = model {
                 cmd.args(["--model", m]);
             }
@@ -440,9 +684,20 @@ impl SandboxedClaudeCode {
             cmd
         } else {
             let mut cmd = Command::new("claude");
+            if autonomous {
+                cmd.arg("--safe-mode");
+            }
             cmd.current_dir(working_dir);
             cmd
         }
+    }
+
+    fn build_writer_command(&self, working_dir: &Path, session: CoderSession<'_>) -> Command {
+        let mut cmd = self.build_command(working_dir, true);
+        if let CoderSession::Resume(session_id) = session {
+            cmd.args(["--resume", session_id]);
+        }
+        cmd
     }
 }
 
@@ -455,6 +710,23 @@ pub struct BareClaudeCode {
 impl BareClaudeCode {
     fn effective_model(&self) -> Option<String> {
         self.model_override.clone().or_else(claude_model)
+    }
+
+    fn build_command(&self, working_dir: &Path, autonomous: bool) -> Command {
+        let mut cmd = Command::new("claude");
+        cmd.current_dir(working_dir);
+        if autonomous {
+            cmd.arg("--safe-mode");
+        }
+        cmd
+    }
+
+    fn build_writer_command(&self, working_dir: &Path, session: CoderSession<'_>) -> Command {
+        let mut cmd = self.build_command(working_dir, true);
+        if let CoderSession::Resume(session_id) = session {
+            cmd.args(["--resume", session_id]);
+        }
+        cmd
     }
 }
 
@@ -509,6 +781,27 @@ impl Coder for BareClaudeCode {
         extra_env: &[(String, String)],
         capture: Option<&TranscriptCapture<'_>>,
     ) -> CoderRunCompletion {
+        self.run_captured_reported_session(
+            prompt,
+            system_prompt,
+            working_dir,
+            extra_args,
+            extra_env,
+            capture,
+            CoderSession::Ephemeral,
+        )
+    }
+
+    fn run_captured_reported_session(
+        &self,
+        prompt: &str,
+        system_prompt: &str,
+        working_dir: &Path,
+        extra_args: &[String],
+        extra_env: &[(String, String)],
+        capture: Option<&TranscriptCapture<'_>>,
+        session: CoderSession<'_>,
+    ) -> CoderRunCompletion {
         if let Err(err) = ensure_not_expired_with_refresh() {
             return CoderRunCompletion::terminal_only(Err(err.into()));
         }
@@ -517,30 +810,37 @@ impl Coder for BareClaudeCode {
         let config = capture.map(|c| c.config.clone()).unwrap_or_default();
         let model = self.effective_model();
         let effort = self.effort.clone();
-        run_with_transcript_retrying_reported(
-            || {
-                let mut cmd = Command::new("claude");
-                cmd.current_dir(working_dir);
-                apply_coder_env(&mut cmd, extra_env);
-                cmd.args(["--dangerously-skip-permissions"]);
-                if let Some(ref m) = model {
-                    cmd.args(["--model", m]);
-                }
-                if let Some(ref e) = effort {
-                    cmd.args(["--effort", e]);
-                }
-                if want_transcript {
-                    cmd.args(["--verbose", "--output-format", "stream-json"]);
-                }
-                cmd.args(["--append-system-prompt", system_prompt]);
-                cmd.args(["-p", prompt]);
-                cmd.args(extra_args);
-                cmd
-            },
-            transcript_file,
-            &config,
-            &crate::notify::notify,
-            &real_credential_refresh,
+        classify_claude_provider_argument_failure(
+            run_with_transcript_retrying_reported(
+                || {
+                    let mut cmd = self.build_writer_command(working_dir, session);
+                    apply_coder_env(&mut cmd, extra_env);
+                    cmd.args(["--dangerously-skip-permissions"]);
+                    if let Some(ref m) = model {
+                        cmd.args(["--model", m]);
+                    }
+                    if let Some(ref e) = effort {
+                        cmd.args(["--effort", e]);
+                    }
+                    if want_transcript {
+                        cmd.args(["--verbose", "--output-format", "stream-json"]);
+                    } else {
+                        cmd.stdout(Stdio::null()).stderr(Stdio::null());
+                    }
+                    cmd.args(["--append-system-prompt", system_prompt]);
+                    cmd.args(["-p", prompt]);
+                    cmd.args(extra_args);
+                    cmd
+                },
+                transcript_file,
+                &config,
+                &crate::notify::notify,
+                &real_credential_refresh,
+                true,
+                None,
+            ),
+            capture,
+            extra_args,
         )
     }
 
@@ -551,8 +851,7 @@ impl Coder for BareClaudeCode {
         extra_args: &[String],
         extra_env: &[(String, String)],
     ) -> Result<i32> {
-        let mut cmd = Command::new("claude");
-        cmd.current_dir(working_dir);
+        let mut cmd = self.build_command(working_dir, false);
         apply_coder_env(&mut cmd, extra_env);
         cmd.args(["--dangerously-skip-permissions"]);
         cmd.args(["--append-system-prompt", system_prompt]);
@@ -569,6 +868,7 @@ pub struct CodexCode {
     pub trusted_sandbox: bool,
     pub model_override: Option<String>,
     pub effort: Option<String>,
+    pub executable: PathBuf,
 }
 
 impl Coder for CodexCode {
@@ -622,25 +922,65 @@ impl Coder for CodexCode {
         extra_env: &[(String, String)],
         capture: Option<&TranscriptCapture<'_>>,
     ) -> CoderRunCompletion {
+        self.run_captured_reported_session(
+            prompt,
+            system_prompt,
+            working_dir,
+            extra_args,
+            extra_env,
+            capture,
+            CoderSession::Ephemeral,
+        )
+    }
+
+    fn run_captured_reported_session(
+        &self,
+        prompt: &str,
+        system_prompt: &str,
+        working_dir: &Path,
+        extra_args: &[String],
+        extra_env: &[(String, String)],
+        capture: Option<&TranscriptCapture<'_>>,
+        session: CoderSession<'_>,
+    ) -> CoderRunCompletion {
         let want_transcript = capture.is_some();
         let transcript_file = capture.map(|c| c.path);
         let config = capture.map(|c| c.config.clone()).unwrap_or_default();
         let combined_prompt = format!("{system_prompt}\n\n---\n\n{prompt}");
-        run_with_transcript_retrying_reported(
-            || {
-                let mut cmd = self.build_command(working_dir, true);
-                apply_coder_env(&mut cmd, extra_env);
-                if want_transcript {
-                    cmd.arg("--json");
-                }
-                cmd.arg(&combined_prompt);
-                cmd.args(extra_args);
-                cmd
-            },
-            transcript_file,
-            &config,
-            &crate::notify::notify,
-            &real_credential_refresh,
+        let initial_session = if capture.is_some()
+            && config.codex_response_continuations > 0
+            && session == CoderSession::Ephemeral
+        {
+            CoderSession::FreshPersistent
+        } else {
+            session
+        };
+        classify_codex_provider_argument_failure(
+            run_codex_response_recovery_reported(
+                |continuation_session| {
+                    let active_session = continuation_session
+                        .map(CoderSession::Resume)
+                        .unwrap_or(initial_session);
+                    let mut cmd = self.build_writer_command(working_dir, active_session);
+                    apply_coder_env(&mut cmd, extra_env);
+                    if want_transcript {
+                        cmd.arg("--json");
+                    }
+                    if continuation_session.is_some() {
+                        cmd.arg("Continue the current Fluent Task from the existing session state. Do not repeat completed tool actions. Finish the requested work and report completion evidence.");
+                    } else {
+                        cmd.arg(&combined_prompt);
+                    }
+                    cmd.args(extra_args);
+                    cmd
+                },
+                transcript_file,
+                &config,
+                &crate::notify::notify,
+                &real_credential_refresh,
+            ),
+            capture,
+            extra_args,
         )
     }
 
@@ -661,25 +1001,107 @@ impl Coder for CodexCode {
     }
 }
 
+fn run_codex_response_recovery_reported<F>(
+    build_cmd: F,
+    transcript_file: Option<&Path>,
+    config: &crate::transcript_pump::TranscriptPumpConfig,
+    notify_fn: &dyn Fn(&str, &str),
+    refresh_fn: &dyn Fn() -> Result<(), crate::claude_auth::AuthError>,
+) -> CoderRunCompletion
+where
+    F: Fn(Option<&str>) -> Command,
+{
+    let deadline = (transcript_file.is_some() && config.codex_response_continuations > 0)
+        .then_some(SupervisionDeadline::CodexResponse(
+            config.codex_response_timeout,
+        ));
+    let mut continuations = 0u32;
+    let mut session_id: Option<String> = None;
+    let mut aggregate = CoderSupervisionReport::default();
+    let mut phase = next_transcript_phase(transcript_file);
+
+    loop {
+        let completion = run_with_transcript_retrying_reported(
+            || build_cmd(session_id.as_deref()),
+            transcript_file,
+            config,
+            notify_fn,
+            refresh_fn,
+            false,
+            deadline,
+        );
+        aggregate.extend_ordered(completion.report);
+        let Err(error) = completion.terminal else {
+            return CoderRunCompletion {
+                terminal: completion.terminal,
+                report: aggregate,
+            };
+        };
+        let Some(timeout) = error.downcast_ref::<CodexResponseTimeoutError>() else {
+            return CoderRunCompletion {
+                terminal: Err(error),
+                report: aggregate,
+            };
+        };
+        if continuations >= config.codex_response_continuations || timeout.session_id().is_empty() {
+            return CoderRunCompletion {
+                terminal: Err(anyhow::Error::new(CodexResponseLivenessExhaustedError {
+                    continuations,
+                })),
+                report: aggregate,
+            };
+        }
+        session_id = Some(timeout.session_id().to_string());
+        if let Err(error) = prepare_transcript_retry_phase(transcript_file, &mut phase) {
+            return CoderRunCompletion {
+                terminal: Err(anyhow::Error::new(error)),
+                report: aggregate,
+            };
+        }
+        continuations = continuations.saturating_add(1);
+        eprintln!(
+            "  Codex model response exceeded the liveness deadline; continuing the same Task and session ({}/{}).",
+            continuations, config.codex_response_continuations
+        );
+    }
+}
+
 impl CodexCode {
     fn effective_model(&self) -> Option<String> {
         self.model_override.clone().or_else(codex_model)
     }
 
     fn build_command(&self, working_dir: &Path, exec_mode: bool) -> Command {
+        self.build_command_with_session(working_dir, exec_mode, CoderSession::Ephemeral)
+    }
+
+    fn build_writer_command(&self, working_dir: &Path, session: CoderSession<'_>) -> Command {
+        self.build_command_with_session(working_dir, true, session)
+    }
+
+    fn build_command_with_session(
+        &self,
+        working_dir: &Path,
+        exec_mode: bool,
+        session: CoderSession<'_>,
+    ) -> Command {
         let mut cmd = if let Some(profile) = &self.sandbox_profile {
-            let mut cmd = Command::new(crate::os::sandbox_launcher(self.trusted_sandbox));
+            let mut cmd = Command::new(if self.trusted_sandbox {
+                trusted_sandbox_executable()
+            } else {
+                "sandbox-exec"
+            });
             if self.trusted_sandbox {
                 restrict_trusted_coder_env(&mut cmd);
             }
-            cmd.args(crate::os::sandbox_launcher_args(profile));
-            cmd.arg("codex");
+            cmd.args(["-f", profile]);
+            cmd.arg(&self.executable);
             if let Some(ca_bundle) = codex_ca_bundle() {
                 cmd.env("SSL_CERT_FILE", ca_bundle);
             }
             cmd
         } else {
-            Command::new("codex")
+            Command::new(&self.executable)
         };
 
         // --ask-for-approval is a top-level option, not an exec subcommand
@@ -689,13 +1111,23 @@ impl CodexCode {
         }
         if exec_mode {
             cmd.arg("exec");
+            if matches!(session, CoderSession::Resume(_)) {
+                cmd.arg("resume");
+            }
             // Autonomous workers must not inherit user configuration, hooks, or
             // session continuity from an interactive Codex home.
             cmd.args(["--disable", "hooks"]);
             cmd.arg("--ignore-user-config");
-            cmd.arg("--ephemeral");
+            if session == CoderSession::Ephemeral {
+                cmd.arg("--ephemeral");
+            }
         }
-        cmd.args(["--cd", &working_dir.to_string_lossy()]);
+        // `--cd` belongs to `codex exec`, but `codex exec resume` does not
+        // accept it. Command::current_dir below supplies the same working root
+        // for resumed sessions without crossing the subcommand grammar.
+        if !matches!(session, CoderSession::Resume(_)) {
+            cmd.args(["--cd", &working_dir.to_string_lossy()]);
+        }
         cmd.args(["--dangerously-bypass-approvals-and-sandbox"]);
         if let Some(model) = self.effective_model() {
             cmd.args(["--model", &model]);
@@ -703,8 +1135,217 @@ impl CodexCode {
         if let Some(ref effort) = self.effort {
             cmd.args(["-c", &format!("model_reasoning_effort={effort}")]);
         }
+        if let CoderSession::Resume(session_id) = session {
+            cmd.arg(session_id);
+        }
         cmd.current_dir(working_dir);
         cmd
+    }
+}
+
+fn classify_codex_provider_argument_failure(
+    completion: CoderRunCompletion,
+    capture: Option<&TranscriptCapture<'_>>,
+    extra_args: &[String],
+) -> CoderRunCompletion {
+    classify_provider_argument_failure(completion, capture, extra_args, CoderKind::Codex)
+}
+
+fn classify_claude_provider_argument_failure(
+    completion: CoderRunCompletion,
+    capture: Option<&TranscriptCapture<'_>>,
+    extra_args: &[String],
+) -> CoderRunCompletion {
+    classify_provider_argument_failure(completion, capture, extra_args, CoderKind::Claude)
+}
+
+fn classify_pi_provider_argument_failure(
+    completion: CoderRunCompletion,
+    capture: Option<&TranscriptCapture<'_>>,
+    extra_args: &[String],
+) -> CoderRunCompletion {
+    classify_provider_argument_failure(completion, capture, extra_args, CoderKind::Pi)
+}
+
+fn classify_provider_argument_failure(
+    mut completion: CoderRunCompletion,
+    capture: Option<&TranscriptCapture<'_>>,
+    extra_args: &[String],
+    provider: CoderKind,
+) -> CoderRunCompletion {
+    let Ok(exit_status) = completion.terminal else {
+        return completion;
+    };
+    if exit_status == 0 {
+        return completion;
+    }
+    let Some(path) = capture.map(|capture| provider_stderr_path(capture.path)) else {
+        return completion;
+    };
+    let Ok(stderr) = std::fs::read_to_string(path) else {
+        return completion;
+    };
+    let normalized = stderr.to_ascii_lowercase();
+    if !normalized.contains(&format!("usage: {}", provider.as_str()))
+        || ![
+            "unknown option",
+            "unknown argument",
+            "unexpected argument",
+            "invalid argument",
+        ]
+        .iter()
+        .any(|marker| normalized.contains(marker))
+        || !extra_args
+            .iter()
+            .any(|argument| argument.starts_with('-') && contains_cli_argument(&stderr, argument))
+    {
+        return completion;
+    }
+    completion.terminal = Err(anyhow::Error::new(ProviderArgumentError {
+        provider,
+        exit_status,
+        diagnostic: stderr
+            .chars()
+            .take(PROVIDER_ARGUMENT_DIAGNOSTIC_LIMIT)
+            .collect(),
+        invocation: extra_args
+            .join(" ")
+            .chars()
+            .take(PROVIDER_ARGUMENT_DIAGNOSTIC_LIMIT)
+            .collect(),
+    }));
+    completion
+}
+
+/// Match a command-line token without accepting it as a prefix of another
+/// option. Provider parser diagnostics use both quoted and unquoted options.
+fn contains_cli_argument(diagnostic: &str, argument: &str) -> bool {
+    diagnostic.match_indices(argument).any(|(offset, _)| {
+        let before = diagnostic[..offset].chars().next_back();
+        let after = diagnostic[offset + argument.len()..].chars().next();
+        !before.is_some_and(|character| {
+            character.is_ascii_alphanumeric() || character == '-' || character == '_'
+        }) && !after.is_some_and(|character| {
+            character.is_ascii_alphanumeric() || character == '-' || character == '_'
+        })
+    })
+}
+
+#[cfg(test)]
+mod provider_argument_tests {
+    use super::*;
+
+    #[test]
+    fn codex_parser_failure_becomes_typed_provider_argument_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let transcript = directory.path().join("transcript.jsonl");
+        let capture = TranscriptCapture::with_config(&transcript, Default::default());
+        std::fs::write(
+            provider_stderr_path(&transcript),
+            format!(
+                "error: unexpected argument '--bad' found\n{}\n\nUsage: codex exec [OPTIONS] [PROMPT]",
+                "x".repeat(PROVIDER_ARGUMENT_DIAGNOSTIC_LIMIT * 2)
+            ),
+        )
+        .unwrap();
+
+        let completion = classify_codex_provider_argument_failure(
+            CoderRunCompletion::terminal_only(Ok(2)),
+            Some(&capture),
+            &["--bad".to_string()],
+        );
+        let error = completion.terminal.expect_err("parser failure is typed");
+        let typed = error.downcast_ref::<ProviderArgumentError>().unwrap();
+        assert_eq!(typed.provider, CoderKind::Codex);
+        assert_eq!(typed.exit_status, 2);
+        assert_eq!(typed.invocation, "--bad");
+        assert!(typed.diagnostic.len() <= PROVIDER_ARGUMENT_DIAGNOSTIC_LIMIT);
+    }
+
+    #[test]
+    fn codex_non_parser_failure_keeps_exit_status() {
+        let directory = tempfile::tempdir().unwrap();
+        let transcript = directory.path().join("transcript.jsonl");
+        let capture = TranscriptCapture::with_config(&transcript, Default::default());
+        std::fs::write(provider_stderr_path(&transcript), "provider unavailable\n").unwrap();
+
+        let completion = classify_codex_provider_argument_failure(
+            CoderRunCompletion::terminal_only(Ok(2)),
+            Some(&capture),
+            &["--bad".to_string()],
+        );
+        assert_eq!(completion.terminal.unwrap(), 2);
+    }
+
+    #[test]
+    fn codex_parser_failure_for_unconfigured_argument_keeps_exit_status() {
+        let directory = tempfile::tempdir().unwrap();
+        let transcript = directory.path().join("transcript.jsonl");
+        let capture = TranscriptCapture::with_config(&transcript, Default::default());
+        std::fs::write(
+            provider_stderr_path(&transcript),
+            "error: unexpected argument '--provider-internal' found\n\nUsage: codex exec [OPTIONS] [PROMPT]",
+        )
+        .unwrap();
+
+        let completion = classify_codex_provider_argument_failure(
+            CoderRunCompletion::terminal_only(Ok(2)),
+            Some(&capture),
+            &["--configured-pass-through".to_string()],
+        );
+
+        assert_eq!(completion.terminal.unwrap(), 2);
+    }
+
+    #[test]
+    fn claude_and_pi_parser_failures_become_typed_provider_argument_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let transcript = directory.path().join("transcript.jsonl");
+        let capture = TranscriptCapture::with_config(&transcript, Default::default());
+
+        for (provider, classify, stderr) in [
+            (
+                CoderKind::Claude,
+                classify_claude_provider_argument_failure
+                    as fn(
+                        CoderRunCompletion,
+                        Option<&TranscriptCapture<'_>>,
+                        &[String],
+                    ) -> CoderRunCompletion,
+                "error: unknown option '--bad'\nUsage: claude [options]",
+            ),
+            (
+                CoderKind::Pi,
+                classify_pi_provider_argument_failure
+                    as fn(
+                        CoderRunCompletion,
+                        Option<&TranscriptCapture<'_>>,
+                        &[String],
+                    ) -> CoderRunCompletion,
+                "Unknown option: --bad\nUsage: pi [options]",
+            ),
+        ] {
+            std::fs::write(provider_stderr_path(&transcript), stderr).unwrap();
+            let completion = classify(
+                CoderRunCompletion::terminal_only(Ok(2)),
+                Some(&capture),
+                &["--bad".to_string()],
+            );
+            let error = completion.terminal.expect_err("parser failure is typed");
+            let typed = error.downcast_ref::<ProviderArgumentError>().unwrap();
+            assert_eq!(typed.provider, provider);
+            assert_eq!(typed.exit_status, 2);
+            assert_eq!(typed.invocation, "--bad");
+            assert!(typed.diagnostic.len() <= PROVIDER_ARGUMENT_DIAGNOSTIC_LIMIT);
+
+            std::fs::write(provider_stderr_path(&transcript), "provider unavailable\n").unwrap();
+            let generic = classify(
+                CoderRunCompletion::terminal_only(Ok(2)),
+                Some(&capture),
+                &["--bad".to_string()],
+            );
+            assert_eq!(generic.terminal.unwrap(), 2);
+        }
     }
 }
 
@@ -723,11 +1364,15 @@ impl PiCode {
     fn build_command(&self, working_dir: &Path) -> Command {
         let model = self.effective_model();
         if let Some(ref profile) = self.sandbox_profile {
-            let mut cmd = Command::new(crate::os::sandbox_launcher(self.trusted_sandbox));
+            let mut cmd = Command::new(if self.trusted_sandbox {
+                trusted_sandbox_executable()
+            } else {
+                "sandbox-exec"
+            });
             if self.trusted_sandbox {
                 restrict_trusted_coder_env(&mut cmd);
             }
-            cmd.args(crate::os::sandbox_launcher_args(profile));
+            cmd.args(["-f", profile]);
             cmd.arg("pi");
             cmd.args(["--provider", "local-openai"]);
             cmd.args(["--model", &model]);
@@ -797,23 +1442,29 @@ impl Coder for PiCode {
         let want_transcript = capture.is_some();
         let transcript_file = capture.map(|c| c.path);
         let config = capture.map(|c| c.config.clone()).unwrap_or_default();
-        run_with_transcript_retrying_reported(
-            || {
-                let mut cmd = self.build_command(working_dir);
-                apply_coder_env(&mut cmd, extra_env);
-                if want_transcript {
-                    cmd.args(["--mode", "json"]);
-                }
-                cmd.args(["--thinking", "off"]);
-                cmd.args(["--append-system-prompt", system_prompt]);
-                cmd.args(["-p", prompt]);
-                cmd.args(extra_args);
-                cmd
-            },
-            transcript_file,
-            &config,
-            &crate::notify::notify,
-            &real_credential_refresh,
+        classify_pi_provider_argument_failure(
+            run_with_transcript_retrying_reported(
+                || {
+                    let mut cmd = self.build_command(working_dir);
+                    apply_coder_env(&mut cmd, extra_env);
+                    if want_transcript {
+                        cmd.args(["--mode", "json"]);
+                    }
+                    cmd.args(["--thinking", "off"]);
+                    cmd.args(["--append-system-prompt", system_prompt]);
+                    cmd.args(["-p", prompt]);
+                    cmd.args(extra_args);
+                    cmd
+                },
+                transcript_file,
+                &config,
+                &crate::notify::notify,
+                &real_credential_refresh,
+                false,
+                None,
+            ),
+            capture,
+            extra_args,
         )
     }
 
@@ -890,6 +1541,14 @@ impl GroupSweepDisposition {
             Self::Delivered | Self::AlreadyGone | Self::NotAttempted
         )
     }
+
+    /// Whether cleanup positively established that the process group and every
+    /// descendant are gone. Unlike a normal coder finalization, a refresh probe
+    /// cannot proceed with an unconfirmed group because it has no durable
+    /// supervision report to preserve that uncertainty.
+    pub fn is_verified_swept(&self) -> bool {
+        matches!(self, Self::Delivered | Self::AlreadyGone)
+    }
 }
 
 /// One launch's supervision outcome: its reaped exit code (when reaped) and its
@@ -899,11 +1558,26 @@ pub struct CoderLaunchSupervision {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub exit_code: Option<i32>,
     pub group_sweep: GroupSweepDisposition,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub provider_liveness: Option<ProviderLivenessIntervention>,
+}
+
+/// One automatic provider-liveness intervention, persisted with the launch's
+/// cleanup result in `coder-supervision.json`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderLivenessIntervention {
+    pub provider: String,
+    pub timeout_ms: u64,
+    pub idle_ms: u64,
+    pub session_id: String,
+    pub phase: String,
+    pub last_event: String,
+    pub last_progress_at_ms: u64,
 }
 
 impl CoderLaunchSupervision {
     fn is_clean(&self) -> bool {
-        self.group_sweep.is_clean()
+        self.group_sweep.is_clean() && self.provider_liveness.is_none()
     }
 }
 
@@ -1047,7 +1721,7 @@ fn run_with_transcript(
     transcript_file: Option<&Path>,
     config: &crate::transcript_pump::TranscriptPumpConfig,
 ) -> Result<i32> {
-    run_with_transcript_reported(cmd, transcript_file, config).into_result()
+    run_with_transcript_reported(cmd, transcript_file, config, None).into_result()
 }
 
 /// Run a command, optionally draining stdout into a transcript file through the
@@ -1065,7 +1739,9 @@ fn run_with_transcript_reported(
     mut cmd: Command,
     transcript_file: Option<&Path>,
     config: &crate::transcript_pump::TranscriptPumpConfig,
+    deadline: Option<SupervisionDeadline>,
 ) -> CoderRunCompletion {
+    restrict_test_provider_credentials(&mut cmd);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -1073,8 +1749,21 @@ fn run_with_transcript_reported(
     }
     match transcript_file {
         Some(path) => {
+            let stderr_path = provider_stderr_path(path);
+            let stderr = match File::create(&stderr_path) {
+                Ok(file) => file,
+                Err(error) => {
+                    return CoderRunCompletion::terminal_only(Err(anyhow::Error::new(
+                        crate::transcript_pump::TranscriptPumpError::new(format!(
+                            "preparing provider stderr artifact {}: {error}",
+                            stderr_path.display()
+                        )),
+                    )));
+                }
+            };
             cmd.stdout(Stdio::piped());
-            let child = match cmd.spawn() {
+            cmd.stderr(Stdio::from(stderr));
+            let child = match crate::execution::spawn(&mut cmd, path) {
                 Ok(child) => child,
                 Err(err) => return CoderRunCompletion::terminal_only(Err(err.into())),
             };
@@ -1083,6 +1772,14 @@ fn run_with_transcript_reported(
             // stdout, a failed pump-thread spawn, or a `?` return — terminates and
             // reaps the coder group through the guard's cleanup.
             let mut supervisor = CoderSupervisor::new(child, child_id);
+            if let Err(error) = supervisor.track_execution(path) {
+                let terminal = Err(supervisor.finalize_setup_error(error));
+                let terminal = supervisor.settle_execution(terminal);
+                return CoderRunCompletion {
+                    report: CoderSupervisionReport::of_launch(supervisor.launch_supervision()),
+                    terminal,
+                };
+            }
 
             // Finalize any stdout/pump SETUP failure explicitly through the managed
             // child — composing the setup error with any cleanup failure — rather
@@ -1094,6 +1791,7 @@ fn run_with_transcript_reported(
                 None => {
                     let terminal = Err(supervisor
                         .finalize_setup_error(anyhow::anyhow!("coder stdout was not piped")));
+                    let terminal = supervisor.settle_execution(terminal);
                     return CoderRunCompletion {
                         report: CoderSupervisionReport::of_launch(supervisor.launch_supervision()),
                         terminal,
@@ -1111,6 +1809,7 @@ fn run_with_transcript_reported(
                 Ok(pump) => pump,
                 Err(err) => {
                     let terminal = Err(supervisor.finalize_setup_error(anyhow::Error::new(err)));
+                    let terminal = supervisor.settle_execution(terminal);
                     return CoderRunCompletion {
                         report: CoderSupervisionReport::of_launch(supervisor.launch_supervision()),
                         terminal,
@@ -1118,7 +1817,8 @@ fn run_with_transcript_reported(
                 }
             };
             supervisor.attach_pump(pump);
-            let terminal = supervisor.supervise();
+            let supervised = supervisor.supervise(deadline);
+            let terminal = supervisor.settle_execution(supervised);
             CoderRunCompletion {
                 report: CoderSupervisionReport::of_launch(supervisor.launch_supervision()),
                 terminal,
@@ -1139,6 +1839,176 @@ fn run_with_transcript_reported(
         }
     }
 }
+
+#[cfg(test)]
+#[test]
+fn captured_run_routes_provider_stderr_to_task_artifact() {
+    let dir = tempfile::tempdir().unwrap();
+    let transcript = dir.path().join("transcript.jsonl");
+    let mut command = Command::new("/bin/sh");
+    command.args([
+        "-c",
+        "printf 'transcript record\\n'; printf 'provider diagnostic\\n' >&2",
+    ]);
+
+    let exit = run_with_transcript(
+        command,
+        Some(&transcript),
+        &crate::transcript_pump::TranscriptPumpConfig::default(),
+    )
+    .unwrap();
+
+    assert_eq!(exit, 0);
+    assert_eq!(
+        std::fs::read_to_string(&transcript).unwrap(),
+        "transcript record\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(provider_stderr_path(&transcript)).unwrap(),
+        "provider diagnostic\n"
+    );
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn safe_claude_no_progress_launch_is_terminated_and_typed() {
+    let dir = tempfile::tempdir().unwrap();
+    let transcript = dir.path().join("transcript.jsonl");
+    let mut command = Command::new("/bin/sh");
+    command.args([
+        "-c",
+        "printf '%s\n' '{\"type\":\"system\",\"subtype\":\"init\"}' '{\"type\":\"system\",\"subtype\":\"api_retry\",\"retry_delay_ms\":5000}'; sleep 5",
+    ]);
+    let started = Instant::now();
+
+    let completion = run_with_transcript_reported(
+        command,
+        Some(&transcript),
+        &crate::transcript_pump::TranscriptPumpConfig::default(),
+        Some(SupervisionDeadline::ClaudeNoProgress(
+            Duration::from_millis(100),
+        )),
+    );
+
+    let error = completion.terminal.unwrap_err();
+    assert!(error.is::<ClaudeNoProgressTimeoutError>());
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the process group must be stopped promptly"
+    );
+    assert!(
+        std::fs::read_to_string(&transcript)
+            .unwrap()
+            .contains("api_retry")
+    );
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn claude_assistant_progress_disables_no_progress_termination() {
+    let dir = tempfile::tempdir().unwrap();
+    let transcript = dir.path().join("transcript.jsonl");
+    let mut command = Command::new("/bin/sh");
+    command.args([
+        "-c",
+        "printf '%s\n' '{\"type\":\"assistant\",\"message\":{}}'; sleep 1; exit 0",
+    ]);
+
+    let completion = run_with_transcript_reported(
+        command,
+        Some(&transcript),
+        &crate::transcript_pump::TranscriptPumpConfig::default(),
+        Some(SupervisionDeadline::ClaudeNoProgress(
+            Duration::from_millis(300),
+        )),
+    );
+
+    assert_eq!(completion.terminal.unwrap(), 0);
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn partial_claude_record_at_deadline_disables_no_progress_termination() {
+    let dir = tempfile::tempdir().unwrap();
+    let transcript = dir.path().join("transcript.jsonl");
+    let mut command = Command::new("/bin/sh");
+    command.args([
+        "-c",
+        "printf '%s' '{\"type\":\"assistant\"'; sleep 1; exit 0",
+    ]);
+
+    let completion = run_with_transcript_reported(
+        command,
+        Some(&transcript),
+        &crate::transcript_pump::TranscriptPumpConfig::default(),
+        Some(SupervisionDeadline::ClaudeNoProgress(
+            Duration::from_millis(300),
+        )),
+    );
+
+    assert_eq!(completion.terminal.unwrap(), 0);
+}
+
+#[cfg(test)]
+#[test]
+fn captured_run_refuses_to_launch_without_provider_stderr_artifact() {
+    let dir = tempfile::tempdir().unwrap();
+    let transcript = dir.path().join("missing/transcript.jsonl");
+    let marker = dir.path().join("provider-started");
+    let mut command = Command::new("/bin/sh");
+    command
+        .args(["-c", "printf started > \"$1\"", "sh"])
+        .arg(&marker);
+
+    let error = run_with_transcript(
+        command,
+        Some(&transcript),
+        &crate::transcript_pump::TranscriptPumpConfig::default(),
+    )
+    .expect_err("the provider must not launch without its stderr artifact");
+
+    assert!(error.is::<crate::transcript_pump::TranscriptPumpError>());
+    assert!(
+        !marker.exists(),
+        "the provider command must not have started"
+    );
+}
+
+/// Keep release fixtures from passing operator credentials through a test-owned
+/// coder process. The opt-in marker makes this seam inert in production builds
+/// and in tests that intentionally exercise provider readiness wiring.
+#[cfg(feature = "test-support")]
+fn restrict_test_provider_credentials(cmd: &mut Command) {
+    if std::env::var_os("FLUENT_TEST_HERMETIC_PROVIDERS").is_none() {
+        return;
+    }
+    let permitted = std::env::var("FLUENT_TEST_FIXTURE_PROVIDER_CREDENTIAL")
+        .ok()
+        .filter(|name| {
+            matches!(
+                name.as_str(),
+                "ANTHROPIC_API_KEY"
+                    | "ANTHROPIC_AUTH_TOKEN"
+                    | "CLAUDE_CODE_OAUTH_TOKEN"
+                    | "OPENAI_API_KEY"
+                    | "PI_API_KEY"
+            )
+        });
+    for name in [
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "OPENAI_API_KEY",
+        "PI_API_KEY",
+    ] {
+        if permitted.as_deref() != Some(name) {
+            cmd.env_remove(name);
+        }
+    }
+}
+
+#[cfg(not(feature = "test-support"))]
+fn restrict_test_provider_credentials(_: &mut Command) {}
 
 /// A failed process operation, retaining WHICH syscall failed, the OS [`ErrorKind`],
 /// the errno, and the ORIGINAL OS message, so a cleanup diagnostic is lossless — it
@@ -1260,6 +2130,27 @@ fn terminate_process_group(leader: u32) -> GroupSweep {
     }
 }
 
+/// Classify the one macOS result that means an exited, still-waitable group
+/// leader has no signalable members. macOS returns `EPERM` rather than `ESRCH`
+/// when `killpg` sees only that zombie leader. If any live same-user descendant
+/// remains, the signal is deliverable and `killpg` returns success, so that path
+/// stays a real delivered sweep. Every other error remains unconfirmed.
+fn classify_group_sweep_after_observation(
+    observation: ExitObservation,
+    sweep: GroupSweep,
+) -> GroupSweep {
+    #[cfg(target_os = "macos")]
+    if observation == ExitObservation::Exited
+        && matches!(
+            &sweep,
+            GroupSweep::Failed(error) if error.errno == Some(libc::EPERM)
+        )
+    {
+        return GroupSweep::AlreadyGone;
+    }
+    sweep
+}
+
 #[cfg(not(unix))]
 fn terminate_process_group(_leader: u32) -> GroupSweep {
     GroupSweep::Delivered
@@ -1348,7 +2239,7 @@ trait LeaderProcess: Send {
     fn wait_exit(&mut self) -> ExitObservation;
     /// SIGKILL the leader's whole process group, returning a structured sweep result
     /// that retains the OS error on a genuine failure.
-    fn signal_group(&mut self) -> GroupSweep;
+    fn signal_group(&mut self, observation: ExitObservation) -> GroupSweep;
     /// SIGKILL the direct leader — the fallback when a verified group signal fails.
     /// `Err` retains the operation and OS error.
     fn kill_leader(&mut self) -> Result<(), ProcessOpError>;
@@ -1422,8 +2313,8 @@ impl LeaderProcess for SystemLeader {
         }
     }
 
-    fn signal_group(&mut self) -> GroupSweep {
-        terminate_process_group(self.id)
+    fn signal_group(&mut self, observation: ExitObservation) -> GroupSweep {
+        classify_group_sweep_after_observation(observation, terminate_process_group(self.id))
     }
 
     fn kill_leader(&mut self) -> Result<(), ProcessOpError> {
@@ -1653,7 +2544,7 @@ impl ManagedChild {
             // whose descendant may still hold stdout open.
             return Err(CleanupError::IdentityLost { id });
         }
-        let sweep = self.leader.signal_group();
+        let sweep = self.leader.signal_group(observed);
         let swept = sweep.swept();
         self.outcome.group_signal = Some(sweep);
         if !swept {
@@ -1719,6 +2610,14 @@ struct CoderSupervisor {
     /// `None` until a pump is attached (the no-transcript branch never attaches
     /// one, and the transcript branch attaches it only after a successful spawn).
     pump: Option<crate::transcript_pump::PumpHandle>,
+    execution: Option<crate::execution::ExecutionHeartbeat>,
+    provider_liveness: Option<ProviderLivenessIntervention>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SupervisionDeadline {
+    ClaudeNoProgress(Duration),
+    CodexResponse(Duration),
 }
 
 impl CoderSupervisor {
@@ -1726,6 +2625,8 @@ impl CoderSupervisor {
         Self {
             managed: ManagedChild::new(Box::new(SystemLeader::new(child, child_id))),
             pump: None,
+            execution: None,
+            provider_liveness: None,
         }
     }
 
@@ -1734,6 +2635,32 @@ impl CoderSupervisor {
         Self {
             managed: ManagedChild::new(leader),
             pump: None,
+            execution: None,
+            provider_liveness: None,
+        }
+    }
+
+    fn track_execution(&mut self, transcript: &Path) -> Result<()> {
+        self.execution = Some(crate::execution::ExecutionHeartbeat::start(
+            transcript,
+            self.managed.id(),
+        )?);
+        Ok(())
+    }
+
+    fn settle_execution(&mut self, terminal: Result<i32>) -> Result<i32> {
+        let settlement = self
+            .execution
+            .as_mut()
+            .map(crate::execution::ExecutionHeartbeat::settle)
+            .transpose();
+        match (terminal, settlement) {
+            (Ok(code), Ok(_)) => Ok(code),
+            (Err(error), Ok(_)) => Err(error),
+            (Ok(_), Err(error)) => Err(error.context("settling local execution identity")),
+            (Err(error), Err(settlement)) => {
+                Err(error.context(settlement.context("settling local execution identity")))
+            }
         }
     }
 
@@ -1748,6 +2675,7 @@ impl CoderSupervisor {
         CoderLaunchSupervision {
             exit_code: self.managed.exit_code(),
             group_sweep: self.managed.group_sweep_disposition(),
+            provider_liveness: self.provider_liveness.clone(),
         }
     }
 
@@ -1768,8 +2696,20 @@ impl CoderSupervisor {
     /// descendants before reaping. Every cleanup failure is composed with the pump
     /// outcome rather than discarded, and an unobservable leader is terminal rather
     /// than an infinite poll loop.
-    fn supervise(&mut self) -> Result<i32> {
+    fn supervise(&mut self, deadline: Option<SupervisionDeadline>) -> Result<i32> {
+        let started = Instant::now();
+        let mut deadline = deadline;
         loop {
+            if let Some(execution) = self.execution.as_mut()
+                && let Err(error) = execution.heartbeat()
+            {
+                let cleanup = self.managed.terminate_and_reap();
+                let base = error.context("persisting local execution heartbeat");
+                return Err(match cleanup {
+                    Ok(_) => base,
+                    Err(cleanup) => base.context(cleanup),
+                });
+            }
             // First-fault fast path: the pump published its immutable first fault
             // (capture, preview, phase-preservation, or status persistence) before
             // attempting terminal settlement. Sweep and reap the coder NOW — only
@@ -1785,6 +2725,99 @@ impl CoderSupervisor {
                 let cleanup = self.managed.terminate_and_reap();
                 let outcome = self.pump_mut().wait_terminal();
                 return compose_terminal(outcome, cleanup);
+            }
+            if matches!(deadline, Some(SupervisionDeadline::ClaudeNoProgress(_)))
+                && self
+                    .pump
+                    .as_ref()
+                    .expect("supervise runs only after a pump is attached")
+                    .claude_progress_observed()
+            {
+                // Any complete malformed, unknown, model, or tool record makes
+                // automatic relaunch unsafe for the rest of this launch.
+                deadline = None;
+            }
+            if let Some(SupervisionDeadline::ClaudeNoProgress(duration)) = deadline
+                && started.elapsed() >= duration
+            {
+                if !self
+                    .pump
+                    .as_ref()
+                    .expect("supervise runs only after a pump is attached")
+                    .claude_no_progress_retry_is_safe()
+                {
+                    // A partial record at the deadline may hide model or tool
+                    // activity. Fail closed and let this launch finish naturally.
+                    deadline = None;
+                    continue;
+                }
+                let cleanup = self.managed.terminate_and_reap();
+                let pump = self.pump_mut().wait_terminal();
+                return match pump {
+                    Err(pump_error) => Err(compose_pump_error(pump_error, cleanup)),
+                    Ok(_) => match cleanup {
+                        Ok(_) if self.managed.group_swept() => {
+                            Err(anyhow::Error::new(ClaudeNoProgressTimeoutError {
+                                deadline: duration,
+                            }))
+                        }
+                        Ok(_) => Err(anyhow::Error::new(
+                            ClaudeNoProgressCleanupUnconfirmedError::new(format!(
+                                "{:?}",
+                                self.managed.group_sweep_disposition()
+                            )),
+                        )),
+                        Err(cleanup) => Err(anyhow::Error::new(
+                            ClaudeNoProgressCleanupUnconfirmedError::new(cleanup.to_string()),
+                        )),
+                    },
+                };
+            }
+            if let Some(SupervisionDeadline::CodexResponse(timeout)) = deadline
+                && let Some(diagnostic) = self
+                    .pump
+                    .as_ref()
+                    .expect("supervise runs only after a pump is attached")
+                    .codex_response_idle(timeout)
+            {
+                let idle_since = diagnostic.response_idle_since_ms.unwrap_or_default();
+                let intervention = ProviderLivenessIntervention {
+                    provider: "codex".to_string(),
+                    timeout_ms: timeout.as_millis() as u64,
+                    idle_ms: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|duration| duration.as_millis() as u64)
+                        .unwrap_or_default()
+                        .saturating_sub(idle_since),
+                    session_id: diagnostic.session_id.unwrap_or_default(),
+                    phase: diagnostic.phase.unwrap_or_else(|| "unknown".to_string()),
+                    last_event: diagnostic
+                        .last_event
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    last_progress_at_ms: diagnostic.last_progress_at_ms.unwrap_or_default(),
+                };
+                self.provider_liveness = Some(intervention.clone());
+                let cleanup = self.managed.terminate_and_reap();
+                let pump = self.pump_mut().wait_terminal();
+                return match pump {
+                    Err(pump_error) => Err(compose_pump_error(pump_error, cleanup)),
+                    Ok(_) => match cleanup {
+                        Ok(_) if self.managed.group_swept() => {
+                            Err(anyhow::Error::new(CodexResponseTimeoutError {
+                                intervention,
+                            }))
+                        }
+                        Ok(_) => Err(anyhow::Error::new(
+                            CodexResponseCleanupUnconfirmedError::new(format!(
+                                "{:?}",
+                                self.managed.group_sweep_disposition()
+                            )),
+                        )),
+                        Err(cleanup) => Err(anyhow::Error::new(
+                            CodexResponseCleanupUnconfirmedError::new(cleanup.to_string()),
+                        )),
+                    },
+                };
             }
             if let Some(terminal) = self.pump_mut().try_terminal() {
                 return match terminal {
@@ -1859,6 +2892,88 @@ impl CoderSupervisor {
     }
 }
 
+/// Terminate a separately spawned Claude process through the same identity-safe
+/// process-group owner used by autonomous coder launches.  This is deliberately
+/// crate-private: bounded host-side credential and readiness probes need the
+/// cleanup boundary without a transcript pump.
+pub(crate) fn terminate_owned_process_tree(child: Child) -> Result<GroupSweepDisposition, String> {
+    let child_id = child.id();
+    let mut managed = ManagedChild::new(Box::new(SystemLeader::new(child, child_id)));
+    managed
+        .terminate_and_reap()
+        .map(|_| managed.group_sweep_disposition())
+        .map_err(|error| error.to_string())
+}
+
+/// Wait for a separately spawned host command until its deadline, then sweep
+/// every descendant before returning. The leader is polled without reaping so
+/// its PID continues to pin process-group identity through cleanup.
+pub(crate) fn wait_owned_process_tree(
+    child: Child,
+    deadline: Duration,
+) -> Result<(i32, bool, GroupSweepDisposition), String> {
+    let child_id = child.id();
+    let mut managed = ManagedChild::new(Box::new(SystemLeader::new(child, child_id)));
+    let started = Instant::now();
+    loop {
+        let timed_out = started.elapsed() >= deadline;
+        match managed.poll_exit() {
+            ExitObservation::Exited => {
+                let code = managed
+                    .terminate_and_reap()
+                    .map_err(|error| error.to_string())?;
+                return Ok((code, false, managed.group_sweep_disposition()));
+            }
+            ExitObservation::Running if timed_out => {
+                let code = managed
+                    .terminate_and_reap()
+                    .map_err(|error| error.to_string())?;
+                return Ok((code, true, managed.group_sweep_disposition()));
+            }
+            ExitObservation::Running => std::thread::sleep(Duration::from_millis(20)),
+            ExitObservation::IdentityLost => {
+                return Err(format!(
+                    "host command process {child_id} identity was lost before cleanup"
+                ));
+            }
+            ExitObservation::Unknown => {
+                let cleanup = managed.terminate_and_reap();
+                return Err(match cleanup {
+                    Ok(_) => format!("host command process {child_id} exit state is unknown"),
+                    Err(error) => format!(
+                        "host command process {child_id} exit state is unknown; cleanup failed: {error}"
+                    ),
+                });
+            }
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn bounded_host_command_preserves_exit_and_sweeps_descendants() {
+    use std::os::unix::process::CommandExt;
+    let mut command = Command::new("/bin/sh");
+    command.args(["-c", "exit 7"]).process_group(0);
+    let (code, timed_out, disposition) =
+        wait_owned_process_tree(command.spawn().unwrap(), Duration::from_secs(2)).unwrap();
+    assert_eq!(code, 7);
+    assert!(!timed_out);
+    assert!(disposition.is_verified_swept());
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn bounded_host_command_timeout_confirms_process_cleanup() {
+    use std::os::unix::process::CommandExt;
+    let mut command = Command::new("/bin/sh");
+    command.args(["-c", "sleep 30"]).process_group(0);
+    let (_code, timed_out, disposition) =
+        wait_owned_process_tree(command.spawn().unwrap(), Duration::from_millis(30)).unwrap();
+    assert!(timed_out);
+    assert!(disposition.is_verified_swept());
+}
+
 /// Compose a pump terminal outcome with a cleanup outcome. A pump failure is the
 /// primary cause; a cleanup failure that follows it is attached as context. When
 /// the pump succeeded, a cleanup failure is itself the terminal error — a coder that
@@ -1905,6 +3020,9 @@ impl Drop for CoderSupervisor {
                 pump.join();
             }
         }
+        if let Some(execution) = self.execution.as_mut() {
+            let _ = execution.settle();
+        }
     }
 }
 
@@ -1913,13 +3031,189 @@ impl Drop for CoderSupervisor {
 // ---------------------------------------------------------------------------
 
 const DEFAULT_RATE_LIMIT_RETRY_AFTER_SECS: u64 = 1800;
-const RATE_LIMIT_MAX_RETRIES: u32 = 2;
+pub(crate) const RATE_LIMIT_MAX_RETRIES: u32 = 2;
 const DEFAULT_JITTER_MAX_SECS: u64 = 30;
 
+/// A provider exhausted the coder-owned rate-limit retry budget. Task orchestration
+/// must not retry this logical run again and multiply the same launch budget.
+#[derive(Debug)]
+pub(crate) struct RateLimitExhaustedError {
+    exit_code: i32,
+}
+
+impl RateLimitExhaustedError {
+    pub(crate) fn new(exit_code: i32) -> Self {
+        Self { exit_code }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn exit_code(&self) -> i32 {
+        self.exit_code
+    }
+}
+
+impl std::fmt::Display for RateLimitExhaustedError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "provider rate-limit retry budget exhausted with exit code {}",
+            self.exit_code
+        )
+    }
+}
+
+impl std::error::Error for RateLimitExhaustedError {}
+
+/// One autonomous Claude launch exceeded its deadline while the canonical
+/// transcript still proved that no model or tool activity had occurred.
+#[derive(Debug)]
+pub(crate) struct ClaudeNoProgressTimeoutError {
+    deadline: Duration,
+}
+
+impl std::fmt::Display for ClaudeNoProgressTimeoutError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Claude produced no model progress within {} seconds",
+            self.deadline.as_secs()
+        )
+    }
+}
+
+impl std::error::Error for ClaudeNoProgressTimeoutError {}
+
+/// A safe no-progress launch's leader exited, but Fluent could not prove that
+/// every descendant in its process group stopped. Relaunching would be unsafe.
+#[derive(Debug)]
+pub(crate) struct ClaudeNoProgressCleanupUnconfirmedError {
+    disposition: String,
+}
+
+impl ClaudeNoProgressCleanupUnconfirmedError {
+    pub(crate) fn new(disposition: impl Into<String>) -> Self {
+        Self {
+            disposition: disposition.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ClaudeNoProgressCleanupUnconfirmedError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Claude no-progress recovery stopped because process-group cleanup was not confirmed ({})",
+            self.disposition
+        )
+    }
+}
+
+impl std::error::Error for ClaudeNoProgressCleanupUnconfirmedError {}
+
+/// Claude exhausted its bounded safe no-progress relaunches. Task orchestration
+/// pauses the same Task as provider-unavailable instead of multiplying retries.
+#[derive(Debug)]
+pub(crate) struct ClaudeNoProgressExhaustedError {
+    launches: u32,
+}
+
+impl ClaudeNoProgressExhaustedError {
+    pub(crate) fn new(launches: u32) -> Self {
+        Self { launches }
+    }
+}
+
+impl std::fmt::Display for ClaudeNoProgressExhaustedError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Claude remained unavailable before model progress across {} bounded launches",
+            self.launches
+        )
+    }
+}
+
+impl std::error::Error for ClaudeNoProgressExhaustedError {}
+
+/// Codex stopped emitting records while its stream proved that it was waiting
+/// for the model rather than running a tool.
+#[derive(Debug)]
+pub(crate) struct CodexResponseTimeoutError {
+    intervention: ProviderLivenessIntervention,
+}
+
+impl CodexResponseTimeoutError {
+    fn session_id(&self) -> &str {
+        &self.intervention.session_id
+    }
+}
+
+impl std::fmt::Display for CodexResponseTimeoutError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Codex produced no model response for {} seconds after {}",
+            self.intervention.timeout_ms / 1000,
+            self.intervention.last_event
+        )
+    }
+}
+
+impl std::error::Error for CodexResponseTimeoutError {}
+
+#[derive(Debug)]
+pub(crate) struct CodexResponseCleanupUnconfirmedError {
+    disposition: String,
+}
+
+impl CodexResponseCleanupUnconfirmedError {
+    fn new(disposition: impl Into<String>) -> Self {
+        Self {
+            disposition: disposition.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for CodexResponseCleanupUnconfirmedError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Codex response-liveness recovery stopped because process-group cleanup was not confirmed ({})",
+            self.disposition
+        )
+    }
+}
+
+impl std::error::Error for CodexResponseCleanupUnconfirmedError {}
+
+#[derive(Debug)]
+pub(crate) struct CodexResponseLivenessExhaustedError {
+    continuations: u32,
+}
+
+impl std::fmt::Display for CodexResponseLivenessExhaustedError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Codex response liveness failed after {} automatic same-session continuations",
+            self.continuations
+        )
+    }
+}
+
+impl std::error::Error for CodexResponseLivenessExhaustedError {}
+
 fn ensure_not_expired_with_refresh() -> Result<(), crate::claude_auth::AuthError> {
+    if crate::credential::hermetic_provider_test_mode() {
+        return Ok(());
+    }
     if crate::claude_auth::ensure_not_expired().is_err() {
         eprintln!("  Token expired — refreshing credentials before launch.");
-        let _ = crate::credential::refresh_credentials();
+        crate::credential::refresh_credentials().map_err(|error| {
+            crate::claude_auth::AuthError::RefreshFailed {
+                failure: error.probe_failure(),
+            }
+        })?;
         if let Err(err) = crate::claude_auth::ensure_not_expired() {
             return Err(err);
         }
@@ -2119,8 +3413,12 @@ pub fn transcript_indicates_rate_limit(transcript_path: &Path) -> bool {
     false
 }
 
-fn real_credential_refresh() {
-    let _ = crate::credential::refresh_credentials();
+fn real_credential_refresh() -> Result<(), crate::claude_auth::AuthError> {
+    crate::credential::refresh_credentials().map_err(|error| {
+        crate::claude_auth::AuthError::RefreshFailed {
+            failure: error.probe_failure(),
+        }
+    })
 }
 
 /// Preserve the transcript of a just-finished attempt as an immutable sibling
@@ -2247,13 +3545,21 @@ fn run_with_transcript_retrying<F>(
     transcript_file: Option<&Path>,
     config: &crate::transcript_pump::TranscriptPumpConfig,
     notify_fn: &dyn Fn(&str, &str),
-    refresh_fn: &dyn Fn(),
+    refresh_fn: &dyn Fn() -> Result<(), crate::claude_auth::AuthError>,
 ) -> Result<i32>
 where
     F: Fn() -> Command,
 {
-    run_with_transcript_retrying_reported(build_cmd, transcript_file, config, notify_fn, refresh_fn)
-        .into_result()
+    run_with_transcript_retrying_reported(
+        build_cmd,
+        transcript_file,
+        config,
+        notify_fn,
+        refresh_fn,
+        false,
+        None,
+    )
+    .into_result()
 }
 
 /// The reported retry loop: identical retry behavior, but it returns the terminal
@@ -2264,7 +3570,9 @@ fn run_with_transcript_retrying_reported<F>(
     transcript_file: Option<&Path>,
     config: &crate::transcript_pump::TranscriptPumpConfig,
     notify_fn: &dyn Fn(&str, &str),
-    refresh_fn: &dyn Fn(),
+    refresh_fn: &dyn Fn() -> Result<(), crate::claude_auth::AuthError>,
+    claude_no_progress_recovery: bool,
+    launch_deadline: Option<SupervisionDeadline>,
 ) -> CoderRunCompletion
 where
     F: Fn() -> Command,
@@ -2275,7 +3583,11 @@ where
         config,
         notify_fn,
         refresh_fn,
-        &|cmd, transcript, cfg| run_with_transcript_reported(cmd, transcript, cfg),
+        claude_no_progress_recovery,
+        launch_deadline,
+        &|cmd, transcript, cfg, deadline| {
+            run_with_transcript_reported(cmd, transcript, cfg, deadline)
+        },
     )
 }
 
@@ -2288,7 +3600,7 @@ fn run_with_transcript_retrying_using<F>(
     transcript_file: Option<&Path>,
     config: &crate::transcript_pump::TranscriptPumpConfig,
     notify_fn: &dyn Fn(&str, &str),
-    refresh_fn: &dyn Fn(),
+    refresh_fn: &dyn Fn() -> Result<(), crate::claude_auth::AuthError>,
     run_fn: &dyn Fn(
         Command,
         Option<&Path>,
@@ -2304,7 +3616,11 @@ where
         config,
         notify_fn,
         refresh_fn,
-        &|cmd, transcript, cfg| CoderRunCompletion::terminal_only(run_fn(cmd, transcript, cfg)),
+        false,
+        None,
+        &|cmd, transcript, cfg, _deadline| {
+            CoderRunCompletion::terminal_only(run_fn(cmd, transcript, cfg))
+        },
     )
     .into_result()
 }
@@ -2317,11 +3633,14 @@ fn run_with_transcript_retrying_reported_using<F>(
     transcript_file: Option<&Path>,
     config: &crate::transcript_pump::TranscriptPumpConfig,
     notify_fn: &dyn Fn(&str, &str),
-    refresh_fn: &dyn Fn(),
+    refresh_fn: &dyn Fn() -> Result<(), crate::claude_auth::AuthError>,
+    claude_no_progress_recovery: bool,
+    launch_deadline: Option<SupervisionDeadline>,
     run_fn: &dyn Fn(
         Command,
         Option<&Path>,
         &crate::transcript_pump::TranscriptPumpConfig,
+        Option<SupervisionDeadline>,
     ) -> CoderRunCompletion,
 ) -> CoderRunCompletion
 where
@@ -2330,6 +3649,7 @@ where
     let mut attempt: u32 = 0;
     let mut rl_state = RateLimitState::Normal;
     let mut auth_refreshed = false;
+    let mut no_progress_retries = 0u32;
     // Derive the starting phase from existing per-phase siblings so a resumed
     // Task never overwrites or collides with `.N.jsonl` evidence a prior run
     // preserved; the process-local counter alone would restart at 0.
@@ -2342,11 +3662,65 @@ where
         // The one resolved config value is retained across every auth/rate-limit
         // phase of this launch, so a mid-launch retry never re-resolves or picks
         // up a different value.
-        let completion = run_fn(build_cmd(), transcript_file, config);
+        let deadline = launch_deadline.or_else(|| {
+            (claude_no_progress_recovery
+                && transcript_file.is_some()
+                && config.claude_no_progress_retries > 0)
+                .then_some(SupervisionDeadline::ClaudeNoProgress(
+                    config.claude_no_progress_timeout,
+                ))
+        });
+        let completion = run_fn(build_cmd(), transcript_file, config, deadline);
         aggregate.extend_ordered(completion.report);
         let exit = match completion.terminal {
             Ok(exit) => exit,
             Err(err) => {
+                if claude_no_progress_recovery && err.is::<ClaudeNoProgressTimeoutError>() {
+                    if no_progress_retries >= config.claude_no_progress_retries {
+                        return CoderRunCompletion {
+                            terminal: Err(anyhow::Error::new(ClaudeNoProgressExhaustedError::new(
+                                no_progress_retries.saturating_add(1),
+                            ))),
+                            report: aggregate,
+                        };
+                    }
+                    if let Err(phase_error) =
+                        prepare_transcript_retry_phase(transcript_file, &mut phase)
+                    {
+                        return CoderRunCompletion {
+                            terminal: Err(anyhow::Error::new(phase_error)),
+                            report: aggregate,
+                        };
+                    }
+                    let factor = 1u32.checked_shl(no_progress_retries).unwrap_or(u32::MAX);
+                    let wait = config
+                        .claude_no_progress_backoff
+                        .checked_mul(factor)
+                        .unwrap_or(Duration::MAX);
+                    no_progress_retries = no_progress_retries.saturating_add(1);
+                    eprintln!(
+                        "  Claude made no model progress before the deadline; retrying the same Task after {}s ({}/{}).",
+                        wait.as_secs(),
+                        no_progress_retries,
+                        config.claude_no_progress_retries
+                    );
+                    if let Some(path) = transcript_file
+                        && let Err(error) = write_provider_retry_wait(path, wait)
+                    {
+                        eprintln!(
+                            "warning: could not persist Claude no-progress retry timing: {error:#}"
+                        );
+                    }
+                    std::thread::sleep(wait);
+                    if let Some(path) = transcript_file
+                        && let Err(error) = finish_provider_retry_wait(path)
+                    {
+                        eprintln!(
+                            "warning: could not finalize Claude no-progress retry timing: {error:#}"
+                        );
+                    }
+                    continue;
+                }
                 return CoderRunCompletion {
                     terminal: Err(err),
                     report: aggregate,
@@ -2375,17 +3749,28 @@ where
             };
         };
 
-        if let Some(auth_err) = crate::claude_auth::classify_transcript_401(path) {
+        if let Some(auth_err) = crate::claude_auth::classify_transcript_auth_failure(path) {
             if !auth_refreshed {
                 auth_refreshed = true;
-                eprintln!("  Auth 401 detected — refreshing credentials and retrying.");
-                if let Err(err) = preserve_transcript_phase(transcript_file, &mut phase) {
+                if matches!(auth_err, crate::claude_auth::AuthError::NotLoggedIn) {
+                    eprintln!(
+                        "  Claude login failure detected — refreshing credentials and retrying."
+                    );
+                } else {
+                    eprintln!("  Auth 401 detected — refreshing credentials and retrying.");
+                }
+                if let Err(err) = prepare_transcript_retry_phase(transcript_file, &mut phase) {
                     return CoderRunCompletion {
                         terminal: Err(anyhow::Error::new(err)),
                         report: aggregate,
                     };
                 }
-                refresh_fn();
+                if let Err(error) = refresh_fn() {
+                    return CoderRunCompletion {
+                        terminal: Err(anyhow::Error::new(error)),
+                        report: aggregate,
+                    };
+                }
                 continue;
             }
             return CoderRunCompletion {
@@ -2407,11 +3792,11 @@ where
 
         if attempt >= RATE_LIMIT_MAX_RETRIES {
             eprintln!(
-                "  Rate-limit detected on attempt {}; retry budget exhausted, propagating exit code {exit}.",
+                "  Rate-limit detected on attempt {}; retry budget exhausted.",
                 attempt + 1
             );
             return CoderRunCompletion {
-                terminal: Ok(exit),
+                terminal: Err(anyhow::Error::new(RateLimitExhaustedError::new(exit))),
                 report: aggregate,
             };
         }
@@ -2437,13 +3822,19 @@ where
             attempt + 1,
             wait.as_secs()
         );
-        if let Err(err) = preserve_transcript_phase(transcript_file, &mut phase) {
+        if let Err(err) = prepare_transcript_retry_phase(transcript_file, &mut phase) {
             return CoderRunCompletion {
                 terminal: Err(anyhow::Error::new(err)),
                 report: aggregate,
             };
         }
+        if let Err(error) = write_provider_retry_wait(path, wait) {
+            eprintln!("warning: could not persist provider retry timing: {error:#}");
+        }
         std::thread::sleep(wait);
+        if let Err(error) = finish_provider_retry_wait(path) {
+            eprintln!("warning: could not finalize provider retry timing: {error:#}");
+        }
         attempt += 1;
     }
 }
@@ -2546,7 +3937,7 @@ mod pump_supervision_tests {
         supervisor.attach_pump(pump);
 
         let started = Instant::now();
-        let result = supervisor.supervise();
+        let result = supervisor.supervise(None);
         let elapsed = started.elapsed();
 
         let err = result.expect_err("a pump panic must surface as a typed failure");
@@ -2584,8 +3975,8 @@ mod pump_supervision_tests {
     #[cfg(unix)]
     #[test]
     fn pump_failure_terminates_and_reaps_live_coder() {
-        // The pump cannot open its transcript because the path is a directory, so
-        // it fails immediately while the coder is still alive. A pump failure must
+        // Once both processes are ready, start a pump whose transcript path is a
+        // directory, so it fails while the coder is still alive. A pump failure must
         // terminate and reap the coder's WHOLE process group — the leader and a
         // backgrounded descendant that never touches stdout, so neither can be
         // killed incidentally by SIGPIPE. Both must be gone and neither's delayed
@@ -2595,21 +3986,53 @@ mod pump_supervision_tests {
         std::fs::create_dir(&transcript).unwrap();
         let d = dir.path().display();
 
-        // The leader records its and the descendant's pids, then both sleep and
-        // touch a side-effect file. Nothing reads or writes stdout.
+        // Delay startup to exercise the readiness barrier. The leader records
+        // both PIDs; each process waits for the test before its delayed side effect.
+        // Nothing reads or writes stdout, so neither dies incidentally from SIGPIPE.
         let mut cmd = Command::new("/bin/sh");
         cmd.arg("-c").arg(format!(
-            "echo $$ > {d}/leader.pid; \
-             ( sleep 1; : > {d}/descendant-ran ) & echo $! > {d}/descendant.pid; \
+            "sleep 0.1; echo $$ > {d}/leader.pid; \
+             ( while [ ! -f {d}/ready ]; do sleep 0.01; done; \
+               sleep 1; : > {d}/descendant-ran ) & echo $! > {d}/descendant.pid; \
+             while [ ! -f {d}/ready ]; do sleep 0.01; done; \
              sleep 1; : > {d}/leader-ran"
         ));
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+        let child = cmd.stdout(Stdio::piped()).spawn().unwrap();
+        let child_id = child.id();
+        let mut supervisor = CoderSupervisor::new(child, child_id);
+        let ready_deadline = Instant::now() + Duration::from_secs(5);
+        let pids = ["leader.pid", "descendant.pid"].map(|pidfile| {
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(dir.path().join(pidfile)) {
+                    if pid.trim().parse::<u32>().is_ok() {
+                        break pid;
+                    }
+                }
+                assert!(
+                    Instant::now() < ready_deadline,
+                    "{pidfile} was not recorded"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
 
         let started = Instant::now();
-        let result = run_with_transcript(
-            cmd,
-            Some(&transcript),
-            &crate::transcript_pump::TranscriptPumpConfig::default(),
-        );
+        std::fs::write(dir.path().join("ready"), "").unwrap();
+        let pump = crate::transcript_pump::spawn_pump(
+            supervisor.take_stdout().unwrap(),
+            transcript.clone(),
+            Some(crate::transcript_pump::status_path_for(&transcript)),
+            crate::transcript_pump::console_preview_sink(),
+            crate::transcript_pump::TranscriptPumpConfig::default(),
+        )
+        .unwrap();
+        supervisor.attach_pump(pump);
+        let result = supervisor.supervise(None);
+        drop(supervisor);
         let elapsed = started.elapsed();
 
         let err = result.expect_err("a pump failure must surface as an error");
@@ -2632,13 +4055,8 @@ mod pump_supervision_tests {
                 .map(|s| s.success())
                 .unwrap_or(false)
         };
-        for pidfile in ["leader.pid", "descendant.pid"] {
-            let pid = std::fs::read_to_string(dir.path().join(pidfile))
-                .unwrap_or_else(|_| panic!("{pidfile} must have been recorded"));
-            assert!(
-                !is_alive(&pid),
-                "{pidfile} process survived the pump failure"
-            );
+        for pid in pids {
+            assert!(!is_alive(&pid), "process {pid} survived the pump failure");
         }
 
         // Wait past the 1s side-effect delay: neither the leader nor the reaped
@@ -2684,6 +4102,13 @@ mod pump_supervision_tests {
         let body = std::fs::read_to_string(&transcript).unwrap();
         assert!(body.contains("\"type\":\"a\""));
         assert!(body.contains("\"type\":\"b\""));
+        let execution: crate::execution::ExecutionRecord = serde_json::from_slice(
+            &std::fs::read(crate::execution::record_path_for_transcript(&transcript)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(execution.state, crate::execution::ExecutionState::Settled);
+        assert_eq!(execution.owner_pid, std::process::id());
+        assert!(execution.settled_at.is_some());
     }
 
     #[cfg(unix)]
@@ -2789,7 +4214,7 @@ mod pump_supervision_tests {
             self.calls.lock().unwrap().push("wait_exit");
             ExitObservation::Exited
         }
-        fn signal_group(&mut self) -> GroupSweep {
+        fn signal_group(&mut self, _observation: ExitObservation) -> GroupSweep {
             self.calls.lock().unwrap().push("signal_group");
             if self.group_settles {
                 GroupSweep::Delivered
@@ -2822,6 +4247,26 @@ mod pump_supervision_tests {
                 )
             })
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exited_macos_group_eperm_means_no_signalable_members() {
+        let failed = || {
+            GroupSweep::Failed(ProcessOpError::from_io(
+                "kill process group",
+                &std::io::Error::from_raw_os_error(libc::EPERM),
+            ))
+        };
+
+        assert!(matches!(
+            classify_group_sweep_after_observation(ExitObservation::Exited, failed()),
+            GroupSweep::AlreadyGone
+        ));
+        assert!(matches!(
+            classify_group_sweep_after_observation(ExitObservation::Running, failed()),
+            GroupSweep::Failed(_)
+        ));
     }
 
     #[test]
@@ -3542,7 +4987,7 @@ mod pump_supervision_tests {
 
         let mut supervisor = CoderSupervisor::new(child, child_id);
         supervisor.attach_pump(pump);
-        let handle = std::thread::spawn(move || supervisor.supervise());
+        let handle = std::thread::spawn(move || supervisor.supervise(None));
 
         // Handshake: the store has entered terminal persistence and is now blocked.
         let entered = entered_rx
@@ -3683,6 +5128,7 @@ mod pump_supervision_tests {
                 errno: Some(errno),
                 message: Some("Operation not permitted".to_string()),
             }),
+            provider_liveness: None,
         })
     }
 
@@ -3721,7 +5167,8 @@ mod pump_supervision_tests {
         let phase = std::sync::atomic::AtomicUsize::new(0);
         let run_fn = |_cmd: Command,
                       _t: Option<&Path>,
-                      _c: &crate::transcript_pump::TranscriptPumpConfig|
+                      _c: &crate::transcript_pump::TranscriptPumpConfig,
+                      _deadline: Option<SupervisionDeadline>|
          -> CoderRunCompletion {
             let n = phase.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if n == 0 {
@@ -3736,6 +5183,7 @@ mod pump_supervision_tests {
                     report: CoderSupervisionReport::of_launch(CoderLaunchSupervision {
                         exit_code: Some(0),
                         group_sweep: GroupSweepDisposition::Delivered,
+                        provider_liveness: None,
                     }),
                 }
             }
@@ -3755,7 +5203,9 @@ mod pump_supervision_tests {
             Some(&transcript),
             &crate::transcript_pump::TranscriptPumpConfig::default(),
             &|_, _| {},
-            &|| {},
+            &|| Ok(()),
+            false,
+            None,
             &run_fn,
         );
         assert_eq!(completion.terminal.unwrap(), 0, "the final retry succeeds");
@@ -3775,6 +5225,145 @@ mod pump_supervision_tests {
             !completion.report.is_clean(),
             "a report with any non-clean launch is persisted"
         );
+    }
+
+    #[test]
+    fn claude_no_progress_retries_same_logical_run_and_preserves_phases() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("transcript.jsonl");
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let run_fn = |_cmd: Command,
+                      path: Option<&Path>,
+                      _config: &crate::transcript_pump::TranscriptPumpConfig,
+                      deadline: Option<SupervisionDeadline>| {
+            let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert!(matches!(
+                deadline,
+                Some(SupervisionDeadline::ClaudeNoProgress(value))
+                    if value == Duration::from_millis(25)
+            ));
+            std::fs::write(
+                path.unwrap(),
+                "{\"type\":\"system\",\"subtype\":\"api_retry\",\"retry_delay_ms\":25}\n",
+            )
+            .unwrap();
+            if call < 2 {
+                CoderRunCompletion::terminal_only(Err(anyhow::Error::new(
+                    ClaudeNoProgressTimeoutError {
+                        deadline: Duration::from_millis(25),
+                    },
+                )))
+            } else {
+                CoderRunCompletion::terminal_only(Ok(0))
+            }
+        };
+        let config = crate::transcript_pump::TranscriptPumpConfig {
+            claude_no_progress_timeout: Duration::from_millis(25),
+            claude_no_progress_retries: 2,
+            claude_no_progress_backoff: Duration::ZERO,
+            ..Default::default()
+        };
+
+        let completion = run_with_transcript_retrying_reported_using(
+            || Command::new("/bin/true"),
+            Some(&transcript),
+            &config,
+            &|_, _| {},
+            &|| Ok(()),
+            true,
+            None,
+            &run_fn,
+        );
+
+        assert_eq!(completion.terminal.unwrap(), 0);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert!(phase_transcript_path(&transcript, 0).is_file());
+        assert!(phase_transcript_path(&transcript, 1).is_file());
+        assert_eq!(
+            read_provider_retry_timing(&provider_timing_path(&transcript))
+                .unwrap()
+                .retry_count,
+            2,
+            "each no-progress backoff is visible as provider wait"
+        );
+    }
+
+    #[test]
+    fn claude_no_progress_exhaustion_remains_typed() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("transcript.jsonl");
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let run_fn = |_cmd: Command,
+                      path: Option<&Path>,
+                      _config: &crate::transcript_pump::TranscriptPumpConfig,
+                      _deadline: Option<SupervisionDeadline>| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::fs::write(
+                path.unwrap(),
+                "{\"type\":\"system\",\"subtype\":\"init\"}\n",
+            )
+            .unwrap();
+            CoderRunCompletion::terminal_only(Err(anyhow::Error::new(
+                ClaudeNoProgressTimeoutError {
+                    deadline: Duration::from_millis(1),
+                },
+            )))
+        };
+        let config = crate::transcript_pump::TranscriptPumpConfig {
+            claude_no_progress_timeout: Duration::from_millis(1),
+            claude_no_progress_retries: 1,
+            claude_no_progress_backoff: Duration::ZERO,
+            ..Default::default()
+        };
+
+        let completion = run_with_transcript_retrying_reported_using(
+            || Command::new("/bin/true"),
+            Some(&transcript),
+            &config,
+            &|_, _| {},
+            &|| Ok(()),
+            true,
+            None,
+            &run_fn,
+        );
+
+        assert!(
+            completion
+                .terminal
+                .unwrap_err()
+                .is::<ClaudeNoProgressExhaustedError>()
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn zero_claude_no_progress_retries_disables_the_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("transcript.jsonl");
+        let run_fn = |_cmd: Command,
+                      _path: Option<&Path>,
+                      _config: &crate::transcript_pump::TranscriptPumpConfig,
+                      deadline: Option<SupervisionDeadline>| {
+            assert_eq!(deadline, None);
+            CoderRunCompletion::terminal_only(Ok(0))
+        };
+        let config = crate::transcript_pump::TranscriptPumpConfig {
+            claude_no_progress_retries: 0,
+            ..Default::default()
+        };
+
+        let completion = run_with_transcript_retrying_reported_using(
+            || Command::new("/bin/true"),
+            Some(&transcript),
+            &config,
+            &|_, _| {},
+            &|| Ok(()),
+            true,
+            None,
+            &run_fn,
+        );
+
+        assert_eq!(completion.terminal.unwrap(), 0);
     }
 
     #[test]
@@ -4333,10 +5922,7 @@ mod model_default_tests {
 
     #[test]
     fn trusted_sandbox_always_uses_the_system_launcher() {
-        assert_eq!(
-            trusted_sandbox_executable(),
-            crate::os::sandbox_launcher(true)
-        );
+        assert_eq!(trusted_sandbox_executable(), "/usr/bin/sandbox-exec");
     }
 
     #[test]
@@ -4381,16 +5967,27 @@ mod model_default_tests {
             "hostile descendant actually executed"
         );
         let pid = std::fs::read_to_string(pid_path).unwrap();
-        let status = Command::new("/bin/kill")
-            .args(["-0", pid.trim()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .unwrap();
-        assert!(
-            !status.success(),
-            "background descendant survived coder return"
-        );
+        // A killed process may linger as a zombie while init reaps it. Poll
+        // until the process table entry is gone rather than racing init.
+        let gone = {
+            let deadline = std::time::Instant::now() + Duration::from_millis(500);
+            let mut cleared = false;
+            while std::time::Instant::now() < deadline {
+                let s = Command::new("/bin/kill")
+                    .args(["-0", pid.trim()])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .unwrap();
+                if !s.success() {
+                    cleared = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            cleared
+        };
+        assert!(gone, "background descendant survived coder return");
         std::thread::sleep(Duration::from_millis(300));
         assert!(
             !denied_path.exists(),
@@ -4423,7 +6020,7 @@ mod model_default_tests {
             effort: None,
         };
         let dir = tempfile::tempdir().unwrap();
-        let cmd = coder.build_command(dir.path());
+        let cmd = coder.build_command(dir.path(), true);
         assert!(
             !cmd_has_arg(&cmd, "--model"),
             "should not pass --model when no model is configured"
@@ -4439,7 +6036,7 @@ mod model_default_tests {
             effort: None,
         };
         let dir = tempfile::tempdir().unwrap();
-        let cmd = coder.build_command(dir.path());
+        let cmd = coder.build_command(dir.path(), true);
         assert!(
             cmd_has_arg(&cmd, "--model"),
             "should pass --model when model is configured"
@@ -4460,9 +6057,9 @@ mod model_default_tests {
         };
         let dir = tempfile::tempdir().unwrap();
 
-        let cmd = coder.build_command(dir.path());
+        let cmd = coder.build_command(dir.path(), true);
 
-        assert_eq!(cmd.get_program(), crate::os::sandbox_launcher(true));
+        assert_eq!(cmd.get_program(), OsStr::new("/usr/bin/sandbox-exec"));
     }
 
     #[test]
@@ -4478,12 +6075,61 @@ mod model_default_tests {
     }
 
     #[test]
+    fn autonomous_claude_commands_use_safe_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let sandboxed = SandboxedClaudeCode {
+            sandbox_profile: Some("/tmp/profile".to_string()),
+            trusted_sandbox: false,
+            model_override: None,
+            effort: None,
+        };
+        let bare = BareClaudeCode {
+            model_override: None,
+            effort: None,
+        };
+
+        assert!(cmd_has_arg(
+            &sandboxed.build_command(dir.path(), true),
+            "--safe-mode"
+        ));
+        assert!(cmd_has_arg(
+            &bare.build_command(dir.path(), true),
+            "--safe-mode"
+        ));
+    }
+
+    #[test]
+    fn interactive_claude_commands_preserve_user_customizations() {
+        let dir = tempfile::tempdir().unwrap();
+        let sandboxed = SandboxedClaudeCode {
+            sandbox_profile: Some("/tmp/profile".to_string()),
+            trusted_sandbox: false,
+            model_override: None,
+            effort: None,
+        };
+        let bare = BareClaudeCode {
+            model_override: None,
+            effort: None,
+        };
+
+        assert!(!cmd_has_arg(
+            &sandboxed.build_command(dir.path(), false),
+            "--safe-mode"
+        ));
+        assert!(!cmd_has_arg(
+            &bare.build_command(dir.path(), false),
+            "--safe-mode"
+        ));
+    }
+
+    #[test]
     fn codex_command_omits_model_when_unset() {
         let coder = CodexCode {
             sandbox_profile: None,
             trusted_sandbox: false,
             model_override: None,
             effort: None,
+            executable: PathBuf::from("codex"),
         };
         let dir = tempfile::tempdir().unwrap();
         let cmd = coder.build_command(dir.path(), true);
@@ -4494,12 +6140,48 @@ mod model_default_tests {
     }
 
     #[test]
+    fn bare_codex_command_uses_prepared_absolute_executable() {
+        let executable = PathBuf::from("/external/codex/bin/codex");
+        let coder = CodexCode {
+            sandbox_profile: None,
+            trusted_sandbox: false,
+            model_override: None,
+            effort: None,
+            executable: executable.clone(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+
+        let command = coder.build_command(dir.path(), true);
+
+        assert_eq!(command.get_program(), executable);
+    }
+
+    #[test]
+    fn sandboxed_codex_command_passes_prepared_absolute_executable() {
+        let executable = PathBuf::from("/external/codex/bin/codex");
+        let coder = CodexCode {
+            sandbox_profile: Some("/tmp/profile".to_string()),
+            trusted_sandbox: false,
+            model_override: None,
+            effort: None,
+            executable: executable.clone(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+
+        let command = coder.build_command(dir.path(), true);
+
+        assert_eq!(command.get_program(), "sandbox-exec");
+        assert!(command.get_args().any(|argument| argument == executable));
+    }
+
+    #[test]
     fn autonomous_codex_command_isolated_from_user_hooks_config_and_sessions() {
         let coder = CodexCode {
             sandbox_profile: None,
             trusted_sandbox: false,
             model_override: Some("gpt-5".to_string()),
             effort: Some("high".to_string()),
+            executable: PathBuf::from("codex"),
         };
         let dir = tempfile::tempdir().unwrap();
         let cmd = coder.build_command(dir.path(), true);
@@ -4514,12 +6196,81 @@ mod model_default_tests {
     }
 
     #[test]
+    fn fresh_writer_codex_command_persists_its_session() {
+        let coder = CodexCode {
+            sandbox_profile: None,
+            trusted_sandbox: false,
+            model_override: None,
+            effort: None,
+            executable: PathBuf::from("codex"),
+        };
+        let dir = tempfile::tempdir().unwrap();
+
+        let cmd = coder.build_writer_command(dir.path(), CoderSession::FreshPersistent);
+
+        assert!(cmd_has_arg(&cmd, "exec"));
+        assert!(!cmd_has_arg(&cmd, "resume"));
+        assert!(!cmd_has_arg(&cmd, "--ephemeral"));
+    }
+
+    #[test]
+    fn resumed_writer_codex_command_uses_the_recorded_session() {
+        let coder = CodexCode {
+            sandbox_profile: None,
+            trusted_sandbox: false,
+            model_override: None,
+            effort: None,
+            executable: PathBuf::from("codex"),
+        };
+        let dir = tempfile::tempdir().unwrap();
+
+        let cmd = coder.build_writer_command(dir.path(), CoderSession::Resume("writer-thread-1"));
+        let args = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        let resume = args.iter().position(|arg| arg == "resume").unwrap();
+        assert_eq!(args[resume - 1], "exec");
+        assert!(
+            args[resume + 1..]
+                .iter()
+                .any(|arg| arg == "writer-thread-1")
+        );
+        assert!(
+            !args.iter().any(|arg| arg == "--cd"),
+            "the resume subcommand does not accept exec's --cd option: {args:?}"
+        );
+        assert_eq!(cmd.get_current_dir(), Some(dir.path()));
+        assert!(!args.iter().any(|arg| arg == "--ephemeral"));
+    }
+
+    #[test]
+    fn resumed_writer_claude_command_uses_the_recorded_session() {
+        let coder = BareClaudeCode {
+            model_override: None,
+            effort: None,
+        };
+        let dir = tempfile::tempdir().unwrap();
+
+        let cmd = coder.build_writer_command(dir.path(), CoderSession::Resume("writer-session-1"));
+        let args = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        let resume = args.iter().position(|arg| arg == "--resume").unwrap();
+        assert_eq!(args[resume + 1], "writer-session-1");
+    }
+
+    #[test]
     fn interactive_codex_command_preserves_user_configuration() {
         let coder = CodexCode {
             sandbox_profile: None,
             trusted_sandbox: false,
             model_override: None,
             effort: None,
+            executable: PathBuf::from("codex"),
         };
         let dir = tempfile::tempdir().unwrap();
         let cmd = coder.build_command(dir.path(), false);
@@ -4536,6 +6287,7 @@ mod model_default_tests {
             trusted_sandbox: false,
             model_override: Some("gpt-4o".to_string()),
             effort: None,
+            executable: PathBuf::from("codex"),
         };
         let dir = tempfile::tempdir().unwrap();
         let cmd = coder.build_command(dir.path(), true);
@@ -4558,7 +6310,7 @@ mod model_default_tests {
             effort: Some("high".to_string()),
         };
         let dir = tempfile::tempdir().unwrap();
-        let cmd = coder.build_command(dir.path());
+        let cmd = coder.build_command(dir.path(), true);
         assert!(cmd_has_arg(&cmd, "--effort"), "should pass --effort flag");
         assert!(cmd_has_arg(&cmd, "high"), "should pass effort value");
     }
@@ -4572,7 +6324,7 @@ mod model_default_tests {
             effort: None,
         };
         let dir = tempfile::tempdir().unwrap();
-        let cmd = coder.build_command(dir.path());
+        let cmd = coder.build_command(dir.path(), true);
         assert!(
             !cmd_has_arg(&cmd, "--effort"),
             "should not pass --effort when unset"
@@ -4586,6 +6338,7 @@ mod model_default_tests {
             trusted_sandbox: false,
             model_override: None,
             effort: Some("medium".to_string()),
+            executable: PathBuf::from("codex"),
         };
         let dir = tempfile::tempdir().unwrap();
         let cmd = coder.build_command(dir.path(), true);
@@ -4602,6 +6355,7 @@ mod model_default_tests {
             trusted_sandbox: false,
             model_override: None,
             effort: None,
+            executable: PathBuf::from("codex"),
         };
         let dir = tempfile::tempdir().unwrap();
         let cmd = coder.build_command(dir.path(), true);
@@ -4618,6 +6372,32 @@ mod auth_refresh_tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
+    struct ScopedEnv {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl ScopedEnv {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: this serial test restores the process environment on drop.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for ScopedEnv {
+        fn drop(&mut self) {
+            // SAFETY: restore the value this test observed before mutating it.
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
     fn make_401_script(counter_path: &Path, succeed_on_call: Option<u32>) -> String {
         let counter = counter_path.display();
         let success_check = match succeed_on_call {
@@ -4633,6 +6413,98 @@ printf '%s' "$count" > "{counter}"
 echo '{{"type":"result","api_error_status":401,"request_id":"req-test"}}'
 exit 1"#
         )
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn rate_limit_retry_helper_exhausts_every_provider_launch() {
+        let _jitter = ScopedEnv::set("FLUENT_RATE_LIMIT_JITTER_MAX_SECONDS", "0");
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("transcript.jsonl");
+        let counter = dir.path().join("launches");
+        let script = format!(
+            "count=0; [ -f '{0}' ] && count=$(cat '{0}'); count=$((count + 1)); \\
+             printf '%s' \"$count\" > '{0}'; \\
+             printf '%s\\n' '{{\"type\":\"error\",\"code\":\"rate_limit\",\"retry_after\":0}}'; \\
+             exit 1",
+            counter.display()
+        );
+
+        let result = run_with_transcript_retrying(
+            move || {
+                let mut cmd = Command::new("/bin/sh");
+                cmd.arg("-c").arg(&script);
+                cmd
+            },
+            Some(&transcript),
+            &crate::transcript_pump::TranscriptPumpConfig::default(),
+            &|_, _| {},
+            &|| Ok(()),
+        );
+
+        let error = result.unwrap_err();
+        let exhausted = error
+            .downcast_ref::<RateLimitExhaustedError>()
+            .expect("rate-limit exhaustion remains typed");
+        assert_eq!(exhausted.exit_code(), 1);
+        assert_eq!(
+            std::fs::read_to_string(&counter).unwrap(),
+            (RATE_LIMIT_MAX_RETRIES + 1).to_string(),
+            "the real capture-and-retry helper launches the provider through its full bounded budget"
+        );
+        for phase in 0..RATE_LIMIT_MAX_RETRIES {
+            assert!(
+                transcript
+                    .with_file_name(format!("transcript.{phase}.jsonl"))
+                    .is_file(),
+                "retry phase {phase} must be preserved before the next launch"
+            );
+        }
+        let timing = read_provider_retry_timing(&provider_timing_path(&transcript))
+            .expect("outer rate-limit waits persist provider timing");
+        assert_eq!(timing.retry_count, u64::from(RATE_LIMIT_MAX_RETRIES));
+        assert_eq!(timing.resume_at_ms, None);
+    }
+
+    #[test]
+    fn retry_phase_preserves_pump_provider_timing() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("transcript.jsonl");
+        std::fs::write(&transcript, "phase zero body\n").unwrap();
+        let status = crate::transcript_pump::PumpStatus {
+            schema_version: crate::transcript_pump::PUMP_STATUS_SCHEMA_VERSION,
+            state: crate::transcript_pump::PumpState::Complete,
+            started_at_ms: 100,
+            updated_at_ms: 900,
+            bytes: 16,
+            records: 2,
+            dropped_console: 2,
+            provider_timing: crate::transcript_pump::ProviderTimingDiagnostics {
+                retry_count: 2,
+                wait_ms: 700,
+                waiting_since_ms: None,
+                resume_at_ms: None,
+            },
+            provider_liveness: Default::default(),
+            error: None,
+            periodic_error: None,
+            transport: Default::default(),
+        };
+        std::fs::write(
+            crate::transcript_pump::status_path_for(&transcript),
+            serde_json::to_vec_pretty(&status).unwrap(),
+        )
+        .unwrap();
+        let mut phase = 0;
+
+        prepare_transcript_retry_phase(Some(&transcript), &mut phase).unwrap();
+        absorb_pump_provider_timing(&transcript, 0).unwrap();
+
+        let timing = read_provider_retry_timing(&provider_timing_path(&transcript)).unwrap();
+        assert_eq!(timing.retry_count, 2);
+        assert_eq!(timing.wait_ms, 700);
+        assert_eq!(timing.absorbed_through_phase, Some(0));
+        assert_eq!(phase, 1);
     }
 
     #[test]
@@ -4673,7 +6545,7 @@ exit 1"#
             Some(&transcript),
             &capture.config,
             &|_, _| {},
-            &|| {},
+            &|| Ok(()),
             &run_fn,
         );
         assert_eq!(result.unwrap(), 0, "the retry recovers");
@@ -4705,6 +6577,7 @@ exit 1"#
         let refresh_clone = Arc::clone(&refresh_count);
         let refresh = move || {
             *refresh_clone.lock().unwrap() += 1;
+            Ok(())
         };
 
         let _ = run_with_transcript_retrying(
@@ -4736,6 +6609,47 @@ exit 1"#
     }
 
     #[test]
+    fn coder_retries_once_then_surfaces_structured_login_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("transcript.jsonl");
+        let counter = dir.path().join("counter");
+        let script = format!(
+            "count=0; [ -f '{0}' ] && count=$(cat '{0}'); count=$((count + 1)); \
+             printf '%s' \"$count\" > '{0}'; \
+             printf '%s\\n' '{{\"type\":\"assistant\",\"error\":\"authentication_failed\"}}' \
+             '{{\"type\":\"result\",\"is_error\":true,\"api_error_status\":null}}'; \
+             exit 1",
+            counter.display()
+        );
+
+        let refresh_count = Arc::new(Mutex::new(0u32));
+        let refresh_clone = Arc::clone(&refresh_count);
+        let result = run_with_transcript_retrying(
+            move || {
+                let mut cmd = Command::new("/bin/sh");
+                cmd.arg("-c").arg(&script);
+                cmd
+            },
+            Some(&transcript),
+            &crate::transcript_pump::TranscriptPumpConfig::default(),
+            &|_, _| {},
+            &move || {
+                *refresh_clone.lock().unwrap() += 1;
+                Ok(())
+            },
+        );
+
+        assert!(matches!(
+            result
+                .unwrap_err()
+                .downcast_ref::<crate::claude_auth::AuthError>(),
+            Some(crate::claude_auth::AuthError::NotLoggedIn)
+        ));
+        assert_eq!(std::fs::read_to_string(counter).unwrap(), "2");
+        assert_eq!(*refresh_count.lock().unwrap(), 1);
+    }
+
+    #[test]
     fn coder_succeeds_on_retry_when_refresh_fixes_auth() {
         let dir = tempfile::tempdir().unwrap();
         let transcript = dir.path().join("transcript.jsonl");
@@ -4751,10 +6665,49 @@ exit 1"#
             Some(&transcript),
             &crate::transcript_pump::TranscriptPumpConfig::default(),
             &|_, _| {},
-            &|| {},
+            &|| Ok(()),
         );
 
         assert_eq!(result.unwrap(), 0, "should succeed after retry");
+    }
+
+    #[test]
+    fn failed_refresh_probe_stops_the_auth_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("transcript.jsonl");
+        let counter = dir.path().join("counter");
+        let script = make_401_script(&counter, Some(2));
+
+        let result = run_with_transcript_retrying(
+            move || {
+                let mut cmd = Command::new("/bin/sh");
+                cmd.arg("-c").arg(&script);
+                cmd
+            },
+            Some(&transcript),
+            &crate::transcript_pump::TranscriptPumpConfig::default(),
+            &|_, _| {},
+            &|| {
+                Err(crate::claude_auth::AuthError::RefreshFailed {
+                    failure: crate::claude_diagnostics::ClaudeProbeFailure::new(
+                        crate::claude_diagnostics::ClaudeProbeFailureKind::Timeout,
+                        "refresh timeout",
+                    ),
+                })
+            },
+        );
+
+        assert!(matches!(
+            result
+                .unwrap_err()
+                .downcast_ref::<crate::claude_auth::AuthError>(),
+            Some(crate::claude_auth::AuthError::RefreshFailed { .. })
+        ));
+        assert_eq!(
+            std::fs::read_to_string(counter).unwrap().lines().count(),
+            1,
+            "a failed refresh must not consume a second coder phase"
+        );
     }
 
     #[test]
@@ -4773,7 +6726,7 @@ exit 1"#
             Some(&transcript),
             &crate::transcript_pump::TranscriptPumpConfig::default(),
             &|_, _| {},
-            &|| {},
+            &|| Ok(()),
         );
 
         let err = result.unwrap_err();
@@ -4820,7 +6773,7 @@ exit 1"#
             Some(&transcript),
             &crate::transcript_pump::TranscriptPumpConfig::default(),
             &|_, _| {},
-            &|| {},
+            &|| Ok(()),
         );
         assert_eq!(result.unwrap(), 0, "should recover after refresh");
 
@@ -4905,7 +6858,7 @@ exit 1"#
             Some(&transcript),
             &crate::transcript_pump::TranscriptPumpConfig::default(),
             &|_, _| {},
-            &|| {},
+            &|| Ok(()),
         );
 
         assert_eq!(result.unwrap(), 0, "should recover after refresh");
@@ -4969,7 +6922,7 @@ exit 1"#
             Some(&transcript),
             &crate::transcript_pump::TranscriptPumpConfig::default(),
             &|_, _| {},
-            &|| {},
+            &|| Ok(()),
         );
 
         let err = result.expect_err("a failed phase preservation must surface as an error");
@@ -5000,6 +6953,7 @@ exit 1"#
         let refresh_clone = Arc::clone(&refresh_count);
         let refresh = move || {
             *refresh_clone.lock().unwrap() += 1;
+            Ok(())
         };
 
         let result = run_with_transcript_retrying(

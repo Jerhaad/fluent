@@ -11,7 +11,7 @@ use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
@@ -28,7 +28,11 @@ use serde::{Deserialize, Serialize};
 /// v3 adds `transport`: the status coordinator's exact accounting of every status
 /// submission (written, coalesced, dropped, disconnected, write-failed) plus the
 /// last error, so a terminal status proves it lost nothing silently.
-pub const PUMP_STATUS_SCHEMA_VERSION: u32 = 3;
+///
+/// v4 adds provider retry timing observed directly from streamed provider records.
+///
+/// v5 adds the current Codex execution phase used by response-liveness supervision.
+pub const PUMP_STATUS_SCHEMA_VERSION: u32 = 5;
 
 /// Built-in size, in bytes, of each read chunk pulled from coder stdout.
 pub const DEFAULT_READ_CHUNK_SIZE: usize = 64 * 1024;
@@ -43,8 +47,8 @@ pub const DEFAULT_CONSOLE_PREVIEW_LIMIT: usize = 8 * 1024;
 /// payload is capped to leave room for it.
 pub const TRUNCATION_MARKER: &[u8] = b"...[preview truncated; full record in transcript]";
 
-/// Operator-facing thresholds that shape console previews and status flushes.
-/// Resolved from layered configuration; see `config::resolve_transcript_pump_config`.
+/// Immutable settings for one transcript-enabled launch: pump thresholds plus
+/// the Claude recovery policy whose evidence the pump observes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TranscriptPumpConfig {
     /// Bytes read per stdout chunk.
@@ -54,6 +58,17 @@ pub struct TranscriptPumpConfig {
     pub console_preview_limit: usize,
     /// Minimum interval between periodic `Running` status flushes.
     pub status_flush_interval: Duration,
+    /// Maximum time a Claude launch may remain in the recognized pre-progress state.
+    pub claude_no_progress_timeout: Duration,
+    /// Same-Task relaunches allowed after a safe Claude no-progress timeout.
+    pub claude_no_progress_retries: u32,
+    /// Initial delay between safe no-progress launches; each retry doubles it.
+    pub claude_no_progress_backoff: Duration,
+    /// Maximum time Codex may remain between streamed records while waiting for
+    /// the model. Active tool execution is never subject to this deadline.
+    pub codex_response_timeout: Duration,
+    /// Same-Task, same-session continuations allowed after a Codex response timeout.
+    pub codex_response_continuations: u32,
 }
 
 impl Default for TranscriptPumpConfig {
@@ -62,6 +77,11 @@ impl Default for TranscriptPumpConfig {
             read_chunk_size: DEFAULT_READ_CHUNK_SIZE,
             console_preview_limit: DEFAULT_CONSOLE_PREVIEW_LIMIT,
             status_flush_interval: Duration::from_millis(1000),
+            claude_no_progress_timeout: Duration::from_secs(60),
+            claude_no_progress_retries: 2,
+            claude_no_progress_backoff: Duration::from_secs(5),
+            codex_response_timeout: Duration::from_secs(10 * 60),
+            codex_response_continuations: 2,
         }
     }
 }
@@ -71,11 +91,10 @@ impl Default for TranscriptPumpConfig {
 // process-global config: a concurrent launch cannot overwrite another capture's
 // resolved thresholds between resolution and pump spawn.
 
-/// Resolve this project's layered transcript-pump thresholds into an immutable
+/// Resolve this project's layered transcript launch settings into an immutable
 /// value the caller threads into its launch. A malformed or unreadable
-/// configuration fails closed to the built-in defaults — every field, not just
-/// the one that failed to parse — because capture correctness never depends on
-/// these diagnostics knobs.
+/// configuration keeps safe pump defaults but disables automatic Claude
+/// relaunch, because capture diagnostics may fail open while recovery may not.
 ///
 /// This lives beside the pump (rather than in an executor) so every
 /// transcript-enabled entry point — Writer, Reviewer, Learner, rebase agent —
@@ -109,9 +128,31 @@ fn map_resolved_config(
             status_flush_interval: Duration::from_millis(
                 resolved.status_flush_interval_ms.value as u64,
             ),
+            claude_no_progress_timeout: Duration::from_secs(
+                resolved.claude_no_progress_timeout_seconds.value as u64,
+            ),
+            claude_no_progress_retries: resolved.claude_no_progress_retries.value,
+            claude_no_progress_backoff: Duration::from_secs(
+                resolved.claude_no_progress_backoff_seconds.value as u64,
+            ),
+            codex_response_timeout: Duration::from_secs(
+                resolved.codex_response_timeout_seconds.value as u64,
+            ),
+            codex_response_continuations: resolved.codex_response_continuations.value,
             ..TranscriptPumpConfig::default()
         },
-        Err(_) => TranscriptPumpConfig::default(),
+        Err(error) => {
+            eprintln!(
+                "warning: {error}; automatic Claude no-progress recovery is disabled for this launch"
+            );
+            TranscriptPumpConfig {
+                // Capture diagnostics may safely use defaults, but automatic provider
+                // relaunch is correctness-sensitive. A malformed layer disables it.
+                claude_no_progress_retries: 0,
+                codex_response_continuations: 0,
+                ..TranscriptPumpConfig::default()
+            }
+        }
     }
 }
 
@@ -259,9 +300,44 @@ pub struct PumpSummary {
     pub bytes: u64,
     pub records: u64,
     pub dropped_console: u64,
+    pub provider_timing: ProviderTimingDiagnostics,
+    pub provider_liveness: ProviderLivenessDiagnostics,
     /// The final balanced status transport accounting, populated when the capture
     /// settles successfully (it is carried on the typed error otherwise).
     pub transport: StatusTransportDiagnostics,
+}
+
+/// Transcript-derived state used to decide whether a Codex launch is safely
+/// waiting for a model response. Unknown or partial records fail closed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderLivenessDiagnostics {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_event: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_progress_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_idle_since_ms: Option<u64>,
+}
+
+/// Best-effort timing derived from provider-owned retry records in the canonical
+/// stream. `wait_ms` is elapsed wait observed so far; `resume_at_ms` is present
+/// only while the latest declared retry delay remains active.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderTimingDiagnostics {
+    #[serde(default)]
+    pub retry_count: u64,
+    #[serde(default)]
+    pub wait_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_since_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_at_ms: Option<u64>,
 }
 
 /// The lifecycle state of a transcript pump, persisted in its status document.
@@ -289,6 +365,10 @@ pub struct PumpStatus {
     pub bytes: u64,
     pub records: u64,
     pub dropped_console: u64,
+    #[serde(default)]
+    pub provider_timing: ProviderTimingDiagnostics,
+    #[serde(default)]
+    pub provider_liveness: ProviderLivenessDiagnostics,
     /// The terminal failure cause, present only on a `Failed` state.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -347,11 +427,57 @@ impl StatusTransportDiagnostics {
 /// Shared, panic-safe pump counters. They live behind atomics so the pump's
 /// panic path can read the values accumulated before the panic instead of
 /// reporting zeros.
-#[derive(Default)]
 struct SharedCounters {
     bytes: AtomicU64,
     records: AtomicU64,
     dropped_console: AtomicU64,
+    provider_timing: Mutex<ProviderTimingState>,
+    claude_progress: AtomicU8,
+    codex_liveness: Mutex<CodexLivenessState>,
+}
+
+const CLAUDE_PROGRESS_SAFE: u8 = 0;
+const CLAUDE_PROGRESS_PARTIAL: u8 = 1;
+const CLAUDE_PROGRESS_OBSERVED: u8 = 2;
+
+impl Default for SharedCounters {
+    fn default() -> Self {
+        Self {
+            bytes: AtomicU64::new(0),
+            records: AtomicU64::new(0),
+            dropped_console: AtomicU64::new(0),
+            provider_timing: Mutex::new(ProviderTimingState::default()),
+            claude_progress: AtomicU8::new(CLAUDE_PROGRESS_SAFE),
+            codex_liveness: Mutex::new(CodexLivenessState::default()),
+        }
+    }
+}
+
+#[derive(Default)]
+struct ProviderTimingState {
+    retry_count: u64,
+    settled_wait_ms: u64,
+    waiting_since_ms: Option<u64>,
+    resume_at_ms: Option<u64>,
+}
+
+#[derive(Default)]
+struct CodexLivenessState {
+    session_id: Option<String>,
+    phase: CodexPhase,
+    last_event: Option<String>,
+    last_progress_at_ms: Option<u64>,
+    response_idle_since_ms: Option<u64>,
+    partial_record: bool,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum CodexPhase {
+    #[default]
+    Unknown,
+    AwaitingResponse,
+    ActiveTool,
+    Complete,
 }
 
 impl SharedCounters {
@@ -368,13 +494,205 @@ impl SharedCounters {
         self.dropped_console.fetch_sub(1, Ordering::Relaxed);
     }
     fn snapshot(&self) -> PumpSummary {
+        let provider_timing = self.provider_timing.lock().unwrap().snapshot(now_ms());
+        let provider_liveness = self.codex_liveness.lock().unwrap().diagnostics();
         PumpSummary {
             transport: StatusTransportDiagnostics::default(),
             bytes: self.bytes.load(Ordering::Relaxed),
             records: self.records.load(Ordering::Relaxed),
             dropped_console: self.dropped_console.load(Ordering::Relaxed),
+            provider_timing,
+            provider_liveness,
         }
     }
+
+    fn observe_record(&self, record: &[u8]) -> bool {
+        if !is_safe_claude_pre_progress_record(record) {
+            self.claude_progress
+                .store(CLAUDE_PROGRESS_OBSERVED, Ordering::Release);
+        }
+        let now = now_ms();
+        self.codex_liveness.lock().unwrap().observe(record, now);
+        let mut timing = self.provider_timing.lock().unwrap();
+        timing.finish_wait(now);
+        let Some(delay_ms) = claude_api_retry_delay_ms(record) else {
+            return false;
+        };
+        timing.retry_count = timing.retry_count.saturating_add(1);
+        timing.waiting_since_ms = Some(now);
+        timing.resume_at_ms = Some(now.saturating_add(delay_ms));
+        true
+    }
+
+    fn observe_partial_record(&self) {
+        let _ = self.claude_progress.compare_exchange(
+            CLAUDE_PROGRESS_SAFE,
+            CLAUDE_PROGRESS_PARTIAL,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        self.codex_liveness.lock().unwrap().partial_record = true;
+    }
+
+    fn finish_complete_record_boundary(&self) {
+        let _ = self.claude_progress.compare_exchange(
+            CLAUDE_PROGRESS_PARTIAL,
+            CLAUDE_PROGRESS_SAFE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        self.codex_liveness.lock().unwrap().partial_record = false;
+    }
+
+    fn claude_no_progress_retry_is_safe(&self) -> bool {
+        self.claude_progress.load(Ordering::Acquire) == CLAUDE_PROGRESS_SAFE
+    }
+
+    fn claude_progress_observed(&self) -> bool {
+        self.claude_progress.load(Ordering::Acquire) == CLAUDE_PROGRESS_OBSERVED
+    }
+
+    fn finish_provider_wait(&self) {
+        self.provider_timing.lock().unwrap().finish_wait(now_ms());
+    }
+
+    fn codex_response_idle(&self, timeout: Duration) -> Option<ProviderLivenessDiagnostics> {
+        let state = self.codex_liveness.lock().unwrap();
+        if state.partial_record || state.phase != CodexPhase::AwaitingResponse {
+            return None;
+        }
+        let idle_since = state.response_idle_since_ms?;
+        (now_ms().saturating_sub(idle_since) >= timeout.as_millis() as u64)
+            .then(|| state.diagnostics())
+    }
+}
+
+impl CodexLivenessState {
+    fn observe(&mut self, record: &[u8], now: u64) {
+        let Ok(event) = serde_json::from_slice::<serde_json::Value>(record) else {
+            self.phase = CodexPhase::Unknown;
+            self.last_event = Some("malformed".to_string());
+            self.last_progress_at_ms = Some(now);
+            self.response_idle_since_ms = None;
+            return;
+        };
+        let Some(event_type) = event["type"].as_str() else {
+            self.phase = CodexPhase::Unknown;
+            self.last_event = Some("unknown".to_string());
+            self.last_progress_at_ms = Some(now);
+            self.response_idle_since_ms = None;
+            return;
+        };
+        match event_type {
+            "thread.started" => {
+                self.session_id = event["thread_id"].as_str().map(str::to_string);
+                self.last_event = Some(event_type.to_string());
+                self.last_progress_at_ms = Some(now);
+            }
+            "turn.started" => self.await_response(event_type, now),
+            "item.started" => {
+                let item_type = event["item"]["type"].as_str().unwrap_or("unknown");
+                self.last_event = Some(format!("item.started:{item_type}"));
+                self.last_progress_at_ms = Some(now);
+                if codex_item_is_model_response(item_type) {
+                    self.phase = CodexPhase::AwaitingResponse;
+                    self.response_idle_since_ms = Some(now);
+                } else {
+                    // Unknown item kinds fail closed because they may own a live tool.
+                    self.phase = CodexPhase::ActiveTool;
+                    self.response_idle_since_ms = None;
+                }
+            }
+            "item.completed" => {
+                let item_type = event["item"]["type"].as_str().unwrap_or("unknown");
+                self.await_response(&format!("item.completed:{item_type}"), now);
+            }
+            "turn.completed" | "turn.failed" | "error" => {
+                self.phase = CodexPhase::Complete;
+                self.last_event = Some(event_type.to_string());
+                self.last_progress_at_ms = Some(now);
+                self.response_idle_since_ms = None;
+            }
+            _ => {
+                // Non-Codex records and future Codex events cannot prove that an
+                // external action is absent, so automatic interruption is disabled.
+                self.phase = CodexPhase::Unknown;
+                self.last_event = Some(event_type.to_string());
+                self.last_progress_at_ms = Some(now);
+                self.response_idle_since_ms = None;
+            }
+        }
+    }
+
+    fn await_response(&mut self, event: &str, now: u64) {
+        self.phase = CodexPhase::AwaitingResponse;
+        self.last_event = Some(event.to_string());
+        self.last_progress_at_ms = Some(now);
+        self.response_idle_since_ms = Some(now);
+    }
+
+    fn diagnostics(&self) -> ProviderLivenessDiagnostics {
+        ProviderLivenessDiagnostics {
+            provider: self.session_id.as_ref().map(|_| "codex".to_string()),
+            session_id: self.session_id.clone(),
+            phase: Some(
+                match self.phase {
+                    CodexPhase::Unknown => "unknown",
+                    CodexPhase::AwaitingResponse => "awaiting-response",
+                    CodexPhase::ActiveTool => "active-tool",
+                    CodexPhase::Complete => "complete",
+                }
+                .to_string(),
+            ),
+            last_event: self.last_event.clone(),
+            last_progress_at_ms: self.last_progress_at_ms,
+            response_idle_since_ms: self.response_idle_since_ms,
+        }
+    }
+}
+
+fn codex_item_is_model_response(item_type: &str) -> bool {
+    matches!(item_type, "agent_message" | "reasoning")
+}
+
+fn is_safe_claude_pre_progress_record(record: &[u8]) -> bool {
+    let Ok(event) = serde_json::from_slice::<serde_json::Value>(record) else {
+        return false;
+    };
+    event["type"].as_str() == Some("system")
+        && matches!(event["subtype"].as_str(), Some("init") | Some("api_retry"))
+}
+
+impl ProviderTimingState {
+    fn finish_wait(&mut self, now: u64) {
+        if let (Some(started), Some(resume)) = (self.waiting_since_ms, self.resume_at_ms) {
+            self.settled_wait_ms = self
+                .settled_wait_ms
+                .saturating_add(now.min(resume).saturating_sub(started));
+        }
+        self.waiting_since_ms = None;
+        self.resume_at_ms = None;
+    }
+
+    fn snapshot(&self, now: u64) -> ProviderTimingDiagnostics {
+        let live_wait = match (self.waiting_since_ms, self.resume_at_ms) {
+            (Some(started), Some(resume)) => now.min(resume).saturating_sub(started),
+            _ => 0,
+        };
+        ProviderTimingDiagnostics {
+            retry_count: self.retry_count,
+            wait_ms: self.settled_wait_ms.saturating_add(live_wait),
+            waiting_since_ms: self.waiting_since_ms,
+            resume_at_ms: self.resume_at_ms.filter(|resume| *resume > now),
+        }
+    }
+}
+
+fn claude_api_retry_delay_ms(record: &[u8]) -> Option<u64> {
+    let value: serde_json::Value = serde_json::from_slice(record).ok()?;
+    (value["type"].as_str() == Some("system") && value["subtype"].as_str() == Some("api_retry"))
+        .then(|| value["retry_delay_ms"].as_u64())
+        .flatten()
 }
 
 /// Drain `reader` into the transcript at `transcript_path`, writing every byte
@@ -545,6 +863,7 @@ fn capture(
     let chunk_size = config.read_chunk_size.max(1);
     let mut buf = vec![0u8; chunk_size];
     let mut line = PreviewLine::new(config.console_preview_limit);
+    let mut diagnostic_line = DiagnosticLine::default();
     let mut last_flush = Instant::now();
 
     loop {
@@ -555,14 +874,26 @@ fn capture(
             break;
         }
         let chunk = &buf[..read];
-        persist_chunk(
+        let provider_retry_observed = persist_chunk(
             &mut file,
             chunk,
             &mut line,
+            &mut diagnostic_line,
             preview,
             counters,
             transcript_path,
         )?;
+
+        if provider_retry_observed && let Some(coordinator) = coordinator {
+            coordinator.submit_periodic(build_status(
+                PumpState::Running,
+                started,
+                &counters.snapshot(),
+                None,
+                None,
+                StatusTransportDiagnostics::default(),
+            ));
+        }
 
         if last_flush.elapsed() >= config.status_flush_interval {
             // Periodic snapshots go through the coordinator's coalescing slot, never
@@ -585,8 +916,11 @@ fn capture(
     // emitted; count it and offer its preview before completing.
     if line.has_bytes() {
         counters.add_record();
+        counters.observe_record(diagnostic_line.as_slice());
+        counters.finish_complete_record_boundary();
         deliver_preview(&mut line, preview, counters);
     }
+    counters.finish_provider_wait();
 
     file.flush().map_err(|err| {
         TranscriptPumpError::new(format!(
@@ -610,11 +944,13 @@ fn persist_chunk<W: Write>(
     writer: &mut W,
     chunk: &[u8],
     line: &mut PreviewLine,
+    diagnostic_line: &mut DiagnosticLine,
     preview: &dyn PreviewSink,
     counters: &SharedCounters,
     transcript_path: &Path,
-) -> Result<(), TranscriptPumpError> {
+) -> Result<bool, TranscriptPumpError> {
     let mut written = 0;
+    let mut provider_retry_observed = false;
     while written < chunk.len() {
         match writer.write(&chunk[written..]) {
             Ok(0) => {
@@ -627,13 +963,24 @@ fn persist_chunk<W: Write>(
                 // Count the persisted prefix and parse only those bytes before the
                 // next fallible write.
                 counters.add_bytes(n as u64);
+                // The complete persisted prefix must be classified before the
+                // supervisor can treat the stream as safely pre-progress.
                 for &byte in &chunk[written..written + n] {
                     if byte == b'\n' {
                         counters.add_record();
+                        provider_retry_observed |=
+                            counters.observe_record(diagnostic_line.take().as_slice());
                         deliver_preview(line, preview, counters);
                     } else {
+                        if diagnostic_line.as_slice().is_empty() {
+                            counters.observe_partial_record();
+                        }
                         line.push(byte);
+                        diagnostic_line.push(byte);
                     }
+                }
+                if diagnostic_line.as_slice().is_empty() {
+                    counters.finish_complete_record_boundary();
                 }
                 written += n;
             }
@@ -646,7 +993,7 @@ fn persist_chunk<W: Write>(
             }
         }
     }
-    Ok(())
+    Ok(provider_retry_observed)
 }
 
 /// Offer one record's bounded preview to the console sink, accounting the loss
@@ -687,6 +1034,8 @@ fn build_status(
         bytes: summary.bytes,
         records: summary.records,
         dropped_console: summary.dropped_console,
+        provider_timing: summary.provider_timing.clone(),
+        provider_liveness: summary.provider_liveness.clone(),
         // Bound the persisted primary and periodic errors so a pathological store
         // error can never bloat the on-disk status document either.
         error: error.map(bound_error),
@@ -2130,6 +2479,7 @@ fn ensure_pump_panic_hook() {
 pub struct PumpHandle {
     terminal: Receiver<Result<PumpSummary, TranscriptPumpError>>,
     first_fault: Arc<FirstFault>,
+    counters: Arc<SharedCounters>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -2139,6 +2489,25 @@ impl PumpHandle {
     /// the coder without waiting for a delayed or blocked terminal status write.
     pub fn first_fault_observed(&self) -> bool {
         self.first_fault.observed()
+    }
+
+    /// Whether the captured Claude stream still proves that no model or tool
+    /// activity occurred. Partial, malformed, and unknown records fail closed.
+    pub fn claude_no_progress_retry_is_safe(&self) -> bool {
+        self.counters.claude_no_progress_retry_is_safe()
+    }
+
+    /// Whether a complete malformed, unknown, model, or tool record permanently
+    /// disabled no-progress recovery for this launch.
+    pub fn claude_progress_observed(&self) -> bool {
+        self.counters.claude_progress_observed()
+    }
+
+    /// Return transcript-derived diagnostics only when Codex has remained in a
+    /// response-wait phase for at least `timeout`. Active and unknown tool phases
+    /// return `None` and therefore cannot be interrupted by liveness recovery.
+    pub fn codex_response_idle(&self, timeout: Duration) -> Option<ProviderLivenessDiagnostics> {
+        self.counters.codex_response_idle(timeout)
     }
 
     /// The pump's terminal outcome if it has finished, or `None` while it is
@@ -2206,6 +2575,7 @@ where
     let first_fault = Arc::new(FirstFault::default());
     let first_fault_for_thread = Arc::clone(&first_fault);
     let counters = Arc::new(SharedCounters::default());
+    let counters_for_thread = Arc::clone(&counters);
     let join = std::thread::Builder::new()
         .name("transcript-pump".to_string())
         .spawn(move || {
@@ -2220,7 +2590,7 @@ where
                     store,
                     preview,
                     &config,
-                    &counters,
+                    &counters_for_thread,
                     Some(Arc::clone(&first_fault_for_thread)),
                 )
             }))
@@ -2235,6 +2605,7 @@ where
     Ok(PumpHandle {
         terminal: rx,
         first_fault,
+        counters,
         join: Some(join),
     })
 }
@@ -2266,6 +2637,42 @@ struct ConsoleSink;
 impl PreviewSink for ConsoleSink {
     fn deliver(&self, _preview: &[u8]) -> bool {
         false
+    }
+}
+
+const MAX_DIAGNOSTIC_RECORD_BYTES: usize = 64 * 1024;
+
+/// Retains a bounded copy of one record for best-effort provider diagnostics.
+/// Oversized records remain canonical transcript evidence but are ignored by the
+/// diagnostic parser, so parsing can never make capture memory unbounded.
+#[derive(Default)]
+struct DiagnosticLine {
+    buf: Vec<u8>,
+    oversized: bool,
+}
+
+impl DiagnosticLine {
+    fn push(&mut self, byte: u8) {
+        if self.buf.len() < MAX_DIAGNOSTIC_RECORD_BYTES {
+            self.buf.push(byte);
+        } else {
+            self.oversized = true;
+        }
+    }
+
+    fn take(&mut self) -> Vec<u8> {
+        let record = if self.oversized {
+            Vec::new()
+        } else {
+            std::mem::take(&mut self.buf)
+        };
+        self.buf.clear();
+        self.oversized = false;
+        record
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        if self.oversized { &[] } else { &self.buf }
     }
 }
 
@@ -5197,6 +5604,81 @@ mod tests {
         assert_eq!(summary.transport.disconnected, 0);
         assert_eq!(summary.transport.write_failures, 0);
         assert!(summary.transport.is_balanced());
+        assert_eq!(
+            summary.provider_timing,
+            ProviderTimingDiagnostics::default(),
+            "ordinary provider activity must not be classified as wait"
+        );
+    }
+
+    #[test]
+    fn claude_api_retry_records_provider_wait_diagnostics() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("transcript.jsonl");
+        let status = status_path_for(&transcript);
+        let sink = SaturatedSink::new();
+        let input = concat!(
+            "{\"type\":\"system\",\"subtype\":\"api_retry\",\"retry_delay_ms\":10000}\n",
+            "{\"type\":\"assistant\",\"message\":{}}\n"
+        );
+
+        let summary = drain(
+            Cursor::new(input.as_bytes()),
+            &transcript,
+            Some(&status),
+            &sink,
+            &TranscriptPumpConfig::default(),
+        )
+        .unwrap();
+
+        assert_eq!(summary.provider_timing.retry_count, 1);
+        assert_eq!(summary.provider_timing.resume_at_ms, None);
+        let persisted: PumpStatus =
+            serde_json::from_slice(&std::fs::read(status).unwrap()).unwrap();
+        assert_eq!(persisted.schema_version, PUMP_STATUS_SCHEMA_VERSION);
+        assert_eq!(persisted.provider_timing.retry_count, 1);
+        assert_eq!(persisted.provider_timing.resume_at_ms, None);
+    }
+
+    #[test]
+    fn provider_wait_accumulates_only_declared_interval() {
+        let mut timing = ProviderTimingState {
+            retry_count: 1,
+            settled_wait_ms: 200,
+            waiting_since_ms: Some(1_000),
+            resume_at_ms: Some(1_500),
+        };
+
+        assert_eq!(timing.snapshot(1_250).wait_ms, 450);
+        timing.finish_wait(2_000);
+
+        assert_eq!(timing.settled_wait_ms, 700);
+        assert_eq!(timing.snapshot(2_000).resume_at_ms, None);
+    }
+
+    #[test]
+    fn legacy_pump_status_without_provider_timing_deserializes() {
+        let legacy = r#"{
+            "schema_version":3,
+            "state":"complete",
+            "started_at_ms":1,
+            "updated_at_ms":2,
+            "bytes":3,
+            "records":1,
+            "dropped_console":1,
+            "transport":{
+                "submitted":2,
+                "written":2,
+                "coalesced":0,
+                "dropped":0,
+                "disconnected":0,
+                "write_failures":0
+            }
+        }"#;
+
+        let status: PumpStatus = serde_json::from_str(legacy).unwrap();
+
+        assert_eq!(status.provider_timing, ProviderTimingDiagnostics::default());
     }
 
     #[test]
@@ -5720,6 +6202,7 @@ mod tests {
         // transcript, not the whole chunk it was handed.
         let counters = SharedCounters::default();
         let mut line = PreviewLine::new(DEFAULT_CONSOLE_PREVIEW_LIMIT);
+        let mut diagnostic_line = DiagnosticLine::default();
         let sink = SaturatedSink::new();
         let chunk = b"{\"rec\":1}\n{\"rec\":2}\n"; // 20 bytes, two records
         let mut writer = WriteThenFail { budget: 10 }; // persists exactly the first record
@@ -5727,6 +6210,7 @@ mod tests {
             &mut writer,
             chunk,
             &mut line,
+            &mut diagnostic_line,
             &sink,
             &counters,
             Path::new("t.jsonl"),
@@ -5888,6 +6372,97 @@ mod tests {
             "the terminal status must preserve counters accumulated before the panic"
         );
         assert!(persisted.error.is_some());
+    }
+
+    #[test]
+    fn claude_startup_retry_records_remain_pre_progress() {
+        let counters = SharedCounters::default();
+        assert!(counters.claude_no_progress_retry_is_safe());
+
+        counters.observe_partial_record();
+        counters.observe_record(br#"{"type":"system","subtype":"init"}"#);
+        counters.finish_complete_record_boundary();
+        assert!(counters.claude_no_progress_retry_is_safe());
+        counters.observe_partial_record();
+        counters
+            .observe_record(br#"{"type":"system","subtype":"api_retry","retry_delay_ms":1000}"#);
+        counters.finish_complete_record_boundary();
+        assert!(counters.claude_no_progress_retry_is_safe());
+    }
+
+    #[test]
+    fn claude_assistant_record_marks_progress() {
+        let counters = SharedCounters::default();
+        counters.observe_partial_record();
+        counters.observe_record(br#"{"type":"assistant","message":{}}"#);
+        assert!(counters.claude_progress_observed());
+        assert!(!counters.claude_no_progress_retry_is_safe());
+    }
+
+    #[test]
+    fn claude_progress_classifier_fails_closed_on_malformed_or_unknown_records() {
+        for record in [
+            b"not-json".as_slice(),
+            br#"{"type":"system","subtype":"mystery"}"#.as_slice(),
+            br#"{"type":"user","message":{"content":[{"type":"tool_result"}]}}"#.as_slice(),
+        ] {
+            let counters = SharedCounters::default();
+            counters.observe_record(record);
+            assert!(counters.claude_progress_observed());
+            assert!(!counters.claude_no_progress_retry_is_safe());
+        }
+    }
+
+    #[test]
+    fn codex_response_wait_becomes_interruptible_without_an_active_tool() {
+        let counters = SharedCounters::default();
+        counters.observe_record(br#"{"type":"thread.started","thread_id":"thread-1"}"#);
+        counters.observe_record(br#"{"type":"turn.started"}"#);
+
+        let diagnostic = counters
+            .codex_response_idle(Duration::ZERO)
+            .expect("a response wait is eligible after its deadline");
+        assert_eq!(diagnostic.session_id.as_deref(), Some("thread-1"));
+        assert_eq!(diagnostic.phase.as_deref(), Some("awaiting-response"));
+        assert_eq!(diagnostic.last_event.as_deref(), Some("turn.started"));
+    }
+
+    #[test]
+    fn codex_active_tool_is_never_interruptible() {
+        let counters = SharedCounters::default();
+        counters.observe_record(br#"{"type":"thread.started","thread_id":"thread-1"}"#);
+        counters.observe_record(br#"{"type":"turn.started"}"#);
+        counters.observe_record(
+            br#"{"type":"item.started","item":{"id":"tool-1","type":"command_execution"}}"#,
+        );
+
+        assert!(counters.codex_response_idle(Duration::ZERO).is_none());
+    }
+
+    #[test]
+    fn codex_partial_record_disables_response_interruption() {
+        let counters = SharedCounters::default();
+        counters.observe_record(br#"{"type":"thread.started","thread_id":"thread-1"}"#);
+        counters.observe_record(br#"{"type":"turn.started"}"#);
+        counters.observe_partial_record();
+
+        assert!(counters.codex_response_idle(Duration::ZERO).is_none());
+    }
+
+    #[test]
+    fn malformed_layered_config_disables_automatic_claude_relaunch() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project.yaml");
+        std::fs::write(
+            &project,
+            "provider-recovery:\n  claude:\n    no-progress-timeout-seconds: 0\n",
+        )
+        .unwrap();
+
+        let resolved = resolve_config_from(&project, None);
+
+        assert_eq!(resolved.claude_no_progress_retries, 0);
+        assert_eq!(resolved.read_chunk_size, DEFAULT_READ_CHUNK_SIZE);
     }
 
     /// A reader that emits `count` records, sleeping between each so the pump's

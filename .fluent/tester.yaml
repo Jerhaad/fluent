@@ -1,17 +1,72 @@
 commands:
-  - command: NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest run --no-fail-fast --message-format libtest-json 2>&1
-    test_harness: cargo-nextest
   - command: |
-      exit_code=0
-      for script in tests/behaviors/operations/*.sh tests/behaviors/skills/*.sh; do
-        [ -f "$script" ] || continue
-        echo "--- $script ---"
-        if bash "$script"; then
-          echo "ok $script"
-        else
-          echo "not ok $script"
-          exit_code=1
-        fi
-      done
-      exit $exit_code
+      set -eu
+      unset FLUENT_MAX_TOTAL_WRITE_ROUNDS
+      FLUENT_OWNERSHIP_OLD_BIN="$(bash tests/fixtures/build-ownership-old-reader.sh)"
+      export FLUENT_OWNERSHIP_OLD_BIN
+      FLUENT_LAUNCH_HANDOFF_OLD_BIN="$(bash tests/fixtures/build-launch-handoff-old-reader.sh)"
+      export FLUENT_LAUNCH_HANDOFF_OLD_BIN
+      FLUENT_VERIFICATION_OLD_BIN="$(bash tests/fixtures/build-verification-old-reader.sh)"
+      export FLUENT_VERIFICATION_OLD_BIN
+      FLUENT_ROUND_CAP_APPROACH_STABLE_OLD_BIN="$(bash tests/fixtures/build-round-cap-approach-revision-stable-old-reader.sh)"
+      export FLUENT_ROUND_CAP_APPROACH_STABLE_OLD_BIN
+      FLUENT_ROUND_CAP_APPROACH_ASSIGNMENT_OLD_BIN="$(bash tests/fixtures/build-round-cap-approach-revision-assignment-old-reader.sh)"
+      export FLUENT_ROUND_CAP_APPROACH_ASSIGNMENT_OLD_BIN
+      FLUENT_WRITER_ASSIGNMENT_MAIN_OLD_BIN="$(bash tests/fixtures/build-writer-assignment-main-old-reader.sh)"
+      export FLUENT_WRITER_ASSIGNMENT_MAIN_OLD_BIN
+      FLUENT_WRITER_ASSIGNMENT_PAUSED_OLD_BIN="$(bash tests/fixtures/build-writer-assignment-paused-old-reader.sh)"
+      export FLUENT_WRITER_ASSIGNMENT_PAUSED_OLD_BIN
+      FLUENT_USAGE_LIMIT_OLD_BIN="$(bash tests/fixtures/build-usage-limit-old-reader.sh)"
+      export FLUENT_USAGE_LIMIT_OLD_BIN
+      FLUENT_CARRIED_FINDING_OLD_BIN="$(bash tests/fixtures/build-carried-finding-old-reader.sh)"
+      export FLUENT_CARRIED_FINDING_OLD_BIN
+      FLUENT_COMBINED_BASE_OLD_BIN="$(bash tests/fixtures/build-combined-recovery-base-old-reader.sh)"
+      export FLUENT_COMBINED_BASE_OLD_BIN
+      FLUENT_COMBINED_ASSIGNMENT_OLD_BIN="$(bash tests/fixtures/build-combined-recovery-assignment-old-reader.sh)"
+      export FLUENT_COMBINED_ASSIGNMENT_OLD_BIN
+      FLUENT_COMBINED_EVIDENCE_OLD_BIN="$(bash tests/fixtures/build-combined-recovery-evidence-old-reader.sh)"
+      export FLUENT_COMBINED_EVIDENCE_OLD_BIN
+      FLUENT_OUTPUT_FREE_CONTEXT_OLD_BIN="$(bash tests/fixtures/build-output-free-context-old-reader.sh)"
+      export FLUENT_OUTPUT_FREE_CONTEXT_OLD_BIN
+      FLUENT_INSTALLATION_MAIN_OLD_BIN="$(bash tests/fixtures/build-installation-main-old-reader.sh)"
+      export FLUENT_INSTALLATION_MAIN_OLD_BIN
+      FLUENT_INSTALLATION_OUTPUT_FREE_OLD_BIN="$(bash tests/fixtures/build-installation-output-free-old-reader.sh)"
+      export FLUENT_INSTALLATION_OUTPUT_FREE_OLD_BIN
+      FLUENT_INSTALLATION_ACCEPTED_PROOF_OLD_BIN="$(bash tests/fixtures/build-installation-accepted-proof-old-reader.sh)"
+      export FLUENT_INSTALLATION_ACCEPTED_PROOF_OLD_BIN
+      FLUENT_LANDING_RECOVERY_OLD_BIN="$(bash tests/fixtures/build-landing-recovery-old-reader.sh)"
+      export FLUENT_LANDING_RECOVERY_OLD_BIN
+      cargo build
+      production_bin="$(pwd)/target/debug/fluent-production"
+      cp target/debug/fluent "$production_bin"
+      export FLUENT_PRODUCTION_BIN="$production_bin"
+      cargo build --features test-support
+      export FLUENT_BIN_OVERRIDE="$(pwd)/target/debug/fluent"
+      export FLUENT_TEST_HERMETIC_PROVIDERS=1
+      export PATH="$(pwd)/tests/fixtures/provider-doubles:$PATH"
+      FLUENT_TEST_HOST_SANDBOX_PREFLIGHT=pass NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest run --features test-support --no-fail-fast --message-format libtest-json 2>&1
+    test_harness: cargo-nextest
+    reject_process_leaks: true
+  - command: |
+      unset FLUENT_MAX_TOTAL_WRITE_ROUNDS
+      export FLUENT_TEST_HOST_SANDBOX_PREFLIGHT=pass
+      cargo build --features test-support
+      export FLUENT_BIN_OVERRIDE="$(pwd)/target/debug/fluent"
+      export FLUENT_TEST_HERMETIC_PROVIDERS=1
+      export PATH="$(pwd)/tests/fixtures/provider-doubles:$PATH"
+      bash -c '
+        exit_code=0
+        for script in tests/behaviors/operations/*.sh tests/behaviors/skills/*.sh; do
+          [ -f "$script" ] || continue
+          echo "--- $script ---"
+          if bash "$script"; then
+            echo "ok $script"
+          else
+            echo "not ok $script"
+            exit_code=1
+          fi
+        done
+        exit $exit_code
+      '
     test_harness: shell-harness
+    reject_process_leaks: true
