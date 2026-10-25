@@ -1556,9 +1556,24 @@ pub fn check_prerequisites_for(coder_kind: CoderKind) -> Result<()> {
     Ok(())
 }
 
+/// Check that this host's sandbox launcher is available.
+///
+/// The two backends launch differently: Seatbelt uses the system's
+/// `sandbox-exec`, and Landlock has no launcher of its own, so Fluent
+/// re-executes itself. Checking only for `sandbox-exec` failed on a Linux
+/// host, where the launcher is the running binary.
 pub fn check_sandbox_prerequisite() -> Result<()> {
-    if !command_exists("sandbox-exec") {
-        bail!("sandbox-exec not found (macOS only)");
+    match backend() {
+        SandboxBackend::Seatbelt => {
+            if !command_exists("sandbox-exec") {
+                bail!("sandbox-exec not found (macOS only)");
+            }
+        }
+        SandboxBackend::Landlock => {
+            if env::current_exe().is_err() {
+                bail!("the Landlock launcher needs Fluent's own executable path");
+            }
+        }
     }
     Ok(())
 }
