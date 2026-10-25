@@ -403,6 +403,51 @@ fn common_only_with_denied_access_withholds_paths_on_linux() {
 }
 
 #[test]
+fn scoped_codex_provider_without_shared_temp_confines_tmp_on_linux() {
+    let root = fixture_root();
+    let private = root.path().join("private");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir_all(&private).unwrap();
+    std::fs::create_dir_all(private.join(".codex")).unwrap();
+    std::fs::create_dir_all(&workspace).unwrap();
+
+    let profile = fluent::os::render_profile_for_scoped_codex_provider(
+        &fluent::content::ContentResolver::new(None),
+        &private,
+        std::slice::from_ref(&workspace),
+        &[],
+        &private,
+    )
+    .unwrap();
+    let policy_file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::copy(profile.path, policy_file.path()).unwrap();
+    let shared_temp = tempfile::TempDir::new().unwrap();
+    let shared_path = shared_temp.path().join("scoped-escape.txt");
+    let private_path = private.join(".codex/allowed.txt");
+
+    if kernel_enforces_landlock() {
+        assert_denied(
+            policy_file.path(),
+            &format!("printf escaped > {}", shared_path.display()),
+            "a scoped provider could write in the shared temp tree",
+        );
+        let (ok, stderr) = run_confined(
+            policy_file.path(),
+            &format!("printf allowed > {}", private_path.display()),
+        );
+        assert!(
+            ok,
+            "a write to the scoped provider's private home was refused: {stderr}"
+        );
+        assert_eq!(std::fs::read_to_string(&private_path).unwrap(), "allowed");
+    } else {
+        let (ok, stderr) = run_confined(policy_file.path(), "true");
+        assert!(!ok, "a kernel with no Landlock ran the provider anyway");
+        assert!(stderr.contains(NOT_ENFORCED), "{stderr}");
+    }
+}
+
+#[test]
 fn scoped_codex_provider_with_tools_withholds_installed_writes_on_linux() {
     let root = fixture_root();
     let private = root.path().join("private");

@@ -218,7 +218,7 @@ pub fn render_writer_profile_for_landlock(
             denied_write_paths.extend(installed_tools.iter().cloned());
             let mut readable = readable_roots.to_vec();
             readable.extend_from_slice(installed_tools);
-            render_profile_for_access_with_exclusions(
+            render_profile_for_access_with_exclusions_and_shared_temp(
                 resolver,
                 &private_home.to_string_lossy(),
                 writable_roots,
@@ -230,6 +230,7 @@ pub fn render_writer_profile_for_landlock(
                 &denied_write_paths,
                 &denied_read_paths,
                 &reallowed_write_paths,
+                false,
             )?
         }
         WriterProfileKind::Coder {
@@ -947,7 +948,7 @@ pub fn render_profile_for_scoped_codex_provider(
     // traverse its ancestors without reading unrelated temporary contents.
     let mut readable = readable_roots.to_vec();
     readable.push(codex_home.to_path_buf());
-    let profile = render_profile_for_access(
+    let profile = render_profile_for_access_with_exclusions_and_shared_temp(
         resolver,
         &private_home.to_string_lossy(),
         writable_roots,
@@ -955,6 +956,10 @@ pub fn render_profile_for_scoped_codex_provider(
         &[],
         Some(CoderKind::Codex),
         Some(codex_home),
+        false,
+        &[],
+        &[],
+        &[],
         false,
     )?;
     let mut content = std::fs::read_to_string(&profile.path)?;
@@ -1027,7 +1032,7 @@ pub(crate) fn render_profile_for_scoped_codex_provider_with_tools_and_exclusions
 ) -> Result<SandboxProfile> {
     let mut readable = readable_roots.to_vec();
     readable.extend_from_slice(installed_tools);
-    let profile = render_profile_for_access_with_exclusions(
+    let profile = render_profile_for_access_with_exclusions_and_shared_temp(
         resolver,
         &private_home.to_string_lossy(),
         writable_roots,
@@ -1039,6 +1044,7 @@ pub(crate) fn render_profile_for_scoped_codex_provider_with_tools_and_exclusions
         denied_write_paths,
         &[],
         &[],
+        false,
     )?;
     if backend() == SandboxBackend::Seatbelt {
         let mut content = std::fs::read_to_string(&profile.path)?;
@@ -1312,6 +1318,42 @@ fn render_profile_for_access_with_exclusions(
     denied_read_paths: &[PathBuf],
     reallowed_write_paths: &[PathBuf],
 ) -> Result<SandboxProfile> {
+    render_profile_for_access_with_exclusions_and_shared_temp(
+        resolver,
+        home,
+        writable_roots,
+        readable_roots,
+        denied_write_roots,
+        coder_kind,
+        codex_home,
+        deny_codex_source_home,
+        denied_write_paths,
+        denied_read_paths,
+        reallowed_write_paths,
+        true,
+    )
+}
+
+/// Render a profile with explicit control over the shared temporary trees.
+///
+/// Scoped providers must not inherit those grants. They need their own
+/// private home and scope roots instead, regardless of whether they withhold
+/// a denied write root.
+#[allow(clippy::too_many_arguments)]
+fn render_profile_for_access_with_exclusions_and_shared_temp(
+    resolver: &ContentResolver,
+    home: &str,
+    writable_roots: &[PathBuf],
+    readable_roots: &[PathBuf],
+    denied_write_roots: &[PathBuf],
+    coder_kind: Option<CoderKind>,
+    codex_home: Option<&Path>,
+    deny_codex_source_home: bool,
+    denied_write_paths: &[PathBuf],
+    denied_read_paths: &[PathBuf],
+    reallowed_write_paths: &[PathBuf],
+    grant_shared_temp: bool,
+) -> Result<SandboxProfile> {
     if writable_roots.is_empty() {
         bail!("At least one writable sandbox root is required");
     }
@@ -1340,6 +1382,7 @@ fn render_profile_for_access_with_exclusions(
             denied_write_paths,
             denied_read_paths,
             reallowed_write_paths,
+            grant_shared_temp,
         );
     }
 
@@ -1410,6 +1453,7 @@ fn render_landlock_policy(
     denied_write_paths: &[PathBuf],
     denied_read_paths: &[PathBuf],
     reallowed_write_paths: &[PathBuf],
+    grant_shared_temp: bool,
 ) -> Result<SandboxProfile> {
     let policy = linux_sandbox::render(&linux_sandbox::PolicyRequest {
         home: Path::new(home),
@@ -1418,7 +1462,7 @@ fn render_landlock_policy(
         denied_write_roots,
         coder_kind,
         codex_home,
-        grant_shared_temp: denied_write_roots.is_empty(),
+        grant_shared_temp,
         denied_write_paths,
         denied_read_paths,
         reallowed_write_paths,
