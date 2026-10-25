@@ -37,6 +37,7 @@ pub enum SandboxBackend {
 /// Backend this host confines with, unless `FLUENT_SANDBOX_BACKEND` names
 /// `seatbelt` or `landlock`.
 pub fn backend() -> SandboxBackend {
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(forced) = pinned_backend() {
         return forced;
     }
@@ -91,11 +92,6 @@ pub struct BackendPin {
 impl BackendPin {
     pub fn seatbelt() -> Self {
         Self::pin(Some(SandboxBackend::Seatbelt))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn landlock() -> Self {
-        Self::pin(Some(SandboxBackend::Landlock))
     }
 
     fn pin(backend: Option<SandboxBackend>) -> Self {
