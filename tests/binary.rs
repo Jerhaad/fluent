@@ -775,6 +775,11 @@ fn fluent_cmd() -> LoggedCommand {
     cmd.env_remove("CLAUDE_CODE_OAUTH_TOKEN");
     cmd.env_remove("OPENAI_API_KEY");
     cmd.env_remove("PI_API_KEY");
+    // A pinned backend has to reach the command this test starts, and the pin
+    // lives in this process.
+    if let Some(pinned) = fluent::os::pinned_backend_name() {
+        cmd.env("FLUENT_SANDBOX_BACKEND", pinned);
+    }
     cmd
 }
 
@@ -783,25 +788,9 @@ fn fluent_cmd() -> LoggedCommand {
 /// Several upstream tests assert on the rendered Seatbelt profile's text: the
 /// rule that grants a path, the deny that withholds it. A Linux host renders
 /// the Landlock policy instead, so those assertions would read the wrong
-/// artifact. The backend is selected by an environment variable, and the test
-/// harness runs one test per process, so setting it here reaches both this
-/// process and any command it starts.
-struct SeatbeltBackendGuard;
-
-impl SeatbeltBackendGuard {
-    fn install() -> Self {
-        // SAFETY: the test harness runs one test per process, so no other
-        // thread reads this variable while it is set.
-        unsafe { std::env::set_var("FLUENT_SANDBOX_BACKEND", "seatbelt") };
-        Self
-    }
-}
-
-impl Drop for SeatbeltBackendGuard {
-    fn drop(&mut self) {
-        // SAFETY: see `SeatbeltBackendGuard::install`.
-        unsafe { std::env::remove_var("FLUENT_SANDBOX_BACKEND") };
-    }
+/// artifact.
+fn seatbelt_backend() -> fluent::os::BackendPin {
+    fluent::os::BackendPin::seatbelt()
 }
 
 #[cfg(unix)]
@@ -2310,7 +2299,7 @@ fn writer_completion_context_repaired_retry_rechecks_spawn() {
 #[test]
 fn assignment_context_recovery_output_free_retry_real_confinement() {
     // The assertions below read the rendered Seatbelt profile.
-    let _seatbelt = SeatbeltBackendGuard::install();
+    let _seatbelt = seatbelt_backend();
     let mandatory =
         std::env::var_os("FLUENT_ASSIGNMENT_CONTEXT_REQUIRE_REAL_CONFINEMENT").is_some();
     let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/output");
@@ -14584,7 +14573,7 @@ exit 0
 #[test]
 fn dry_run_with_codex_uses_codex_profile_layer() {
     // The assertions below read the rendered Seatbelt profile.
-    let _seatbelt = SeatbeltBackendGuard::install();
+    let _seatbelt = seatbelt_backend();
     let tmp = TempDir::new().unwrap();
     let bin_dir = tmp.path().join("bin");
     write_mock_codex(&bin_dir, "#!/bin/bash\nexit 0\n");
@@ -25037,7 +25026,7 @@ exec "$@"
 #[test]
 fn reviewer_sandbox_does_not_include_writer_artifact_dir() {
     // The assertions below read the rendered Seatbelt profile.
-    let _seatbelt = SeatbeltBackendGuard::install();
+    let _seatbelt = seatbelt_backend();
     let tmp = TempDir::new().unwrap();
     let main_dir = setup_git_project(&tmp);
     create_completed_work_attempt(&tmp, &main_dir);
@@ -39941,7 +39930,7 @@ fn attempt_evidence_run_plans_only_targeted_tests_review() {
 #[test]
 fn scheduled_verification_task_runs_in_confined_worker() {
     // The assertions below read the rendered Seatbelt profile.
-    let _seatbelt = SeatbeltBackendGuard::install();
+    let _seatbelt = seatbelt_backend();
     let tmp = TempDir::new().unwrap();
     let (project, candidate, review_path) = setup_focused_evidence_fixture(
         &tmp,
@@ -50926,7 +50915,7 @@ git rebase "$TARGET" 2>/dev/null"##,
 #[test]
 fn autonomous_codex_learner_uses_canonical_worker_home_in_strict_profile() {
     // The assertions below read the rendered Seatbelt profile.
-    let _seatbelt = SeatbeltBackendGuard::install();
+    let _seatbelt = seatbelt_backend();
     let tmp = TempDir::new().unwrap();
     let main_dir = setup_git_project(&tmp);
     let bin_dir = tmp.path().join("bin-codex-worker-home-strict-learner");
@@ -51049,7 +51038,7 @@ git rebase "$TARGET" 2>/dev/null"##,
 #[test]
 fn canonical_worker_home_learner_retry_consumes_no_writer_round() {
     // The assertions below read the rendered Seatbelt profile.
-    let _seatbelt = SeatbeltBackendGuard::install();
+    let _seatbelt = seatbelt_backend();
     let tmp = TempDir::new().unwrap();
     let main_dir = setup_git_project(&tmp);
     let bin_dir = tmp
@@ -54679,12 +54668,13 @@ impl Drop for VerificationConcurrencyExecution {
 #[test]
 fn verification_worker_does_not_block_unrelated_attempt_progress() {
     // The assertions below read the rendered Seatbelt profile.
-    let _seatbelt = SeatbeltBackendGuard::install();
+    let _seatbelt = seatbelt_backend();
     let tmp = TempDir::new().unwrap();
     let mut fixture = VerificationConcurrencyFixture::new(&tmp);
     fixture.wait_until_blocked();
     // Scheduling takes the real project landing lock; command timeout catches a regression.
     assert_cmd::Command::new(assert_cmd::cargo::cargo_bin!("fluent"))
+        .env("FLUENT_SANDBOX_BACKEND", "seatbelt")
         .env("FLUENT_NO_UPDATE_CHECK", "1")
         .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "pass")
         .current_dir(&fixture.project)
@@ -54701,6 +54691,7 @@ fn verification_worker_does_not_block_unrelated_attempt_progress() {
         .assert()
         .success();
     assert_cmd::Command::new(assert_cmd::cargo::cargo_bin!("fluent"))
+        .env("FLUENT_SANDBOX_BACKEND", "seatbelt")
         .env("FLUENT_NO_UPDATE_CHECK", "1")
         .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "pass")
         .current_dir(&fixture.project)
@@ -62266,7 +62257,7 @@ fn usage_limit_prepare_confinement_probe(
 #[test]
 fn usage_limit_writer_recovery_profile_resolves_fixture_paths() {
     // The assertions below read the rendered Seatbelt profile.
-    let _seatbelt = SeatbeltBackendGuard::install();
+    let _seatbelt = seatbelt_backend();
     let fixture = usage_limit_fixture();
     let (item, worker) = usage_limit_prepare_confinement_probe(&fixture);
     let (git_configs, inactive_config) = usage_limit_git_config_fixture(&fixture);
@@ -63688,7 +63679,7 @@ fn ordinary_tests_review_revalidates_host_evidence_before_launch() {
 #[serial]
 fn ordinary_tests_review_keeps_host_evidence_read_only() {
     // The assertions below read the rendered Seatbelt profile.
-    let _seatbelt = SeatbeltBackendGuard::install();
+    let _seatbelt = seatbelt_backend();
     use fluent::work_model::*;
     ordinary_accepted_proof_sequence(false, |project, item| {
         let attempt = &item.attempts[0];

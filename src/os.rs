@@ -37,8 +37,7 @@ pub enum SandboxBackend {
 /// Backend this host confines with, unless `FLUENT_SANDBOX_BACKEND` names
 /// `seatbelt` or `landlock`.
 pub fn backend() -> SandboxBackend {
-    #[cfg(test)]
-    if let Some(forced) = test_backend_override() {
+    if let Some(forced) = pinned_backend() {
         return forced;
     }
     match env::var("FLUENT_SANDBOX_BACKEND").as_deref() {
@@ -49,22 +48,33 @@ pub fn backend() -> SandboxBackend {
     }
 }
 
-/// The backend a test pins for its own thread.
+/// The backend a test pinned for the current thread.
 ///
-/// Several upstream tests assert on the Seatbelt profile's text. That profile
-/// is what the macOS host renders, but a Linux host renders the Landlock
-/// policy instead, so those assertions would read the wrong artifact. The
-/// override lives in a thread-local because the tests run in parallel and an
-/// environment variable would leak across them.
-#[cfg(test)]
+/// Several upstream tests assert on the Seatbelt profile's text: the rule that
+/// grants a path, the deny that withholds it. A Linux host renders the
+/// Landlock policy instead, so those assertions would read the wrong
+/// artifact. The pin is thread-local because the tests run in parallel threads
+/// inside one process, where a process-wide value would leak between them.
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
-    static TEST_BACKEND_OVERRIDE: std::cell::Cell<Option<SandboxBackend>> =
+    static PINNED_BACKEND: std::cell::Cell<Option<SandboxBackend>> =
         const { std::cell::Cell::new(None) };
 }
 
-#[cfg(test)]
-fn test_backend_override() -> Option<SandboxBackend> {
-    TEST_BACKEND_OVERRIDE.with(|override_backend| override_backend.get())
+#[cfg(any(test, feature = "test-support"))]
+fn pinned_backend() -> Option<SandboxBackend> {
+    PINNED_BACKEND.with(|pinned| pinned.get())
+}
+
+/// The pinned backend's name, for a test that starts a command in a child
+/// process and needs the same boundary there.
+#[cfg(any(test, feature = "test-support"))]
+pub fn pinned_backend_name() -> Option<&'static str> {
+    match pinned_backend() {
+        Some(SandboxBackend::Seatbelt) => Some("seatbelt"),
+        Some(SandboxBackend::Landlock) => Some("landlock"),
+        None => None,
+    }
 }
 
 /// Pin the sandbox backend for the current thread.
@@ -72,29 +82,33 @@ fn test_backend_override() -> Option<SandboxBackend> {
 /// A test that asserts on a rendered profile has to name the backend it
 /// inspects, because the two backends write different artifacts. The pin
 /// lasts until the returned guard is dropped.
-#[cfg(test)]
-pub(crate) struct BackendPin {
+#[cfg(any(test, feature = "test-support"))]
+pub struct BackendPin {
     previous: Option<SandboxBackend>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl BackendPin {
-    pub(crate) fn seatbelt() -> Self {
-        Self::pin(SandboxBackend::Seatbelt)
+    pub fn seatbelt() -> Self {
+        Self::pin(Some(SandboxBackend::Seatbelt))
     }
 
-    fn pin(backend: SandboxBackend) -> Self {
-        let previous =
-            TEST_BACKEND_OVERRIDE.with(|override_backend| override_backend.replace(Some(backend)));
+    #[cfg(test)]
+    pub(crate) fn landlock() -> Self {
+        Self::pin(Some(SandboxBackend::Landlock))
+    }
+
+    fn pin(backend: Option<SandboxBackend>) -> Self {
+        let previous = PINNED_BACKEND.with(|pinned| pinned.replace(backend));
         Self { previous }
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Drop for BackendPin {
     fn drop(&mut self) {
         let previous = self.previous;
-        TEST_BACKEND_OVERRIDE.with(|override_backend| override_backend.set(previous));
+        PINNED_BACKEND.with(|pinned| pinned.set(previous));
     }
 }
 
