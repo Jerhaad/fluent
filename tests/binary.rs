@@ -24976,6 +24976,9 @@ exit 1
 
 #[test]
 fn write_task_sandbox_grants_artifact_dir_write_access() {
+    // The assertions below read the rendered Seatbelt profile, which the
+    // mock launcher in this fixture copies out of the way.
+    let _seatbelt = seatbelt_backend();
     let tmp = TempDir::new().unwrap();
     let main_dir = setup_git_project(&tmp);
     let bin_dir = tmp.path().join("bin-write-sandbox");
@@ -29979,6 +29982,9 @@ exit 0
 
 #[test]
 fn work_task_run_sandboxes_review_with_read_only_candidate() {
+    // The assertions below read the rendered Seatbelt profile, which the
+    // mock launcher in this fixture copies out of the way.
+    let _seatbelt = seatbelt_backend();
     let tmp = TempDir::new().unwrap();
     let main_dir = setup_git_project(&tmp);
     create_completed_work_attempt(&tmp, &main_dir);

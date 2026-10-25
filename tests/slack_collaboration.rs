@@ -3622,6 +3622,8 @@ fn codex_app_server_provider_exchanges_a_stable_turn() {
 
 #[test]
 fn scoped_codex_provider_accesses_checkout_below_runner_home() {
+    // The assertions below read the rendered Seatbelt profile.
+    let _seatbelt = fluent::os::BackendPin::seatbelt();
     let fixture = TempDir::new().unwrap();
     let executable = codex_fixture(&fixture);
     let runner_home = TempDir::new().unwrap();
