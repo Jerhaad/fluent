@@ -430,8 +430,10 @@ fn a_denied_write_root_keeps_the_shared_temp_trees_closed_on_linux() {
     let policy_file = tempfile::NamedTempFile::new().unwrap();
     std::fs::copy(profile.path, policy_file.path()).unwrap();
     // A fresh path under the shared temp tree. It does not exist when the
-    // policy is rendered, so only the grant itself can make it writable.
-    let shared = tempfile::TempDir::new().unwrap();
+    // policy is rendered, so only the grant itself can make it writable. The
+    // directory is placed under `/tmp` outright rather than through the
+    // environment's temporary directory, which a host may point elsewhere.
+    let shared = tempfile::TempDir::new_in("/tmp").unwrap();
     let escape = shared.path().join("escape.txt");
 
     if kernel_enforces_landlock() {
