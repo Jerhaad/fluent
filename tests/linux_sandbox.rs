@@ -452,18 +452,26 @@ fn a_denied_write_root_keeps_the_shared_temp_trees_closed_on_linux() {
 }
 
 #[test]
-fn common_only_with_denied_access_keeps_the_shared_temp_trees_closed_on_linux() {
-    // The denied-access renderer withholds the operator's own trees. A writable
-    // `/tmp` reaches around that denial, so the profile closes the shared temp
-    // trees as well.
+fn common_only_with_denied_access_keeps_shared_temp_and_withholds_its_tree_on_linux() {
+    // Upstream's denied-access renderer is the ordinary common profile with
+    // denies appended for the withheld trees, so it keeps the shared temporary
+    // grants. The Linux profile matches: a fresh path under the shared temp
+    // tree stays writable, and the withheld tree placed inside it does not.
     let root = fixture_root();
     let scratch = root.path().join("scratch");
     let readable = root.path().join("readable");
-    let denied = root.path().join("denied");
-    for path in [&scratch, &readable, &denied] {
+    for path in [&scratch, &readable] {
         std::fs::create_dir_all(path).unwrap();
     }
     std::fs::write(scratch.join("allowed.txt"), "granted").unwrap();
+
+    // The withheld tree sits under the shared temp tree, so the temporary
+    // directory grant encloses it and the carve-out has to reach that grant.
+    // It exists before the policy is rendered, because a carve-out enumerates
+    // the tree it cuts and a path created later falls outside every rule.
+    let shared = tempfile::TempDir::new().unwrap();
+    let denied = shared.path().join("denied");
+    std::fs::create_dir_all(&denied).unwrap();
 
     let profile = fluent::os::render_profile_common_only_with_denied_access(
         &fluent::content::ContentResolver::new(None),
@@ -476,21 +484,30 @@ fn common_only_with_denied_access_keeps_the_shared_temp_trees_closed_on_linux() 
     .unwrap();
     let policy_file = tempfile::NamedTempFile::new().unwrap();
     std::fs::copy(profile.path, policy_file.path()).unwrap();
-    let shared = tempfile::TempDir::new().unwrap();
-    let escape = shared.path().join("escape.txt");
+    // A fresh path under the shared temp tree, beside the withheld one. It
+    // does not exist when the policy is rendered, so only the grant itself
+    // can make it writable.
+    let allowed = shared.path().join("allowed.txt");
 
     if kernel_enforces_landlock() {
-        assert_denied(
-            policy_file.path(),
-            &format!("printf escaped > {}", escape.display()),
-            "the denied-access profile left the shared temp tree writable",
-        );
-        assert!(!escape.exists(), "the escape file was written anyway");
         let (ok, stderr) = run_confined(
             policy_file.path(),
-            &format!("printf written > {}", scratch.join("allowed.txt").display()),
+            &format!("printf written > {}", allowed.display()),
         );
-        assert!(ok, "a write to the granted root was refused: {stderr}");
+        assert!(
+            ok,
+            "a write to a fresh path in the shared temp tree was refused: {stderr}"
+        );
+        assert_eq!(std::fs::read_to_string(&allowed).unwrap(), "written");
+        assert_denied(
+            policy_file.path(),
+            &format!("printf escaped > {}", denied.join("new.txt").display()),
+            "the withheld tree under the shared temp tree was writable",
+        );
+        assert!(
+            !denied.join("new.txt").exists(),
+            "the withheld file was written anyway"
+        );
     } else {
         let (ok, stderr) = run_confined(policy_file.path(), "true");
         assert!(!ok, "a kernel with no Landlock ran the command anyway");

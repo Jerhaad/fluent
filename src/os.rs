@@ -1243,20 +1243,20 @@ pub fn render_profile_common_only_with_denied_access(
     denied_write_roots: &[PathBuf],
 ) -> Result<SandboxProfile> {
     // Landlock has no deny rule, so a withheld tree has to be an exclusion the
-    // renderer enumerates around. Naming it a denied write root rather than a
-    // denied write path also keeps the shared temporary trees away: they are a
-    // channel around whatever the profile withholds.
-    let landlock = backend() == SandboxBackend::Landlock;
+    // renderer enumerates around. It joins the denied write paths rather than
+    // the denied write roots: the roots decide whether the shared temporary
+    // trees are granted at all, and this renderer keeps them, exactly as the
+    // ordinary profile it is derived from does.
     let profile = render_profile_for_access_with_exclusions(
         resolver,
         home,
         writable_roots,
         readable_roots,
-        if landlock { denied_write_roots } else { &[] },
+        &[],
         None,
         None,
         true,
-        if landlock { &[] } else { denied_write_roots },
+        denied_write_roots,
         denied_read_roots,
         &[],
     )?;
