@@ -176,7 +176,11 @@ fn the_launcher_refuses_a_policy_it_cannot_parse() {
 
 #[test]
 fn linux_writer_confinement_matches_seatbelt_probe() {
-    let root = fixture_root();
+    // The fixture lives under the shared temp tree, so the temporary-directory
+    // grant encloses the source checkout. Upstream's Seatbelt profile denies
+    // the source entries after that broad grant, and the Linux profile has to
+    // carve them out of it instead.
+    let root = tempfile::TempDir::new().unwrap();
     let physical_source = root.path().join("physical-source");
     let source_link = root.path().join("source");
     let candidate = root.path().join("candidate");
@@ -212,30 +216,36 @@ fn linux_writer_confinement_matches_seatbelt_probe() {
     )
     .unwrap();
 
+    // A symlink outside the shared temp tree points at the same source. A
+    // write through it must be refused like the direct one: the denial
+    // follows the tree, not the spelling of the path.
+    let outside = fixture_root();
+    let outside_link = outside.path().join("source-alias");
+    std::os::unix::fs::symlink(&physical_source, &outside_link).unwrap();
+
     let confinement =
         fluent::os::writer_confinement(&source_link, &candidate, &artifact, &cache).unwrap();
-    let writable = vec![candidate.clone(), source_link.clone(), artifact.clone()];
-    let landlock = linux_sandbox::render(&linux_sandbox::PolicyRequest {
-        home: root.path(),
-        writable_roots: &writable,
-        readable_roots: &[],
-        denied_write_roots: &[],
-        coder_kind: Some(CoderKind::Claude),
-        codex_home: None,
-        grant_shared_temp: false,
-        denied_write_paths: &confinement.denied,
-        denied_read_paths: &[],
-        reallowed_write_paths: &confinement.allowed,
-    })
-    .unwrap();
-    let policy_file = tempfile::NamedTempFile::new().unwrap();
-    std::fs::write(
-        policy_file.path(),
-        linux_sandbox::serialize(&landlock).unwrap(),
+    // The roots the executor grants the Writer: the candidate worktree, the
+    // Git directory, the Task artifact, and the Attempt's writer cache.
+    let writable = vec![
+        candidate.clone(),
+        physical_source.join(".git"),
+        artifact.clone(),
+        cache.clone(),
+    ];
+    let profile = fluent::os::render_writer_profile_for_landlock(
+        &fluent::content::ContentResolver::new(None),
+        &fluent::os::WriterProfileKind::AutonomousClaude,
+        root.path().to_str().unwrap(),
+        &writable,
+        &[],
+        &confinement,
     )
     .unwrap();
+    let policy_file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::copy(profile.path, policy_file.path()).unwrap();
 
-    let probes: [(u8, &Path, bool); 9] = [
+    let probes: [(u8, &Path, bool); 10] = [
         (10, &physical_source.join("src/lib.rs"), false),
         (11, &candidate.join("change.txt"), true),
         (12, &physical_source.join(".git/test"), true),
@@ -245,6 +255,7 @@ fn linux_writer_confinement_matches_seatbelt_probe() {
         (16, &gate_artifact.join("test"), false),
         (17, &cache.join("test"), true),
         (18, &sibling_cache.join("test"), false),
+        (19, &outside_link.join("src/lib.rs"), false),
     ];
 
     if kernel_enforces_landlock() {
@@ -293,61 +304,100 @@ fn autonomous_claude_profile_denies_operator_project_state_on_linux() {
     let worker_home = root.path().join("worker-home");
     std::fs::create_dir_all(&projects).unwrap();
     std::fs::create_dir_all(worker_home.join(".claude/projects")).unwrap();
+    // A sibling inside the coder's own configuration tree stays writable, so
+    // the refusal below names the project tree and not the whole grant.
+    let settings = home.join(".claude/settings.json");
+    std::fs::write(&settings, "{}").unwrap();
+    std::fs::write(projects.join("session.jsonl"), "operator").unwrap();
 
-    let policy = fluent::os::render_profile_for_access_for_autonomous_claude(
+    let profile = fluent::os::render_profile_for_access_for_autonomous_claude(
         &fluent::content::ContentResolver::new(None),
         &home.to_string_lossy(),
         std::slice::from_ref(&worker_home),
         &[],
     )
     .unwrap();
-    let text = std::fs::read_to_string(policy.path).unwrap();
-    let policy: linux_sandbox::Policy = serde_json::from_str(&text).unwrap();
-    assert!(
-        !policy.rules.iter().any(|rule| {
-            rule.path == projects
-                && matches!(
-                    rule.access,
-                    linux_sandbox::Access::ReadWrite | linux_sandbox::Access::Read
-                )
-        }),
-        "the operator project tree was readable or writable: {policy:?}"
-    );
+    let policy_file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::copy(profile.path, policy_file.path()).unwrap();
+
+    if kernel_enforces_landlock() {
+        assert_denied(
+            policy_file.path(),
+            &format!("printf written > {}", projects.join("new.jsonl").display()),
+            "a write landed in the operator's project tree",
+        );
+        assert_denied(
+            policy_file.path(),
+            &format!("cat {}", projects.join("session.jsonl").display()),
+            "the operator's project tree was readable",
+        );
+        let (ok, stderr) = run_confined(
+            policy_file.path(),
+            &format!("printf written > {}", settings.display()),
+        );
+        assert!(
+            ok,
+            "a write to a sibling of the project tree was refused: {stderr}"
+        );
+    } else {
+        let (ok, stderr) = run_confined(policy_file.path(), "true");
+        assert!(!ok, "a kernel with no Landlock ran the coder anyway");
+        assert!(stderr.contains(NOT_ENFORCED), "{stderr}");
+    }
 }
 
 #[test]
 fn common_only_with_denied_access_withholds_paths_on_linux() {
     let root = fixture_root();
     let scratch = root.path().join("scratch");
-    let denied = root.path().join("denied");
     let readable = root.path().join("readable");
     std::fs::create_dir_all(&scratch).unwrap();
-    std::fs::create_dir_all(&denied).unwrap();
     std::fs::create_dir_all(&readable).unwrap();
     std::fs::create_dir_all(readable.join("denied")).unwrap();
     let denied = readable.join("denied");
+    // A second denied path under the shared temp tree: the temporary
+    // directory grant encloses it, so the carve-out has to reach that grant
+    // too.
+    let temp = tempfile::TempDir::new().unwrap();
+    let temp_denied = temp.path().join("denied");
+    std::fs::create_dir_all(&temp_denied).unwrap();
 
-    let policy = fluent::os::render_profile_common_only_with_denied_access(
+    let profile = fluent::os::render_profile_common_only_with_denied_access(
         &fluent::content::ContentResolver::new(None),
         &root.path().to_string_lossy(),
         std::slice::from_ref(&scratch),
         std::slice::from_ref(&readable),
-        std::slice::from_ref(&denied),
-        std::slice::from_ref(&denied),
+        std::slice::from_ref(&temp_denied),
+        &[denied.clone(), temp_denied.clone()],
     )
     .unwrap();
-    let text = std::fs::read_to_string(policy.path).unwrap();
-    let policy: linux_sandbox::Policy = serde_json::from_str(&text).unwrap();
-    assert!(
-        !policy.rules.iter().any(|rule| {
-            rule.path == denied
-                && matches!(
-                    rule.access,
-                    linux_sandbox::Access::ReadWrite | linux_sandbox::Access::Read
-                )
-        }),
-        "the denied path was readable or writable: {policy:?}"
-    );
+    let policy_file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::copy(profile.path, policy_file.path()).unwrap();
+
+    if kernel_enforces_landlock() {
+        assert_denied(
+            policy_file.path(),
+            &format!("printf written > {}", denied.join("new.txt").display()),
+            "a write landed in a denied path",
+        );
+        assert_denied(
+            policy_file.path(),
+            &format!("printf written > {}", temp_denied.join("new.txt").display()),
+            "a write landed in a denied path under the shared temp tree",
+        );
+        let (ok, stderr) = run_confined(
+            policy_file.path(),
+            &format!(
+                "printf written > {}",
+                readable.join("allowed.txt").display()
+            ),
+        );
+        assert!(ok, "a write to a granted sibling was refused: {stderr}");
+    } else {
+        let (ok, stderr) = run_confined(policy_file.path(), "true");
+        assert!(!ok, "a kernel with no Landlock ran the command anyway");
+        assert!(stderr.contains(NOT_ENFORCED), "{stderr}");
+    }
 }
 
 #[test]
@@ -369,14 +419,28 @@ fn scoped_codex_provider_with_tools_withholds_installed_writes_on_linux() {
         std::slice::from_ref(&installed),
     )
     .unwrap();
-    let text = std::fs::read_to_string(profile.path).unwrap();
-    let policy: linux_sandbox::Policy = serde_json::from_str(&text).unwrap();
-    assert!(
-        !policy.rules.iter().any(|rule| {
-            rule.path == installed && rule.access == linux_sandbox::Access::ReadWrite
-        }),
-        "the installed tool tree was writable: {policy:?}"
-    );
+    let policy_file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::copy(profile.path, policy_file.path()).unwrap();
+
+    if kernel_enforces_landlock() {
+        assert_denied(
+            policy_file.path(),
+            &format!("printf written > {}", installed.join("tool").display()),
+            "the installed tool tree was writable",
+        );
+        let (ok, stderr) = run_confined(
+            policy_file.path(),
+            &format!(
+                "printf written > {}",
+                workspace.join("change.txt").display()
+            ),
+        );
+        assert!(ok, "a write to a granted sibling was refused: {stderr}");
+    } else {
+        let (ok, stderr) = run_confined(policy_file.path(), "true");
+        assert!(!ok, "a kernel with no Landlock ran the provider anyway");
+        assert!(stderr.contains(NOT_ENFORCED), "{stderr}");
+    }
 }
 
 #[test]

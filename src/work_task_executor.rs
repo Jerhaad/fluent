@@ -4496,19 +4496,19 @@ fn preflight_write_sandbox_profile(
     writable_roots.extend(claude_home.map(Path::to_path_buf));
     writable_roots.push(writer_cache.root().to_path_buf());
 
-    let profile = if coder_kind == CoderKind::Claude {
-        os::render_profile_for_access_for_autonomous_claude(
-            resolver,
-            &home,
-            &writable_roots,
-            &readable_roots,
-        )?
-    } else if task.input_artifacts.iter().any(|a| {
+    // Pick the profile the Writer renders for. The macOS and Landlock
+    // backends render the same choice, so the selection happens once: each
+    // kind carries its own denials, and the Landlock render adds the
+    // Writer's source exclusions on top.
+    let usage_limit_retry = task.input_artifacts.iter().any(|a| {
         matches!(
             a.producer_id.as_str(),
             "usage-limit-writer-approval" | "writer-completion-context-retry"
         )
-    }) {
+    });
+    let profile_kind = if coder_kind == CoderKind::Claude {
+        os::WriterProfileKind::AutonomousClaude
+    } else if usage_limit_retry {
         let worker = codex_worker.context("usage-limit retry requires its private Codex home")?;
         let installed_tools = installed_writer_tool_roots(
             Path::new(&home),
@@ -4536,23 +4536,15 @@ fn preflight_write_sandbox_profile(
                 readable_roots.push(fs::canonicalize(path)?);
             }
         }
-        os::render_profile_for_scoped_codex_provider_with_tools(
-            resolver,
-            worker.home(),
-            &writable_roots,
-            &readable_roots,
-            worker.home(),
-            &installed_tools,
-        )?
+        os::WriterProfileKind::ScopedCodex {
+            private_home: worker.home().to_path_buf(),
+            installed_tools,
+        }
     } else {
-        os::render_profile_for_access_for_coder_with_codex_home(
-            resolver,
-            &home,
-            &writable_roots,
-            &readable_roots,
+        os::WriterProfileKind::Coder {
             coder_kind,
-            codex_worker.map(|worker| worker.home()),
-        )?
+            codex_home: codex_worker.map(|worker| worker.home().to_path_buf()),
+        }
     };
     let task_artifact = task
         .artifact_area
@@ -4566,17 +4558,13 @@ fn preflight_write_sandbox_profile(
             &task_artifact_path,
             writer_cache.root(),
         )?;
-        let profile = os::render_profile_for_access_for_coder_with_denied_writes_and_codex_home_and_exclusions(
+        let profile = os::render_writer_profile_for_landlock(
             resolver,
+            &profile_kind,
             &home,
             &writable_roots,
             &readable_roots,
-            &[],
-            coder_kind,
-            codex_worker.map(|worker| worker.home()),
-            &confinement.denied,
-            &[],
-            &confinement.allowed,
+            &confinement,
         )?;
         #[cfg(not(test))]
         if let Some(worker) = codex_worker {
@@ -4587,6 +4575,38 @@ fn preflight_write_sandbox_profile(
         os::preflight_readable_paths(&profile, prior_reviews)?;
         return Ok(Some(profile));
     }
+    let profile = match &profile_kind {
+        os::WriterProfileKind::AutonomousClaude => {
+            os::render_profile_for_access_for_autonomous_claude(
+                resolver,
+                &home,
+                &writable_roots,
+                &readable_roots,
+            )?
+        }
+        os::WriterProfileKind::ScopedCodex {
+            private_home,
+            installed_tools,
+        } => os::render_profile_for_scoped_codex_provider_with_tools(
+            resolver,
+            private_home,
+            &writable_roots,
+            &readable_roots,
+            private_home,
+            installed_tools,
+        )?,
+        os::WriterProfileKind::Coder {
+            coder_kind,
+            codex_home,
+        } => os::render_profile_for_access_for_coder_with_codex_home(
+            resolver,
+            &home,
+            &writable_roots,
+            &readable_roots,
+            *coder_kind,
+            codex_home.as_deref(),
+        )?,
+    };
     os::deny_writer_source_entries(
         &profile,
         project_root,

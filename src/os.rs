@@ -80,6 +80,115 @@ pub struct WriterConfinement {
     pub allowed: Vec<PathBuf>,
 }
 
+/// Which profile the Writer renders for a given coder kind.
+///
+/// The macOS Writer picks one of three profiles before it applies the source
+/// exclusions, and each carries its own denials. Linux renders the same
+/// choice, so the selection lives here instead of in the executor.
+#[derive(Debug, Clone)]
+pub enum WriterProfileKind {
+    /// An autonomous Claude. The operator's project tree stays withheld.
+    AutonomousClaude,
+    /// A usage-limit retry. The scoped Codex provider renders it, and the
+    /// installed tools stay readable but not writable.
+    ScopedCodex {
+        /// The provider's private home.
+        private_home: PathBuf,
+        /// Tool roots the provider may read but not write.
+        installed_tools: Vec<PathBuf>,
+    },
+    /// Any other coder.
+    Coder {
+        /// The coder the profile is rendered for.
+        coder_kind: CoderKind,
+        /// Codex's private worker home, when it has one.
+        codex_home: Option<PathBuf>,
+    },
+}
+
+/// Render the Writer's Landlock profile.
+///
+/// The macOS Writer renders a profile by coder kind and then denies the source
+/// entries inside it. Landlock has no deny rule, so the same selection happens
+/// before rendering and every exclusion the Seatbelt profile carries enters
+/// the policy request: the coder kind's own denials, the Writer's source
+/// exclusions, and the shared temporary trees the macOS profile keeps.
+pub fn render_writer_profile_for_landlock(
+    resolver: &ContentResolver,
+    kind: &WriterProfileKind,
+    home: &str,
+    writable_roots: &[PathBuf],
+    readable_roots: &[PathBuf],
+    confinement: &WriterConfinement,
+) -> Result<SandboxProfile> {
+    let mut denied_write_paths = confinement.denied.clone();
+    let mut denied_read_paths: Vec<PathBuf> = Vec::new();
+    let reallowed_write_paths = confinement.allowed.clone();
+
+    let profile = match kind {
+        WriterProfileKind::AutonomousClaude => {
+            // The operator's project tree is withheld from reads and writes.
+            // `linux_sandbox::render` adds the canonical spelling, so only the
+            // logical path is named here.
+            let projects = vec![PathBuf::from(home).join(".claude/projects")];
+            denied_write_paths.extend(projects.iter().cloned());
+            denied_read_paths.extend(projects.iter().cloned());
+            render_profile_for_access_with_exclusions(
+                resolver,
+                home,
+                writable_roots,
+                readable_roots,
+                &[],
+                Some(CoderKind::Claude),
+                None,
+                true,
+                &denied_write_paths,
+                &denied_read_paths,
+                &reallowed_write_paths,
+            )?
+        }
+        WriterProfileKind::ScopedCodex {
+            private_home,
+            installed_tools,
+        } => {
+            // Installed tools stay readable but not writable.
+            denied_write_paths.extend(installed_tools.iter().cloned());
+            let mut readable = readable_roots.to_vec();
+            readable.extend_from_slice(installed_tools);
+            render_profile_for_access_with_exclusions(
+                resolver,
+                &private_home.to_string_lossy(),
+                writable_roots,
+                &readable,
+                &[],
+                Some(CoderKind::Codex),
+                Some(private_home),
+                false,
+                &denied_write_paths,
+                &denied_read_paths,
+                &reallowed_write_paths,
+            )?
+        }
+        WriterProfileKind::Coder {
+            coder_kind,
+            codex_home,
+        } => render_profile_for_access_with_exclusions(
+            resolver,
+            home,
+            writable_roots,
+            readable_roots,
+            &[],
+            Some(*coder_kind),
+            codex_home.as_deref(),
+            true,
+            &denied_write_paths,
+            &denied_read_paths,
+            &reallowed_write_paths,
+        )?,
+    };
+    Ok(profile)
+}
+
 /// Compute the Writer's Landlock carve-outs from the same inputs as the
 /// Seatbelt profile mutation.
 pub fn writer_confinement(
@@ -824,7 +933,10 @@ pub fn render_profile_for_scoped_codex_provider_with_tools(
         &readable,
         codex_home,
         installed_tools,
-        &[],
+        // The installed tools stay readable and lose their write access. The
+        // Seatbelt profile denies the writes in the rendered file; Landlock
+        // needs them as exclusions, because it cannot subtract a grant.
+        installed_tools,
     )?;
     Ok(profile)
 }
@@ -884,13 +996,9 @@ pub fn render_profile_for_access_for_autonomous_claude(
     readable_roots: &[PathBuf],
 ) -> Result<SandboxProfile> {
     let source_home_path = PathBuf::from(source_home);
-    let canonical_source_home =
-        std::fs::canonicalize(&source_home_path).unwrap_or_else(|_| source_home_path.clone());
-    let mut source_projects = vec![source_home_path.join(".claude/projects")];
-    let canonical_projects = canonical_source_home.join(".claude/projects");
-    if canonical_projects != source_projects[0] {
-        source_projects.push(canonical_projects);
-    }
+    // The Landlock renderer canonicalizes every excluded path itself, so the
+    // policy request names the logical path only.
+    let source_projects = vec![source_home_path.join(".claude/projects")];
     let profile = render_profile_for_access_with_exclusions(
         resolver,
         source_home,
@@ -905,7 +1013,16 @@ pub fn render_profile_for_access_for_autonomous_claude(
         &[],
     )?;
     if backend() == SandboxBackend::Seatbelt {
-        let deny = source_projects
+        // Seatbelt matches the resolved path, so the deny names both
+        // spellings of the operator's project tree.
+        let canonical_source_home =
+            std::fs::canonicalize(&source_home_path).unwrap_or_else(|_| source_home_path.clone());
+        let canonical_projects = canonical_source_home.join(".claude/projects");
+        let mut denied = source_projects.clone();
+        if canonical_projects != source_projects[0] {
+            denied.push(canonical_projects);
+        }
+        let deny = denied
             .iter()
             .flat_map(|projects| {
                 [
