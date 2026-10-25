@@ -354,8 +354,12 @@ fn common_only_with_denied_access_withholds_paths_on_linux() {
     std::fs::create_dir_all(&scratch).unwrap();
     std::fs::create_dir_all(&readable).unwrap();
     // A denied path inside the writable root, beside a path the root grants.
-    // The sibling is what proves the carve-out is narrow.
+    // The sibling is what proves the carve-out is narrow. It exists before the
+    // policy is rendered, because a denied path inside a writable root makes
+    // the renderer enumerate that root, and a path created later falls outside
+    // every rule.
     std::fs::create_dir_all(scratch.join("denied")).unwrap();
+    std::fs::write(scratch.join("allowed.txt"), "granted").unwrap();
     let denied = scratch.join("denied");
     // A denied path inside the shared temp tree: the temporary directory grant
     // encloses it, so the carve-out has to reach that grant too.
