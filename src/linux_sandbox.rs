@@ -375,9 +375,12 @@ fn push_root_rules(
     // A denied write root keeps the read access every other rule grants it;
     // only the write half is withheld. A root the read exclusions withhold
     // keeps nothing: naming it here would hand back the read access the
-    // caller's own denial removed.
+    // caller's own denial removed. The canonical spelling is checked as well,
+    // so a symlinked root cannot smuggle the read grant back through the
+    // physical tree.
     for root in request.denied_write_roots {
-        if read_exclusions.contains(root) {
+        let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+        if read_exclusions.contains(root) || read_exclusions.contains(&canonical) {
             continue;
         }
         rules.push(Rule::optional(root, Access::Read));
@@ -847,6 +850,35 @@ mod tests {
             access_for(&policy, &workspace),
             Some(Access::ReadWrite),
             "{policy:?}"
+        );
+    }
+
+    #[test]
+    fn a_denied_write_root_the_read_exclusions_withhold_keeps_no_read_grant() {
+        // A tree that is both write-denied and read-denied must stay
+        // unreadable. The denied write root's own read grant would hand the
+        // read access straight back.
+        let home = fixture_home();
+        let agent_state = home.path().join(".claude");
+        std::fs::create_dir_all(&agent_state).unwrap();
+        let roots = vec![home.path().join("code")];
+
+        let policy = render(&PolicyRequest {
+            denied_write_roots: &[agent_state.clone()],
+            denied_read_paths: &[agent_state.clone()],
+            ..request(home.path(), &roots)
+        })
+        .unwrap();
+
+        assert_ne!(
+            effective_access(&policy, &agent_state),
+            Some(Access::Read),
+            "the read-denied tree was readable: {policy:?}"
+        );
+        assert_ne!(
+            effective_access(&policy, &agent_state),
+            Some(Access::ReadWrite),
+            "the read-denied tree was writable: {policy:?}"
         );
     }
 
