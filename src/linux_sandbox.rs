@@ -196,6 +196,21 @@ pub fn render(request: &PolicyRequest<'_>) -> Result<Policy> {
     })
 }
 
+/// Add the canonical form of every path that exists.
+///
+/// The same tree can be reached through a symlink, and the kernel resolves the
+/// path the process actually opens. Withholding only the logical spelling
+/// leaves the physical tree granted, so both spellings are excluded.
+fn canonical_forms(paths: BTreeSet<PathBuf>) -> BTreeSet<PathBuf> {
+    let mut extended = paths.clone();
+    for path in &paths {
+        if let Ok(canonical) = std::fs::canonicalize(path) {
+            extended.insert(canonical);
+        }
+    }
+    extended
+}
+
 /// Paths no rule may grant, whichever hierarchy they happen to fall under.
 fn withheld_paths(request: &PolicyRequest<'_>) -> BTreeSet<PathBuf> {
     let mut withheld: BTreeSet<PathBuf> = HOME_SECRETS
@@ -211,7 +226,7 @@ fn withheld_paths(request: &PolicyRequest<'_>) -> BTreeSet<PathBuf> {
             withheld.insert(source_home);
         }
     }
-    withheld
+    canonical_forms(withheld)
 }
 
 /// A system hierarchy is carved around the withheld paths too. Landlock unions
@@ -232,6 +247,7 @@ fn push_system_rules(
     if request.grant_shared_temp {
         let mut unwritable = withheld.clone();
         unwritable.extend(request.denied_write_roots.iter().cloned());
+        let unwritable = canonical_forms(unwritable);
         for path in SYSTEM_WRITE {
             grant_excluding(Path::new(path), Access::ReadWrite, &unwritable, rules)?;
         }
@@ -294,12 +310,12 @@ fn push_coder_rules(request: &PolicyRequest<'_>, rules: &mut Vec<Rule>) {
 }
 
 fn push_root_rules(request: &PolicyRequest<'_>, rules: &mut Vec<Rule>) -> Result<()> {
-    let denied: BTreeSet<PathBuf> = request.denied_write_roots.iter().cloned().collect();
+    let mut exclusions: BTreeSet<PathBuf> = request.denied_write_roots.iter().cloned().collect();
+    exclusions.extend(request.denied_write_paths.iter().cloned());
+    let exclusions = canonical_forms(exclusions);
 
     for root in request.writable_roots {
         let mut granted = Vec::new();
-        let mut exclusions = denied.clone();
-        exclusions.extend(request.denied_write_paths.iter().cloned());
         grant_excluding(root, Access::ReadWrite, &exclusions, &mut granted)?;
         for rule in &mut granted {
             rule.required = true;
@@ -317,7 +333,7 @@ fn push_root_rules(request: &PolicyRequest<'_>, rules: &mut Vec<Rule>) -> Result
         grant_excluding(
             root,
             Access::Read,
-            &request.denied_read_paths.iter().cloned().collect(),
+            &canonical_forms(request.denied_read_paths.iter().cloned().collect()),
             &mut granted,
         )?;
         for rule in &mut granted {
@@ -325,7 +341,7 @@ fn push_root_rules(request: &PolicyRequest<'_>, rules: &mut Vec<Rule>) -> Result
         }
         rules.append(&mut granted);
     }
-    for path in request.reallowed_write_paths {
+    for path in canonical_forms(request.reallowed_write_paths.iter().cloned().collect()) {
         rules.push(Rule::optional(path, Access::ReadWrite));
     }
     Ok(())
@@ -597,6 +613,60 @@ mod tests {
             .iter()
             .find(|rule| rule.path == path)
             .map(|rule| rule.access)
+    }
+
+    /// The access a path actually gets, resolved through the rules on its
+    /// ancestry.
+    ///
+    /// Landlock unions every rule whose path is an ancestor of the opened
+    /// file, so the widest grant on the ancestry is the one that applies. A
+    /// lookup by exact path would miss it and report a policy as narrower
+    /// than the kernel enforces.
+    fn effective_access(policy: &Policy, path: &Path) -> Option<Access> {
+        let mut effective: Option<Access> = None;
+        for rule in &policy.rules {
+            if !path.starts_with(&rule.path) {
+                continue;
+            }
+            effective = Some(match effective {
+                Some(current) => current.max(rule.access),
+                None => rule.access,
+            });
+        }
+        effective
+    }
+
+    #[test]
+    fn an_excluded_path_is_withheld_under_its_canonical_form() {
+        // The logical spelling and the physical tree are the same directory.
+        // Withholding only the logical spelling leaves the physical one
+        // writable through the grant that encloses it.
+        let home = fixture_home();
+        let physical = home.path().join("physical");
+        let link = home.path().join("link");
+        let excluded = link.join("excluded");
+        std::fs::create_dir_all(&physical).unwrap();
+        std::os::unix::fs::symlink(&physical, &link).unwrap();
+        std::fs::create_dir_all(&excluded).unwrap();
+        let roots = vec![home.path().to_path_buf()];
+
+        let policy = render(&PolicyRequest {
+            denied_write_paths: &[excluded.clone()],
+            ..request(home.path(), &roots)
+        })
+        .unwrap();
+
+        let physical_excluded = physical.join("excluded");
+        assert_ne!(
+            effective_access(&policy, &physical_excluded),
+            Some(Access::ReadWrite),
+            "the physical tree was writable: {policy:?}"
+        );
+        assert_ne!(
+            effective_access(&policy, &excluded),
+            Some(Access::ReadWrite),
+            "the logical tree was writable: {policy:?}"
+        );
     }
 
     #[test]
