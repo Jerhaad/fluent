@@ -510,6 +510,11 @@ fn common_only_with_denied_access_keeps_shared_temp_and_withholds_its_tree_on_li
             "a write to a fresh path in the shared temp tree was refused: {stderr}"
         );
         assert_eq!(std::fs::read_to_string(&allowed).unwrap(), "written");
+        let (ok, stderr) = run_confined(
+            policy_file.path(),
+            &format!("printf written > {}", scratch.join("allowed.txt").display()),
+        );
+        assert!(ok, "a write to the granted root was refused: {stderr}");
         assert_denied(
             policy_file.path(),
             &format!("printf escaped > {}", denied.join("new.txt").display()),
